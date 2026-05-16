@@ -1552,6 +1552,41 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
     assert write_calls == []
 
 
+def test_read_wcs_header_str_from_time_promoted_zarr(tmp_path: Path) -> None:
+    """Resume must read WCS from stores where ``wcs_header_str`` spans ``time``."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    hdr = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+    hdr_encoded = hdr.encode("utf-8")
+    hdr_bytes = np.bytes_(hdr_encoded)
+    n_time = 4
+    nl = nm = 8
+    out_zarr = tmp_path / "resume_probe.zarr"
+    wcs_per_time = np.array([hdr_encoded] * n_time, dtype=f"S{len(hdr_encoded)}")
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "m", "l"),
+                np.zeros((n_time, 2, nm, nl), dtype=np.float32),
+            ),
+            "wcs_header_str": (("time",), wcs_per_time),
+        },
+        coords={
+            "time": ("time", np.linspace(59000.0, 59000.0 + n_time - 1, n_time)),
+            "frequency": ("frequency", np.array([55e6, 65e6])),
+            "l": ("l", np.linspace(-0.1, 0.1, nl)),
+            "m": ("m", np.linspace(-0.1, 0.1, nm)),
+        },
+    )
+    ds.to_zarr(out_zarr, mode="w", consolidated=False)
+
+    ref = mod._lm_reference_from_existing_zarr(out_zarr)
+    assert ref.attrs.get("fits_wcs_header") == hdr
+    assert ref.sizes == {"l": nl, "m": nm}
+
+
 def test_fix_headers_relabels_singleton_axis_to_stokes_for_4d(tmp_path: Path) -> None:
     """4D cubes with a mis-tagged length-1 axis must expose a literal ``STOKES`` CTYPE for xradio."""
     import numpy as np

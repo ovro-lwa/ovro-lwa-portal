@@ -1688,7 +1688,12 @@ def _read_wcs_header_str(ds: xr.Dataset) -> Optional[str]:
     """
     s = ds.attrs.get("fits_wcs_header")
     if s is None and "wcs_header_str" in ds:
-        raw = ds["wcs_header_str"].values.item()
+        raw_arr = np.asarray(ds["wcs_header_str"].values)
+        if raw_arr.size == 0:
+            return None
+        # After incremental Zarr appends, ``wcs_header_str`` is promoted to ``(time,)``
+        # (or ``(time, frequency)``); use any representative row for the LM grid WCS.
+        raw = np.ravel(raw_arr)[0]
         s = raw.decode("utf-8") if isinstance(raw, (bytes, np.bytes_)) else str(raw)
     if s is None:
         return None
