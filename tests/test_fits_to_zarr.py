@@ -1146,6 +1146,60 @@ def test_filter_invalid_beam_files_logs_unreadable_files(tmp_path: Path, caplog)
     assert "could not read primary header" in caplog.text
 
 
+def test_truncated_fits_reason_detects_short_file(tmp_path: Path) -> None:
+    """Partial files must be flagged before image data is read."""
+    import numpy as np
+
+    mod = _import_module()
+    full = tmp_path / "full.fits"
+    data = np.zeros((8, 8), dtype=np.float32)
+    fits.PrimaryHDU(
+        data=data,
+        header=fits.Header({"BMAJ": 0.1, "BMIN": 0.1, "BITPIX": -32, "NAXIS": 2, "NAXIS1": 8, "NAXIS2": 8}),
+    ).writeto(full)
+    assert mod._truncated_fits_reason(full) is None
+
+    with fits.open(full, memmap=True) as hdul:
+        required = int(hdul[0]._data_offset) + int(hdul[0].size)
+    short = tmp_path / "short.fits"
+    short.write_bytes(full.read_bytes()[: required - 100])
+    reason = mod._truncated_fits_reason(short)
+    assert reason is not None
+    assert "truncated" in reason.lower()
+
+
+def test_truncated_fits_reason_detects_empty_file(tmp_path: Path) -> None:
+    """Zero-byte paths are treated as corrupt."""
+    mod = _import_module()
+    empty = tmp_path / "empty.fits"
+    empty.write_bytes(b"")
+    assert mod._truncated_fits_reason(empty) == "empty file (0 bytes)"
+
+
+def test_filter_invalid_beam_files_drops_truncated(tmp_path: Path, caplog) -> None:
+    """Truncated FITS must be dropped during discovery with a clear warning."""
+    import logging
+    import numpy as np
+
+    mod = _import_module()
+    good = tmp_path / "good.fits"
+    fits.PrimaryHDU(
+        data=np.zeros((4, 4), dtype=np.float32),
+        header=fits.Header({"BMAJ": 0.1, "BMIN": 0.1, "BITPIX": -32, "NAXIS": 2, "NAXIS1": 4, "NAXIS2": 4}),
+    ).writeto(good)
+    with fits.open(good, memmap=True) as hdul:
+        required = int(hdul[0]._data_offset) + int(hdul[0].size)
+    bad = tmp_path / "bad.fits"
+    bad.write_bytes(good.read_bytes()[: required - 100])
+
+    caplog.set_level(logging.WARNING, logger="ovro_lwa_portal.fits_to_zarr_xradio")
+    filtered = mod._filter_invalid_beam_files({"20240524_050009": [good, bad]})
+
+    assert filtered == {"20240524_050009": [good]}
+    assert "bad.fits" in caplog.text
+    assert "truncated" in caplog.text.lower()
+
+
 def test_fix_headers_raises_invalid_beam_error_on_missing_beam(tmp_path: Path):
     """``_fix_headers`` must refuse to invent a placeholder beam for unfit images."""
     import numpy as _np

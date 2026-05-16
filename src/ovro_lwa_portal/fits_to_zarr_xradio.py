@@ -2004,13 +2004,56 @@ def _invalid_beam_reason(header: fits.Header) -> Optional[str]:
     return None
 
 
+def _min_primary_hdu_file_bytes(header: fits.Header) -> int:
+    """Minimum on-disk bytes for an uncompressed primary image HDU (header blocks + data)."""
+    header_size = ((len(header) * 80 + 2879) // 2880) * 2880
+    bitpix = abs(int(header.get("BITPIX", 8)))
+    naxis = int(header.get("NAXIS", 0))
+    nelem = 1
+    for i in range(1, naxis + 1):
+        nelem *= int(header[f"NAXIS{i}"])
+    bps = max(1, bitpix // 8)
+    return header_size + nelem * bps
+
+
+def _truncated_fits_reason(fp: Path) -> Optional[str]:
+    """Return a short reason when *fp* is empty or shorter than its primary HDU data.
+
+    Covers zero-byte files and partial copies where the on-disk size is less than the
+    minimum required for the primary HDU header and uncompressed image array (typical for
+    broken lustre symlinks). Without this check, combine fails later with opaque NumPy
+    errors such as ``buffer is too small for requested array``.
+    """
+    try:
+        file_size = fp.stat().st_size
+    except OSError as exc:
+        return f"cannot stat file ({exc})"
+    if file_size == 0:
+        return "empty file (0 bytes)"
+    try:
+        # Parse header from raw bytes so a truncated file does not leave astropy file
+        # handles open (``getheader`` can leak on validation failure).
+        with fp.open("rb") as f:
+            raw = f.read(min(file_size, 2880 * 64))
+        hdr = fits.Header.fromstring(raw, sep="")
+        required = _min_primary_hdu_file_bytes(hdr)
+    except Exception as exc:
+        return f"truncated or unreadable FITS ({exc})"
+    if file_size < required:
+        return (
+            f"truncated FITS ({file_size} bytes on disk, "
+            f"{required} bytes required for primary HDU data)"
+        )
+    return None
+
+
 def _filter_invalid_beam_files(
     by_time: Dict[str, List[Path]],
 ) -> Dict[str, List[Path]]:
-    """Drop FITS files whose primary header has a missing or non-positive beam.
+    """Drop FITS files with truncated data or a missing/non-positive synthesized beam.
 
-    Files surviving this filter have a real, finite, strictly positive ``BMAJ`` and
-    ``BMIN``. Skipped files are *omitted* from the returned grouping so downstream
+    Files surviving this filter are complete on disk and have a real, finite, strictly
+    positive ``BMAJ`` and ``BMIN``. Skipped files are *omitted* from the returned grouping so downstream
     combine and Zarr append leave their ``(time, frequency)`` cells unwritten; on
     append, :func:`xarray.concat` outer-joins the frequency axis and fills missing
     cells with the float ``NaN`` fill value. Time keys whose entire bucket fails the
@@ -2033,6 +2076,17 @@ def _filter_invalid_beam_files(
     for tkey, files in by_time.items():
         kept: List[Path] = []
         for fp in files:
+            trunc_reason = _truncated_fits_reason(fp)
+            if trunc_reason is not None:
+                logger.warning(
+                    "Skipping %s: %s; its (time=%s, frequency=*) slot will be filled "
+                    "with NaN in Zarr.",
+                    fp.name,
+                    trunc_reason,
+                    tkey,
+                )
+                n_dropped_files += 1
+                continue
             try:
                 hdr = fits.getheader(fp, ext=0)
             except Exception as exc:
@@ -2067,7 +2121,8 @@ def _filter_invalid_beam_files(
             )
     if n_dropped_files:
         logger.info(
-            "Beam-validity filter dropped %d file(s) across %d remaining time step(s).",
+            "Discovery quality filter dropped %d file(s) (truncated or invalid beam) "
+            "across %d remaining time step(s).",
             n_dropped_files,
             len(filtered),
         )

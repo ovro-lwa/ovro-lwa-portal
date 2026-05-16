@@ -59,7 +59,7 @@ def prepare_ingest_time_groups(
     require_73mhz: bool = False,
     context: str = "convert",
 ) -> Dict[str, List[Path]]:
-    """Apply beam validity, optional 73 MHz, and optional resume filters."""
+    """Apply truncation/beam validity, optional 73 MHz, and optional resume filters."""
     filtered = _filter_invalid_beam_files(by_time)
     if require_73mhz:
         from ovro_lwa_portal.ingest.dewarp_convert import (
