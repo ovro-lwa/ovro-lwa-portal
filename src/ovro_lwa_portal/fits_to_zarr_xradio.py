@@ -660,6 +660,14 @@ def _zarr_store_exists(out_zarr: Path) -> bool:
     return True
 
 
+def _consolidate_zarr_metadata(out_zarr: Path) -> None:
+    """Write ``.zmetadata`` so ``xr.open_zarr(consolidated=True)`` opens quickly."""
+    if not _zarr_store_exists(out_zarr):
+        return
+    logger.info("Consolidating Zarr metadata for %s", out_zarr)
+    zarr.consolidate_metadata(str(out_zarr))
+
+
 def _time_axis_length_buckets(out_zarr: Path) -> Dict[int, List[str]]:
     """Return mapping of time-axis length -> array names."""
     zg = zarr.open_group(str(out_zarr), mode="r")
@@ -785,7 +793,7 @@ def repair_zarr_store(
                 wcs_arr[ti, :] = row
                 rewritten_wcs_rows += 1
 
-    zarr.consolidate_metadata(str(out_zarr))
+    _consolidate_zarr_metadata(out_zarr)
     post = validate_zarr_store(out_zarr)
     return {
         "store": str(out_zarr),
@@ -2974,6 +2982,7 @@ def convert_fits_dir_to_zarr(
     lm_reference_target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: Literal["header", "filename"] = "filename",
+    consolidate_metadata_at_end: bool = True,
 ) -> Path:
     """Convert all matching FITS in a directory into a single LM-only Zarr store.
 
@@ -3029,6 +3038,11 @@ def convert_fits_dir_to_zarr(
         Used when ``group_metadata_source`` is ``"fits"``. ``"filename"`` (default):
         prefer ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS``.
         ``"header"``: use ``DATE-OBS`` only.
+    consolidate_metadata_at_end
+        When True (default), write a consolidated ``.zmetadata`` file after all
+        pending time steps in this run are written (or when resume finds nothing
+        left to do). Set False for intermediate per-time calls (e.g. dewarp
+        append-each-time) and consolidate once after the full batch.
     resume
         When True (default) and *rebuild* is False, skip time keys already present in
         an existing output Zarr via :func:`_filter_completed_time_keys`. Set False to
@@ -3132,6 +3146,8 @@ def convert_fits_dir_to_zarr(
                 "Pass rebuild=True to overwrite the store, or resume=False to reprocess all times.",
                 out_zarr,
             )
+            if consolidate_metadata_at_end:
+                _consolidate_zarr_metadata(out_zarr)
             return out_zarr
 
     if _zarr_store_exists(out_zarr) and not rebuild:
@@ -3215,4 +3231,6 @@ def convert_fits_dir_to_zarr(
             )
 
     logger.info(f"[done] All times appended into: {out_zarr}")
+    if consolidate_metadata_at_end:
+        _consolidate_zarr_metadata(out_zarr)
     return out_zarr

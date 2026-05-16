@@ -1543,6 +1543,13 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
         lambda _xds, _out, *, first_write, chunk_lm: write_calls.append(first_write),
     )
 
+    consolidate_calls: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_consolidate_zarr_metadata",
+        lambda path: consolidate_calls.append(path),
+    )
+
     result = mod.convert_fits_dir_to_zarr(
         input_dir=tmp_path,
         out_dir=out_dir,
@@ -1553,6 +1560,58 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
     assert result == out_zarr
     assert len(write_calls) == 1
     assert write_calls == [False]
+    assert consolidate_calls == [out_zarr]
+
+
+def test_convert_skips_consolidate_when_disabled(monkeypatch, tmp_path: Path):
+    """Per-time ingest callers can defer consolidation until the full batch finishes."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out_zarr = out_dir / "ovro_lwa_full_lm_only.zarr"
+
+    f1 = tmp_path / "a.fits"
+    f1.touch()
+    by_time = {"20241218_063336": [f1]}
+    monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
+    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
+    monkeypatch.setattr(
+        mod,
+        "_global_frequency_coord_hz",
+        lambda *_args, **_kwargs: np.asarray([4.1e7], dtype=np.float64),
+    )
+
+    ref = xr.Dataset(coords={"l": ("l", np.array([0.0, 1.0])), "m": ("m", np.array([0.0, 1.0]))})
+    monkeypatch.setattr(mod, "_load_global_lm_reference_dataset", lambda *_args, **_kwargs: ref)
+
+    xds_t = xr.Dataset(
+        {"SKY": (("time", "m", "l"), np.zeros((1, 2, 2), dtype=np.float32))},
+        coords={
+            "time": np.array(["2024-12-18T06:33:37"], dtype="datetime64[s]"),
+            "m": np.array([0.0, 1.0]),
+            "l": np.array([0.0, 1.0]),
+            "frequency": np.array([4.1e7]),
+        },
+    )
+    monkeypatch.setattr(mod, "_combine_time_step", lambda *_args, **_kwargs: (xds_t, [4.1e7], []))
+    monkeypatch.setattr(mod, "_write_or_append_zarr", lambda *_args, **_kwargs: None)
+
+    consolidate_calls: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_consolidate_zarr_metadata",
+        lambda path: consolidate_calls.append(path),
+    )
+
+    mod.convert_fits_dir_to_zarr(
+        input_dir=tmp_path,
+        out_dir=out_dir,
+        consolidate_metadata_at_end=False,
+    )
+    assert consolidate_calls == []
 
 
 def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Path):
@@ -1593,6 +1652,12 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
         "_write_or_append_zarr",
         lambda *_args, **_kwargs: write_calls.append(True),  # pragma: no cover
     )
+    consolidate_calls: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_consolidate_zarr_metadata",
+        lambda path: consolidate_calls.append(path),
+    )
 
     result = mod.convert_fits_dir_to_zarr(
         input_dir=tmp_path,
@@ -1604,6 +1669,7 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
     assert result == out_zarr
     assert combine_calls == []
     assert write_calls == []
+    assert consolidate_calls == [out_zarr]
 
 
 def test_read_wcs_header_str_from_time_promoted_zarr(tmp_path: Path) -> None:

@@ -92,6 +92,9 @@ class ConversionConfig:
         ``"fits"`` (default) reads FITS headers (with filename fallbacks).
         ``"filename"`` uses only basename ``-image-`` and ``_NNNMHz_`` tokens (no header
         reads during discovery). Match the value used when building ``lm_reference_ds``.
+    consolidate_metadata_at_end : bool, optional
+        When True (default), write consolidated ``.zmetadata`` after conversion.
+        Set False for intermediate per-time Zarr appends (dewarp workflow).
     """
 
     def __init__(
@@ -113,6 +116,7 @@ class ConversionConfig:
         group_metadata_source: Literal["fits", "filename"] = "fits",
         discovery_time_key_source: Literal["header", "filename"] = "filename",
         lm_reference_target_size: int | None = None,
+        consolidate_metadata_at_end: bool = True,
     ) -> None:
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -131,6 +135,7 @@ class ConversionConfig:
         self.group_metadata_source = group_metadata_source
         self.discovery_time_key_source = discovery_time_key_source
         self.lm_reference_target_size = lm_reference_target_size
+        self.consolidate_metadata_at_end = consolidate_metadata_at_end
 
     @property
     def zarr_path(self) -> Path:
@@ -285,6 +290,7 @@ class FITSToZarrConverter:
                     group_metadata_source=self.config.group_metadata_source,
                     time_key_source=self.config.discovery_time_key_source,
                     lm_reference_target_size=self.config.lm_reference_target_size,
+                    consolidate_metadata_at_end=self.config.consolidate_metadata_at_end,
                 )
 
                 self._report_progress("complete", 1, 1, "Conversion complete")

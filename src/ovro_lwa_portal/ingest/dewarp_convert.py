@@ -9,7 +9,10 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
 
-from ovro_lwa_portal.fits_to_zarr_xradio import _load_global_lm_reference_dataset
+from ovro_lwa_portal.fits_to_zarr_xradio import (
+    _consolidate_zarr_metadata,
+    _load_global_lm_reference_dataset,
+)
 from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
     discover_time_grouped_fits,
@@ -540,6 +543,7 @@ def dewarp_and_convert_append_each_time(
             "Pass --rebuild to start over, or --no-resume to reprocess all times.",
             out_zarr,
         )
+        _consolidate_zarr_metadata(out_zarr)
         return 0, []
 
     first_zarr_write = not (out_zarr.exists() and not rebuild)
@@ -580,6 +584,7 @@ def dewarp_and_convert_append_each_time(
             group_metadata_source=group_metadata_source,
             discovery_time_key_source=time_key_source,
             lm_reference_target_size=target_size,
+            consolidate_metadata_at_end=False,
         )
         FITSToZarrConverter(config, progress_callback=progress_callback).convert()
         first_zarr_write = False
@@ -595,4 +600,5 @@ def dewarp_and_convert_append_each_time(
                 f"Completed dewarp+Zarr for time {idx + 1}/{total_steps} ({tkey})",
             )
 
+    _consolidate_zarr_metadata(out_zarr)
     return n_staged_total, time_keys_sorted
