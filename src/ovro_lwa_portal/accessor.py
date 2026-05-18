@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
@@ -67,6 +68,223 @@ def _dask_progress(label: str = "Computing") -> Generator[None, None, None]:
             yield
     except ImportError:
         yield
+
+
+PatchStatisticName = Literal["std", "max", "min", "mean", "mad"]
+PatchStatisticComparison = Literal["gt", "ge", "lt", "le"]
+
+
+def _reduce_spatial_statistic(values: np.ndarray, statistic: PatchStatisticName) -> float:
+    """Reduce a 2D spatial patch to one scalar."""
+    flat = np.asarray(values, dtype=np.float64).ravel()
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        return float("nan")
+    if statistic == "std":
+        return float(np.std(finite))
+    if statistic == "max":
+        return float(np.max(finite))
+    if statistic == "min":
+        return float(np.min(finite))
+    if statistic == "mean":
+        return float(np.mean(finite))
+    if statistic == "mad":
+        med = float(np.median(finite))
+        return float(np.median(np.abs(finite - med)))
+    msg = f"Unsupported statistic {statistic!r}"
+    raise ValueError(msg)
+
+
+def _reduce_patch_cube_statistics(
+    patch: np.ndarray,
+    statistic: PatchStatisticName,
+) -> np.ndarray:
+    """Apply a spatial statistic to each frequency plane in ``(frequency, l, m)``."""
+    patch_arr = np.asarray(patch)
+    if patch_arr.ndim != 3:
+        msg = f"Expected patch with shape (frequency, l, m), got {patch_arr.shape}"
+        raise ValueError(msg)
+    return np.array(
+        [_reduce_spatial_statistic(patch_arr[fi], statistic) for fi in range(patch_arr.shape[0])],
+        dtype=np.float64,
+    )
+
+
+def _threshold_patch_selection(
+    stat_values: np.ndarray,
+    *,
+    threshold: float,
+    comparison: PatchStatisticComparison,
+) -> np.ndarray:
+    """Build a boolean ``(time, frequency)`` mask from a statistic map.
+
+    Returns ``True`` where the statistic passes the threshold test and is
+    finite; ``False`` elsewhere (including NaN cells).
+    """
+    if stat_values.ndim != 2:
+        msg = f"stat_values must be 2D (time, frequency), got shape {stat_values.shape}"
+        raise ValueError(msg)
+
+    stats = np.asarray(stat_values, dtype=np.float64)
+    finite = np.isfinite(stats)
+    if comparison == "gt":
+        passed = stats > threshold
+    elif comparison == "ge":
+        passed = stats >= threshold
+    elif comparison == "lt":
+        passed = stats < threshold
+    elif comparison == "le":
+        passed = stats <= threshold
+    else:
+        msg = f"Unsupported comparison {comparison!r}"
+        raise ValueError(msg)
+    return np.asarray(finite & passed, dtype=bool)
+
+
+@dataclass
+class PatchStatisticResult:
+    """Statistic map and threshold selection for follow-up 1D/2D extractions.
+
+    Returned by :meth:`RadportAccessor.patch_statistic`.  The ``selection``
+    mask is ``True`` where the statistic passes the threshold test.
+    Use :meth:`light_curve`, :meth:`dynamic_spectrum`, or :meth:`spectrum` to
+    extract data with unselected cells masked to NaN.
+    """
+
+    stat_map: xr.DataArray
+    selection: xr.DataArray | None
+    threshold: float | None
+    comparison: PatchStatisticComparison | None
+    statistic: PatchStatisticName
+    radius: int
+    _accessor: Any
+    _ra: float | None
+    _dec: float | None
+    _l: float | None
+    _m: float | None
+    _var: Literal["SKY", "BEAM"]
+    _pol: int
+    _track_freq_idx: int | None
+    _track_freq_mhz: float | None
+    _observatory: Any
+
+    def _apply_selection_time(
+        self,
+        da: xr.DataArray,
+        *,
+        freq_idx: int,
+        freq_mhz: float | None,
+        apply_selection: bool,
+    ) -> xr.DataArray:
+        if not apply_selection or self.selection is None:
+            return da
+        if freq_mhz is not None:
+            sel = self.selection.sel(frequency=freq_mhz, method="nearest")
+        else:
+            sel = self.selection.isel(frequency=int(freq_idx))
+        return da.where(sel)
+
+    def _apply_selection_frequency(
+        self,
+        da: xr.DataArray,
+        *,
+        time_idx: int,
+        time_mjd: float | None,
+        apply_selection: bool,
+    ) -> xr.DataArray:
+        if not apply_selection or self.selection is None:
+            return da
+        if time_mjd is not None:
+            sel = self.selection.sel(time=time_mjd, method="nearest")
+        else:
+            sel = self.selection.isel(time=int(time_idx))
+        return da.where(sel)
+
+    def light_curve(
+        self,
+        *,
+        freq_idx: int = 0,
+        freq_mhz: float | None = None,
+        apply_selection: bool = True,
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """Light curve at the tracked location, masked by ``selection``."""
+        fi = int(self._accessor.nearest_freq_idx(freq_mhz)) if freq_mhz is not None else freq_idx
+        lc = self._accessor.light_curve(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            freq_idx=fi,
+            freq_mhz=freq_mhz,
+            var=self._var,
+            pol=self._pol,
+            observatory=self._observatory,
+            **kwargs,
+        )
+        return self._apply_selection_time(
+            lc,
+            freq_idx=fi,
+            freq_mhz=freq_mhz,
+            apply_selection=apply_selection,
+        )
+
+    def dynamic_spectrum(
+        self,
+        *,
+        apply_selection: bool = True,
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """Time–frequency dynamic spectrum with unselected cells masked to NaN."""
+        dynspec = self._accessor.dynamic_spectrum(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            var=self._var,
+            pol=self._pol,
+            freq_idx=self._track_freq_idx,
+            freq_mhz=self._track_freq_mhz,
+            observatory=self._observatory,
+            **kwargs,
+        )
+        if apply_selection and self.selection is not None:
+            dynspec = dynspec.where(self.selection)
+        return dynspec
+
+    def spectrum(
+        self,
+        *,
+        time_idx: int = 0,
+        time_mjd: float | None = None,
+        apply_selection: bool = True,
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """Frequency spectrum at one time, masked by ``selection``."""
+        ti = (
+            int(self._accessor.nearest_time_idx(time_mjd))
+            if time_mjd is not None
+            else time_idx
+        )
+        spec = self._accessor.spectrum(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            time_idx=ti,
+            time_mjd=time_mjd,
+            var=self._var,
+            pol=self._pol,
+            freq_idx=self._track_freq_idx,
+            freq_mhz=self._track_freq_mhz,
+            **kwargs,
+        )
+        return self._apply_selection_frequency(
+            spec,
+            time_idx=ti,
+            time_mjd=time_mjd,
+            apply_selection=apply_selection,
+        )
 
 
 @xr.register_dataset_accessor("radport")
@@ -1690,6 +1908,292 @@ class RadportAccessor:
         )
 
         return da
+
+    # =========================================================================
+    # Patch Statistic Methods
+    # =========================================================================
+
+    def _extract_tracked_patch_cubes(
+        self,
+        *,
+        l_indices: np.ndarray,
+        m_indices: np.ndarray,
+        visible: np.ndarray,
+        var: str,
+        pol: int,
+        radius: int,
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Load ``(frequency, l, m)`` patches for visible tracked time steps.
+
+        Uses one batched ``dask.compute`` call to avoid per-iteration scheduler
+        overhead on large time series.
+        """
+        data_var = self._obj[var].isel(polarization=pol)
+        n_l = int(self._obj.sizes["l"])
+        n_m = int(self._obj.sizes["m"])
+
+        vis_times = np.asarray(np.where(visible)[0], dtype=int)
+        vis_l = np.asarray(l_indices, dtype=int)[visible]
+        vis_m = np.asarray(m_indices, dtype=int)[visible]
+
+        patch_arrays = []
+        for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True):
+            l_sl = slice(max(0, int(li) - radius), min(n_l, int(li) + radius + 1))
+            m_sl = slice(max(0, int(mi) - radius), min(n_m, int(mi) + radius + 1))
+            patch_arrays.append(data_var.isel(time=int(t), l=l_sl, m=m_sl))
+
+        if not patch_arrays:
+            return vis_times, []
+
+        if hasattr(data_var, "chunks") and data_var.chunks is not None:
+            import dask
+
+            with _dask_progress("Extracting tracked patches"):
+                results = dask.compute(*patch_arrays)
+        else:
+            results = [np.asarray(p.values) for p in patch_arrays]
+
+        return vis_times, [np.asarray(r) for r in results]
+
+    def patch_statistic(
+        self,
+        *,
+        ra: float | None = None,
+        dec: float | None = None,
+        l: float | None = None,
+        m: float | None = None,
+        radius: int = 5,
+        statistic: PatchStatisticName = "std",
+        var: Literal["SKY", "BEAM"] = "SKY",
+        pol: int = 0,
+        freq_idx: int | None = None,
+        freq_mhz: float | None = None,
+        observatory: Any = None,
+        threshold: float | None = None,
+        comparison: PatchStatisticComparison = "gt",
+    ) -> PatchStatisticResult:
+        """Compute a spatial statistic on a tracked patch for each time/frequency cell.
+
+        For each time step the patch is centred on the pixel nearest to the
+        given celestial or direction-cosine coordinates.  A statistic is
+        applied to all pixels in the patch independently for every frequency
+        channel, producing a 2D ``(time, frequency)`` map.
+
+        When ``threshold`` is set, a boolean ``selection`` mask marks cells
+        where the statistic passes the comparison test.  Unselected cells are
+        ``False``; NaN statistic values are always ``False``.  Use
+        :meth:`PatchStatisticResult.light_curve`,
+        :meth:`PatchStatisticResult.dynamic_spectrum`, or
+        :meth:`PatchStatisticResult.spectrum` to extract data with unselected
+        cells masked to NaN.
+
+        Parameters
+        ----------
+        ra, dec : float, optional
+            Celestial coordinates in degrees (FK5/J2000).  Requires tracking
+            across time when both are provided.
+        l, m : float, optional
+            Direction-cosine coordinates for a fixed patch centre.
+        radius : int, default 5
+            Patch half-width in pixels.  The patch spans
+            ``[center - radius, center + radius]`` along ``l`` and ``m``.
+        statistic : {'std', 'max', 'min', 'mean', 'mad'}, default 'std'
+            Spatial reducer applied within each patch.  ``mad`` is the
+            median absolute deviation from the patch median.
+        var : {'SKY', 'BEAM'}, default 'SKY'
+            Data variable to analyse.
+        pol : int, default 0
+            Polarization index.
+        freq_idx, freq_mhz : optional
+            Passed to coordinate tracking for RA/Dec pixel mapping.
+        observatory : astropy.coordinates.EarthLocation, optional
+            Observatory location for RA/Dec tracking.
+        threshold : float, optional
+            Statistic threshold for the ``selection`` mask.  When omitted,
+            ``selection`` is ``None``.
+        comparison : {'gt', 'ge', 'lt', 'le'}, default 'gt'
+            Comparison applied at each ``(time, frequency)`` cell.  The
+            cell is selected (``True``) when the statistic satisfies the
+            comparison against ``threshold``.  For example, ``comparison='le'``
+            selects cells with statistic less than or equal to ``threshold``;
+            cells above the threshold are ``False``.
+
+        Returns
+        -------
+        PatchStatisticResult
+            Container with ``stat_map``, optional ``selection`` mask, and
+            convenience methods for downstream extractions.
+
+        Examples
+        --------
+        >>> result = ds.radport.patch_statistic(
+        ...     ra=299.868, dec=40.734, statistic="std", threshold=0.5, comparison="gt"
+        ... )
+        >>> dynspec = result.dynamic_spectrum()
+        >>> lc = result.light_curve(freq_idx=0)
+        """
+        if var not in self._obj.data_vars:
+            available = sorted(self._obj.data_vars)
+            raise ValueError(f"Variable '{var}' not found. Available: {available}")
+        if radius < 0:
+            msg = f"radius must be non-negative, got {radius}"
+            raise ValueError(msg)
+
+        track_freq_idx = freq_idx
+        if freq_mhz is not None:
+            track_freq_idx = int(self.nearest_freq_idx(freq_mhz))
+
+        resolved = self._resolve_coordinates(
+            ra=ra,
+            dec=dec,
+            l=l,
+            m=m,
+            observatory=observatory,
+            freq_idx=track_freq_idx,
+            freq_mhz=freq_mhz,
+            pol=pol,
+        )
+
+        n_times = int(self._obj.sizes["time"])
+        n_freqs = int(self._obj.sizes["frequency"])
+        stat_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        tracking = ra is not None and dec is not None
+
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            l_idx, m_idx = resolved
+            visible = np.ones(n_times, dtype=bool)
+            l_indices = np.full(n_times, int(l_idx), dtype=int)
+            m_indices = np.full(n_times, int(m_idx), dtype=int)
+        else:
+            l_indices, m_indices, visible = resolved
+
+        vis_times, patches = self._extract_tracked_patch_cubes(
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+            var=var,
+            pol=pol,
+            radius=radius,
+        )
+        for ti, patch in zip(vis_times, patches, strict=True):
+            stat_values[int(ti)] = _reduce_patch_cube_statistics(patch, statistic)
+
+        selection_array: np.ndarray | None
+        if threshold is not None:
+            selection_array = _threshold_patch_selection(
+                stat_values,
+                threshold=threshold,
+                comparison=comparison,
+            )
+        else:
+            selection_array = None
+
+        attrs: dict[str, Any] = {
+            "statistic": statistic,
+            "radius": radius,
+            "variable": var,
+            "pol": pol,
+            "tracking": tracking,
+        }
+        if threshold is not None:
+            attrs["threshold"] = threshold
+            attrs["comparison"] = comparison
+        if ra is not None:
+            attrs["ra"] = ra
+            attrs["dec"] = dec
+        if l is not None:
+            attrs["l"] = l
+            attrs["m"] = m
+
+        stat_map = xr.DataArray(
+            stat_values,
+            dims=["time", "frequency"],
+            coords={
+                "time": self._obj.coords["time"].values,
+                "frequency": self._obj.coords["frequency"].values,
+            },
+            attrs=attrs,
+            name=f"{var}_patch_{statistic}",
+        )
+
+        selection: xr.DataArray | None = None
+        if selection_array is not None:
+            selection = xr.DataArray(
+                selection_array,
+                dims=["time", "frequency"],
+                coords={
+                    "time": self._obj.coords["time"].values,
+                    "frequency": self._obj.coords["frequency"].values,
+                },
+                attrs={
+                    "threshold": threshold,
+                    "comparison": comparison,
+                },
+                name="selection",
+            )
+
+        return PatchStatisticResult(
+            stat_map=stat_map,
+            selection=selection,
+            threshold=threshold,
+            comparison=comparison if threshold is not None else None,
+            statistic=statistic,
+            radius=radius,
+            _accessor=self,
+            _ra=ra,
+            _dec=dec,
+            _l=l,
+            _m=m,
+            _var=var,
+            _pol=pol,
+            _track_freq_idx=track_freq_idx,
+            _track_freq_mhz=freq_mhz,
+            _observatory=observatory,
+        )
+
+    def select_patch_statistic(
+        self,
+        stat_map: xr.DataArray,
+        *,
+        threshold: float,
+        comparison: PatchStatisticComparison = "gt",
+    ) -> xr.DataArray:
+        """Build a boolean ``(time, frequency)`` selection mask from a statistic map.
+
+        Parameters
+        ----------
+        stat_map : xr.DataArray
+            2D ``(time, frequency)`` array, e.g. from
+            :meth:`patch_statistic` ``.stat_map``.
+        threshold : float
+            Statistic threshold.
+        comparison : {'gt', 'ge', 'lt', 'le'}, default 'gt'
+            Comparison for selection.  Cells where the statistic satisfies
+            the comparison are ``True``; others are ``False``.
+
+        Returns
+        -------
+        xr.DataArray
+            Boolean mask with dimensions ``(time, frequency)``.
+        """
+        if set(stat_map.dims) != {"time", "frequency"}:
+            msg = f"stat_map must have dims ('time', 'frequency'), got {stat_map.dims}"
+            raise ValueError(msg)
+        mask = _threshold_patch_selection(
+            np.asarray(stat_map.values, dtype=np.float64),
+            threshold=threshold,
+            comparison=comparison,
+        )
+        return xr.DataArray(
+            mask,
+            dims=["time", "frequency"],
+            coords={
+                "time": stat_map.coords["time"].values,
+                "frequency": stat_map.coords["frequency"].values,
+            },
+            attrs={"threshold": threshold, "comparison": comparison},
+            name="selection",
+        )
 
     def plot_dynamic_spectrum(
         self,
