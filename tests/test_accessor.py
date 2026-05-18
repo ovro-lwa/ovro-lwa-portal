@@ -13,7 +13,13 @@ matplotlib.use("Agg")
 
 # Import to register the accessor
 import ovro_lwa_portal  # noqa: F401
-from ovro_lwa_portal.accessor import PatchStatisticResult, RadportAccessor, _reduce_spatial_statistic
+from ovro_lwa_portal.accessor import (
+    PatchFitResult,
+    PatchStatisticResult,
+    RadportAccessor,
+    _fit_spatial_gaussian,
+    _reduce_spatial_statistic,
+)
 
 
 class TestRadportAccessorRegistration:
@@ -748,6 +754,118 @@ class TestRadportPatchStatistic:
         assert result.stat_map.attrs["tracking"] is True
         assert result.selection is not None
         assert np.any(result.selection.values)
+
+
+class TestRadportPatchFit:
+    """Tests for patch_fit() and Gaussian fit helpers."""
+
+    def test_patch_fit_returns_result(self, valid_ovro_dataset: xr.Dataset) -> None:
+        """patch_fit() returns PatchFitResult with parameter and chi-squared maps."""
+        result = valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0)
+        assert isinstance(result, PatchFitResult)
+        assert result.max_reduced_chi_squared == 3.0
+        for da in (
+            result.peak_map,
+            result.widthx_map,
+            result.widthy_map,
+            result.background_map,
+            result.reduced_chi_squared_map,
+        ):
+            assert set(da.dims) == {"time", "frequency"}
+            assert da.shape == (2, 3)
+
+    def test_fit_spatial_gaussian_recovers_synthetic_peak(
+        self,
+    ) -> None:
+        """Gaussian fit recovers peak and FWHM on a synthetic patch."""
+        ny, nx = 11, 11
+        true_peak = 50.0
+        true_fwhm = 3.0
+        true_bg = 2.0
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = true_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = true_bg + true_peak * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        peak, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, default_fwhm=3.0
+        )
+        assert np.isfinite(peak)
+        assert chi2_red < 3.0
+        np.testing.assert_allclose(peak, true_peak, rtol=0.15)
+        np.testing.assert_allclose(widthx, true_fwhm, rtol=0.2)
+        np.testing.assert_allclose(widthy, true_fwhm, rtol=0.2)
+        np.testing.assert_allclose(background, true_bg, atol=1.0)
+
+    def test_patch_fit_on_injected_gaussian(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """patch_fit() returns finite peaks on a centred Gaussian bump with low chi2."""
+        ds = valid_ovro_dataset.copy(deep=True)
+        l_idx, m_idx = ds.radport._resolve_coordinates(l=0.0, m=0.0)
+        radius = 5
+        sky = np.zeros(ds["SKY"].shape, dtype=float)
+        ny = nx = 2 * radius + 1
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = 3.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        bump = 100.0 * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        sky[0, :, 0, l_idx - radius : l_idx + radius + 1, m_idx - radius : m_idx + radius + 1] = (
+            bump[np.newaxis, :, :]
+        )
+        ds["SKY"].values[:] = sky
+
+        result = ds.radport.patch_fit(l=0.0, m=0.0, radius=radius)
+        peaks = result.peak_map.sel(time=ds.coords["time"][0])
+        chi2 = result.reduced_chi_squared_map.sel(time=ds.coords["time"][0])
+        assert np.all(np.isfinite(peaks.values))
+        assert np.all(peaks.values > 50.0)
+        assert np.all(chi2.values <= result.max_reduced_chi_squared)
+
+    def test_patch_fit_negative_radius_raises(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """Negative radius raises ValueError."""
+        with pytest.raises(ValueError, match="radius must be non-negative"):
+            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, radius=-1)
+
+    def test_patch_fit_invalid_default_fwhm_raises(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """Non-positive default_fwhm raises ValueError."""
+        with pytest.raises(ValueError, match="default_fwhm must be positive"):
+            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, default_fwhm=0.0)
+
+    def test_patch_fit_masks_poor_chi2_fits(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """Cells with reduced chi-squared above threshold have NaN parameters."""
+        result = valid_ovro_dataset.radport.patch_fit(
+            l=0.0, m=0.0, max_reduced_chi_squared=0.01
+        )
+        assert np.all(np.isfinite(result.reduced_chi_squared_map.values))
+        assert not np.any(np.isfinite(result.peak_map.values))
+
+    def test_patch_fit_invalid_max_chi2_raises(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """Non-positive max_reduced_chi_squared raises ValueError."""
+        with pytest.raises(ValueError, match="max_reduced_chi_squared must be positive"):
+            valid_ovro_dataset.radport.patch_fit(
+                l=0.0, m=0.0, max_reduced_chi_squared=0.0
+            )
+
+    def test_patch_fit_radec_tracking(
+        self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
+    ) -> None:
+        """RA/Dec patch_fit uses tracked pixels and records reduced chi-squared."""
+        ds = valid_ovro_dataset_with_tracking_wcs
+        result = ds.radport.patch_fit(ra=180.0, dec=37.0, radius=2)
+        assert result.peak_map.attrs["tracking"] is True
+        assert np.any(np.isfinite(result.reduced_chi_squared_map.values))
 
 
 class TestRadportPlotDynamicSpectrum:

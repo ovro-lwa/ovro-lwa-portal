@@ -110,6 +110,168 @@ def _reduce_patch_cube_statistics(
     )
 
 
+# FWHM (pixels) = _FWHM_TO_SIGMA * sigma for a 2D Gaussian profile.
+_FWHM_TO_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def _gaussian_predict(
+    params: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    """Evaluate a centred 2D Gaussian model on a pixel grid."""
+    peak, widthx, widthy, background = params
+    sx = max(float(widthx) / _FWHM_TO_SIGMA, 1e-6)
+    sy = max(float(widthy) / _FWHM_TO_SIGMA, 1e-6)
+    return background + peak * np.exp(-0.5 * ((x / sx) ** 2 + (y / sy) ** 2))
+
+
+def _reduced_chi_squared(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    n_params: int = 4,
+) -> float:
+    """Compute reduced chi-squared for a 2D patch fit."""
+    obs = np.asarray(observed, dtype=np.float64)
+    pred = np.asarray(predicted, dtype=np.float64)
+    finite = np.isfinite(obs) & np.isfinite(pred)
+    if not np.any(finite):
+        return float("nan")
+    residuals = obs[finite] - pred[finite]
+    chi2 = float(np.sum(residuals**2))
+    dof = int(np.sum(finite)) - n_params
+    if dof <= 0:
+        return float("nan")
+    return chi2 / dof
+
+
+def _fit_spatial_gaussian(
+    values: np.ndarray,
+    *,
+    default_fwhm: float = 3.0,
+) -> tuple[float, float, float, float, float]:
+    """Fit a centred 2D Gaussian to a spatial patch.
+
+    The model is ``background + peak * exp(-0.5 * ((x/sx)**2 + (y/sy)**2))`` with
+    the peak centred on the patch centre.  ``widthx`` and ``widthy`` are returned
+    as full width at half maximum (FWHM) in pixels.
+
+    Initial guesses use ``peak = max(patch)``, ``widthx = widthy = default_fwhm``,
+    and ``background = min(patch)``.
+    """
+    nan5 = (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 2:
+        msg = f"Expected 2D patch, got shape {arr.shape}"
+        raise ValueError(msg)
+
+    ny, nx = arr.shape
+    if ny < 2 or nx < 2:
+        return nan5
+
+    if not np.any(np.isfinite(arr)):
+        return nan5
+
+    cy = (ny - 1) / 2.0
+    cx = (nx - 1) / 2.0
+    yy, xx = np.indices((ny, nx))
+    y = yy - cy
+    x = xx - cx
+
+    peak0 = float(np.nanmax(arr))
+    bg0 = float(np.nanmin(arr))
+    width0 = float(default_fwhm)
+    if not np.isfinite(peak0):
+        return nan5
+
+    def residual(params: np.ndarray) -> np.ndarray:
+        return (_gaussian_predict(params, x, y) - arr).ravel()
+
+    x0 = np.array([peak0, width0, width0, bg0], dtype=np.float64)
+    lower = np.array([0.0, 0.5, 0.5, -np.inf], dtype=np.float64)
+    upper = np.array([np.inf, max(nx, ny) * 4.0, max(nx, ny) * 4.0, np.inf], dtype=np.float64)
+
+    try:
+        res = least_squares(
+            residual,
+            x0=x0,
+            bounds=(lower, upper),
+            method="trf",
+            ftol=1e-8,
+            xtol=1e-8,
+            max_nfev=300,
+        )
+    except (ValueError, RuntimeError):
+        return nan5
+
+    if not res.success:
+        return nan5
+
+    peak, widthx, widthy, background = res.x
+    predicted = _gaussian_predict(res.x, x, y)
+    chi2_red = _reduced_chi_squared(arr, predicted)
+    return float(peak), float(widthx), float(widthy), float(background), chi2_red
+
+
+def _fit_patch_cube_gaussian(
+    patch: np.ndarray,
+    *,
+    default_fwhm: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit a 2D Gaussian on each frequency plane in ``(frequency, l, m)``."""
+    patch_arr = np.asarray(patch)
+    if patch_arr.ndim != 3:
+        msg = f"Expected patch with shape (frequency, l, m), got {patch_arr.shape}"
+        raise ValueError(msg)
+
+    peaks = []
+    widthxs = []
+    widthys = []
+    backgrounds = []
+    chi2_reds = []
+    for fi in range(patch_arr.shape[0]):
+        peak, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch_arr[fi],
+            default_fwhm=default_fwhm,
+        )
+        peaks.append(peak)
+        widthxs.append(widthx)
+        widthys.append(widthy)
+        backgrounds.append(background)
+        chi2_reds.append(chi2_red)
+
+    return (
+        np.array(peaks, dtype=np.float64),
+        np.array(widthxs, dtype=np.float64),
+        np.array(widthys, dtype=np.float64),
+        np.array(backgrounds, dtype=np.float64),
+        np.array(chi2_reds, dtype=np.float64),
+    )
+
+
+def _mask_patch_fit_by_chi2(
+    peaks: np.ndarray,
+    widthxs: np.ndarray,
+    widthys: np.ndarray,
+    backgrounds: np.ndarray,
+    chi2_red: np.ndarray,
+    *,
+    max_reduced_chi_squared: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Set fit parameters to NaN where reduced chi-squared exceeds the threshold."""
+    bad = np.isfinite(chi2_red) & (chi2_red > max_reduced_chi_squared)
+    peaks = np.asarray(peaks, dtype=np.float64).copy()
+    widthxs = np.asarray(widthxs, dtype=np.float64).copy()
+    widthys = np.asarray(widthys, dtype=np.float64).copy()
+    backgrounds = np.asarray(backgrounds, dtype=np.float64).copy()
+    peaks[bad] = np.nan
+    widthxs[bad] = np.nan
+    widthys[bad] = np.nan
+    backgrounds[bad] = np.nan
+    return peaks, widthxs, widthys, backgrounds
+
+
 def _threshold_patch_selection(
     stat_values: np.ndarray,
     *,
@@ -285,6 +447,37 @@ class PatchStatisticResult:
             time_mjd=time_mjd,
             apply_selection=apply_selection,
         )
+
+
+@dataclass
+class PatchFitResult:
+    """Gaussian fit parameters on a tracked patch for each time/frequency cell.
+
+    Returned by :meth:`RadportAccessor.patch_fit`.  Each parameter map has
+    dimensions ``(time, frequency)``.  ``widthx`` and ``widthy`` are full width
+    at half maximum in pixels.  ``reduced_chi_squared_map`` stores the fit
+    quality; parameter maps are NaN where reduced chi-squared exceeds
+    ``max_reduced_chi_squared``.
+    """
+
+    peak_map: xr.DataArray
+    widthx_map: xr.DataArray
+    widthy_map: xr.DataArray
+    background_map: xr.DataArray
+    reduced_chi_squared_map: xr.DataArray
+    radius: int
+    default_fwhm: float
+    max_reduced_chi_squared: float
+    _accessor: Any
+    _ra: float | None
+    _dec: float | None
+    _l: float | None
+    _m: float | None
+    _var: Literal["SKY", "BEAM"]
+    _pol: int
+    _track_freq_idx: int | None
+    _track_freq_mhz: float | None
+    _observatory: Any
 
 
 @xr.register_dataset_accessor("radport")
@@ -2139,6 +2332,226 @@ class RadportAccessor:
             comparison=comparison if threshold is not None else None,
             statistic=statistic,
             radius=radius,
+            _accessor=self,
+            _ra=ra,
+            _dec=dec,
+            _l=l,
+            _m=m,
+            _var=var,
+            _pol=pol,
+            _track_freq_idx=track_freq_idx,
+            _track_freq_mhz=freq_mhz,
+            _observatory=observatory,
+        )
+
+    def patch_fit(
+        self,
+        *,
+        ra: float | None = None,
+        dec: float | None = None,
+        l: float | None = None,
+        m: float | None = None,
+        radius: int = 5,
+        default_fwhm: float = 3.0,
+        max_reduced_chi_squared: float = 3.0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+        pol: int = 0,
+        freq_idx: int | None = None,
+        freq_mhz: float | None = None,
+        observatory: Any = None,
+    ) -> PatchFitResult:
+        """Fit a 2D Gaussian to a tracked patch for each time/frequency cell.
+
+        For each time step the patch is centred on the pixel nearest to the
+        given celestial or direction-cosine coordinates.  A centred Gaussian
+        with parameters ``peak``, ``widthx``, ``widthy``, and ``background`` is
+        fit independently on every frequency channel, producing four
+        ``(time, frequency)`` maps plus a reduced chi-squared quality map.
+
+        The Gaussian is centred on the patch centre.  ``widthx`` and ``widthy``
+        are full width at half maximum in pixels.  Initial guesses use
+        ``peak = max(patch)``, ``widthx = widthy = default_fwhm`` (3 pixels by
+        default), and ``background = min(patch)``.
+
+        When reduced chi-squared exceeds ``max_reduced_chi_squared`` (default
+        3), the fit parameters for that cell are set to NaN.  The reduced
+        chi-squared value is always retained in ``reduced_chi_squared_map``.
+
+        Parameters
+        ----------
+        ra, dec : float, optional
+            Celestial coordinates in degrees (FK5/J2000).  Requires tracking
+            across time when both are provided.
+        l, m : float, optional
+            Direction-cosine coordinates for a fixed patch centre.
+        radius : int, default 5
+            Patch half-width in pixels.  The patch spans
+            ``[center - radius, center + radius]`` along ``l`` and ``m``.
+        default_fwhm : float, default 3.0
+            Initial full width at half maximum in pixels for ``widthx`` and
+            ``widthy``.
+        max_reduced_chi_squared : float, default 3.0
+            Maximum acceptable reduced chi-squared.  Cells above this threshold
+            have ``peak``, ``widthx``, ``widthy``, and ``background`` set to
+            NaN.
+        var : {'SKY', 'BEAM'}, default 'SKY'
+            Data variable to analyse.
+        pol : int, default 0
+            Polarization index.
+        freq_idx, freq_mhz : optional
+            Passed to coordinate tracking for RA/Dec pixel mapping.
+        observatory : astropy.coordinates.EarthLocation, optional
+            Observatory location for RA/Dec tracking.
+
+        Returns
+        -------
+        PatchFitResult
+            Container with parameter maps, ``reduced_chi_squared_map``, and
+            ``max_reduced_chi_squared``.
+
+        Examples
+        --------
+        >>> result = ds.radport.patch_fit(ra=299.868, dec=40.734, radius=5)
+        >>> peaks = result.peak_map
+        """
+        if var not in self._obj.data_vars:
+            available = sorted(self._obj.data_vars)
+            raise ValueError(f"Variable '{var}' not found. Available: {available}")
+        if radius < 0:
+            msg = f"radius must be non-negative, got {radius}"
+            raise ValueError(msg)
+        if default_fwhm <= 0:
+            msg = f"default_fwhm must be positive, got {default_fwhm}"
+            raise ValueError(msg)
+        if max_reduced_chi_squared <= 0:
+            msg = f"max_reduced_chi_squared must be positive, got {max_reduced_chi_squared}"
+            raise ValueError(msg)
+
+        track_freq_idx = freq_idx
+        if freq_mhz is not None:
+            track_freq_idx = int(self.nearest_freq_idx(freq_mhz))
+
+        resolved = self._resolve_coordinates(
+            ra=ra,
+            dec=dec,
+            l=l,
+            m=m,
+            observatory=observatory,
+            freq_idx=track_freq_idx,
+            freq_mhz=freq_mhz,
+            pol=pol,
+        )
+
+        n_times = int(self._obj.sizes["time"])
+        n_freqs = int(self._obj.sizes["frequency"])
+        peak_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        widthx_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        widthy_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        background_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        chi2_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        tracking = ra is not None and dec is not None
+
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            l_idx, m_idx = resolved
+            visible = np.ones(n_times, dtype=bool)
+            l_indices = np.full(n_times, int(l_idx), dtype=int)
+            m_indices = np.full(n_times, int(m_idx), dtype=int)
+        else:
+            l_indices, m_indices, visible = resolved
+
+        vis_times, patches = self._extract_tracked_patch_cubes(
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+            var=var,
+            pol=pol,
+            radius=radius,
+        )
+        for ti, patch in zip(vis_times, patches, strict=True):
+            peaks, widthxs, widthys, backgrounds, chi2_red = _fit_patch_cube_gaussian(
+                patch,
+                default_fwhm=default_fwhm,
+            )
+            peaks, widthxs, widthys, backgrounds = _mask_patch_fit_by_chi2(
+                peaks,
+                widthxs,
+                widthys,
+                backgrounds,
+                chi2_red,
+                max_reduced_chi_squared=max_reduced_chi_squared,
+            )
+            ti_int = int(ti)
+            peak_values[ti_int] = peaks
+            widthx_values[ti_int] = widthxs
+            widthy_values[ti_int] = widthys
+            background_values[ti_int] = backgrounds
+            chi2_values[ti_int] = chi2_red
+
+        attrs: dict[str, Any] = {
+            "radius": radius,
+            "default_fwhm": default_fwhm,
+            "max_reduced_chi_squared": max_reduced_chi_squared,
+            "variable": var,
+            "pol": pol,
+            "tracking": tracking,
+        }
+        if ra is not None:
+            attrs["ra"] = ra
+            attrs["dec"] = dec
+        if l is not None:
+            attrs["l"] = l
+            attrs["m"] = m
+
+        coords = {
+            "time": self._obj.coords["time"].values,
+            "frequency": self._obj.coords["frequency"].values,
+        }
+
+        peak_map = xr.DataArray(
+            peak_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_peak",
+        )
+        widthx_map = xr.DataArray(
+            widthx_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_widthx",
+        )
+        widthy_map = xr.DataArray(
+            widthy_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_widthy",
+        )
+        background_map = xr.DataArray(
+            background_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_background",
+        )
+        reduced_chi_squared_map = xr.DataArray(
+            chi2_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_reduced_chi_squared",
+        )
+
+        return PatchFitResult(
+            peak_map=peak_map,
+            widthx_map=widthx_map,
+            widthy_map=widthy_map,
+            background_map=background_map,
+            reduced_chi_squared_map=reduced_chi_squared_map,
+            radius=radius,
+            default_fwhm=default_fwhm,
+            max_reduced_chi_squared=max_reduced_chi_squared,
             _accessor=self,
             _ra=ra,
             _dec=dec,
