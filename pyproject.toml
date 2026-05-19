@@ -180,6 +180,7 @@ python-casacore = ">=3.7.1,<4"
 mkdocs = ">=1.6.1,<2"
 mkdocs-material = ">=9.7.1,<10"
 mkdocstrings-python = ">=2.0.2,<3"
+panel = ">=1.8.10,<2"
 
 [tool.pixi.pypi-dependencies]
 # Dependency to the local package in editable mode
