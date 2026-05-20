@@ -1677,6 +1677,46 @@ class TestRadportHasWcs:
         assert valid_ovro_dataset_with_wcs.radport.has_wcs is True
 
 
+class TestRadportGetWcsTimePromotedHeader:
+    """``_get_wcs`` must read ``wcs_header_str`` when stored per time step."""
+
+    def test_get_wcs_uses_time_index_for_wcs_header_str(self) -> None:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _read_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=181.0, crval2=46.0)
+        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
+        n_time = 2
+        wcs_per_time = np.array(
+            [np.bytes_(enc0), np.bytes_(enc1)],
+            dtype=f"S{max(len(enc0), len(enc1))}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((n_time, 1, 1, 8, 8), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", np.arange(n_time, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+        )
+
+        w0 = ds.radport._get_wcs(time_idx=0)
+        w1 = ds.radport._get_wcs(time_idx=1)
+        assert w0.wcs.crval[0] == pytest.approx(180.0)
+        assert w1.wcs.crval[0] == pytest.approx(181.0)
+        assert _read_wcs_header_str(ds, time_idx=1) == hdr1
+
+
 class TestRadportPixelToCoords:
     """Tests for pixel_to_coords() method."""
 

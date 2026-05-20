@@ -46,6 +46,48 @@ _MAX_PIXEL_TRACK_PLANE_ELEMENTS = 72_000_000
 _MAX_PIXEL_TRACK_CHUNK_ELEMENTS = 40_000_000
 
 
+def _read_wcs_header_str(
+    ds: xr.Dataset,
+    *,
+    var: str = "SKY",
+    time_idx: int = 0,
+) -> str | None:
+    """Return the persisted FITS WCS header string from *ds*, if any.
+
+    Checks ``fits_wcs_header`` on the data variable and dataset attrs, then
+    ``wcs_header_str`` (0-D scalar or 1-D per ``time`` from incremental Zarr).
+    """
+    hdr_str = None
+    if var in ds.data_vars:
+        hdr_str = ds[var].attrs.get("fits_wcs_header")
+    if not hdr_str:
+        hdr_str = ds.attrs.get("fits_wcs_header")
+    if hdr_str is not None:
+        return str(hdr_str)
+
+    if "wcs_header_str" not in ds:
+        return None
+
+    wcs_var = ds["wcs_header_str"]
+    if wcs_var.ndim == 0:
+        raw = wcs_var.values
+        if isinstance(raw, np.ndarray):
+            raw = raw.item()
+    elif wcs_var.ndim == 1 and "time" in wcs_var.dims:
+        raw = wcs_var.isel(time=time_idx).values
+        if isinstance(raw, np.ndarray) and raw.ndim == 0:
+            raw = raw.item()
+    else:
+        raw_arr = np.asarray(wcs_var.values)
+        if raw_arr.size == 0:
+            return None
+        raw = np.ravel(raw_arr)[time_idx]
+
+    if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
+    return str(raw).rstrip("\x00")
+
+
 def _maybe_load(da: xr.DataArray) -> xr.DataArray:
     """Eagerly load a dask-backed DataArray if it is below the size threshold."""
     if hasattr(da, "nbytes") and da.nbytes < _EAGER_LOAD_THRESHOLD:
@@ -4320,13 +4362,21 @@ class RadportAccessor:
     # WCS & Coordinate Methods
     # =========================================================================
 
-    def _get_wcs(self, var: Literal["SKY", "BEAM"] = "SKY"):
+    def _get_wcs(
+        self,
+        var: Literal["SKY", "BEAM"] = "SKY",
+        *,
+        time_idx: int = 0,
+    ):
         """Get WCS object from the dataset.
 
         Parameters
         ----------
         var : {'SKY', 'BEAM'}, default 'SKY'
             Data variable to get WCS from (checks attrs first).
+        time_idx : int, default 0
+            Time index when ``wcs_header_str`` is stored per time step (common
+            after incremental Zarr writes).
 
         Returns
         -------
@@ -4349,27 +4399,7 @@ class RadportAccessor:
                 "Install with: pip install astropy"
             ) from e
 
-        # Try to get WCS header string from various locations
-        hdr_str = None
-
-        # 1. Check variable attrs
-        if var in self._obj.data_vars:
-            hdr_str = self._obj[var].attrs.get("fits_wcs_header")
-
-        # 2. Check dataset attrs
-        if not hdr_str:
-            hdr_str = self._obj.attrs.get("fits_wcs_header")
-
-        # 3. Check wcs_header_str variable
-        if not hdr_str and "wcs_header_str" in self._obj:
-            val = self._obj["wcs_header_str"].values
-            if isinstance(val, np.ndarray):
-                val = val.item()
-            if isinstance(val, (bytes, bytearray)) or type(val).__name__ == "bytes_":
-                hdr_str = val.decode("utf-8", errors="replace")
-            else:
-                hdr_str = str(val)
-
+        hdr_str = _read_wcs_header_str(self._obj, var=var, time_idx=time_idx)
         if not hdr_str:
             raise ValueError(
                 "No WCS header found in dataset. Expected 'fits_wcs_header' "
