@@ -1054,6 +1054,55 @@ class RadportAccessor:
 
         return l_indices, m_indices, visible
 
+    def _use_persisted_wcs_for_pixel_mapping(self) -> bool:
+        """True when RA/Dec should map via stored FITS WCS rather than SIN drift."""
+        obj = self._obj
+        n_times = int(obj.sizes.get("time", 1))
+        if "wcs_header_str" in obj:
+            wv = obj["wcs_header_str"]
+            if wv.ndim == 1 and "time" in wv.dims and n_times > 1:
+                return True
+        if n_times <= 1 and _read_wcs_header_str(obj, time_idx=0) is not None:
+            return True
+        return False
+
+    def _coords_to_pixel_via_wcs(
+        self,
+        ra: float,
+        dec: float,
+        time_idx: int,
+        *,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> tuple[int, int] | None:
+        """Map (RA, Dec) with the persisted FITS WCS at *time_idx*, if available.
+
+        Matches astrowidget ``get_wcs(ds, time_idx)`` / ``all_world2pix`` on the
+        full-resolution image grid. Returns ``None`` when no WCS header is stored.
+        """
+        if _read_wcs_header_str(self._obj, var=var, time_idx=time_idx) is None:
+            return None
+
+        wcs = self._get_wcs(var=var, time_idx=time_idx)
+        xp, yp = wcs.all_world2pix(float(ra), float(dec), 0)
+        xp_f = float(np.asarray(xp).ravel()[0])
+        yp_f = float(np.asarray(yp).ravel()[0])
+        if not (np.isfinite(xp_f) and np.isfinite(yp_f)):
+            raise ValueError(
+                f"Source (RA={ra}, Dec={dec}) is outside the image footprint "
+                f"at time index {time_idx}."
+            )
+
+        n_l = int(self._obj.sizes["l"])
+        n_m = int(self._obj.sizes["m"])
+        l_idx = int(np.round(xp_f))
+        m_idx = int(np.round(yp_f))
+        if not (0 <= l_idx < n_l and 0 <= m_idx < n_m):
+            raise ValueError(
+                f"Source (RA={ra}, Dec={dec}) maps outside the image FOV "
+                f"at time index {time_idx}."
+            )
+        return l_idx, m_idx
+
     def _compute_pixel_at_time(
         self,
         ra: float,
@@ -1066,15 +1115,16 @@ class RadportAccessor:
     ) -> tuple[int, int]:
         """Compute the pixel index for (RA, Dec) at a single time step.
 
-        When the dataset provides ``right_ascension`` and ``declination``
-        coordinates that include a ``time`` dimension (or the cube has only one
-        time step), this method finds the nearest sky pixel by minimizing
-        angular distance on the stored RA/Dec grids. If those coordinates also
-        carry ``frequency`` and/or ``polarization`` dimensions, the slice at
-        ``freq_idx`` / ``pol`` is taken first so the minimization is only over
-        ``(l, m)``. Otherwise it falls back to the closed-form SIN projection
-        using mean sidereal time at the dataset timestamp (the analytical branch
-        used when :meth:`coords_to_pixel` does not use stored RA/Dec grids).
+        When a FITS WCS header is stored (``fits_wcs_header`` or per-time
+        ``wcs_header_str``), this method uses :meth:`_get_wcs` and
+        ``all_world2pix`` so pixel indices match astrowidget and
+        :meth:`plot_wcs`. Otherwise, when the dataset provides
+        ``right_ascension`` and ``declination`` coordinates that include a
+        ``time`` dimension (or the cube has only one time step), it finds the
+        nearest sky pixel by minimizing angular distance on those grids. If those
+        coordinates also carry ``frequency`` and/or ``polarization`` dimensions,
+        the slice at ``freq_idx`` / ``pol`` is taken first. Otherwise it falls
+        back to the closed-form SIN projection using mean sidereal time.
 
         Parameters
         ----------
@@ -1111,6 +1161,11 @@ class RadportAccessor:
             observatory = EarthLocation(
                 lat=37.2339 * u.deg, lon=-118.2817 * u.deg, height=1222 * u.m
             )
+
+        if self._use_persisted_wcs_for_pixel_mapping():
+            wcs_pixel = self._coords_to_pixel_via_wcs(ra, dec, time_idx)
+            if wcs_pixel is not None:
+                return wcs_pixel
 
         lst_deg = self._lst_deg_for_time_index(time_idx, observatory=observatory)
 
@@ -4381,14 +4436,15 @@ class RadportAccessor:
         Returns
         -------
         astropy.wcs.WCS
-            The WCS object for coordinate transformations.
+            The 2D celestial (RA/Dec) WCS, matching astrowidget ``get_wcs``.
 
         Raises
         ------
         ImportError
             If astropy is not installed.
         ValueError
-            If no WCS header is found in the dataset.
+            If no WCS header is found in the dataset, or the header has no
+            celestial axes.
         """
         try:
             from astropy.io.fits import Header
@@ -4406,7 +4462,10 @@ class RadportAccessor:
                 "attribute on variable/dataset or 'wcs_header_str' variable."
             )
 
-        return WCS(Header.fromstring(hdr_str, sep="\n"))
+        wcs = WCS(Header.fromstring(hdr_str, sep="\n"))
+        if not wcs.has_celestial:
+            raise ValueError("WCS header has no celestial axes (RA/Dec)")
+        return wcs.celestial
 
     @property
     def has_wcs(self) -> bool:

@@ -1716,6 +1716,45 @@ class TestRadportGetWcsTimePromotedHeader:
         assert w1.wcs.crval[0] == pytest.approx(181.0)
         assert _read_wcs_header_str(ds, time_idx=1) == hdr1
 
+    def test_coords_to_pixel_uses_per_time_wcs_header_str(self) -> None:
+        """coords_to_pixel must follow wcs_header_str(time), not analytical SIN."""
+        from astropy.io.fits import Header
+        from astropy.wcs import WCS
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=200.0, crval2=50.0)
+        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
+        wcs_per_time = np.array(
+            [np.bytes_(enc0), np.bytes_(enc1)],
+            dtype=f"S{max(len(enc0), len(enc1))}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+        )
+
+        for ti, hdr in enumerate((hdr0, hdr1)):
+            wcs = WCS(Header.fromstring(hdr, sep="\n"))
+            sky = wcs.pixel_to_world(4, 4)
+            ra_deg = float(sky.ra.deg)
+            dec_deg = float(sky.dec.deg)
+            li, mi = ds.radport.coords_to_pixel(ra_deg, dec_deg, time_idx=ti)
+            assert li == 4
+            assert mi == 4
+
 
 class TestRadportPixelToCoords:
     """Tests for pixel_to_coords() method."""
