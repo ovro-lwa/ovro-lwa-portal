@@ -46,6 +46,15 @@ _MAX_PIXEL_TRACK_PLANE_ELEMENTS = 72_000_000
 _MAX_PIXEL_TRACK_CHUNK_ELEMENTS = 40_000_000
 
 
+def _decode_wcs_header_bytes(raw: object) -> str:
+    """Decode a scalar WCS header payload from Zarr (bytes or str)."""
+    if isinstance(raw, np.ndarray):
+        raw = raw.item()
+    if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
+    return str(raw).rstrip("\x00")
+
+
 def _read_wcs_header_str(
     ds: xr.Dataset,
     *,
@@ -54,9 +63,16 @@ def _read_wcs_header_str(
 ) -> str | None:
     """Return the persisted FITS WCS header string from *ds*, if any.
 
-    Checks ``fits_wcs_header`` on the data variable and dataset attrs, then
-    ``wcs_header_str`` (0-D scalar or 1-D per ``time`` from incremental Zarr).
+    When ``wcs_header_str`` is stored per ``time`` step (incremental Zarr),
+    that header is preferred over static ``fits_wcs_header`` attrs so each
+    slice keeps its own phase-center CRVAL. Otherwise falls back to attrs,
+    then scalar ``wcs_header_str``.
     """
+    if "wcs_header_str" in ds:
+        wcs_var = ds["wcs_header_str"]
+        if wcs_var.ndim == 1 and "time" in wcs_var.dims and wcs_var.sizes["time"] > 0:
+            return _decode_wcs_header_bytes(wcs_var.isel(time=time_idx).values)
+
     hdr_str = None
     if var in ds.data_vars:
         hdr_str = ds[var].attrs.get("fits_wcs_header")
@@ -70,22 +86,12 @@ def _read_wcs_header_str(
 
     wcs_var = ds["wcs_header_str"]
     if wcs_var.ndim == 0:
-        raw = wcs_var.values
-        if isinstance(raw, np.ndarray):
-            raw = raw.item()
-    elif wcs_var.ndim == 1 and "time" in wcs_var.dims:
-        raw = wcs_var.isel(time=time_idx).values
-        if isinstance(raw, np.ndarray) and raw.ndim == 0:
-            raw = raw.item()
-    else:
-        raw_arr = np.asarray(wcs_var.values)
-        if raw_arr.size == 0:
-            return None
-        raw = np.ravel(raw_arr)[time_idx]
+        return _decode_wcs_header_bytes(wcs_var.values)
 
-    if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
-        return raw.decode("utf-8", errors="replace").rstrip("\x00")
-    return str(raw).rstrip("\x00")
+    raw_arr = np.asarray(wcs_var.values)
+    if raw_arr.size == 0:
+        return None
+    return _decode_wcs_header_bytes(np.ravel(raw_arr)[time_idx])
 
 
 def _maybe_load(da: xr.DataArray) -> xr.DataArray:
