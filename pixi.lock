@@ -102,7 +102,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pandas-3.0.3-py313hbfd7664_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/panel-1.8.10-pyhd8ed1ab_0.conda
-      - conda: https://prefix.dev/conda-forge/noarch/param-2.3.3-pyhc455866_0.conda
+      - conda: https://prefix.dev/conda-forge/noarch/param-2.4.0-pyhc455866_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/pathspec-1.0.4-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pgplot-5.2.2-hbeaba86_1009.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pillow-12.1.1-py313h80991f8_0.conda
@@ -439,7 +439,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pandas-3.0.3-py313hbfd7664_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/panel-1.8.10-pyhd8ed1ab_0.conda
-      - conda: https://prefix.dev/conda-forge/noarch/param-2.3.3-pyhc455866_0.conda
+      - conda: https://prefix.dev/conda-forge/noarch/param-2.4.0-pyhc455866_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/pathspec-1.0.4-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pgplot-5.2.2-hbeaba86_1009.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pillow-12.1.1-py313h80991f8_0.conda
@@ -780,7 +780,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pandas-3.0.3-py312h8ecdadd_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/panel-1.8.10-pyhd8ed1ab_0.conda
-      - conda: https://prefix.dev/conda-forge/noarch/param-2.3.3-pyhc455866_0.conda
+      - conda: https://prefix.dev/conda-forge/noarch/param-2.4.0-pyhc455866_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/pathspec-1.1.1-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pgplot-5.2.2-hbeaba86_1009.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pillow-12.2.0-py312h50c33e8_0.conda
@@ -1160,7 +1160,7 @@ environments:
       - conda: https://prefix.dev/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pandas-3.0.3-py313hbfd7664_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/panel-1.8.10-pyhd8ed1ab_0.conda
-      - conda: https://prefix.dev/conda-forge/noarch/param-2.3.3-pyhc455866_0.conda
+      - conda: https://prefix.dev/conda-forge/noarch/param-2.4.0-pyhc455866_0.conda
       - conda: https://prefix.dev/conda-forge/noarch/pathspec-1.0.4-pyhd8ed1ab_0.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pgplot-5.2.2-hbeaba86_1009.conda
       - conda: https://prefix.dev/conda-forge/linux-64/pillow-12.1.1-py313h80991f8_0.conda
@@ -6577,8 +6577,8 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev40
-  sha256: 717b68342f85701a7e91350134d9a88736f6a22e9eaa07810309a9b9997a5777
+  version: 0.1.1.dev44
+  sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
   requires_dist:
   - astropy>=7.1.0,<8
   - dask>=2025.9.1,<2026
@@ -6595,6 +6595,7 @@ packages:
   - bokeh>=3.3,<4 ; extra == 'all'
   - holoviews>=1.18,<2 ; extra == 'all'
   - ipyaladin>=0.5.0 ; extra == 'all'
+  - ipympl>=0.9 ; extra == 'all'
   - ipywidgets-bokeh>=1.5 ; extra == 'all'
   - ipywidgets>=8.0,<9 ; extra == 'all'
   - jupyter-bokeh>=4.0 ; extra == 'all'
@@ -6626,6 +6627,7 @@ packages:
   - bokeh>=3.3,<4 ; extra == 'visualization'
   - holoviews>=1.18,<2 ; extra == 'visualization'
   - ipyaladin>=0.5.0 ; extra == 'visualization'
+  - ipympl>=0.9 ; extra == 'visualization'
   - ipywidgets-bokeh>=1.5 ; extra == 'visualization'
   - ipywidgets>=8.0,<9 ; extra == 'visualization'
   - jupyter-bokeh>=4.0 ; extra == 'visualization'
@@ -6820,17 +6822,17 @@ packages:
   - pkg:pypi/panel?source=hash-mapping
   size: 23227506
   timestamp: 1773735459759
-- conda: https://prefix.dev/conda-forge/noarch/param-2.3.3-pyhc455866_0.conda
-  sha256: 7b5cbfbfeca555e69ec89d74e62b18c3cc5a301529ab395f6cd8f7a9454b7b1c
-  md5: 13d9aaa9ed7c9a4ca3bbecbee88eab21
+- conda: https://prefix.dev/conda-forge/noarch/param-2.4.0-pyhc455866_0.conda
+  sha256: 2365f5b08b1fc06b8f6da1b28aa13c1ee5c5666eaa14b7f8e404972e99c73ccc
+  md5: 3ea5fcb669c6a1ae33fc0db596076e02
   depends:
   - python >=3.10
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/param?source=hash-mapping
-  size: 180946
-  timestamp: 1775721079068
+  - pkg:pypi/param?source=compressed-mapping
+  size: 192480
+  timestamp: 1779371605272
 - pypi: https://files.pythonhosted.org/packages/b6/61/fae042894f4296ec49e3f193aff5d7c18440da9e48102c3315e1bc4519a7/parso-0.8.6-py2.py3-none-any.whl
   name: parso
   version: 0.8.6

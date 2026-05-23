@@ -146,6 +146,29 @@ def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(layout, pn.Column)
 
 
+def test_display_pipeline_qa_app_displays_single_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import display_pipeline_qa_app
+
+    displayed: list[Any] = []
+
+    def _display(obj: Any, **_kwargs: Any) -> None:
+        displayed.append(obj)
+
+    monkeypatch.setattr("IPython.display.display", _display)
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self: None,
+    )
+
+    display_pipeline_qa_app()
+
+    assert len(displayed) == 1
+    assert isinstance(displayed[0], pn.Column)
+
+
 def test_convert_button_label_and_disabled() -> None:
     assert pq.convert_button_label({"I": True, "V": True}) == "Convert FITS → Zarr (complete)"
     assert pq.convert_button_label({"I": True, "V": False}) == "Convert Stokes V"
@@ -271,31 +294,16 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
 
     panel._select_slice(2, 5)
     assert panel.time_idx == 2 and panel.freq_idx == 5
+    assert panel._heatmap._time_idx == 2 and panel._heatmap._freq_idx == 5
     assert "time=2" in panel._status_pane.object
     assert "freq=5" in panel._status_pane.object
     assert "Stokes I" in panel._status_pane.object
 
 
-def test_sky_widget_host_mount_uses_display_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    from ovro_lwa_portal.viz.pipeline_qa_app import _SKY_DISPLAY_ID, _SkyWidgetHost
-
-    published: list[dict[str, Any]] = []
-
-    def _display(obj: Any, *, display_id: str | None = None, update: bool = False, **_: Any) -> None:
-        published.append(
-            {
-                "display_id": display_id,
-                "update": update,
-                "obj": obj,
-            }
-        )
-
-    monkeypatch.setattr("IPython.display.display", _display)
+def test_sky_widget_host_mount_updates_container() -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _SkyWidgetHost
 
     host = _SkyWidgetHost()
-    host.mark_displayed()
-    assert published[0]["display_id"] == _SKY_DISPLAY_ID
-    assert published[0]["update"] is False
 
     class _FakeSky(widgets.HTML):
         def __init__(self) -> None:
@@ -306,8 +314,8 @@ def test_sky_widget_host_mount_uses_display_id(monkeypatch: pytest.MonkeyPatch) 
             return _FakeSky()
 
     host.mount({"I": _FakePanel(), "V": None})  # type: ignore[arg-type]
-    assert published[-1]["display_id"] == _SKY_DISPLAY_ID
-    assert published[-1]["update"] is True
-    shell = published[-1]["obj"]
-    assert isinstance(shell, widgets.VBox)
-    assert isinstance(shell.children[0], widgets.HBox)
+    assert len(host._containers["I"].children) == 2
+    assert isinstance(host._containers["I"].children[1], _FakeSky)
+    assert len(host._containers["V"].children) == 1
+    assert isinstance(host.panel_row, pn.Row)
+    assert host.panel_row.width == 1048

@@ -1,4 +1,4 @@
-"""Panel application for per-day pipeline QA review."""
+"""JupyterLab Panel application for per-day pipeline QA review."""
 
 from __future__ import annotations
 
@@ -174,11 +174,6 @@ def build_thermal_noise_grid(
                 *footer,
                 width=280,
                 margin=(6, 6),
-                styles={
-                    "border": "1px solid #e0e0e0",
-                    "border-radius": "4px",
-                    "padding": "6px",
-                },
             )
         )
 
@@ -432,7 +427,7 @@ class ZenithReviewPanel(param.Parameterized):
 
         self._header = pn.pane.Markdown(
             f"**Stokes {stokes_label}** — click the heatmap to choose time and frequency. "
-            "The matching sky view appears in the row below."
+            "The matching sky view appears directly below."
         )
         self._status_pane = pn.pane.Markdown("")
         self._layout = pn.Column(
@@ -459,7 +454,13 @@ class ZenithReviewPanel(param.Parameterized):
         self._sky_widget.colormap = "inferno"
         self._sky_widget.background_survey = ""
         self._sky_widget.invert_horizontal_pan = True
-        self._sky_widget.layout = widgets.Layout(width="520px", height="520px")
+        self._sky_widget.layout = widgets.Layout(
+            width=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
+            min_width=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
+            max_width=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
+            height=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
+            min_height=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
+        )
         bind_ds = dataset if dataset is not None else self._dataset
         self._bind_sky_dataset(self._sky_widget, bind_ds)
         self._on_slice_changed()
@@ -467,8 +468,11 @@ class ZenithReviewPanel(param.Parameterized):
 
     def _select_slice(self, time_idx: int, freq_idx: int) -> None:
         """Heatmap tap handler: update Param slice indices (drives sky + status)."""
-        self.time_idx = int(np.clip(time_idx, 0, self._n_times - 1))
-        self.freq_idx = int(np.clip(freq_idx, 0, self._n_freqs - 1))
+        time_idx = int(np.clip(time_idx, 0, self._n_times - 1))
+        freq_idx = int(np.clip(freq_idx, 0, self._n_freqs - 1))
+        with param.parameterized.batch_call_watchers(self):
+            self.time_idx = time_idx
+            self.freq_idx = freq_idx
 
     def _on_slice_changed(self, *_events: param.parameterized.Event) -> None:
         """Sync heatmap marker, status text, and SkyWidget for the current slice."""
@@ -514,7 +518,7 @@ class ZenithReviewPanel(param.Parameterized):
             self._heatmap.pane,
             width=ZENITH_REVIEW_COLUMN_WIDTH,
             sizing_mode="fixed",
-            margin=(0, 8, 0, 0),
+            margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
         )
 
     def dispose(self) -> None:
@@ -563,97 +567,88 @@ _ZENITH_PLACEHOLDER = (
 )
 
 _ZENITH_SKY_PLACEHOLDER = (
-    "*Sky views appear in the row below the heatmaps after **Load zenith panels**.*"
+    "*Sky views appear directly below the heatmaps after **Load zenith panels**.*"
 )
 
 ZENITH_REVIEW_COLUMN_WIDTH = 520
-
-_SKY_DISPLAY_ID = "ovro-lwa-portal-pipeline-qa-sky-host"
+ZENITH_REVIEW_COLUMN_GAP = 8
+ZENITH_REVIEW_ROW_WIDTH = 2 * ZENITH_REVIEW_COLUMN_WIDTH + ZENITH_REVIEW_COLUMN_GAP
+# SkyWidget height + label + ipywidgets padding (must fit inside the Panel IPyWidget pane).
+ZENITH_SKY_PANE_HEIGHT = ZENITH_REVIEW_COLUMN_WIDTH + 64
+ZENITH_SKY_ROW_MARGIN = (0, 0, 32, 0)
 
 
 class _SkyWidgetHost:
-    """Native ipywidgets sky area (cell output via IPython display_id, not Output capture)."""
+    """Embedded ipywidgets sky columns inside the Panel layout (JupyterLab only)."""
 
     def __init__(self) -> None:
-        self._display_id = _SKY_DISPLAY_ID
-        self._displayed = False
+        col_width = f"{ZENITH_REVIEW_COLUMN_WIDTH}px"
+        self._containers: dict[str, widgets.VBox] = {
+            spec.stokes: widgets.VBox(
+                children=[widgets.HTML(_ZENITH_SKY_PLACEHOLDER)],
+                layout=widgets.Layout(
+                    width=col_width,
+                    min_width=col_width,
+                    overflow="hidden",
+                ),
+            )
+            for spec in _STOKES_SECTIONS
+        }
+        self._panes: dict[str, pn.pane.IPyWidget] = {}
+        for index, spec in enumerate(_STOKES_SECTIONS):
+            column_margin = (
+                (0, ZENITH_REVIEW_COLUMN_GAP, 0, 0) if index == 0 else (0, 0, 0, 0)
+            )
+            self._panes[spec.stokes] = pn.pane.IPyWidget(
+                self._containers[spec.stokes],
+                width=ZENITH_REVIEW_COLUMN_WIDTH,
+                height=ZENITH_SKY_PANE_HEIGHT,
+                sizing_mode="fixed",
+                margin=column_margin,
+            )
 
     @property
-    def widget(self) -> widgets.HTML:
-        """Compatibility handle; sky content is published via :meth:`mark_displayed`."""
-        return widgets.HTML("")
+    def panel_row(self) -> pn.Row:
+        """Panel row aligned with the zenith heatmap columns above."""
+        return pn.Row(
+            *[self._panes[spec.stokes] for spec in _STOKES_SECTIONS],
+            sizing_mode="fixed",
+            width=ZENITH_REVIEW_ROW_WIDTH,
+            margin=ZENITH_SKY_ROW_MARGIN,
+        )
 
-    def _sky_shell(self, body: widgets.Widget) -> widgets.VBox:
-        return widgets.VBox(
-            [body],
+    @property
+    def widget(self) -> widgets.HBox:
+        """Native ipywidgets row for the sky columns."""
+        return widgets.HBox(
+            list(self._containers.values()),
             layout=widgets.Layout(
-                width="100%",
-                min_height="560px",
-                border="1px solid #e0e0e0",
-                padding="8px",
+                width=f"{ZENITH_REVIEW_ROW_WIDTH}px",
+                min_width=f"{ZENITH_REVIEW_ROW_WIDTH}px",
             ),
         )
 
-    def _publish(self, body: widgets.Widget, *, first: bool = False) -> None:
-        from IPython.display import display
-
-        shell = self._sky_shell(body)
-        if first:
-            display(shell, display_id=self._display_id)
-        else:
-            display(shell, display_id=self._display_id, update=True)
-
     def show_placeholder(self) -> None:
-        """Render the waiting message into the sky output area."""
-        if not self._displayed:
-            return
-        self._publish(widgets.HTML(_ZENITH_SKY_PLACEHOLDER))
-
-    def mark_displayed(self) -> None:
-        """Register the sky display_id and show the placeholder."""
-        self._displayed = True
-        self._publish(widgets.HTML(_ZENITH_SKY_PLACEHOLDER), first=True)
+        """Render the waiting message in each sky column."""
+        for container in self._containers.values():
+            container.children = [widgets.HTML(_ZENITH_SKY_PLACEHOLDER)]
 
     def reset(self) -> None:
-        if self._displayed:
-            self.show_placeholder()
+        self.show_placeholder()
 
     def mount(self, panels: dict[str, "ZenithReviewPanel | None"]) -> None:
-        """Create SkyWidgets and publish them to the sky display_id."""
-        if not self._displayed:
-            return
-
-        rows: list[Any] = []
+        """Create SkyWidgets and show them in the matching columns."""
         for spec in _STOKES_SECTIONS:
+            container = self._containers[spec.stokes]
             panel = panels.get(spec.stokes)
             if panel is None:
+                container.children = [widgets.HTML(_ZENITH_SKY_PLACEHOLDER)]
                 continue
             sky = panel.mount_sky()
-            rows.append(widgets.HTML(f"<strong>Stokes {spec.stokes} sky view</strong>"))
-            rows.append(sky)
-
-        if rows:
-            sky_columns = [
-                widgets.VBox(
-                    [rows[i], rows[i + 1]],
-                    layout=widgets.Layout(
-                        width=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
-                        min_width=f"{ZENITH_REVIEW_COLUMN_WIDTH}px",
-                    ),
-                )
-                for i in range(0, len(rows), 2)
+            container.children = [
+                widgets.HTML(f"<strong>Stokes {spec.stokes} sky view</strong>"),
+                sky,
             ]
-            self._publish(
-                widgets.HBox(
-                    sky_columns,
-                    layout=widgets.Layout(
-                        width="100%",
-                        justify_content="flex-start",
-                    ),
-                ),
-            )
-        else:
-            self.show_placeholder()
 
 
 class _StokesReviewHolder:
@@ -709,7 +704,7 @@ class _StokesReviewHolder:
                 pn.pane.Markdown(spec.missing_zarr_message),
                 width=ZENITH_REVIEW_COLUMN_WIDTH,
                 sizing_mode="fixed",
-                margin=(0, 8, 0, 0),
+                margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
             )
 
         dataset = datasets[spec.stokes]
@@ -756,7 +751,7 @@ class _StokesReviewHolder:
                 pn.pane.Markdown(spec.missing_zarr_message),
                 width=ZENITH_REVIEW_COLUMN_WIDTH,
                 sizing_mode="fixed",
-                margin=(0, 8, 0, 0),
+                margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
             )
             for spec in _STOKES_SECTIONS
         ]
@@ -873,8 +868,8 @@ class PipelineQAApp(param.Parameterized):
         self._active_datasets: dict[str, xr.Dataset] = {}
 
     @property
-    def sky_widgets(self) -> widgets.HTML:
-        """Sky area is published via IPython display_id (see :func:`display_pipeline_qa_app`)."""
+    def sky_widgets(self) -> widgets.HBox:
+        """Embedded ipywidgets row for the sky columns."""
         return self._sky_host.widget
 
     def _execute(self, callback: Any) -> None:
@@ -882,6 +877,11 @@ class PipelineQAApp(param.Parameterized):
             pn.state.execute(callback)
         except Exception:
             callback()
+
+    def _push_panel_roots(self) -> None:
+        """Push the dashboard layout to the notebook frontend."""
+        if self._layout is not None:
+            _push_panel_layout(self._layout)
 
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
         """Push day options into the Select widget (needed in JupyterLab)."""
@@ -904,10 +904,7 @@ class PipelineQAApp(param.Parameterized):
             self._zenith_slot.objects = [pn.pane.Markdown(_ZENITH_PLACEHOLDER)]
 
             def _push() -> None:
-                views: list[pn.viewable.Viewable] = [self._zenith_slot]
-                if self._layout is not None:
-                    views.append(self._layout)
-                _push_panel_layout(*views)
+                self._push_panel_roots()
 
             self._execute(_push)
         self._refresh_action_buttons()
@@ -1117,17 +1114,12 @@ class PipelineQAApp(param.Parameterized):
         self._execute(self._push_zenith_root)
 
     def _push_zenith_root(self) -> None:
-        """Push zenith slot and app root after nested panel updates."""
-        views: list[pn.viewable.Viewable] = [self._zenith_slot]
-        if self._layout is not None:
-            views.append(self._layout)
-        _push_panel_layout(*views)
+        """Push zenith heatmaps after nested panel updates."""
+        self._push_panel_roots()
 
     def _mount_zenith_column(self, review_column: pn.Column) -> None:
         """Swap zenith heatmaps into the dashboard and mount sky widgets below."""
         self._zenith_slot.objects = [review_column]
-        if not self._sky_host._displayed:
-            self._sky_host.mark_displayed()
         self._sky_host.mount(self._stokes_review._panels)
         self._execute(self._push_zenith_root)
 
@@ -1213,13 +1205,7 @@ class PipelineQAApp(param.Parameterized):
         self._flush_log()
 
         def _push_loaded_day() -> None:
-            views: list[pn.viewable.Viewable] = [
-                self._qa_grid,
-                self._zenith_slot,
-            ]
-            if self._layout is not None:
-                views.append(self._layout)
-            _push_panel_layout(*views)
+            self._push_panel_roots()
 
         self._execute(_push_loaded_day)
 
@@ -1267,9 +1253,11 @@ class PipelineQAApp(param.Parameterized):
             pn.pane.PNG(png_path, sizing_mode="scale_width"),
             self._close_modal_button,
         ]
+        self._push_panel_roots()
 
     def _close_modal(self) -> None:
         self._modal_container.objects = []
+        self._push_panel_roots()
 
     def _on_convert_click(self, _event: Any) -> None:
         if self.converting or self.select_day is None:
@@ -1308,50 +1296,69 @@ class PipelineQAApp(param.Parameterized):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _build_layouts(self) -> None:
+        """Build the single Panel layout with sky widgets below the heatmaps."""
+        if self._layout is not None:
+            return
+
+        header = pn.pane.Markdown(
+            "# Pipeline QA check\n\n"
+            "Scan finds available days automatically. Select a day and click **Load day** "
+            "for the thermal-noise QA grid, then **Load zenith panels** for Stokes I/V "
+            "heatmaps side by side. Matching sky views appear directly below the heatmaps."
+        )
+        log_section = pn.Column(
+            pn.pane.Markdown("**Activity log**"),
+            self._log_pane,
+            sizing_mode="stretch_width",
+        )
+        self._layout = pn.Column(
+            header,
+            pn.Row(
+                self._day_selector,
+                self._load_button,
+                self._convert_button,
+                sizing_mode="stretch_width",
+            ),
+            log_section,
+            pn.pane.Markdown("### Zenith review (Stokes I / V)"),
+            pn.Row(self._zenith_load_button, sizing_mode="stretch_width"),
+            self._zenith_slot,
+            self._sky_host.panel_row,
+            pn.pane.Markdown("### Thermal-noise QA by LST hour"),
+            self._qa_grid,
+            self._modal_container,
+            sizing_mode="stretch_width",
+        )
+
     def panel(self) -> pn.Column:
-        """Return the full Panel layout."""
-        if self._layout is None:
-            header = pn.pane.Markdown(
-                "# Pipeline QA check\n\n"
-                "Scan finds available days automatically. Select a day and click **Load day** "
-                "for the thermal-noise QA grid, then **Load zenith panels** for Stokes I/V "
-                "heatmaps side by side. Matching sky views appear in the row below."
-            )
-            log_section = pn.Column(
-                pn.pane.Markdown("**Activity log**"),
-                self._log_pane,
-                sizing_mode="stretch_width",
-            )
-            self._layout = pn.Column(
-                header,
-                pn.Row(
-                    self._day_selector,
-                    self._load_button,
-                    self._convert_button,
-                    sizing_mode="stretch_width",
-                ),
-                log_section,
-                pn.pane.Markdown("### Zenith review (Stokes I / V)"),
-                pn.Row(self._zenith_load_button, sizing_mode="stretch_width"),
-                self._zenith_slot,
-                pn.pane.Markdown("### Thermal-noise QA by LST hour"),
-                self._qa_grid,
-                self._modal_container,
-                sizing_mode="stretch_width",
-            )
+        """Return the JupyterLab dashboard layout."""
+        self._build_layouts()
 
         if not self._scan_started:
             self._scan_started = True
             pn.state.onload(self._start_initial_scan)
 
+        assert self._layout is not None
         return self._layout
 
 
 def display_pipeline_qa_app(app: PipelineQAApp | None = None) -> PipelineQAApp:
-    """Display the Panel dashboard and native sky-widget area in Jupyter."""
+    """Display the QA dashboard in JupyterLab (single Panel document + embedded sky row)."""
     from IPython.display import display
 
+    try:
+        pn.extension("ipywidgets")
+    except Exception as exc:
+        logger.debug("Panel ipywidgets extension unavailable: %s", exc)
+
     app = app or PipelineQAApp()
-    display(app.panel())
-    app._sky_host.mark_displayed()
+    app._build_layouts()
+
+    if not app._scan_started:
+        app._scan_started = True
+        pn.state.onload(app._start_initial_scan)
+
+    assert app._layout is not None
+    display(app._layout)
     return app
