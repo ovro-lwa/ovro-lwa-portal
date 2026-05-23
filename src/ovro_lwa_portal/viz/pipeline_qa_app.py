@@ -21,7 +21,7 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astrowidget import SkyWidget
 from bokeh.events import Tap
-from bokeh.models import CustomJS, FixedTicker
+from bokeh.models import FixedTicker
 from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 
@@ -52,7 +52,7 @@ THERMAL_NOISE_GRID_COLS = 4
 
 
 def _schedule_ipython_main(callback: Callable[[], None]) -> None:
-    """Run callback on the IPython kernel event loop (required for display_id updates)."""
+    """Run callback on the IPython kernel event loop."""
     try:
         from IPython import get_ipython
 
@@ -67,6 +67,14 @@ def _schedule_ipython_main(callback: Callable[[], None]) -> None:
     callback()
 
 
+def _run_on_main_thread(callback: Callable[[], None]) -> None:
+    """Run a callback on the active notebook/UI thread when possible."""
+    try:
+        pn.state.execute(callback)
+    except Exception:
+        _schedule_ipython_main(callback)
+
+
 def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
     """Push Panel layout changes to the notebook frontend."""
     try:
@@ -77,6 +85,10 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
 
     pushed_docs: set[int] = set()
     for view in views:
+        if not view._models:
+            continue
+        if not any(ref in state._views for ref in view._models):
+            continue
         for ref in view._models:
             if ref not in state._views:
                 continue
@@ -327,15 +339,8 @@ class _ZenithHeatmapSelector:
         self._time_idx = time_idx
         self._freq_idx = freq_idx
         self._on_select = on_select
-        self._status_line = ""
         self._plot = self._build_plot()
         self.pane = pn.pane.Bokeh(self._plot, width=520, height=420, sizing_mode="fixed")
-
-    def _compose_title(self) -> str:
-        base = f"Zenith patch {self._metric_label} (click to set slice)"
-        if self._status_line:
-            return f"{base}\n{self._status_line}"
-        return base
 
     def _clim(self) -> tuple[float, float] | None:
         finite = self._stat_map[np.isfinite(self._stat_map)]
@@ -362,7 +367,7 @@ class _ZenithHeatmapSelector:
         plot = figure(
             width=520,
             height=400,
-            title=self._compose_title(),
+            title=f"Zenith patch {self._metric_label} (click to set slice)",
             x_range=(0, n_times),
             y_range=(0, n_freqs),
             tools="pan,wheel_zoom,reset,tap",
@@ -395,19 +400,6 @@ class _ZenithHeatmapSelector:
         plot.yaxis.major_label_overrides = y_labels
         plot.xaxis.axis_label = "Time index"
         plot.yaxis.axis_label = "Frequency index"
-        marker_source = self._marker.data_source
-        plot.js_on_event(
-            Tap,
-            CustomJS(
-                args=dict(source=marker_source, n_times=n_times, n_freqs=n_freqs),
-                code="""
-                if (cb_obj.x == null || cb_obj.y == null) return;
-                const tx = Math.min(n_times - 1, Math.max(0, Math.floor(cb_obj.x)));
-                const fy = Math.min(n_freqs - 1, Math.max(0, Math.floor(cb_obj.y)));
-                source.patch({x: [[0, tx + 0.5]], y: [[0, fy + 0.5]]});
-                """,
-            ),
-        )
         plot.on_event(Tap, self._on_tap)
         return plot
 
@@ -419,25 +411,14 @@ class _ZenithHeatmapSelector:
         freq_idx = _heatmap_index_from_coord(event.y, n_freqs)
         self._on_select(time_idx, freq_idx)
 
-    def set_slice(
-        self,
-        time_idx: int,
-        freq_idx: int,
-        *,
-        status: str | None = None,
-        push: bool = True,
-    ) -> None:
+    def set_slice(self, time_idx: int, freq_idx: int, *, push: bool = True) -> None:
         self._time_idx = time_idx
         self._freq_idx = freq_idx
-        if status is not None:
-            self._status_line = status
-            self._plot.title.text = self._compose_title()
-            self.pane.object = self._plot
         cx = _heatmap_cell_center(time_idx)
         cy = _heatmap_cell_center(freq_idx)
         self._marker.data_source.patch({"x": [(0, cx)], "y": [(0, cy)]})
         if push:
-            _schedule_ipython_main(lambda: _push_panel_layout(self.pane))
+            _run_on_main_thread(lambda: _push_panel_layout(self.pane))
 
     def set_data(self, stat_map: np.ndarray, *, time_idx: int, freq_idx: int) -> None:
         self._stat_map = stat_map
@@ -471,6 +452,7 @@ class ZenithReviewPanel(param.Parameterized):
         self._n_times = int(dataset.sizes["time"])
         self._n_freqs = int(dataset.sizes["frequency"])
         self._sky_widget: SkyWidget | None = None
+        self._push_root: Callable[[], None] | None = None
 
         default_time, default_freq = default_stat_slice(stat_map, dataset)
         super().__init__(
@@ -491,27 +473,43 @@ class ZenithReviewPanel(param.Parameterized):
         )
 
         self._header = pn.pane.Markdown(
-            f"**Stokes {stokes_label}** — click the heatmap to choose time and frequency. "
-            "The matching sky view appears directly below."
+            f"**Stokes {stokes_label}** — click the heatmap or use the sliders to choose "
+            "time and frequency. The matching sky view appears directly below."
+        )
+        self._status_pane = pn.pane.Markdown(self._slice_status, sizing_mode="stretch_width")
+        self._time_slider = pn.widgets.IntSlider.from_param(
+            self.param.time_idx,
+            name="Time index",
+        )
+        self._freq_slider = pn.widgets.IntSlider.from_param(
+            self.param.freq_idx,
+            name="Frequency index",
         )
         self._layout = pn.Column(
             self._header,
+            self._status_pane,
+            self._time_slider,
+            self._freq_slider,
             self._heatmap.pane,
             width=ZENITH_REVIEW_COLUMN_WIDTH,
             sizing_mode="fixed",
             margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
         )
-
         self.param.watch(self._on_slice_changed, ["time_idx", "freq_idx"])
         self._on_slice_changed()
 
-    def _format_status(self) -> str:
-        """Slice summary shown above the heatmap."""
+    def set_push_root(self, callback: Callable[[], None] | None) -> None:
+        """Register the displayed dashboard root push callback (required in JupyterLab)."""
+        self._push_root = callback
+
+    @param.depends("time_idx", "freq_idx")
+    def _slice_status(self) -> str:
+        """Slice summary shown above the heatmap (reactive via Param + Panel)."""
         coord = zenith_lm_coord(self._dataset, self.time_idx)
         metric_val = float(self._stat_map[self.time_idx, self.freq_idx])
         freq_mhz = float(self._dataset.frequency.values[self.freq_idx]) / 1e6
         return (
-            f"Stokes {self.stokes_label} zenith (l=0, m=0) | time={self.time_idx}, "
+            f"**Stokes {self.stokes_label} zenith (l=0, m=0)** | time={self.time_idx}, "
             f"freq={self.freq_idx} ({freq_mhz:.1f} MHz)"
             f" | center RA={coord.ra.to_string(unit=u.hour, precision=1)}, "
             f"Dec={coord.dec.to_string(unit=u.deg, precision=1)}"
@@ -544,35 +542,41 @@ class ZenithReviewPanel(param.Parameterized):
         return self._sky_widget
 
     def _select_slice(self, time_idx: int, freq_idx: int) -> None:
-        """Heatmap tap handler: update Param slice indices (drives sky + status)."""
+        """Heatmap tap handler: update Param slice indices on the notebook UI thread."""
         time_idx = int(np.clip(time_idx, 0, self._n_times - 1))
         freq_idx = int(np.clip(freq_idx, 0, self._n_freqs - 1))
-        with param.parameterized.batch_call_watchers(self):
-            self.time_idx = time_idx
-            self.freq_idx = freq_idx
+
+        def _apply() -> None:
+            with param.parameterized.batch_call_watchers(self):
+                self.time_idx = time_idx
+                self.freq_idx = freq_idx
+
+        _run_on_main_thread(_apply)
 
     def _on_slice_changed(self, *_events: param.parameterized.Event) -> None:
-        """Sync heatmap marker, title status line, and SkyWidget for the current slice."""
-        self._heatmap.set_slice(
-            self.time_idx,
-            self.freq_idx,
-            status=self._format_status(),
-            push=True,
-        )
-        if self._sky_widget is None:
-            return
-        coord = zenith_lm_coord(self._dataset, self.time_idx)
-        self._sky_widget.update_slice(
-            self.time_idx,
-            self.freq_idx,
-            center=coord,
-            fov=DEFAULT_FOV_DEG * u.deg,
-            percentile_low=2,
-            percentile_high=98,
-        )
-        send_state = getattr(self._sky_widget, "send_state", None)
-        if callable(send_state):
-            send_state()
+        """Sync heatmap crosshair and SkyWidget when slice Param values change."""
+        self._heatmap.set_slice(self.time_idx, self.freq_idx, push=False)
+        if self._sky_widget is not None:
+            coord = zenith_lm_coord(self._dataset, self.time_idx)
+            self._sky_widget.update_slice(
+                self.time_idx,
+                self.freq_idx,
+                center=coord,
+                fov=DEFAULT_FOV_DEG * u.deg,
+                percentile_low=2,
+                percentile_high=98,
+            )
+            send_state = getattr(self._sky_widget, "send_state", None)
+            if callable(send_state):
+                send_state()
+        self._push_slice_ui()
+
+    def _push_slice_ui(self) -> None:
+        """Push the displayed dashboard so nested zenith controls update in JupyterLab."""
+        if self._push_root is not None:
+            self._push_root()
+        else:
+            _push_panel_layout(self._layout, self._heatmap.pane)
 
     @property
     def layout(self) -> pn.Column:
@@ -580,12 +584,13 @@ class ZenithReviewPanel(param.Parameterized):
 
     @property
     def heatmap_column(self) -> pn.Column:
-        """Header, status, and heatmap for side-by-side zenith review layout."""
+        """Header, status, sliders, and heatmap for side-by-side zenith review layout."""
         return self._layout
 
     def dispose(self) -> None:
         self._heatmap.dispose()
         self._sky_widget = None
+        self._push_root = None
 
 
 @dataclass(frozen=True)
@@ -740,6 +745,24 @@ class _StokesReviewHolder:
                 panel.dispose()
                 self._panels[stokes] = None
 
+    def build_section_contents(
+        self,
+        datasets: dict[str, xr.Dataset],
+        log: LogFn,
+        flush: Callable[[], None] | None = None,
+    ) -> dict[str, pn.viewable.Viewable]:
+        """Build Stokes I/V review panel content for stable zenith section slots."""
+        self._dispose_panels()
+        return {
+            spec.stokes: self._build_section_content_for_spec(
+                spec,
+                datasets,
+                log,
+                flush=flush,
+            )
+            for spec in _STOKES_SECTIONS
+        }
+
     def build_column(
         self,
         datasets: dict[str, xr.Dataset],
@@ -747,31 +770,25 @@ class _StokesReviewHolder:
         flush: Callable[[], None] | None = None,
     ) -> pn.Column:
         """Compute stat maps and assemble heatmaps in a side-by-side row."""
-        self._dispose_panels()
-        heatmap_columns: list[pn.Column] = []
-        for spec in _STOKES_SECTIONS:
-            heatmap_columns.append(self._build_section_for_spec(spec, datasets, log, flush=flush))
+        contents = self.build_section_contents(datasets, log, flush=flush)
+        heatmap_columns = [
+            self._build_section(spec, contents[spec.stokes]) for spec in _STOKES_SECTIONS
+        ]
         return pn.Column(
             pn.Row(*heatmap_columns, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
 
-    def _build_section_for_spec(
+    def _build_section_content_for_spec(
         self,
         spec: _StokesSectionSpec,
         datasets: dict[str, xr.Dataset],
         log: LogFn,
         *,
         flush: Callable[[], None] | None = None,
-    ) -> pn.Column:
+    ) -> pn.viewable.Viewable:
         if spec.stokes not in datasets:
-            return pn.Column(
-                pn.pane.Markdown(spec.heading),
-                pn.pane.Markdown(spec.missing_zarr_message),
-                width=ZENITH_REVIEW_COLUMN_WIDTH,
-                sizing_mode="fixed",
-                margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
-            )
+            return pn.pane.Markdown(spec.missing_zarr_message)
 
         dataset = datasets[spec.stokes]
         log(
@@ -808,18 +825,19 @@ class _StokesReviewHolder:
             flush()
         return panel.heatmap_column
 
+    def build_no_zarr_contents(self) -> dict[str, pn.viewable.Viewable]:
+        """Placeholder content when the selected day has no QA Zarr stores."""
+        self._dispose_panels()
+        return {
+            spec.stokes: pn.pane.Markdown(spec.missing_zarr_message)
+            for spec in _STOKES_SECTIONS
+        }
+
     def build_no_zarr_column(self) -> pn.Column:
         """Column shown when the selected day has no QA Zarr stores."""
-        self._dispose_panels()
+        contents = self.build_no_zarr_contents()
         columns = [
-            pn.Column(
-                pn.pane.Markdown(spec.heading),
-                pn.pane.Markdown(spec.missing_zarr_message),
-                width=ZENITH_REVIEW_COLUMN_WIDTH,
-                sizing_mode="fixed",
-                margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
-            )
-            for spec in _STOKES_SECTIONS
+            self._build_section(spec, contents[spec.stokes]) for spec in _STOKES_SECTIONS
         ]
         return pn.Column(
             pn.Row(*columns, sizing_mode="stretch_width"),
@@ -886,8 +904,33 @@ class PipelineQAApp(param.Parameterized):
         self._loaded_day: str | None = None
         self._stokes_review = _StokesReviewHolder()
         self._sky_host = _SkyWidgetHost()
+        self._zenith_banner = pn.pane.Markdown(_ZENITH_PLACEHOLDER)
+        self._zenith_section_content: dict[str, pn.Column] = {}
+        self._zenith_sections: dict[str, pn.Column] = {}
+        for index, spec in enumerate(_STOKES_SECTIONS):
+            column_margin = (
+                (0, ZENITH_REVIEW_COLUMN_GAP, 0, 0) if index == 0 else (0, 0, 0, 0)
+            )
+            content = pn.Column(
+                pn.pane.Markdown(spec.waiting_message),
+                sizing_mode="fixed",
+                width=ZENITH_REVIEW_COLUMN_WIDTH,
+            )
+            self._zenith_section_content[spec.stokes] = content
+            self._zenith_sections[spec.stokes] = pn.Column(
+                pn.pane.Markdown(spec.heading),
+                content,
+                width=ZENITH_REVIEW_COLUMN_WIDTH,
+                sizing_mode="fixed",
+                margin=column_margin,
+            )
+        self._zenith_review_row = pn.Row(
+            *[self._zenith_sections[spec.stokes] for spec in _STOKES_SECTIONS],
+            sizing_mode="stretch_width",
+        )
         self._zenith_slot = pn.Column(
-            pn.pane.Markdown(_ZENITH_PLACEHOLDER),
+            self._zenith_banner,
+            self._zenith_review_row,
             sizing_mode="stretch_width",
         )
         self._zenith_load_button = pn.widgets.Button(
@@ -941,6 +984,35 @@ class PipelineQAApp(param.Parameterized):
         if self._layout is not None:
             _push_panel_layout(self._layout)
 
+    def _reset_zenith_sections(self, *, banner: str | None = None) -> None:
+        """Restore zenith placeholders without replacing the displayed layout tree."""
+        self._stokes_review.dispose()
+        self._sky_host.reset()
+        self._zenith_banner.object = banner if banner is not None else _ZENITH_PLACEHOLDER
+        for spec in _STOKES_SECTIONS:
+            self._zenith_section_content[spec.stokes].objects = [
+                pn.pane.Markdown(spec.waiting_message),
+            ]
+
+    def _mount_zenith_sections(
+        self,
+        section_contents: dict[str, pn.viewable.Viewable],
+        *,
+        banner: str,
+    ) -> None:
+        """Populate stable zenith section slots and mount sky widgets below."""
+        self._zenith_banner.object = banner
+        push_root = lambda: self._execute(self._push_panel_roots)
+        for spec in _STOKES_SECTIONS:
+            self._zenith_section_content[spec.stokes].objects = [
+                section_contents[spec.stokes],
+            ]
+            panel = self._stokes_review._panels.get(spec.stokes)
+            if panel is not None:
+                panel.set_push_root(push_root)
+        self._sky_host.mount(self._stokes_review._panels)
+        self._execute(self._push_zenith_root)
+
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
         """Push day options into the Select widget (needed in JupyterLab)."""
         self._syncing_day = True
@@ -957,9 +1029,7 @@ class PipelineQAApp(param.Parameterized):
         self.select_day = event.new
         if self._loaded_day != event.new:
             self._release_active_datasets()
-            self._stokes_review.dispose()
-            self._sky_host.reset()
-            self._zenith_slot.objects = [pn.pane.Markdown(_ZENITH_PLACEHOLDER)]
+            self._reset_zenith_sections()
 
             def _push() -> None:
                 self._push_panel_roots()
@@ -1132,11 +1202,7 @@ class PipelineQAApp(param.Parameterized):
         self._log(f"Loading zenith review panels for {select_day}…")
         self._flush_log()
         self._release_active_datasets()
-        self._stokes_review.dispose()
-        self._sky_host.reset()
-        self._zenith_slot.objects = [
-            pn.pane.Markdown("*Loading zenith panels…*"),
-        ]
+        self._reset_zenith_sections(banner="*Loading zenith panels…*")
         self._execute(self._push_zenith_root)
 
         def _run() -> None:
@@ -1145,7 +1211,8 @@ class PipelineQAApp(param.Parameterized):
                     raise _LoadSuperseded
                 status = zarr_status(select_day)
                 if not (status["I"] or status["V"]):
-                    review_column = self._stokes_review.build_no_zarr_column()
+                    section_contents = self._stokes_review.build_no_zarr_contents()
+                    banner = _NO_QA_ZARR_MESSAGE
                 else:
                     datasets = load_qa_datasets(
                         select_day,
@@ -1155,10 +1222,14 @@ class PipelineQAApp(param.Parameterized):
                     if not self._is_current_load(load_seq):
                         raise _LoadSuperseded
                     self._active_datasets = dict(datasets)
-                    review_column = self._stokes_review.build_column(
+                    section_contents = self._stokes_review.build_section_contents(
                         datasets,
                         self._log,
                         flush=self._flush_log,
+                    )
+                    banner = (
+                        "*Zenith heatmaps loaded. Click a cell or move the sliders "
+                        "to inspect time/frequency slices.*"
                     )
                     if not self._is_current_load(load_seq):
                         raise _LoadSuperseded
@@ -1167,7 +1238,7 @@ class PipelineQAApp(param.Parameterized):
                     if not self._is_current_load(load_seq):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
-                    self._mount_zenith_column(review_column)
+                    self._mount_zenith_sections(section_contents, banner=banner)
                     self._log(f"Zenith review panels ready for {select_day}.")
                     self._finish_zenith_load(load_seq=load_seq)
 
@@ -1187,8 +1258,7 @@ class PipelineQAApp(param.Parameterized):
                         return
                     self._log_error(f"Failed to load zenith panels for {select_day}: {exc}")
                     self._log(traceback.format_exc(), sync=False)
-                    self._zenith_slot.objects = [pn.pane.Markdown(_ZENITH_PLACEHOLDER)]
-                    self._sky_host.reset()
+                    self._reset_zenith_sections()
                     self._finish_zenith_load(load_seq=load_seq)
 
                 _schedule_ipython_main(_fail)
@@ -1208,12 +1278,6 @@ class PipelineQAApp(param.Parameterized):
     def _push_zenith_root(self) -> None:
         """Push zenith heatmaps after nested panel updates."""
         self._push_panel_roots()
-
-    def _mount_zenith_column(self, review_column: pn.Column) -> None:
-        """Swap zenith heatmaps into the dashboard and mount sky widgets below."""
-        self._zenith_slot.objects = [review_column]
-        self._sky_host.mount(self._stokes_review._panels)
-        self._execute(self._push_zenith_root)
 
     def _run_day_load(self, select_day: str, load_seq: int) -> None:
         """Fetch Zarr data and rebuild widgets on the main thread."""
@@ -1280,8 +1344,7 @@ class PipelineQAApp(param.Parameterized):
         select_day = payload.select_day
         self._loaded_day = select_day
         self._active_datasets.clear()
-        self._stokes_review.dispose()
-        self._sky_host.reset()
+        self._reset_zenith_sections()
         self._summary_df = payload.summary_df
         thermal_grid = build_thermal_noise_grid(
             payload.summary_df,
@@ -1289,7 +1352,6 @@ class PipelineQAApp(param.Parameterized):
             open_full_size=self._open_modal,
         )
         self._qa_grid.objects = [thermal_grid]
-        self._zenith_slot.objects = [pn.pane.Markdown(_ZENITH_PLACEHOLDER)]
         self._refresh_convert_button()
         self._log(
             f"Loaded QA data for {select_day} "

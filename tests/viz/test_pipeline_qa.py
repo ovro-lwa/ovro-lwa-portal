@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -144,6 +145,8 @@ def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     app = PipelineQAApp()
     layout = app.panel()
     assert isinstance(layout, pn.Column)
+    assert isinstance(app._zenith_review_row, pn.Row)
+    assert set(app._zenith_section_content) == {"I", "V"}
 
 
 def test_display_pipeline_qa_app_displays_single_layout(
@@ -239,7 +242,7 @@ def test_stokes_review_holder_builds_both_sections(monkeypatch: pytest.MonkeyPat
         stokes_order.append(spec.stokes)
         return pn.Column(pn.pane.Markdown(f"{spec.stokes} section"))
 
-    monkeypatch.setattr(holder, "_build_section_for_spec", _record)
+    monkeypatch.setattr(holder, "_build_section_content_for_spec", _record)
     column = holder.build_column({"I": object(), "V": object()}, lambda _message: None)  # type: ignore[arg-type]
 
     assert stokes_order == ["I", "V"]
@@ -313,6 +316,7 @@ def test_heatmap_axis_ticks_at_cell_centers() -> None:
 
 def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatch) -> None:
     import astropy.units as u
+    import param
 
     from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel
 
@@ -357,26 +361,61 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
         frequency = type("Freq", (), {"values": freq_values})()
         radport = _Radport()
 
+    scheduled: list[Callable[[], None]] = []
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._schedule_ipython_main",
+        lambda callback: scheduled.append(callback),
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
+        lambda callback: callback(),
+    )
+
     panel = ZenithReviewPanel(
         _Dataset(),  # type: ignore[arg-type]
         stat_map,
         stokes_label="I",
         metric_label="STD",
     )
+
+    def _run_scheduled() -> None:
+        while scheduled:
+            scheduled.pop(0)()
+
+    _run_scheduled()
     assert panel.time_idx == 0 and panel.freq_idx == 8
 
     panel._select_slice(2, 5)
+    _run_scheduled()
+
     assert panel.time_idx == 2 and panel.freq_idx == 5
     assert panel._heatmap._time_idx == 2 and panel._heatmap._freq_idx == 5
     assert panel._heatmap._marker.data_source.data["x"] == [2.5]
     assert panel._heatmap._marker.data_source.data["y"] == [5.5]
-    assert "time=2" in panel._format_status()
-    assert "freq=5" in panel._format_status()
-    assert "time=2" in panel._heatmap._plot.title.text
+    assert "time=2" in panel._slice_status()
+    assert "freq=5" in panel._slice_status()
+    assert "Stokes I" in panel._slice_status()
+    assert panel._time_slider.value == 2
+    assert panel._freq_slider.value == 5
 
     panel._select_slice(3, 6)
+    _run_scheduled()
     assert panel.time_idx == 3 and panel.freq_idx == 6
-    assert "time=3" in panel._heatmap._plot.title.text
+    assert panel._time_slider.value == 3
+    assert panel._freq_slider.value == 6
+    assert "time=3" in panel._slice_status()
+
+    with param.parameterized.batch_call_watchers(panel):
+        panel.time_idx = 1
+        panel.freq_idx = 2
+    assert panel._heatmap._time_idx == 1 and panel._heatmap._freq_idx == 2
+    assert "time=1" in panel._slice_status()
+
+    pushed: list[int] = []
+    panel.set_push_root(lambda: pushed.append(1))
+    panel._select_slice(0, 3)
+    _run_scheduled()
+    assert pushed == [1]
 
 
 def test_finish_load_day_auto_starts_zenith(monkeypatch: pytest.MonkeyPatch) -> None:
