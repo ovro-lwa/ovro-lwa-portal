@@ -176,6 +176,59 @@ def test_convert_button_label_and_disabled() -> None:
     assert pq.convert_button_disabled({"I": False, "V": False}, converting=False) is False
 
 
+def test_refresh_convert_button_uses_primary_when_zarr_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app.scanning = False
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day: {"I": False, "V": False},
+    )
+    app.select_day = "2024-12-27"
+
+    app._refresh_convert_button()
+
+    assert app._convert_button.button_type == "primary"
+    assert app._convert_button.disabled is False
+
+
+def test_refresh_convert_button_uses_default_when_zarr_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app.scanning = False
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day: {"I": True, "V": True},
+    )
+    app.select_day = "2024-12-27"
+
+    app._refresh_convert_button()
+
+    assert app._convert_button.button_type == "default"
+    assert app._convert_button.disabled is True
+
+
+def test_day_selector_triggers_load_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app.scanning = False
+    monkeypatch.setattr(app, "_begin_load_day", lambda: calls.append(app.select_day or ""))
+    app.select_day = "2024-12-27"
+    app._loaded_day = None
+
+    app._on_day_selector_changed(
+        type("Event", (), {"new": "2024-12-28"})(),  # type: ignore[arg-type]
+    )
+
+    assert app.select_day == "2024-12-28"
+    assert calls == ["2024-12-28"]
+
+
 def test_stokes_review_holder_builds_both_sections(monkeypatch: pytest.MonkeyPatch) -> None:
     from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
 
@@ -238,6 +291,26 @@ def test_default_stat_slice_falls_back_to_first_finite_cell() -> None:
     assert default_stat_slice(stat_map, _Dataset()) == (1, 2)
 
 
+def test_heatmap_cell_center_and_index_from_coord() -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import (
+        _heatmap_cell_center,
+        _heatmap_index_from_coord,
+    )
+
+    assert _heatmap_cell_center(3) == 3.5
+    assert _heatmap_index_from_coord(2.2, 10) == 2
+    assert _heatmap_index_from_coord(2.9, 10) == 2
+    assert _heatmap_index_from_coord(9.9, 10) == 9
+
+
+def test_heatmap_axis_ticks_at_cell_centers() -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _heatmap_axis_ticks
+
+    ticks, labels = _heatmap_axis_ticks(5)
+    assert ticks == [0.5, 1.5, 2.5, 3.5, 4.5]
+    assert labels == {0.5: "0", 1.5: "1", 2.5: "2", 3.5: "3", 4.5: "4"}
+
+
 def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatch) -> None:
     import astropy.units as u
 
@@ -295,9 +368,99 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
     panel._select_slice(2, 5)
     assert panel.time_idx == 2 and panel.freq_idx == 5
     assert panel._heatmap._time_idx == 2 and panel._heatmap._freq_idx == 5
-    assert "time=2" in panel._status_pane.object
-    assert "freq=5" in panel._status_pane.object
-    assert "Stokes I" in panel._status_pane.object
+    assert panel._heatmap._marker.data_source.data["x"] == [2.5]
+    assert panel._heatmap._marker.data_source.data["y"] == [5.5]
+    assert "time=2" in panel._format_status()
+    assert "freq=5" in panel._format_status()
+    assert "time=2" in panel._heatmap._plot.title.text
+
+    panel._select_slice(3, 6)
+    assert panel.time_idx == 3 and panel.freq_idx == 6
+    assert "time=3" in panel._heatmap._plot.title.text
+
+
+def test_finish_load_day_auto_starts_zenith(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_auto_load_zenith_if_ready", calls.append)
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app._load_seq = 3
+
+    app._finish_load_day(load_seq=3, auto_zenith=True)
+
+    assert calls == [3]
+
+
+def test_finish_load_day_skips_auto_zenith_on_stale_seq(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_auto_load_zenith_if_ready", calls.append)
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app._load_seq = 2
+
+    app._finish_load_day(load_seq=1, auto_zenith=True)
+
+    assert calls == []
+
+
+def test_auto_load_zenith_if_ready_requires_zarr(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, int]] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app.scanning = False
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day: {"I": False, "V": False},
+    )
+    monkeypatch.setattr(
+        app,
+        "_begin_zenith_load",
+        lambda *, load_seq: calls.append({"load_seq": load_seq}),
+    )
+    app._load_seq = 4
+    app.select_day = "2024-12-27"
+    app._loaded_day = "2024-12-27"
+
+    app._auto_load_zenith_if_ready(4)
+
+    assert calls == []
+
+
+def test_auto_load_zenith_if_ready_starts_when_zarr_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, int]] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app.scanning = False
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day: {"I": True, "V": False},
+    )
+    monkeypatch.setattr(
+        app,
+        "_begin_zenith_load",
+        lambda *, load_seq: calls.append({"load_seq": load_seq}),
+    )
+    app._load_seq = 5
+    app.select_day = "2024-12-27"
+    app._loaded_day = "2024-12-27"
+
+    app._auto_load_zenith_if_ready(5)
+
+    assert calls == [{"load_seq": 5}]
+
+
+def test_begin_zenith_load_rejects_stale_load_seq(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app._load_seq = 2
+    app.select_day = "2024-12-27"
+    app._loaded_day = "2024-12-27"
+
+    app._begin_zenith_load(load_seq=1)
+
+    assert app.loading_zenith is False
 
 
 def test_sky_widget_host_mount_updates_container() -> None:
