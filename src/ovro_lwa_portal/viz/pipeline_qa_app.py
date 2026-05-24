@@ -448,11 +448,57 @@ class _ZenithHeatmapSelector:
         return
 
 
-class ZenithReviewPanel(param.Parameterized):
-    """Heatmap + SkyWidget zenith review with Param-driven slice selection."""
+class ZenithSliceSelection(param.Parameterized):
+    """Shared time/frequency slice indices for all Stokes zenith review panels."""
 
-    time_idx = param.Integer(default=0, doc="Selected time index from the heatmap.")
-    freq_idx = param.Integer(default=0, doc="Selected frequency index from the heatmap.")
+    time_idx = param.Integer(default=0, bounds=(0, 0), doc="Selected time index.")
+    freq_idx = param.Integer(default=0, bounds=(0, 0), doc="Selected frequency index.")
+
+    def __init__(self, **params: Any) -> None:
+        super().__init__(**params)
+        self._push_root: Callable[[], None] | None = None
+
+    def set_push_root(self, callback: Callable[[], None] | None) -> None:
+        """Register the displayed dashboard root push callback (required in JupyterLab)."""
+        self._push_root = callback
+
+    def configure(
+        self,
+        *,
+        n_times: int,
+        n_freqs: int,
+        default_time: int,
+        default_freq: int,
+    ) -> None:
+        """Set slider bounds and the initial slice for a loaded observation day."""
+        max_time = max(0, int(n_times) - 1)
+        max_freq = max(0, int(n_freqs) - 1)
+        self.param.time_idx.bounds = (0, max_time)
+        self.param.freq_idx.bounds = (0, max_freq)
+        with param.parameterized.batch_call_watchers(self):
+            self.time_idx = int(np.clip(default_time, 0, max_time))
+            self.freq_idx = int(np.clip(default_freq, 0, max_freq))
+
+    def apply_slice(self, time_idx: int, freq_idx: int) -> None:
+        """Update slice indices on the notebook UI thread."""
+        t_lo, t_hi = self.param.time_idx.bounds
+        f_lo, f_hi = self.param.freq_idx.bounds
+
+        def _apply() -> None:
+            with param.parameterized.batch_call_watchers(self):
+                self.time_idx = int(np.clip(time_idx, t_lo, t_hi))
+                self.freq_idx = int(np.clip(freq_idx, f_lo, f_hi))
+
+        _run_on_main_thread(_apply)
+
+    def _push_ui(self) -> None:
+        if self._push_root is not None:
+            self._push_root()
+
+
+class ZenithReviewPanel(param.Parameterized):
+    """Heatmap + SkyWidget zenith review linked to shared slice selection."""
+
     stokes_label = param.String(default="", doc="Stokes parameter label (I or V).")
     metric_label = param.String(default="", doc="Zenith patch metric label (STD).")
 
@@ -461,73 +507,67 @@ class ZenithReviewPanel(param.Parameterized):
         dataset: xr.Dataset,
         stat_map: np.ndarray,
         *,
+        slice_selection: ZenithSliceSelection,
         stokes_label: str,
         metric_label: str,
     ) -> None:
         self._dataset = dataset
         self._stat_map = stat_map
+        self._slice_selection = slice_selection
         self._n_times = int(dataset.sizes["time"])
         self._n_freqs = int(dataset.sizes["frequency"])
         self._sky_widget: SkyWidget | None = None
-        self._push_root: Callable[[], None] | None = None
 
-        default_time, default_freq = default_stat_slice(stat_map, dataset)
         super().__init__(
-            time_idx=default_time,
-            freq_idx=default_freq,
             stokes_label=stokes_label,
             metric_label=metric_label,
         )
-        self.param.time_idx.bounds = (0, max(0, self._n_times - 1))
-        self.param.freq_idx.bounds = (0, max(0, self._n_freqs - 1))
 
         self._heatmap = _ZenithHeatmapSelector(
             stat_map,
             metric_label=metric_label,
-            time_idx=self.time_idx,
-            freq_idx=self.freq_idx,
+            time_idx=self._slice_selection.time_idx,
+            freq_idx=self._slice_selection.freq_idx,
             on_select=self._select_slice,
         )
 
         self._header = pn.pane.Markdown(
-            f"**Stokes {stokes_label}** — click the heatmap or use the sliders to choose "
-            "time and frequency. The matching sky view appears directly below."
+            f"**Stokes {stokes_label}** — click the heatmap to choose time and frequency. "
+            "The matching sky view appears directly below."
         )
-        self._status_pane = pn.pane.Markdown(self._slice_status, sizing_mode="stretch_width")
-        self._time_slider = pn.widgets.IntSlider.from_param(
-            self.param.time_idx,
-            name="Time index",
-        )
-        self._freq_slider = pn.widgets.IntSlider.from_param(
-            self.param.freq_idx,
-            name="Frequency index",
-        )
+        self._status_pane = pn.pane.Markdown(self._slice_status(), sizing_mode="stretch_width")
         self._layout = pn.Column(
             self._header,
             self._status_pane,
-            self._time_slider,
-            self._freq_slider,
             self._heatmap.pane,
             width=ZENITH_REVIEW_COLUMN_WIDTH,
             sizing_mode="fixed",
             margin=(0, ZENITH_REVIEW_COLUMN_GAP, 0, 0),
         )
-        self.param.watch(self._on_slice_changed, ["time_idx", "freq_idx"])
+        self._slice_watcher = self._slice_selection.param.watch(
+            self._on_slice_changed,
+            ["time_idx", "freq_idx"],
+        )
         self._on_slice_changed()
 
-    def set_push_root(self, callback: Callable[[], None] | None) -> None:
-        """Register the displayed dashboard root push callback (required in JupyterLab)."""
-        self._push_root = callback
+    @property
+    def time_idx(self) -> int:
+        return int(self._slice_selection.time_idx)
 
-    @param.depends("time_idx", "freq_idx")
+    @property
+    def freq_idx(self) -> int:
+        return int(self._slice_selection.freq_idx)
+
     def _slice_status(self) -> str:
-        """Slice summary shown above the heatmap (reactive via Param + Panel)."""
-        coord = zenith_lm_coord(self._dataset, self.time_idx)
-        metric_val = float(self._stat_map[self.time_idx, self.freq_idx])
-        freq_mhz = float(self._dataset.frequency.values[self.freq_idx]) / 1e6
+        """Slice summary shown above the heatmap."""
+        time_idx = self._slice_selection.time_idx
+        freq_idx = self._slice_selection.freq_idx
+        coord = zenith_lm_coord(self._dataset, time_idx)
+        metric_val = float(self._stat_map[time_idx, freq_idx])
+        freq_mhz = float(self._dataset.frequency.values[freq_idx]) / 1e6
         return (
-            f"**Stokes {self.stokes_label} zenith (l=0, m=0)** | time={self.time_idx}, "
-            f"freq={self.freq_idx} ({freq_mhz:.1f} MHz)"
+            f"**Stokes {self.stokes_label} zenith (l=0, m=0)** | time={time_idx}, "
+            f"freq={freq_idx} ({freq_mhz:.1f} MHz)"
             f" | center RA={coord.ra.to_string(unit=u.hour, precision=1)}, "
             f"Dec={coord.dec.to_string(unit=u.deg, precision=1)}"
             f" | patch {self.metric_label}={metric_val:.3g}"
@@ -559,25 +599,22 @@ class ZenithReviewPanel(param.Parameterized):
         return self._sky_widget
 
     def _select_slice(self, time_idx: int, freq_idx: int) -> None:
-        """Heatmap tap handler: update Param slice indices on the notebook UI thread."""
+        """Heatmap tap handler: update shared slice indices on the notebook UI thread."""
         time_idx = int(np.clip(time_idx, 0, self._n_times - 1))
         freq_idx = int(np.clip(freq_idx, 0, self._n_freqs - 1))
-
-        def _apply() -> None:
-            with param.parameterized.batch_call_watchers(self):
-                self.time_idx = time_idx
-                self.freq_idx = freq_idx
-
-        _run_on_main_thread(_apply)
+        self._slice_selection.apply_slice(time_idx, freq_idx)
 
     def _on_slice_changed(self, *_events: param.parameterized.Event) -> None:
-        """Sync heatmap crosshair and SkyWidget when slice Param values change."""
-        self._heatmap.set_slice(self.time_idx, self.freq_idx, push=False)
+        """Sync heatmap crosshair and SkyWidget when shared slice values change."""
+        time_idx = self._slice_selection.time_idx
+        freq_idx = self._slice_selection.freq_idx
+        self._heatmap.set_slice(time_idx, freq_idx, push=False)
+        self._status_pane.object = self._slice_status()
         if self._sky_widget is not None:
-            coord = zenith_lm_coord(self._dataset, self.time_idx)
+            coord = zenith_lm_coord(self._dataset, time_idx)
             self._sky_widget.update_slice(
-                self.time_idx,
-                self.freq_idx,
+                time_idx,
+                freq_idx,
                 center=coord,
                 fov=DEFAULT_FOV_DEG * u.deg,
                 percentile_low=2,
@@ -586,14 +623,6 @@ class ZenithReviewPanel(param.Parameterized):
             send_state = getattr(self._sky_widget, "send_state", None)
             if callable(send_state):
                 send_state()
-        self._push_slice_ui()
-
-    def _push_slice_ui(self) -> None:
-        """Push the displayed dashboard so nested zenith controls update in JupyterLab."""
-        if self._push_root is not None:
-            self._push_root()
-        else:
-            _push_panel_layout(self._layout, self._heatmap.pane)
 
     @property
     def layout(self) -> pn.Column:
@@ -601,13 +630,13 @@ class ZenithReviewPanel(param.Parameterized):
 
     @property
     def heatmap_column(self) -> pn.Column:
-        """Header, status, sliders, and heatmap for side-by-side zenith review layout."""
+        """Header, status, and heatmap for side-by-side zenith review layout."""
         return self._layout
 
     def dispose(self) -> None:
+        self._slice_selection.param.unwatch(self._slice_watcher)
         self._heatmap.dispose()
         self._sky_widget = None
-        self._push_root = None
 
 
 @dataclass(frozen=True)
@@ -743,9 +772,75 @@ class _StokesReviewHolder:
     """Builds Stokes I/V review columns when zenith panels are loaded."""
 
     def __init__(self) -> None:
+        self._slice_selection = ZenithSliceSelection()
+        self._push_watcher = self._slice_selection.param.watch(
+            self._on_shared_slice_changed,
+            ["time_idx", "freq_idx"],
+        )
+        self._time_slider = pn.widgets.IntSlider.from_param(
+            self._slice_selection.param.time_idx,
+            name="Time index",
+            width=480,
+        )
+        self._freq_slider = pn.widgets.IntSlider.from_param(
+            self._slice_selection.param.freq_idx,
+            name="Frequency index",
+            width=480,
+        )
+        self._slice_controls = pn.Column(
+            pn.pane.Markdown(
+                "**Time / frequency slice** — shared across Stokes I and V "
+                "(use sliders or click a heatmap cell)."
+            ),
+            pn.Row(
+                self._time_slider,
+                self._freq_slider,
+                sizing_mode="stretch_width",
+            ),
+            sizing_mode="stretch_width",
+            max_width=ZENITH_REVIEW_ROW_WIDTH,
+            visible=False,
+        )
         self._panels: dict[str, ZenithReviewPanel | None] = {
             spec.stokes: None for spec in _STOKES_SECTIONS
         }
+
+    @property
+    def slice_controls(self) -> pn.Column:
+        """Shared time/frequency sliders for the zenith review section."""
+        return self._slice_controls
+
+    @property
+    def slice_selection(self) -> ZenithSliceSelection:
+        return self._slice_selection
+
+    def set_push_root(self, callback: Callable[[], None] | None) -> None:
+        self._slice_selection.set_push_root(callback)
+
+    def _on_shared_slice_changed(self, *_events: param.parameterized.Event) -> None:
+        self._slice_selection._push_ui()
+
+    def _configure_slice_selection(self) -> None:
+        """Set shared slider bounds and default slice from the first loaded panel."""
+        primary: ZenithReviewPanel | None = None
+        for spec in _STOKES_SECTIONS:
+            panel = self._panels.get(spec.stokes)
+            if panel is not None:
+                primary = panel
+                break
+
+        if primary is None:
+            self._slice_controls.visible = False
+            return
+
+        default_time, default_freq = default_stat_slice(primary._stat_map, primary._dataset)
+        self._slice_selection.configure(
+            n_times=primary._n_times,
+            n_freqs=primary._n_freqs,
+            default_time=default_time,
+            default_freq=default_freq,
+        )
+        self._slice_controls.visible = True
 
     @staticmethod
     def _build_section(spec: _StokesSectionSpec, content: pn.viewable.Viewable) -> pn.Column:
@@ -761,6 +856,7 @@ class _StokesReviewHolder:
             if panel is not None:
                 panel.dispose()
                 self._panels[stokes] = None
+        self._slice_controls.visible = False
 
     def build_section_contents(
         self,
@@ -770,7 +866,7 @@ class _StokesReviewHolder:
     ) -> dict[str, pn.viewable.Viewable]:
         """Build Stokes I/V review panel content for stable zenith section slots."""
         self._dispose_panels()
-        return {
+        contents = {
             spec.stokes: self._build_section_content_for_spec(
                 spec,
                 datasets,
@@ -779,6 +875,8 @@ class _StokesReviewHolder:
             )
             for spec in _STOKES_SECTIONS
         }
+        self._finalize_section_build()
+        return contents
 
     def build_column(
         self,
@@ -830,6 +928,7 @@ class _StokesReviewHolder:
         panel = ZenithReviewPanel(
             dataset,
             stat_map,
+            slice_selection=self._slice_selection,
             stokes_label=spec.stokes,
             metric_label=spec.metric_label,
         )
@@ -841,6 +940,10 @@ class _StokesReviewHolder:
         if flush is not None:
             flush()
         return panel.heatmap_column
+
+    def _finalize_section_build(self) -> None:
+        """Configure shared slice controls after all Stokes panels are built."""
+        self._configure_slice_selection()
 
     def build_no_zarr_contents(self) -> dict[str, pn.viewable.Viewable]:
         """Placeholder content when the selected day has no QA Zarr stores."""
@@ -873,14 +976,30 @@ def build_zenith_review_panel(
     metric_label: str,
 ) -> pn.Column:
     """Build a one-shot zenith review panel (prefer :class:`ZenithReviewPanel` for reuse)."""
+    slice_selection = ZenithSliceSelection()
+    n_times = int(dataset.sizes["time"])
+    n_freqs = int(dataset.sizes["frequency"])
+    default_time, default_freq = default_stat_slice(stat_map, dataset)
+    slice_selection.configure(
+        n_times=n_times,
+        n_freqs=n_freqs,
+        default_time=default_time,
+        default_freq=default_freq,
+    )
     panel = ZenithReviewPanel(
         dataset,
         stat_map,
+        slice_selection=slice_selection,
         stokes_label=stokes_label,
         metric_label=metric_label,
     )
     panel.mount_sky(dataset)
-    return panel.layout
+    sliders = pn.Row(
+        pn.widgets.IntSlider.from_param(slice_selection.param.time_idx, name="Time index"),
+        pn.widgets.IntSlider.from_param(slice_selection.param.freq_idx, name="Frequency index"),
+        sizing_mode="stretch_width",
+    )
+    return pn.Column(sliders, panel.layout)
 
 
 def build_stokes_review_column(
@@ -961,6 +1080,7 @@ class PipelineQAApp(param.Parameterized):
         self._zenith_slot = pn.Column(
             self._zenith_banner,
             self._zenith_loading_row,
+            self._stokes_review.slice_controls,
             self._zenith_review_row,
             sizing_mode="stretch_width",
         )
@@ -1112,13 +1232,11 @@ class PipelineQAApp(param.Parameterized):
         """Populate stable zenith section slots and mount sky widgets below."""
         self._zenith_banner.object = banner
         push_root = lambda: self._execute(self._push_panel_roots)
+        self._stokes_review.set_push_root(push_root)
         for spec in _STOKES_SECTIONS:
             self._zenith_section_content[spec.stokes].objects = [
                 section_contents[spec.stokes],
             ]
-            panel = self._stokes_review._panels.get(spec.stokes)
-            if panel is not None:
-                panel.set_push_root(push_root)
         self._sky_host.mount(self._stokes_review._panels)
         self._execute(self._push_zenith_root)
 
@@ -1329,7 +1447,7 @@ class PipelineQAApp(param.Parameterized):
                         flush=self._flush_log,
                     )
                     banner = (
-                        "*Zenith heatmaps loaded. Click a cell or move the sliders "
+                        "*Zenith heatmaps loaded. Use the shared sliders or click a cell "
                         "to inspect time/frequency slices.*"
                     )
                     if not self._is_current_load(load_seq):
