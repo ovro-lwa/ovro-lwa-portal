@@ -161,6 +161,31 @@ def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(app._zenith_review_row, pn.Row)
     assert set(app._zenith_section_content) == {"I", "V"}
     assert app._sky_host.panel_row in layout.objects
+    assert app._flux_ratio_grid in layout.objects
+
+
+def test_apply_day_payload_builds_flux_ratio_grid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _DayLoadPayload
+
+    _write_flux_check_tree(tmp_path)
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app._coverage = pq.scan_coverage(tmp_path)
+    app._reset_zenith_sections = lambda **kwargs: None  # type: ignore[method-assign]
+    app._push_panel_roots = lambda: None  # type: ignore[method-assign]
+    app._execute = lambda callback: callback()  # type: ignore[method-assign]
+
+    summary = pq.day_summary_table("2024-12-28", app._coverage)
+    payload = _DayLoadPayload(select_day="2024-12-28", summary_df=summary)
+    app._apply_day_payload(payload)
+
+    assert len(app._flux_ratio_grid.objects) == 1
+    grid = app._flux_ratio_grid.objects[0]
+    assert isinstance(grid, pn.Column)
+    assert len(grid.objects) >= 1
 
 
 def test_display_pipeline_qa_app_displays_single_layout(
@@ -672,3 +697,71 @@ def test_sky_widget_host_mount_updates_container() -> None:
     assert len(host._containers["V"].children) == 1
     assert isinstance(host.panel_row, pn.Row)
     assert host.panel_row.width == 1048
+
+
+def _write_flux_check_tree(root: Path, *, obs_date: str = "2024-12-28") -> None:
+    run_dir = root / "08h" / obs_date / "Run_20241228_120000"
+    for freq_mhz, ratio in ((32, 2.0), (46, 1.5)):
+        qa_dir = run_dir / f"{freq_mhz}MHz" / "QA"
+        qa_dir.mkdir(parents=True, exist_ok=True)
+        (qa_dir / "flux_check_hybrid.csv").write_text(
+            "imfit_flux,imfit_err,elevation,model_flux,source,freq\n"
+            f"20.0,1.0,45.0,10.0,3C48,{freq_mhz}\n"
+            f"{ratio * 6.0},1.0,50.0,6.0,3C147,{freq_mhz}\n"
+        )
+    run_dir2 = root / "09h" / obs_date / "Run_20241228_130000"
+    qa_dir = run_dir2 / "32MHz" / "QA"
+    qa_dir.mkdir(parents=True, exist_ok=True)
+    (qa_dir / "flux_check_hybrid.csv").write_text(
+        "imfit_flux,imfit_err,elevation,model_flux,source,freq\n"
+        "30.0,1.0,45.0,15.0,3C48,32.0\n"
+        "12.0,1.0,50.0,8.0,3C147,32.0\n"
+    )
+    wideband = run_dir / "Wideband"
+    wideband.mkdir(parents=True, exist_ok=True)
+    (wideband / "thermal_noise_vs_subband.png").write_bytes(b"png")
+    wideband2 = run_dir2 / "Wideband"
+    wideband2.mkdir(parents=True, exist_ok=True)
+    (wideband2 / "thermal_noise_vs_subband.png").write_bytes(b"png")
+
+
+def test_load_flux_check_hybrid_dataframe(tmp_path: Path) -> None:
+    _write_flux_check_tree(tmp_path)
+    coverage = pq.scan_coverage(tmp_path)
+    flux_df = pq.load_flux_check_hybrid_dataframe("2024-12-28", coverage)
+
+    assert len(flux_df) == 6
+    assert set(flux_df["source"]) == {"3C48", "3C147"}
+    assert set(flux_df["frequency_mhz"]) == {32.0, 46.0}
+    assert set(flux_df["lst_hour"]) == {"08h", "09h"}
+    assert flux_df.loc[flux_df["source"] == "3C48", "flux_ratio"].iloc[0] == 2.0
+
+
+def test_flux_ratio_grids_and_figures(tmp_path: Path) -> None:
+    from bokeh.models import ColorBar, HoverTool
+
+    from ovro_lwa_portal.viz.flux_check_plots import (
+        FLUX_RATIO_GRID_TOTAL_WIDTH,
+        build_flux_ratio_figures,
+        build_flux_ratio_panel_grid,
+    )
+
+    _write_flux_check_tree(tmp_path)
+    coverage = pq.scan_coverage(tmp_path)
+    flux_df = pq.load_flux_check_hybrid_dataframe("2024-12-28", coverage)
+    grids = pq.flux_ratio_grids(flux_df)
+
+    assert set(grids) == {"3C48", "3C147"}
+    assert grids["3C48"].loc[8, 32.0] == 2.0
+    assert grids["3C48"].loc[9, 32.0] == 2.0
+
+    figures = build_flux_ratio_figures(flux_df)
+    assert set(figures) == {"3C48", "3C147"}
+    hover_tools = [tool for tool in figures["3C48"].tools if isinstance(tool, HoverTool)]
+    assert len(hover_tools) == 1
+    assert figures["3C48"].select_one({"type": ColorBar}) is not None
+
+    panel_grid = build_flux_ratio_panel_grid(figures, n_cols=2)
+    assert isinstance(panel_grid, pn.Column)
+    assert len(panel_grid.objects) == 1
+    assert panel_grid.max_width == FLUX_RATIO_GRID_TOTAL_WIDTH

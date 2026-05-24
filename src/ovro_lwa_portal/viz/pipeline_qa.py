@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 from astropy.io import fits
@@ -19,7 +20,7 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     convert_fits_dir_to_zarr,
 )
 
-PIPELINE_ROOT = Path("/lustre/pipeline/images")
+PIPELINE_ROOT = Path("/lustre/pipeline/exopipe/phase1/")
 SYMLINK_ROOT = Path("/lustre/claw")
 ZARR_ROOT = Path("/fast/claw")
 
@@ -28,6 +29,7 @@ DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HOUR_PATTERN = re.compile(r"^\d{2}h$")
 
 WIDEBAND_QA = Path("Wideband/thermal_noise_vs_subband.png")
+FLUX_CHECK_HYBRID_CSV = Path("QA/flux_check_hybrid.csv")
 I_FITS_GLOB = "*I-Deep-Taper-Robust-0.75-image*.pbcorr.fits"
 V_FITS_GLOB = "*V-Taper-Deep-image*.pbcorr.fits"
 REF_SUBBAND = "82MHz"
@@ -175,6 +177,90 @@ def day_summary_table(select_day: str, coverage: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
         return pd.DataFrame(columns=["lst_hour", "n_subbands", "thermal_noise_png"])
     return rows[["lst_hour", "n_subbands", "thermal_noise_png"]].reset_index(drop=True)
+
+
+def frequency_mhz_from_subdir(subdir_name: str) -> float:
+    """Parse a subband directory name such as ``82MHz`` into MHz."""
+    if not subdir_name.endswith("MHz"):
+        msg = f"Expected a frequency subdirectory name ending in MHz, got {subdir_name!r}"
+        raise ValueError(msg)
+    return float(subdir_name.removesuffix("MHz"))
+
+
+def collect_flux_check_hybrid_paths(run_dir: Path) -> list[Path]:
+    """Return ``flux_check_hybrid.csv`` files under each frequency subband in one run."""
+    return sorted(run_dir.glob(f"*MHz/{FLUX_CHECK_HYBRID_CSV.as_posix()}"))
+
+
+def load_flux_check_hybrid_dataframe(
+    select_day: str,
+    coverage: pd.DataFrame,
+) -> pd.DataFrame:
+    """Load and combine all ``flux_check_hybrid.csv`` files for one observation day.
+
+    Each CSV row is augmented with ``lst_hour``, ``frequency_mhz``, ``obs_date``,
+    and ``flux_ratio`` (= ``imfit_flux`` / ``model_flux``).
+    """
+    chunks: list[pd.DataFrame] = []
+    for _, row in day_rows(select_day, coverage).iterrows():
+        run_dir = Path(str(row["run_path"]))
+        if not run_dir.is_dir():
+            continue
+        for csv_path in collect_flux_check_hybrid_paths(run_dir):
+            subband = csv_path.parent.parent.name
+            freq_from_dir = frequency_mhz_from_subdir(subband)
+            chunk = pd.read_csv(csv_path)
+            chunk["lst_hour"] = row["lst_hour"]
+            chunk["lst_hour_num"] = int(row["lst_hour_num"])
+            chunk["obs_date"] = select_day
+            chunk["run_path"] = str(run_dir)
+            chunk["subband"] = subband
+            if "freq" in chunk.columns:
+                chunk["frequency_mhz"] = chunk["freq"].astype(float)
+            else:
+                chunk["frequency_mhz"] = freq_from_dir
+            chunks.append(chunk)
+
+    if not chunks:
+        return pd.DataFrame(
+            columns=[
+                "imfit_flux",
+                "imfit_err",
+                "elevation",
+                "model_flux",
+                "source",
+                "freq",
+                "lst_hour",
+                "lst_hour_num",
+                "obs_date",
+                "run_path",
+                "subband",
+                "frequency_mhz",
+                "flux_ratio",
+            ]
+        )
+
+    df = pd.concat(chunks, ignore_index=True)
+    model = df["model_flux"].astype(float)
+    df["flux_ratio"] = np.where(model != 0, df["imfit_flux"].astype(float) / model, np.nan)
+    return df.sort_values(["source", "lst_hour_num", "frequency_mhz"]).reset_index(drop=True)
+
+
+def flux_ratio_grids(flux_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Pivot flux ratios into one LST × frequency grid per calibrator source."""
+    if flux_df.empty or "source" not in flux_df.columns:
+        return {}
+
+    grids: dict[str, pd.DataFrame] = {}
+    for source, group in flux_df.groupby("source", sort=True):
+        grid = group.pivot_table(
+            index="lst_hour_num",
+            columns="frequency_mhz",
+            values="flux_ratio",
+            aggfunc="mean",
+        )
+        grids[str(source)] = grid.sort_index().sort_index(axis=1)
+    return grids
 
 
 def collect_pol_fits(select_day: str, pol: str, coverage: pd.DataFrame) -> list[Path]:

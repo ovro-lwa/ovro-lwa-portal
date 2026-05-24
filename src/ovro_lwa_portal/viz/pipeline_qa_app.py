@@ -33,10 +33,15 @@ from ovro_lwa_portal.viz.pipeline_qa import (
     convert_missing_zarr,
     day_summary_table,
     default_select_day,
+    load_flux_check_hybrid_dataframe,
     load_qa_datasets,
     qa_days,
     scan_coverage,
     zarr_status,
+)
+from ovro_lwa_portal.viz.flux_check_plots import (
+    build_flux_ratio_figures,
+    build_flux_ratio_panel_grid,
 )
 
 check_viz_deps()
@@ -969,6 +974,13 @@ class PipelineQAApp(param.Parameterized):
             pn.pane.Markdown("*Select an observation day to build the thermal-noise QA grid.*"),
             sizing_mode="stretch_width",
         )
+        self._flux_ratio_grid = pn.Column(
+            pn.pane.Markdown(
+                "*Hybrid flux ratio plots (imfit / model) appear below the thermal-noise grid "
+                "after a day is loaded.*"
+            ),
+            sizing_mode="stretch_width",
+        )
         self._day_selector = pn.widgets.Select.from_param(
             self.param.select_day,
             name="Observation day",
@@ -1054,6 +1066,33 @@ class PipelineQAApp(param.Parameterized):
         if self._layout is not None:
             _push_panel_layout(self._layout)
 
+    def _reset_flux_ratio_grid(self) -> None:
+        """Restore flux ratio placeholder content."""
+        self._flux_ratio_grid.objects = [
+            pn.pane.Markdown(
+                "*Hybrid flux ratio plots (imfit / model) appear below the thermal-noise grid "
+                "after a day is loaded.*"
+            ),
+        ]
+
+    def _build_flux_ratio_grid(self, select_day: str) -> pn.Column:
+        """Load flux-check CSVs and build the Bokeh heatmap grid for one day."""
+        flux_df = load_flux_check_hybrid_dataframe(select_day, self._coverage)
+        if flux_df.empty:
+            return pn.Column(
+                pn.pane.Markdown(
+                    "*No flux_check_hybrid.csv files found under frequency subbands for this day.*"
+                ),
+                sizing_mode="stretch_width",
+            )
+        figures = build_flux_ratio_figures(flux_df)
+        sources = ", ".join(sorted(figures))
+        self._log(
+            f"Built hybrid flux ratio plots for {len(figures)} source(s): {sources} "
+            f"({len(flux_df)} CSV row(s))."
+        )
+        return build_flux_ratio_panel_grid(figures)
+
     def _reset_zenith_sections(self, *, banner: str | None = None) -> None:
         """Restore zenith placeholders without replacing the displayed layout tree."""
         self._stokes_review.dispose()
@@ -1099,6 +1138,10 @@ class PipelineQAApp(param.Parameterized):
         if self._loaded_day != new_day:
             self._release_active_datasets()
             self._reset_zenith_sections()
+            self._reset_flux_ratio_grid()
+            self._qa_grid.objects = [
+                pn.pane.Markdown("*Loading thermal-noise QA grid…*"),
+            ]
 
             def _push() -> None:
                 self._push_panel_roots()
@@ -1409,6 +1452,7 @@ class PipelineQAApp(param.Parameterized):
             open_full_size=self._open_modal,
         )
         self._qa_grid.objects = [thermal_grid]
+        self._flux_ratio_grid.objects = [self._build_flux_ratio_grid(select_day)]
         self._clear_error()
         self._log(
             f"Loaded QA data for {select_day} "
@@ -1539,6 +1583,8 @@ class PipelineQAApp(param.Parameterized):
             self._sky_host.panel_row,
             pn.pane.Markdown("### Thermal-noise QA by LST hour"),
             self._qa_grid,
+            pn.pane.Markdown("### Hybrid flux ratio (imfit / model)"),
+            self._flux_ratio_grid,
             self._modal_container,
             sizing_mode="stretch_width",
         )
