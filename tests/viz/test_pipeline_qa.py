@@ -160,9 +160,12 @@ def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(layout, pn.Column)
     assert isinstance(app._zenith_review_row, pn.Row)
     assert set(app._zenith_section_content) == {"I", "V"}
-    assert app._sky_host.panel_row in layout.objects
     assert app._flux_ratio_grid in layout.objects
-    assert app._stokes_review.slice_controls in app._zenith_slot.objects
+    assert app._stokes_review.zenith_footer in app._zenith_slot.objects
+    zenith_objects = list(app._zenith_slot.objects)
+    assert zenith_objects.index(app._zenith_review_row) < zenith_objects.index(
+        app._stokes_review.zenith_footer
+    )
 
 
 def test_apply_day_payload_builds_flux_ratio_grid(
@@ -388,11 +391,10 @@ def test_heatmap_hover_source_includes_cell_values() -> None:
     heatmap = _ZenithHeatmapSelector(
         stat_map,
         metric_label="STD",
-        time_idx=0,
-        freq_idx=0,
         on_select=lambda _t, _f: None,
     )
     assert any(isinstance(tool, HoverTool) for tool in heatmap._plot.tools)
+    assert not hasattr(heatmap, "_marker")
 
 
 def test_heatmap_cell_center_and_index_from_coord() -> None:
@@ -420,12 +422,6 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
     import param
 
     from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel, ZenithSliceSelection
-
-    monkeypatch.setattr(
-        ZenithReviewPanel,
-        "_bind_sky_dataset",
-        staticmethod(lambda widget, dataset: None),
-    )
 
     class _Coord:
         ra = type("RA", (), {"to_string": lambda self, **kwargs: "12:00:00"})()
@@ -508,12 +504,9 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
 
     assert slice_selection.time_idx == 2 and slice_selection.freq_idx == 5
     assert panel.time_idx == 2 and panel.freq_idx == 5
-    assert panel._heatmap._time_idx == 2 and panel._heatmap._freq_idx == 5
-    assert panel._heatmap._marker.data_source.data["x"] == [2.5]
-    assert panel._heatmap._marker.data_source.data["y"] == [5.5]
-    assert "time=2" in panel._slice_status()
-    assert "freq=5" in panel._slice_status()
-    assert "Stokes I" in panel._slice_status()
+    assert "time=2" in panel._format_slice_status(2, 5)
+    assert "freq=5" in panel._format_slice_status(2, 5)
+    assert "Stokes I" in panel._format_slice_status(2, 5)
     assert time_slider.value == 2
     assert freq_slider.value == 5
 
@@ -522,13 +515,12 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
     assert slice_selection.time_idx == 3 and slice_selection.freq_idx == 6
     assert time_slider.value == 3
     assert freq_slider.value == 6
-    assert "time=3" in panel._slice_status()
+    assert "time=3" in panel._format_slice_status(3, 6)
 
     with param.parameterized.batch_call_watchers(slice_selection):
         slice_selection.time_idx = 1
         slice_selection.freq_idx = 2
-    assert panel._heatmap._time_idx == 1 and panel._heatmap._freq_idx == 2
-    assert "time=1" in panel._slice_status()
+    assert "time=1" in panel._format_slice_status(1, 2)
 
     pushed: list[int] = []
     slice_selection.set_push_root(lambda: pushed.append(1))
@@ -542,12 +534,6 @@ def test_shared_zenith_slice_links_stokes_panels(monkeypatch: pytest.MonkeyPatch
     import astropy.units as u
 
     from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel, ZenithSliceSelection
-
-    monkeypatch.setattr(
-        ZenithReviewPanel,
-        "_bind_sky_dataset",
-        staticmethod(lambda widget, dataset: None),
-    )
 
     class _Coord:
         ra = type("RA", (), {"to_string": lambda self, **kwargs: "12:00:00"})()
@@ -613,20 +599,93 @@ def test_shared_zenith_slice_links_stokes_panels(monkeypatch: pytest.MonkeyPatch
 
     panel_i._select_slice(2, 5)
 
-    assert panel_i._heatmap._time_idx == 2 and panel_i._heatmap._freq_idx == 5
-    assert panel_v._heatmap._time_idx == 2 and panel_v._heatmap._freq_idx == 5
     assert panel_i.time_idx == panel_v.time_idx == 2
     assert panel_i.freq_idx == panel_v.freq_idx == 5
 
 
-def test_zenith_slice_push_on_slider_change(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_heatmap_click_sets_sky_stokes(monkeypatch: pytest.MonkeyPatch) -> None:
+    import astropy.units as u
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel, _StokesReviewHolder
+
+    monkeypatch.setattr(
+        _StokesReviewHolder,
+        "_update_sky_slice",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        _StokesReviewHolder,
+        "_bind_sky_dataset",
+        staticmethod(lambda widget, dataset: None),
+    )
+
+    class _Coord:
+        ra = type("RA", (), {"to_string": lambda self, **kwargs: "12:00:00"})()
+        dec = type("Dec", (), {"to_string": lambda self, **kwargs: "+00:00:00"})()
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zenith_lm_coord",
+        lambda dataset, time_idx: _Coord(),
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
+        lambda callback: callback(),
+    )
+
+    stat_map = np.ones((4, 10))
+
+    class _Dataset:
+        sizes = {"time": 4, "frequency": 10}
+        frequency = type("Freq", (), {"values": np.linspace(70e6, 90e6, 10)})()
+
+    holder = _StokesReviewHolder()
+    holder.bind_datasets(
+        {
+            "I": _Dataset(),  # type: ignore[arg-type]
+            "V": _Dataset(),  # type: ignore[arg-type]
+        }
+    )
+    panel_i = ZenithReviewPanel(
+        _Dataset(),  # type: ignore[arg-type]
+        stat_map,
+        slice_selection=holder.slice_selection,
+        stokes_label="I",
+        metric_label="STD",
+        on_heatmap_select=holder.select_slice_from_heatmap,
+    )
+    panel_v = ZenithReviewPanel(
+        _Dataset(),  # type: ignore[arg-type]
+        stat_map,
+        slice_selection=holder.slice_selection,
+        stokes_label="V",
+        metric_label="STD",
+        on_heatmap_select=holder.select_slice_from_heatmap,
+    )
+    holder._panels["I"] = panel_i
+    holder._panels["V"] = panel_v
+    holder._configure_slice_selection()
+
+    assert holder.sky_stokes == "I"
+    panel_i._select_slice(1, 3)
+    assert holder.sky_stokes == "I"
+    assert holder.slice_selection.time_idx == 1
+    assert holder.slice_selection.freq_idx == 3
+
+    panel_v._select_slice(2, 4)
+    assert holder.sky_stokes == "V"
+    assert holder.slice_selection.time_idx == 2
+    assert holder.slice_selection.freq_idx == 4
+
+
+def test_zenith_slice_syncs_status_on_slider_change(monkeypatch: pytest.MonkeyPatch) -> None:
     import param
 
     from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel, _StokesReviewHolder
 
     monkeypatch.setattr(
-        "ovro_lwa_portal.viz.pipeline_qa_app.ZenithReviewPanel._bind_sky_dataset",
-        staticmethod(lambda widget, dataset: None),
+        _StokesReviewHolder,
+        "_update_sky_slice",
+        lambda self: None,
     )
 
     class _Coord:
@@ -646,23 +705,22 @@ def test_zenith_slice_push_on_slider_change(monkeypatch: pytest.MonkeyPatch) -> 
         frequency = type("Freq", (), {"values": freq_values})()
 
     holder = _StokesReviewHolder()
-    holder._panels["I"] = ZenithReviewPanel(
+    panel = ZenithReviewPanel(
         _Dataset(),  # type: ignore[arg-type]
         stat_map,
         slice_selection=holder.slice_selection,
         stokes_label="I",
         metric_label="STD",
     )
+    holder._panels["I"] = panel
     holder._configure_slice_selection()
-
-    pushed: list[int] = []
-    holder.set_push_root(lambda: pushed.append(1))
 
     with param.parameterized.batch_call_watchers(holder.slice_selection):
         holder.slice_selection.time_idx = 2
         holder.slice_selection.freq_idx = 4
 
-    assert pushed == [1]
+    assert "time=2" in panel._status_pane.object
+    assert "freq=4" in panel._status_pane.object
 
 
 def test_pipeline_qa_app_shows_error_alert(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -782,25 +840,45 @@ def test_begin_zenith_load_rejects_stale_load_seq(monkeypatch: pytest.MonkeyPatc
     assert app.loading_zenith is False
 
 
-def test_sky_widget_host_mount_updates_container() -> None:
-    from ovro_lwa_portal.viz.pipeline_qa_app import _SkyWidgetHost
+def test_stokes_review_holder_mount_sky_updates_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
 
-    host = _SkyWidgetHost()
+    holder = _StokesReviewHolder()
 
     class _FakeSky(widgets.HTML):
         def __init__(self) -> None:
             super().__init__(value="sky")
 
-    class _FakePanel:
-        def mount_sky(self) -> _FakeSky:
-            return _FakeSky()
+    def _fake_sky_widget() -> _FakeSky:
+        return _FakeSky()
 
-    host.mount({"I": _FakePanel(), "V": None})  # type: ignore[arg-type]
-    assert len(host._containers["I"].children) == 2
-    assert isinstance(host._containers["I"].children[1], _FakeSky)
-    assert len(host._containers["V"].children) == 1
-    assert isinstance(host.panel_row, pn.Row)
-    assert host.panel_row.width == 1048
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.SkyWidget",
+        _fake_sky_widget,
+    )
+    monkeypatch.setattr(
+        _StokesReviewHolder,
+        "_bind_sky_dataset",
+        staticmethod(lambda widget, dataset: None),
+    )
+    monkeypatch.setattr(
+        _StokesReviewHolder,
+        "_update_sky_slice",
+        lambda self: None,
+    )
+
+    class _Dataset:
+        sizes = {"time": 2, "frequency": 3}
+
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder.mount_sky()
+
+    assert len(holder._sky_container.children) == 2
+    assert isinstance(holder._sky_container.children[1], _FakeSky)
+    assert holder.sky_widget is not None
+    assert holder._sky_pane.width == 1048
 
 
 def _write_flux_check_tree(root: Path, *, obs_date: str = "2024-12-28") -> None:
