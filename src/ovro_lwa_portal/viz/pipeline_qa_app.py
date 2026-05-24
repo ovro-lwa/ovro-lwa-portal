@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -279,6 +280,73 @@ def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIU
     return np.asarray(result.stat_map.values, dtype=np.float64)
 
 
+def _time_days_since_start(time_values: np.ndarray) -> np.ndarray:
+    """Convert dataset ``time`` coordinates to elapsed days from the first sample."""
+    from astropy.time import Time
+
+    tv = np.asarray(time_values)
+    if tv.dtype == object:
+        mjd = np.asarray(Time(tv.tolist()).mjd, dtype=np.float64)
+    elif np.issubdtype(tv.dtype, np.datetime64):
+        mjd = np.asarray(Time(tv, format="datetime64").mjd, dtype=np.float64)
+    else:
+        values = tv.astype(np.float64, copy=False)
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return np.zeros_like(values, dtype=np.float64)
+        origin = float(values[0])
+        if np.nanmax(np.abs(finite)) > 1e12:
+            return (values - origin) / 86_400_000_000_000.0
+        if np.nanmax(np.abs(finite)) > 1e7:
+            return (values - origin) / 86_400.0
+        return values - origin
+    return mjd - float(mjd[0])
+
+
+def _zenith_heatmap_time_days(dataset: xr.Dataset) -> np.ndarray:
+    """Elapsed days since the first time sample (for heatmap axis labels)."""
+    return _time_days_since_start(dataset.coords["time"].values)
+
+
+def _zenith_heatmap_freq_mhz(dataset: xr.Dataset) -> np.ndarray:
+    """Frequency coordinate in MHz (for heatmap axis labels)."""
+    return np.asarray(dataset.coords["frequency"].values, dtype=np.float64) / 1e6
+
+
+def _zenith_heatmap_lst_hours(dataset: xr.Dataset) -> np.ndarray:
+    """Mean local sidereal time in hours (0–24) for each dataset time sample."""
+    from astropy import units as u
+    from astropy.coordinates import EarthLocation
+    from astropy.time import Time
+    from astropy.utils.iers import conf as iers_conf
+
+    observatory = EarthLocation(
+        lat=37.2339 * u.deg, lon=-118.2817 * u.deg, height=1222 * u.m
+    )
+    mjd = np.asarray(dataset.coords["time"].values, dtype=np.float64)
+    orig = iers_conf.auto_download
+    try:
+        iers_conf.auto_download = False
+        times = Time(mjd, format="mjd", scale="utc")
+        lst_deg = np.asarray(
+            times.sidereal_time("mean", longitude=observatory.lon).deg,
+            dtype=np.float64,
+        )
+    finally:
+        iers_conf.auto_download = orig
+    return np.mod(lst_deg / 15.0, 24.0)
+
+
+def _format_lst_hour_label(lst_hour: float) -> str:
+    """Format LST as a directory-style hour label such as ``08h``."""
+    hour = int(round(float(lst_hour))) % 24
+    return f"{hour:02d}h"
+
+
+def _format_freq_mhz_label(mhz: float) -> str:
+    return f"{mhz:.1f}"
+
+
 def _heatmap_cell_center(idx: int) -> float:
     """Data-space coordinate at the center of a heatmap cell."""
     return idx + 0.5
@@ -291,18 +359,34 @@ def _heatmap_index_from_coord(coord: float, n: int) -> int:
     return int(np.clip(int(np.floor(float(coord))), 0, n - 1))
 
 
-def _heatmap_axis_ticks(n: int, *, max_ticks: int = 24) -> tuple[list[float], dict[float, str]]:
-    """Tick positions at cell centers with integer index labels."""
+def _heatmap_axis_ticks(
+    n: int,
+    values: np.ndarray | None = None,
+    *,
+    format_value: Callable[[Any], str] | None = None,
+    max_ticks: int = 24,
+) -> tuple[list[float], dict[float, str]]:
+    """Tick positions at cell centers with index or physical-value labels."""
     if n <= 0:
         return [], {}
     step = 1 if n <= max_ticks else int(np.ceil(n / max_ticks))
     indices = range(0, n, step)
     ticks = [_heatmap_cell_center(i) for i in indices]
-    labels = {tick: str(i) for tick, i in zip(ticks, indices, strict=True)}
+    if values is not None and format_value is not None and len(values) >= n:
+        labels = {
+            tick: format_value(values[i]) for tick, i in zip(ticks, indices, strict=True)
+        }
+    else:
+        labels = {tick: str(i) for tick, i in zip(ticks, indices, strict=True)}
     return ticks, labels
 
 
-def _build_heatmap_hover_source(stat_map: np.ndarray) -> ColumnDataSource:
+def _build_heatmap_hover_source(
+    stat_map: np.ndarray,
+    *,
+    lst_hours: np.ndarray,
+    freq_mhz: np.ndarray,
+) -> ColumnDataSource:
     """ColumnDataSource for per-cell hover tooltips on the zenith heatmap."""
     n_times, n_freqs = stat_map.shape
     time_idx, freq_idx = np.meshgrid(
@@ -310,12 +394,17 @@ def _build_heatmap_hover_source(stat_map: np.ndarray) -> ColumnDataSource:
         np.arange(n_freqs, dtype=int),
         indexing="ij",
     )
+    flat_time = time_idx.ravel()
+    flat_freq = freq_idx.ravel()
+    lst_labels = [_format_lst_hour_label(float(h)) for h in lst_hours[flat_time]]
     return ColumnDataSource(
         data={
-            "x": time_idx.ravel() + 0.5,
-            "y": freq_idx.ravel() + 0.5,
-            "time_idx": time_idx.ravel(),
-            "freq_idx": freq_idx.ravel(),
+            "x": flat_time + 0.5,
+            "y": flat_freq + 0.5,
+            "time_idx": flat_time,
+            "freq_idx": flat_freq,
+            "lst_hour": lst_labels,
+            "freq_mhz": freq_mhz[flat_freq],
             "value": stat_map.astype(float, copy=False).ravel(),
         }
     )
@@ -329,10 +418,14 @@ class _ZenithHeatmapSelector:
         stat_map: np.ndarray,
         *,
         metric_label: str,
+        lst_hours: np.ndarray,
+        freq_mhz: np.ndarray,
         on_select: Callable[[int, int], None],
     ) -> None:
         self._stat_map = stat_map
         self._metric_label = metric_label
+        self._lst_hours = np.asarray(lst_hours, dtype=np.float64)
+        self._freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
         self._on_select = on_select
         self._plot = self._build_plot()
         self.pane = pn.pane.Bokeh(self._plot, width=520, height=420, sizing_mode="fixed")
@@ -386,7 +479,11 @@ class _ZenithHeatmapSelector:
             y="y",
             width=1,
             height=1,
-            source=_build_heatmap_hover_source(self._stat_map),
+            source=_build_heatmap_hover_source(
+                self._stat_map,
+                lst_hours=self._lst_hours,
+                freq_mhz=self._freq_mhz,
+            ),
             fill_alpha=0,
             line_alpha=0,
             hover_fill_alpha=0,
@@ -396,20 +493,32 @@ class _ZenithHeatmapSelector:
             HoverTool(
                 renderers=[hover_renderer],
                 tooltips=[
+                    ("LST hour", "@lst_hour"),
+                    ("Freq (MHz)", "@freq_mhz{0.1}"),
                     ("Time idx", "@time_idx"),
                     ("Freq idx", "@freq_idx"),
                     (self._metric_label, "@value{0.3g}"),
                 ],
             )
         )
-        x_ticks, x_labels = _heatmap_axis_ticks(n_times)
-        y_ticks, y_labels = _heatmap_axis_ticks(n_freqs)
+        x_ticks, x_labels = _heatmap_axis_ticks(
+            n_times,
+            self._lst_hours,
+            format_value=_format_lst_hour_label,
+        )
+        y_ticks, y_labels = _heatmap_axis_ticks(
+            n_freqs,
+            self._freq_mhz,
+            format_value=_format_freq_mhz_label,
+        )
         plot.xaxis.ticker = FixedTicker(ticks=x_ticks)
         plot.yaxis.ticker = FixedTicker(ticks=y_ticks)
         plot.xaxis.major_label_overrides = x_labels
         plot.yaxis.major_label_overrides = y_labels
-        plot.xaxis.axis_label = "Time index"
-        plot.yaxis.axis_label = "Frequency index"
+        plot.xaxis.axis_label = "LST hour"
+        plot.yaxis.axis_label = "Frequency (MHz)"
+        plot.xaxis.major_label_orientation = math.pi / 4
+        plot.min_border_bottom = 80
         plot.on_event(Tap, self._on_tap)
         return plot
 
@@ -421,8 +530,16 @@ class _ZenithHeatmapSelector:
         freq_idx = _heatmap_index_from_coord(event.y, n_freqs)
         self._on_select(time_idx, freq_idx)
 
-    def set_data(self, stat_map: np.ndarray) -> None:
+    def set_data(
+        self,
+        stat_map: np.ndarray,
+        *,
+        lst_hours: np.ndarray,
+        freq_mhz: np.ndarray,
+    ) -> None:
         self._stat_map = stat_map
+        self._lst_hours = np.asarray(lst_hours, dtype=np.float64)
+        self._freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
         self._plot = self._build_plot()
         self.pane.object = self._plot
 
@@ -509,6 +626,8 @@ class ZenithReviewPanel(param.Parameterized):
         self._heatmap = _ZenithHeatmapSelector(
             stat_map,
             metric_label=metric_label,
+            lst_hours=_zenith_heatmap_lst_hours(dataset),
+            freq_mhz=_zenith_heatmap_freq_mhz(dataset),
             on_select=self._select_slice,
         )
 
@@ -544,10 +663,11 @@ class ZenithReviewPanel(param.Parameterized):
         """Slice summary shown above the heatmap (bound to shared slice params)."""
         coord = zenith_lm_coord(self._dataset, int(time_idx))
         metric_val = float(self._stat_map[int(time_idx), int(freq_idx)])
-        freq_mhz = float(self._dataset.frequency.values[int(freq_idx)]) / 1e6
+        time_day = float(_zenith_heatmap_time_days(self._dataset)[int(time_idx)])
+        freq_mhz = float(_zenith_heatmap_freq_mhz(self._dataset)[int(freq_idx)])
         return (
-            f"**Stokes {self.stokes_label}** | time={time_idx}, "
-            f"freq={freq_idx} ({freq_mhz:.1f} MHz)"
+            f"**Stokes {self.stokes_label}** | time={time_day:.3f} d ({int(time_idx)}), "
+            f"freq={freq_mhz:.1f} MHz ({int(freq_idx)})"
             f" | center RA={coord.ra.to_string(unit=u.hour, precision=1)}, "
             f"Dec={coord.dec.to_string(unit=u.deg, precision=1)}"
             f" | patch {self.metric_label}={metric_val:.3g}"

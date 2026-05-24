@@ -18,6 +18,37 @@ from ovro_lwa_portal.viz import pipeline_qa as pq
 from ovro_lwa_portal.viz.pipeline_qa_app import PipelineQAApp
 
 
+def _mock_zenith_dataset(
+    *,
+    n_times: int = 4,
+    n_freqs: int = 10,
+    freq_hz: np.ndarray | None = None,
+) -> Any:
+    """Minimal dataset stand-in with time/frequency coordinates for zenith review tests."""
+    if freq_hz is None:
+        freq_hz = np.linspace(70e6, 90e6, n_freqs)
+    time_mjd = np.linspace(60_000.0, 60_000.0 + 0.03 * max(n_times - 1, 0), n_times)
+
+    class _Coord:
+        def __init__(self, values: np.ndarray) -> None:
+            self.values = values
+
+    class _Coords:
+        def __getitem__(self, key: str) -> _Coord:
+            if key == "time":
+                return _Coord(time_mjd)
+            if key == "frequency":
+                return _Coord(freq_hz)
+            raise KeyError(key)
+
+    class _Dataset:
+        sizes = {"time": n_times, "frequency": n_freqs}
+        coords = _Coords()
+        frequency = _Coord(freq_hz)
+
+    return _Dataset()
+
+
 def _set_select_day(
     app: PipelineQAApp,
     day: str,
@@ -382,19 +413,33 @@ def test_heatmap_hover_source_includes_cell_values() -> None:
     )
 
     stat_map = np.array([[1.0, np.nan], [3.5, 4.0]])
-    source = _build_heatmap_hover_source(stat_map)
+    lst_hours = np.array([8.2, 10.7])
+    freq_mhz = np.array([70.0, 80.0])
+    source = _build_heatmap_hover_source(
+        stat_map,
+        lst_hours=lst_hours,
+        freq_mhz=freq_mhz,
+    )
     assert list(source.data["time_idx"]) == [0, 0, 1, 1]
     assert list(source.data["freq_idx"]) == [0, 1, 0, 1]
+    assert source.data["lst_hour"][0] == "08h"
+    assert source.data["lst_hour"][2] == "11h"
+    assert source.data["freq_mhz"][1] == 80.0
     assert source.data["value"][0] == 1.0
     assert np.isnan(source.data["value"][1])
 
     heatmap = _ZenithHeatmapSelector(
         stat_map,
         metric_label="STD",
+        lst_hours=lst_hours,
+        freq_mhz=freq_mhz,
         on_select=lambda _t, _f: None,
     )
     assert any(isinstance(tool, HoverTool) for tool in heatmap._plot.tools)
     assert not hasattr(heatmap, "_marker")
+    assert heatmap._plot.xaxis.axis_label == "LST hour"
+    assert heatmap._plot.yaxis.axis_label == "Frequency (MHz)"
+    assert heatmap._plot.xaxis.major_label_orientation == pytest.approx(np.pi / 4)
 
 
 def test_heatmap_cell_center_and_index_from_coord() -> None:
@@ -410,11 +455,65 @@ def test_heatmap_cell_center_and_index_from_coord() -> None:
 
 
 def test_heatmap_axis_ticks_at_cell_centers() -> None:
-    from ovro_lwa_portal.viz.pipeline_qa_app import _heatmap_axis_ticks
+    from ovro_lwa_portal.viz.pipeline_qa_app import (
+        _format_freq_mhz_label,
+        _format_lst_hour_label,
+        _heatmap_axis_ticks,
+    )
 
     ticks, labels = _heatmap_axis_ticks(5)
     assert ticks == [0.5, 1.5, 2.5, 3.5, 4.5]
     assert labels == {0.5: "0", 1.5: "1", 2.5: "2", 3.5: "3", 4.5: "4"}
+
+    lst_hours = np.array([0.0, 2.4, 4.8, 7.2, 9.6])
+    ticks, labels = _heatmap_axis_ticks(
+        5,
+        lst_hours,
+        format_value=_format_lst_hour_label,
+    )
+    assert labels[0.5] == "00h"
+    assert labels[2.5] == "05h"
+
+    freq_mhz = np.array([70.0, 72.0, 74.0, 76.0, 78.0])
+    _, labels = _heatmap_axis_ticks(
+        5,
+        freq_mhz,
+        format_value=_format_freq_mhz_label,
+    )
+    assert labels[1.5] == "72.0"
+
+
+def test_time_days_since_start_from_mjd() -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _time_days_since_start
+
+    mjd = np.array([60_000.0, 60_000.01, 60_000.03])
+    days = _time_days_since_start(mjd)
+    assert days.tolist() == pytest.approx([0.0, 0.01, 0.03])
+
+
+def test_zenith_heatmap_lst_hours_from_mjd() -> None:
+    from astropy import units as u
+    from astropy.coordinates import EarthLocation
+    from astropy.time import Time
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import _zenith_heatmap_lst_hours
+
+    dataset = _mock_zenith_dataset(n_times=2)
+    lst_hours = _zenith_heatmap_lst_hours(dataset)
+    observatory = EarthLocation(
+        lat=37.2339 * u.deg, lon=-118.2817 * u.deg, height=1222 * u.m
+    )
+    expected = np.mod(
+        np.asarray(
+            Time(dataset.coords["time"].values, format="mjd", scale="utc")
+            .sidereal_time("mean", longitude=observatory.lon)
+            .deg,
+            dtype=np.float64,
+        )
+        / 15.0,
+        24.0,
+    )
+    assert lst_hours.tolist() == pytest.approx(expected.tolist())
 
 
 def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,10 +552,12 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
         def nearest_lm_idx(_l, _m):
             return 0, 0
 
-    class _Dataset:
-        sizes = {"time": 4, "frequency": 10}
-        frequency = type("Freq", (), {"values": freq_values})()
-        radport = _Radport()
+        @staticmethod
+        def pixel_to_coords(l_idx, m_idx, *, time_idx):
+            return 180.0, 45.0
+
+    dataset = _mock_zenith_dataset(freq_hz=freq_values)
+    dataset.radport = _Radport()
 
     scheduled: list[Callable[[], None]] = []
     monkeypatch.setattr(
@@ -485,7 +586,7 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
     )
 
     panel = ZenithReviewPanel(
-        _Dataset(),  # type: ignore[arg-type]
+        dataset,  # type: ignore[arg-type]
         stat_map,
         slice_selection=slice_selection,
         stokes_label="I",
@@ -504,8 +605,10 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
 
     assert slice_selection.time_idx == 2 and slice_selection.freq_idx == 5
     assert panel.time_idx == 2 and panel.freq_idx == 5
-    assert "time=2" in panel._format_slice_status(2, 5)
-    assert "freq=5" in panel._format_slice_status(2, 5)
+    assert "(2)" in panel._format_slice_status(2, 5)
+    assert "(5)" in panel._format_slice_status(2, 5)
+    assert " d (" in panel._format_slice_status(2, 5)
+    assert " MHz (" in panel._format_slice_status(2, 5)
     assert "Stokes I" in panel._format_slice_status(2, 5)
     assert time_slider.value == 2
     assert freq_slider.value == 5
@@ -515,12 +618,12 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
     assert slice_selection.time_idx == 3 and slice_selection.freq_idx == 6
     assert time_slider.value == 3
     assert freq_slider.value == 6
-    assert "time=3" in panel._format_slice_status(3, 6)
+    assert "(3)" in panel._format_slice_status(3, 6)
 
     with param.parameterized.batch_call_watchers(slice_selection):
         slice_selection.time_idx = 1
         slice_selection.freq_idx = 2
-    assert "time=1" in panel._format_slice_status(1, 2)
+    assert "(1)" in panel._format_slice_status(1, 2)
 
     pushed: list[int] = []
     slice_selection.set_push_root(lambda: pushed.append(1))
@@ -565,10 +668,8 @@ def test_shared_zenith_slice_links_stokes_panels(monkeypatch: pytest.MonkeyPatch
         def nearest_lm_idx(_l, _m):
             return 0, 0
 
-    class _Dataset:
-        sizes = {"time": 4, "frequency": 10}
-        frequency = type("Freq", (), {"values": freq_values})()
-        radport = _Radport()
+    dataset = _mock_zenith_dataset(freq_hz=freq_values)
+    dataset.radport = _Radport()
 
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
@@ -583,14 +684,14 @@ def test_shared_zenith_slice_links_stokes_panels(monkeypatch: pytest.MonkeyPatch
         default_freq=8,
     )
     panel_i = ZenithReviewPanel(
-        _Dataset(),  # type: ignore[arg-type]
+        dataset,  # type: ignore[arg-type]
         stat_map,
         slice_selection=slice_selection,
         stokes_label="I",
         metric_label="STD",
     )
     panel_v = ZenithReviewPanel(
-        _Dataset(),  # type: ignore[arg-type]
+        dataset,  # type: ignore[arg-type]
         stat_map,
         slice_selection=slice_selection,
         stokes_label="V",
@@ -633,20 +734,17 @@ def test_heatmap_click_sets_sky_stokes(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     stat_map = np.ones((4, 10))
-
-    class _Dataset:
-        sizes = {"time": 4, "frequency": 10}
-        frequency = type("Freq", (), {"values": np.linspace(70e6, 90e6, 10)})()
+    dataset = _mock_zenith_dataset()
 
     holder = _StokesReviewHolder()
     holder.bind_datasets(
         {
-            "I": _Dataset(),  # type: ignore[arg-type]
-            "V": _Dataset(),  # type: ignore[arg-type]
+            "I": dataset,  # type: ignore[arg-type]
+            "V": dataset,  # type: ignore[arg-type]
         }
     )
     panel_i = ZenithReviewPanel(
-        _Dataset(),  # type: ignore[arg-type]
+        dataset,  # type: ignore[arg-type]
         stat_map,
         slice_selection=holder.slice_selection,
         stokes_label="I",
@@ -654,7 +752,7 @@ def test_heatmap_click_sets_sky_stokes(monkeypatch: pytest.MonkeyPatch) -> None:
         on_heatmap_select=holder.select_slice_from_heatmap,
     )
     panel_v = ZenithReviewPanel(
-        _Dataset(),  # type: ignore[arg-type]
+        dataset,  # type: ignore[arg-type]
         stat_map,
         slice_selection=holder.slice_selection,
         stokes_label="V",
@@ -699,14 +797,11 @@ def test_zenith_slice_syncs_status_on_slider_change(monkeypatch: pytest.MonkeyPa
 
     stat_map = np.ones((4, 10))
     freq_values = np.linspace(70e6, 90e6, 10)
-
-    class _Dataset:
-        sizes = {"time": 4, "frequency": 10}
-        frequency = type("Freq", (), {"values": freq_values})()
+    dataset = _mock_zenith_dataset(freq_hz=freq_values)
 
     holder = _StokesReviewHolder()
     panel = ZenithReviewPanel(
-        _Dataset(),  # type: ignore[arg-type]
+        dataset,  # type: ignore[arg-type]
         stat_map,
         slice_selection=holder.slice_selection,
         stokes_label="I",
@@ -719,8 +814,8 @@ def test_zenith_slice_syncs_status_on_slider_change(monkeypatch: pytest.MonkeyPa
         holder.slice_selection.time_idx = 2
         holder.slice_selection.freq_idx = 4
 
-    assert "time=2" in panel._status_pane.object
-    assert "freq=4" in panel._status_pane.object
+    assert "(2)" in panel._status_pane.object
+    assert "(4)" in panel._status_pane.object
 
 
 def test_pipeline_qa_app_shows_error_alert(monkeypatch: pytest.MonkeyPatch) -> None:
