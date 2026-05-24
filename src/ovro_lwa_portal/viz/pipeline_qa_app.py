@@ -260,17 +260,6 @@ def zenith_lm_coord(dataset: xr.Dataset, time_idx: int) -> SkyCoord:
     return SkyCoord(ra=coord.ra, dec=coord.dec)
 
 
-def _reduce_patch_rms(patch: np.ndarray) -> np.ndarray:
-    """RMS = sqrt(mean(x^2)) for each frequency plane (Stokes V about zero)."""
-    patch_arr = np.asarray(patch)
-    values = np.full(patch_arr.shape[0], np.nan, dtype=np.float64)
-    for fi in range(patch_arr.shape[0]):
-        finite = patch_arr[fi][np.isfinite(patch_arr[fi])]
-        if finite.size:
-            values[fi] = np.sqrt(np.mean(finite**2))
-    return values
-
-
 def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIUS) -> np.ndarray:
     """Spatial STD in a fixed (l=0, m=0) patch for each (time, frequency) cell."""
     result = dataset.radport.patch_statistic(
@@ -280,25 +269,6 @@ def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIU
         radius=radius,
     )
     return np.asarray(result.stat_map.values, dtype=np.float64)
-
-
-def compute_zenith_rms_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIUS) -> np.ndarray:
-    """Spatial RMS in a fixed (l=0, m=0) patch for each (time, frequency) cell."""
-    l_idx, m_idx = dataset.radport.nearest_lm_idx(ZENITH_L, ZENITH_M)
-    n_times = int(dataset.sizes["time"])
-    n_freqs = int(dataset.sizes["frequency"])
-    stat_map = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
-    vis_times, patches = dataset.radport._extract_tracked_patch_cubes(
-        l_indices=np.full(n_times, l_idx, dtype=int),
-        m_indices=np.full(n_times, m_idx, dtype=int),
-        visible=np.ones(n_times, dtype=bool),
-        var="SKY",
-        pol=0,
-        radius=radius,
-    )
-    for ti, patch in zip(vis_times, patches, strict=True):
-        stat_map[int(ti)] = _reduce_patch_rms(np.asarray(patch))
-    return stat_map
 
 
 def _heatmap_cell_center(idx: int) -> float:
@@ -479,7 +449,7 @@ class ZenithReviewPanel(param.Parameterized):
     time_idx = param.Integer(default=0, doc="Selected time index from the heatmap.")
     freq_idx = param.Integer(default=0, doc="Selected frequency index from the heatmap.")
     stokes_label = param.String(default="", doc="Stokes parameter label (I or V).")
-    metric_label = param.String(default="", doc="Zenith patch metric label (STD or RMS).")
+    metric_label = param.String(default="", doc="Zenith patch metric label (STD).")
 
     def __init__(
         self,
@@ -658,11 +628,11 @@ _STOKES_SECTIONS: tuple[_StokesSectionSpec, ...] = (
     ),
     _StokesSectionSpec(
         stokes="V",
-        heading="## Stokes V — zenith patch RMS",
-        metric_label="RMS",
-        waiting_message="*Load a day with QA Zarr to enable Stokes I review.*",
+        heading="## Stokes V — zenith patch STD",
+        metric_label="STD",
+        waiting_message="*Load a day with QA Zarr to enable Stokes V review.*",
         missing_zarr_message="*Run **Convert** to build the Stokes V Zarr and enable review.*",
-        compute_stat_map=compute_zenith_rms_map,
+        compute_stat_map=compute_zenith_std_map,
     ),
 )
 
