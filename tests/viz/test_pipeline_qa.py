@@ -153,7 +153,7 @@ def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         PipelineQAApp,
         "_start_initial_scan",
-        lambda self: None,
+        lambda self, **kwargs: None,
     )
     app = PipelineQAApp()
     layout = app.panel()
@@ -206,7 +206,7 @@ def test_display_pipeline_qa_app_displays_single_layout(
     monkeypatch.setattr(
         PipelineQAApp,
         "_start_initial_scan",
-        lambda self: None,
+        lambda self, **kwargs: None,
     )
 
     display_pipeline_qa_app()
@@ -610,8 +610,8 @@ def test_heatmap_click_sets_sky_stokes(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         _StokesReviewHolder,
-        "_update_sky_slice",
-        lambda self: None,
+        "_update_sky_view",
+        lambda self, **kwargs: None,
     )
     monkeypatch.setattr(
         _StokesReviewHolder,
@@ -684,8 +684,8 @@ def test_zenith_slice_syncs_status_on_slider_change(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(
         _StokesReviewHolder,
-        "_update_sky_slice",
-        lambda self: None,
+        "_update_sky_view",
+        lambda self, **kwargs: None,
     )
 
     class _Coord:
@@ -840,6 +840,160 @@ def test_begin_zenith_load_rejects_stale_load_seq(monkeypatch: pytest.MonkeyPatc
     assert app.loading_zenith is False
 
 
+def test_slider_freq_change_keeps_sky_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    import astropy.units as u
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    class _FakeSky:
+        def __init__(self) -> None:
+            self.update_slice_calls: list[dict[str, object]] = []
+
+        def set_dataset(self, dataset, **kwargs) -> None:
+            return None
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            self.update_slice_calls.append(
+                {"time_idx": time_idx, "freq_idx": freq_idx, **kwargs}
+            )
+
+    fake = _FakeSky()
+
+    class _Dataset:
+        sizes = {"time": 4, "frequency": 10}
+
+    holder = _StokesReviewHolder()
+    holder._sky_widget = fake  # type: ignore[assignment]
+    holder._sky_bound_stokes = "I"
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder.slice_selection.configure(
+        n_times=4,
+        n_freqs=10,
+        default_time=0,
+        default_freq=0,
+    )
+    fake.update_slice_calls.clear()
+
+    holder.slice_selection.freq_idx = 5
+
+    assert len(fake.update_slice_calls) == 1
+    call = fake.update_slice_calls[0]
+    assert call["time_idx"] == 0
+    assert call["freq_idx"] == 5
+    assert "center" not in call
+    assert "fov" not in call
+
+
+def test_slider_time_change_recenters_sky_view(monkeypatch: pytest.MonkeyPatch) -> None:
+    import astropy.units as u
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    class _FakeSky:
+        def __init__(self) -> None:
+            self.update_slice_calls: list[dict[str, object]] = []
+
+        def set_dataset(self, dataset, **kwargs) -> None:
+            return None
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            self.update_slice_calls.append(
+                {"time_idx": time_idx, "freq_idx": freq_idx, **kwargs}
+            )
+
+    fake = _FakeSky()
+
+    class _Dataset:
+        sizes = {"time": 4, "frequency": 10}
+
+    holder = _StokesReviewHolder()
+    holder._sky_widget = fake  # type: ignore[assignment]
+    holder._sky_bound_stokes = "I"
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder.slice_selection.configure(
+        n_times=4,
+        n_freqs=10,
+        default_time=0,
+        default_freq=0,
+    )
+    fake.update_slice_calls.clear()
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zenith_lm_coord",
+        lambda dataset, time_idx: type(
+            "Coord",
+            (),
+            {
+                "ra": type("RA", (), {"deg": 180.0})(),
+                "dec": type("Dec", (), {"deg": 45.0})(),
+                "icrs": property(lambda self: self),
+            },
+        )(),
+    )
+
+    holder.slice_selection.time_idx = 3
+
+    assert len(fake.update_slice_calls) == 1
+    assert fake.update_slice_calls[0]["fov"] == 25.0 * u.deg
+    assert "center" in fake.update_slice_calls[0]
+
+
+def test_stokes_toggle_updates_sky_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    import astropy.units as u
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    class _FakeSky:
+        def __init__(self) -> None:
+            self.set_dataset_calls: list[dict[str, object]] = []
+            self.update_slice_calls: list[dict[str, object]] = []
+
+        def set_dataset(self, dataset, **kwargs) -> None:
+            self.set_dataset_calls.append({"dataset": dataset, **kwargs})
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            self.update_slice_calls.append(
+                {"time_idx": time_idx, "freq_idx": freq_idx, **kwargs}
+            )
+
+        def send_state(self) -> None:
+            return None
+
+    fake = _FakeSky()
+
+    class _Dataset:
+        sizes = {"time": 4, "frequency": 10}
+
+    holder = _StokesReviewHolder()
+    holder._sky_widget = fake  # type: ignore[assignment]
+    holder.bind_datasets({"I": _Dataset(), "V": _Dataset()})  # type: ignore[arg-type]
+    holder._configure_slice_selection()
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
+        lambda callback: callback(),
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zenith_lm_coord",
+        lambda dataset, time_idx: type(
+            "Coord",
+            (),
+            {
+                "ra": type("RA", (), {"deg": 180.0})(),
+                "dec": type("Dec", (), {"deg": 45.0})(),
+                "icrs": property(lambda self: self),
+            },
+        )(),
+    )
+
+    holder.sky_stokes = "V"
+
+    assert len(fake.set_dataset_calls) == 1
+    assert fake.set_dataset_calls[0]["defer_display"] is True
+    assert len(fake.update_slice_calls) == 1
+    assert fake.update_slice_calls[0]["fov"] == 25.0 * u.deg
+
+
 def test_stokes_review_holder_mount_sky_updates_container(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -865,8 +1019,8 @@ def test_stokes_review_holder_mount_sky_updates_container(
     )
     monkeypatch.setattr(
         _StokesReviewHolder,
-        "_update_sky_slice",
-        lambda self: None,
+        "_update_sky_view",
+        lambda self, **kwargs: None,
     )
 
     class _Dataset:

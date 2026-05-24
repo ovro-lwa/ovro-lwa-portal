@@ -258,11 +258,14 @@ def default_stat_slice(
 
 
 def zenith_lm_coord(dataset: xr.Dataset, time_idx: int) -> SkyCoord:
-    """RA/Dec of the fixed (l=0, m=0) grid point for one time slice."""
-    wcs = dataset.radport._get_wcs(time_idx=time_idx)
+    """RA/Dec of the fixed (l=0, m=0) grid point for one time slice.
+
+    Uses :meth:`~ovro_lwa_portal.accessor.RadportAccessor.pixel_to_coords` so zenith
+    matches the time-dependent SIN geometry (same for Stokes I and V).
+    """
     l_idx, m_idx = dataset.radport.nearest_lm_idx(ZENITH_L, ZENITH_M)
-    coord = wcs.pixel_to_world(l_idx, m_idx)
-    return SkyCoord(ra=coord.ra, dec=coord.dec)
+    ra_deg, dec_deg = dataset.radport.pixel_to_coords(l_idx, m_idx, time_idx=int(time_idx))
+    return SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="fk5")
 
 
 def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIUS) -> np.ndarray:
@@ -510,8 +513,7 @@ class ZenithReviewPanel(param.Parameterized):
         )
 
         self._header = pn.pane.Markdown(
-            f"**Stokes {stokes_label}** — use the sliders below for time and frequency; "
-            "click the heatmap to jump the sliders (and sky Stokes)."
+            f"**Click on heatmap or use sliders below to update time/frequency/Stokes view**"
         )
         self._status_pane = pn.pane.Markdown(
             pn.bind(
@@ -544,7 +546,7 @@ class ZenithReviewPanel(param.Parameterized):
         metric_val = float(self._stat_map[int(time_idx), int(freq_idx)])
         freq_mhz = float(self._dataset.frequency.values[int(freq_idx)]) / 1e6
         return (
-            f"**Stokes {self.stokes_label} zenith (l=0, m=0)** | time={time_idx}, "
+            f"**Stokes {self.stokes_label}** | time={time_idx}, "
             f"freq={freq_idx} ({freq_mhz:.1f} MHz)"
             f" | center RA={coord.ra.to_string(unit=u.hour, precision=1)}, "
             f"Dec={coord.dec.to_string(unit=u.deg, precision=1)}"
@@ -619,11 +621,12 @@ _ZENITH_SKY_PLACEHOLDER = (
 ZENITH_REVIEW_COLUMN_WIDTH = 520
 ZENITH_REVIEW_COLUMN_GAP = 8
 ZENITH_REVIEW_ROW_WIDTH = 2 * ZENITH_REVIEW_COLUMN_WIDTH + ZENITH_REVIEW_COLUMN_GAP
-ZENITH_SKY_WIDGET_SIZE = ZENITH_REVIEW_ROW_WIDTH
-# IPyWidget pane height: sky canvas plus a one-line label (avoid extra blank space below).
-ZENITH_SKY_LABEL_HEIGHT = 28
-ZENITH_SKY_PANE_HEIGHT = ZENITH_SKY_WIDGET_SIZE + ZENITH_SKY_LABEL_HEIGHT
-ZENITH_SKY_ROW_MARGIN = (0, 0, 8, 0)
+ZENITH_SKY_WIDGET_WIDTH = ZENITH_REVIEW_ROW_WIDTH
+# astrowidget's WebGL canvas defaults to 600px tall (see widget.js); width is 100%.
+ZENITH_SKY_WIDGET_HEIGHT = 600
+ZENITH_SKY_LABEL_HEIGHT = 22
+ZENITH_SKY_PANE_HEIGHT = ZENITH_SKY_WIDGET_HEIGHT + ZENITH_SKY_LABEL_HEIGHT
+ZENITH_SKY_ROW_MARGIN = (0, 0, 0, 0)
 
 
 class _StokesReviewHolder(param.Parameterized):
@@ -693,6 +696,8 @@ class _StokesReviewHolder(param.Parameterized):
         self._panels: dict[str, ZenithReviewPanel | None] = {
             spec.stokes: None for spec in _STOKES_SECTIONS
         }
+        self._sky_bound_stokes: str | None = None
+        self._skip_sky_watch = False
 
     @property
     def zenith_footer(self) -> pn.Column:
@@ -710,10 +715,14 @@ class _StokesReviewHolder(param.Parameterized):
     def set_push_root(self, callback: Callable[[], None] | None) -> None:
         self._slice_selection.set_push_root(callback)
 
-    def _on_slice_selection_changed(self, *_events: param.parameterized.Event) -> None:
-        """Sync status text and sky view when sliders or heatmap taps change the slice."""
+    def _on_slice_selection_changed(self, *events: param.parameterized.Event) -> None:
+        """Sync status and sky view when sliders or heatmap taps change the slice."""
+        if self._skip_sky_watch:
+            return
         self._sync_zenith_status_lines()
-        self._update_sky_slice()
+        event = events[0] if events else None
+        reset_center = event is None or getattr(event, "name", None) == "time_idx"
+        self._update_sky_view(reset_center=reset_center)
 
     def _sync_zenith_status_lines(self) -> None:
         """Refresh per-column status markdown from the shared slice (no Bokeh push)."""
@@ -724,8 +733,9 @@ class _StokesReviewHolder(param.Parameterized):
                 panel._status_pane.object = panel._format_slice_status(time_idx, freq_idx)
 
     def _on_sky_stokes_changed(self, *_events: param.parameterized.Event) -> None:
-        self._apply_sky_dataset()
-        self._update_sky_slice()
+        if self._skip_sky_watch:
+            return
+        self._update_sky_view(reset_center=True)
 
     def select_slice_from_heatmap(self, stokes: str, time_idx: int, freq_idx: int) -> None:
         """Set shared time/frequency and switch sky view to the clicked heatmap's Stokes."""
@@ -735,22 +745,41 @@ class _StokesReviewHolder(param.Parameterized):
         freq_idx = int(np.clip(freq_idx, f_lo, f_hi))
 
         def _apply() -> None:
-            with param.parameterized.batch_call_watchers(self):
-                if stokes in self.param.sky_stokes.objects:
-                    self.sky_stokes = stokes
-            with param.parameterized.batch_call_watchers(self._slice_selection):
-                self._slice_selection.time_idx = time_idx
-                self._slice_selection.freq_idx = freq_idx
+            self._skip_sky_watch = True
+            try:
+                with param.parameterized.batch_call_watchers(self):
+                    if stokes in self.param.sky_stokes.objects:
+                        self.sky_stokes = stokes
+                with param.parameterized.batch_call_watchers(self._slice_selection):
+                    self._slice_selection.time_idx = time_idx
+                    self._slice_selection.freq_idx = freq_idx
+                self._sync_zenith_status_lines()
+                self._update_sky_view(reset_center=True)
+            finally:
+                self._skip_sky_watch = False
 
         _run_on_main_thread(_apply)
 
     @staticmethod
     def _bind_sky_dataset(widget: SkyWidget, dataset: xr.Dataset) -> None:
-        widget.set_dataset(dataset, max_size=1024)
+        """Load cube only; first frame comes from :meth:`update_slice`."""
+        widget.set_dataset(dataset, max_size=1024, defer_display=True)
+
+    def _rebind_sky_dataset_if_needed(self) -> xr.Dataset | None:
+        if self._sky_widget is None:
+            return None
+        dataset = self._datasets.get(self.sky_stokes)
+        if dataset is None:
+            return None
+        if self._sky_bound_stokes != self.sky_stokes:
+            self._bind_sky_dataset(self._sky_widget, dataset)
+            self._sky_bound_stokes = self.sky_stokes
+        return dataset
 
     def bind_datasets(self, datasets: dict[str, xr.Dataset]) -> None:
         """Remember loaded Stokes datasets and constrain the sky-view toggle."""
         self._datasets = dict(datasets)
+        self._sky_bound_stokes = None
         available = [spec.stokes for spec in _STOKES_SECTIONS if spec.stokes in self._datasets]
         with param.parameterized.batch_call_watchers(self):
             self.param.sky_stokes.objects = available
@@ -771,54 +800,44 @@ class _StokesReviewHolder(param.Parameterized):
         self._sky_widget.colormap = "inferno"
         self._sky_widget.background_survey = ""
         self._sky_widget.invert_horizontal_pan = True
-        size = f"{ZENITH_SKY_WIDGET_SIZE}px"
+        width = f"{ZENITH_SKY_WIDGET_WIDTH}px"
+        height = f"{ZENITH_SKY_WIDGET_HEIGHT}px"
         self._sky_widget.layout = widgets.Layout(
-            width=size,
-            min_width=size,
-            max_width=size,
-            height=size,
-            min_height=size,
+            width=width,
+            min_width=width,
+            max_width=width,
+            height=height,
+            min_height=height,
+            max_height=height,
         )
         self._sky_container.children = [
             widgets.HTML("<strong>Sky view</strong>"),
             self._sky_widget,
         ]
-        self._apply_sky_dataset()
-        self._update_sky_slice()
+        self._sky_bound_stokes = None
+        self._update_sky_view(reset_center=True)
 
     def reset_sky(self) -> None:
         """Restore the sky-view placeholder."""
         self._sky_widget = None
+        self._sky_bound_stokes = None
         self._sky_container.children = [widgets.HTML(_ZENITH_SKY_PLACEHOLDER)]
 
-    def _apply_sky_dataset(self) -> None:
-        if self._sky_widget is None:
-            return
-        dataset = self._datasets.get(self.sky_stokes)
-        if dataset is None:
-            return
-        self._bind_sky_dataset(self._sky_widget, dataset)
-
-    def _update_sky_slice(self) -> None:
-        if self._sky_widget is None:
-            return
-        dataset = self._datasets.get(self.sky_stokes)
-        if dataset is None:
+    def _update_sky_view(self, *, reset_center: bool = False) -> None:
+        """Push one slice via astrowidget (same path as :class:`astrowidget.SkyViewer`)."""
+        dataset = self._rebind_sky_dataset_if_needed()
+        if dataset is None or self._sky_widget is None:
             return
         time_idx = int(self._slice_selection.time_idx)
         freq_idx = int(self._slice_selection.freq_idx)
-        coord = zenith_lm_coord(dataset, time_idx)
-        self._sky_widget.update_slice(
-            time_idx,
-            freq_idx,
-            center=coord,
-            fov=DEFAULT_FOV_DEG * u.deg,
-            percentile_low=2,
-            percentile_high=98,
-        )
-        send_state = getattr(self._sky_widget, "send_state", None)
-        if callable(send_state):
-            send_state()
+        kwargs: dict[str, Any] = {
+            "percentile_low": 2,
+            "percentile_high": 98,
+        }
+        if reset_center:
+            kwargs["center"] = zenith_lm_coord(dataset, time_idx)
+            kwargs["fov"] = DEFAULT_FOV_DEG * u.deg
+        self._sky_widget.update_slice(time_idx, freq_idx, **kwargs)
 
     def _configure_slice_selection(self) -> None:
         """Set shared slider bounds and default slice from the first loaded panel."""
