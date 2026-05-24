@@ -21,7 +21,7 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astrowidget import SkyWidget
 from bokeh.events import Tap
-from bokeh.models import FixedTicker
+from bokeh.models import ColumnDataSource, FixedTicker, HoverTool
 from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 
@@ -109,25 +109,27 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
                     logger.debug("Panel push_on_root failed: %s", exc, exc_info=True)
 
 
-def _activity_log_html(text: str) -> str:
-    """Render the activity log in a scrollable monospace block (newest first)."""
+ACTIVITY_LOG_HEIGHT_PX = 150
+
+
+def _format_activity_log_display(text: str) -> str:
+    """Format log lines for display (newest first)."""
+    lines = [line for line in text.splitlines() if line]
+    return "\n".join(reversed(lines)) if lines else ""
+
+
+def _format_activity_log_html(text: str) -> str:
+    """Render the activity log in a fixed-height scrollable block (newest first)."""
     import html
 
-    lines = [line for line in text.splitlines() if line]
-    display = "\n".join(reversed(lines)) if lines else " "
+    display = _format_activity_log_display(text) or " "
     body = html.escape(display)
     return (
-        '<div id="pipeline-qa-activity-log" '
-        'style="height:150px;overflow-y:auto;border:1px solid #ccc;border-radius:4px;'
-        'padding:8px;background:#fafafa;font-family:monospace;font-size:12px;'
-        'white-space:pre-wrap;margin:0;">'
+        f'<div style="height:{ACTIVITY_LOG_HEIGHT_PX}px;overflow-y:auto;overflow-x:hidden;'
+        'border:1px solid #ccc;border-radius:4px;padding:8px;background:#fafafa;'
+        'font-family:monospace;font-size:12px;white-space:pre-wrap;margin:0;'
+        'box-sizing:border-box;">'
         f"{body}</div>"
-        "<script>"
-        "requestAnimationFrame(function(){"
-        'var el=document.getElementById("pipeline-qa-activity-log");'
-        "if(el){el.scrollTop=0;}"
-        "});"
-        "</script>"
     )
 
 
@@ -322,6 +324,25 @@ def _heatmap_axis_ticks(n: int, *, max_ticks: int = 24) -> tuple[list[float], di
     return ticks, labels
 
 
+def _build_heatmap_hover_source(stat_map: np.ndarray) -> ColumnDataSource:
+    """ColumnDataSource for per-cell hover tooltips on the zenith heatmap."""
+    n_times, n_freqs = stat_map.shape
+    time_idx, freq_idx = np.meshgrid(
+        np.arange(n_times, dtype=int),
+        np.arange(n_freqs, dtype=int),
+        indexing="ij",
+    )
+    return ColumnDataSource(
+        data={
+            "x": time_idx.ravel() + 0.5,
+            "y": freq_idx.ravel() + 0.5,
+            "time_idx": time_idx.ravel(),
+            "freq_idx": freq_idx.ravel(),
+            "value": stat_map.astype(float, copy=False).ravel(),
+        }
+    )
+
+
 class _ZenithHeatmapSelector:
     """Bokeh zenith heatmap embedded in Panel (same JS stack as the rest of the app)."""
 
@@ -367,7 +388,7 @@ class _ZenithHeatmapSelector:
         plot = figure(
             width=520,
             height=400,
-            title=f"Zenith patch {self._metric_label} (click to set slice)",
+            title=f"Zenith patch {self._metric_label} (hover for values; click to set slice)",
             x_range=(0, n_times),
             y_range=(0, n_freqs),
             tools="pan,wheel_zoom,reset,tap",
@@ -382,6 +403,27 @@ class _ZenithHeatmapSelector:
             dh=n_freqs,
             palette=Viridis256,
             level="image",
+        )
+        hover_renderer = plot.rect(
+            x="x",
+            y="y",
+            width=1,
+            height=1,
+            source=_build_heatmap_hover_source(self._stat_map),
+            fill_alpha=0,
+            line_alpha=0,
+            hover_fill_alpha=0,
+            hover_line_alpha=0,
+        )
+        plot.add_tools(
+            HoverTool(
+                renderers=[hover_renderer],
+                tooltips=[
+                    ("Time idx", "@time_idx"),
+                    ("Freq idx", "@freq_idx"),
+                    (self._metric_label, "@value{0.3g}"),
+                ],
+            )
         )
         self._marker = plot.scatter(
             x=[_heatmap_cell_center(self._time_idx)],
@@ -891,6 +933,8 @@ class PipelineQAApp(param.Parameterized):
     """Interactive Panel dashboard for one-day pipeline QA."""
 
     select_day = param.Selector(default=None, objects=[])
+    log_text = param.String(default="")
+    error_message = param.String(default="")
     scanning = param.Boolean(default=True)
     converting = param.Boolean(default=False)
     loading_day = param.Boolean(default=False)
@@ -928,8 +972,20 @@ class PipelineQAApp(param.Parameterized):
             *[self._zenith_sections[spec.stokes] for spec in _STOKES_SECTIONS],
             sizing_mode="stretch_width",
         )
+        self._zenith_loading_spinner = pn.indicators.LoadingSpinner(
+            value=False,
+            size=40,
+            name="Loading zenith panels",
+        )
+        self._zenith_loading_row = pn.Row(
+            self._zenith_loading_spinner,
+            pn.pane.Markdown("Loading zenith review panels…"),
+            visible=False,
+            sizing_mode="stretch_width",
+        )
         self._zenith_slot = pn.Column(
             self._zenith_banner,
+            self._zenith_loading_row,
             self._zenith_review_row,
             sizing_mode="stretch_width",
         )
@@ -943,13 +999,12 @@ class PipelineQAApp(param.Parameterized):
             pn.pane.Markdown("*Select an observation day to build the thermal-noise QA grid.*"),
             sizing_mode="stretch_width",
         )
-        self._syncing_day = False
-        self._day_selector = pn.widgets.Select(
+        self._day_selector = pn.widgets.Select.from_param(
+            self.param.select_day,
             name="Observation day",
-            options=[],
             width=220,
         )
-        self._day_selector.param.watch(self._on_day_selector_changed, "value")
+        self.param.watch(self._on_select_day_changed, "select_day")
         self._convert_button = pn.widgets.Button(
             name="Convert FITS → Zarr",
             button_type="primary",
@@ -960,7 +1015,12 @@ class PipelineQAApp(param.Parameterized):
         self._close_modal_button.on_click(lambda _event: self._close_modal())
         self._modal_container = pn.Column(sizing_mode="stretch_width")
         self._log_pane = pn.pane.HTML(
-            _activity_log_html(""),
+            _format_activity_log_html(""),
+            sizing_mode="stretch_width",
+            height=ACTIVITY_LOG_HEIGHT_PX,
+        )
+        self._error_alert = pn.panel(
+            self._error_alert_view,
             sizing_mode="stretch_width",
         )
         self._layout: pn.Column | None = None
@@ -972,6 +1032,46 @@ class PipelineQAApp(param.Parameterized):
     def sky_widgets(self) -> widgets.HBox:
         """Embedded ipywidgets row for the sky columns."""
         return self._sky_host.widget
+
+    @property
+    def busy(self) -> bool:
+        """True while scan, day load, zenith load, or conversion is in progress."""
+        return bool(
+            self.scanning or self.loading_day or self.loading_zenith or self.converting
+        )
+
+    @param.depends("log_text", watch=True)
+    def _sync_log_pane(self) -> None:
+        self._log_pane.object = _format_activity_log_html(self.log_text)
+
+    @param.depends("error_message")
+    def _error_alert_view(self) -> pn.viewable.Viewable:
+        if not self.error_message:
+            return pn.Spacer(height=0, width=0)
+        return pn.pane.Alert(
+            self.error_message,
+            alert_type="danger",
+            sizing_mode="stretch_width",
+        )
+
+    @param.depends("loading_zenith", watch=True)
+    def _sync_zenith_loading_indicator(self) -> None:
+        self._zenith_loading_row.visible = self.loading_zenith
+        self._zenith_loading_spinner.value = self.loading_zenith
+
+    @param.depends(
+        "select_day",
+        "scanning",
+        "loading_day",
+        "loading_zenith",
+        "converting",
+        watch=True,
+    )
+    def _sync_action_controls(self) -> None:
+        """Keep day selector and action buttons aligned with Param state."""
+        self._day_selector.disabled = self.busy
+        self._sync_convert_button()
+        self._sync_zenith_button()
 
     def _execute(self, callback: Any) -> None:
         try:
@@ -1014,20 +1114,19 @@ class PipelineQAApp(param.Parameterized):
         self._execute(self._push_zenith_root)
 
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
-        """Push day options into the Select widget (needed in JupyterLab)."""
-        self._syncing_day = True
-        try:
+        """Update day options and selection from scan results."""
+        with param.parameterized.batch_call_watchers(self):
             self.param.select_day.objects = days
-            self._day_selector.options = days
-            self._day_selector.value = value
-        finally:
-            self._syncing_day = False
+            self.select_day = value
 
-    def _on_day_selector_changed(self, event: param.parameterized.Event) -> None:
-        if self._syncing_day or event.new is None or event.new == self.select_day:
+    def _on_select_day_changed(self, event: param.parameterized.Event) -> None:
+        new_day = event.new
+        if new_day is None:
             return
-        self.select_day = event.new
-        if self._loaded_day != event.new:
+        old_day = event.old
+        if old_day not in (None, param.Undefined) and old_day == new_day:
+            return
+        if self._loaded_day != new_day:
             self._release_active_datasets()
             self._reset_zenith_sections()
 
@@ -1035,18 +1134,12 @@ class PipelineQAApp(param.Parameterized):
                 self._push_panel_roots()
 
             self._execute(_push)
-        self._refresh_action_buttons()
         self._begin_load_day()
 
     def _on_zenith_load_click(self, _event: Any) -> None:
         self._begin_zenith_load()
 
-    def _refresh_action_buttons(self) -> None:
-        """Sync Convert / zenith button state with the selected day."""
-        self._refresh_convert_button()
-        self._refresh_zenith_button()
-
-    def _refresh_zenith_button(self) -> None:
+    def _sync_zenith_button(self) -> None:
         """Enable manual zenith reload once the selected day has been loaded."""
         if self.select_day is None:
             self._zenith_load_button.disabled = True
@@ -1054,19 +1147,20 @@ class PipelineQAApp(param.Parameterized):
         status = zarr_status(self.select_day)
         has_zarr = status["I"] or status["V"]
         day_ready = self._loaded_day == self.select_day
-        busy = self.loading_zenith or self.loading_day or self.converting or self.scanning
-        self._zenith_load_button.disabled = busy or not day_ready or not has_zarr
+        self._zenith_load_button.disabled = (
+            self.busy or not day_ready or not has_zarr
+        )
 
     def _sync_log(self, *, defer: bool = False) -> None:
-        html = _activity_log_html(self._scroll_log.text)
+        text = self._scroll_log.text
         if defer:
 
             def _push() -> None:
-                self._log_pane.object = html
+                self.log_text = text
 
             self._execute(_push)
         else:
-            self._log_pane.object = html
+            self.log_text = text
 
     def _log(self, message: str, *, sync: bool = True, defer: bool = False) -> None:
         self._scroll_log.append(message)
@@ -1088,13 +1182,16 @@ class PipelineQAApp(param.Parameterized):
                     pass
         self._active_datasets.clear()
 
+    def _clear_error(self) -> None:
+        self.error_message = ""
+
     def _log_error(self, message: str) -> None:
-        """Record an error in the log pane."""
+        """Record an error in the log pane and show an alert."""
+        self.error_message = message
         self._log(f"ERROR: {message}")
 
-    def _refresh_convert_button(self) -> None:
+    def _sync_convert_button(self) -> None:
         """Sync convert button label, color, and disabled state with the selected day."""
-        busy = self.loading_day or self.loading_zenith or self.converting or self.scanning
         if self.select_day is None:
             self._convert_button.disabled = True
             self._convert_button.button_type = "default"
@@ -1105,8 +1202,8 @@ class PipelineQAApp(param.Parameterized):
         self._convert_button.disabled = convert_button_disabled(
             status,
             converting=self.converting,
-        ) or busy
-        self._convert_button.button_type = "default" if zarr_complete or busy else "primary"
+        ) or self.busy
+        self._convert_button.button_type = "default" if zarr_complete or self.busy else "primary"
 
     def _start_initial_scan(self) -> None:
         self.scanning = True
@@ -1127,16 +1224,13 @@ class PipelineQAApp(param.Parameterized):
                     if not days:
                         self._log_error("No Wideband QA days found under the pipeline root.")
                         self._sync_day_selector([], None)
-                        self.select_day = None
                     else:
+                        self._clear_error()
                         self._sync_day_selector(days, default_day)
-                        self.select_day = default_day
                         self._log(
                             f"Found {len(days)} Wideband QA day(s). "
                             f"Loading {default_day}…"
                         )
-                        self._refresh_action_buttons()
-                        self._begin_load_day()
                     self._sync_log()
 
                 self._execute(_apply)
@@ -1158,9 +1252,6 @@ class PipelineQAApp(param.Parameterized):
         self._load_seq += 1
         load_seq = self._load_seq
         self.loading_day = True
-        self._day_selector.disabled = True
-        self._convert_button.disabled = True
-        self._zenith_load_button.disabled = True
         self._log(f"Loading QA data for {select_day}…")
         self._flush_log()
         self._release_active_datasets()
@@ -1196,9 +1287,6 @@ class PipelineQAApp(param.Parameterized):
 
         select_day = self.select_day
         self.loading_zenith = True
-        self._zenith_load_button.disabled = True
-        self._convert_button.disabled = True
-        self._day_selector.disabled = True
         self._log(f"Loading zenith review panels for {select_day}…")
         self._flush_log()
         self._release_active_datasets()
@@ -1239,6 +1327,7 @@ class PipelineQAApp(param.Parameterized):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
                     self._mount_zenith_sections(section_contents, banner=banner)
+                    self._clear_error()
                     self._log(f"Zenith review panels ready for {select_day}.")
                     self._finish_zenith_load(load_seq=load_seq)
 
@@ -1270,8 +1359,6 @@ class PipelineQAApp(param.Parameterized):
         if load_seq is not None and not self._is_current_load(load_seq):
             return
         self.loading_zenith = False
-        self._day_selector.disabled = self.converting
-        self._refresh_action_buttons()
         self._flush_log()
         self._execute(self._push_zenith_root)
 
@@ -1352,7 +1439,7 @@ class PipelineQAApp(param.Parameterized):
             open_full_size=self._open_modal,
         )
         self._qa_grid.objects = [thermal_grid]
-        self._refresh_convert_button()
+        self._clear_error()
         self._log(
             f"Loaded QA data for {select_day} "
             f"({len(payload.summary_df)} thermal-noise plot(s))."
@@ -1378,7 +1465,6 @@ class PipelineQAApp(param.Parameterized):
         if load_seq is not None and not self._is_current_load(load_seq):
             return
         self._log_error(f"Failed to load QA data for {select_day}: {exc}")
-        self._refresh_convert_button()
         self._flush_log()
 
     def _finish_load_day(
@@ -1390,8 +1476,6 @@ class PipelineQAApp(param.Parameterized):
         if load_seq is not None and not self._is_current_load(load_seq):
             return
         self.loading_day = False
-        self._day_selector.disabled = self.converting
-        self._refresh_action_buttons()
         if auto_zenith and load_seq is not None:
             self._auto_load_zenith_if_ready(load_seq)
 
@@ -1430,9 +1514,6 @@ class PipelineQAApp(param.Parameterized):
         self._scroll_log.clear()
         self._sync_log()
         self._log(f"Converting FITS → Zarr for {select_day}…")
-        self._convert_button.disabled = True
-        self._zenith_load_button.disabled = True
-        self._day_selector.disabled = True
 
         def _run() -> None:
             try:
@@ -1451,7 +1532,6 @@ class PipelineQAApp(param.Parameterized):
 
                 def _finish() -> None:
                     self.converting = False
-                    self._refresh_action_buttons()
                     self._sync_log()
 
                 self._execute(_finish)
@@ -1482,6 +1562,7 @@ class PipelineQAApp(param.Parameterized):
                 sizing_mode="stretch_width",
             ),
             log_section,
+            self._error_alert,
             pn.pane.Markdown("### Zenith review (Stokes I / V)"),
             pn.Row(self._zenith_load_button, sizing_mode="stretch_width"),
             self._zenith_slot,

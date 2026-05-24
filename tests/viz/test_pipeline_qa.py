@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import param
 import pytest
 
 pn = pytest.importorskip("panel")
@@ -15,6 +16,18 @@ widgets = pytest.importorskip("ipywidgets")
 
 from ovro_lwa_portal.viz import pipeline_qa as pq
 from ovro_lwa_portal.viz.pipeline_qa_app import PipelineQAApp
+
+
+def _set_select_day(
+    app: PipelineQAApp,
+    day: str,
+    *,
+    days: list[str] | None = None,
+) -> None:
+    """Set select_day with valid Selector objects (avoids spurious load callbacks)."""
+    options = days if days is not None else [day]
+    with param.parameterized.batch_call_watchers(app):
+        app._sync_day_selector(options, day)
 
 
 def _write_qa_tree(root: Path, *, obs_date: str = "2024-12-28", hour: str = "08h") -> None:
@@ -147,6 +160,7 @@ def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(layout, pn.Column)
     assert isinstance(app._zenith_review_row, pn.Row)
     assert set(app._zenith_section_content) == {"I", "V"}
+    assert app._sky_host.panel_row in layout.objects
 
 
 def test_display_pipeline_qa_app_displays_single_layout(
@@ -172,6 +186,37 @@ def test_display_pipeline_qa_app_displays_single_layout(
     assert isinstance(displayed[0], pn.Column)
 
 
+def test_format_activity_log_display_newest_first() -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _format_activity_log_display
+
+    text = "[12:00:01] first\n[12:00:02] second\n"
+    assert _format_activity_log_display(text) == "[12:00:02] second\n[12:00:01] first"
+
+
+def test_format_activity_log_html_is_scrollable() -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import (
+        ACTIVITY_LOG_HEIGHT_PX,
+        _format_activity_log_html,
+    )
+
+    html = _format_activity_log_html("[12:00:01] hello")
+    assert f"height:{ACTIVITY_LOG_HEIGHT_PX}px" in html
+    assert "overflow-y:auto" in html
+    assert "hello" in html
+
+
+def test_pipeline_qa_app_activity_log_is_fixed_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import ACTIVITY_LOG_HEIGHT_PX, PipelineQAApp
+
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+
+    assert isinstance(app._log_pane, pn.pane.HTML)
+    assert app._log_pane.height == ACTIVITY_LOG_HEIGHT_PX
+
+
 def test_convert_button_label_and_disabled() -> None:
     assert pq.convert_button_label({"I": True, "V": True}) == "Convert FITS → Zarr (complete)"
     assert pq.convert_button_label({"I": True, "V": False}) == "Convert Stokes V"
@@ -184,14 +229,16 @@ def test_refresh_convert_button_uses_primary_when_zarr_missing(
 ) -> None:
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
+    app._coverage = pd.DataFrame({"obs_date": ["2024-12-27"]})
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
         lambda _day: {"I": False, "V": False},
     )
-    app.select_day = "2024-12-27"
+    _set_select_day(app, "2024-12-27")
 
-    app._refresh_convert_button()
+    app._sync_action_controls()
 
     assert app._convert_button.button_type == "primary"
     assert app._convert_button.disabled is False
@@ -202,14 +249,16 @@ def test_refresh_convert_button_uses_default_when_zarr_complete(
 ) -> None:
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
+    app._coverage = pd.DataFrame({"obs_date": ["2024-12-27"]})
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
         lambda _day: {"I": True, "V": True},
     )
-    app.select_day = "2024-12-27"
+    _set_select_day(app, "2024-12-27")
 
-    app._refresh_convert_button()
+    app._sync_action_controls()
 
     assert app._convert_button.button_type == "default"
     assert app._convert_button.disabled is True
@@ -219,14 +268,15 @@ def test_day_selector_triggers_load_day(monkeypatch: pytest.MonkeyPatch) -> None
     calls: list[str] = []
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
+    app._coverage = pd.DataFrame({"obs_date": ["2024-12-27", "2024-12-28"]})
     monkeypatch.setattr(app, "_begin_load_day", lambda: calls.append(app.select_day or ""))
-    app.select_day = "2024-12-27"
-    app._loaded_day = None
+    _set_select_day(app, "2024-12-27", days=["2024-12-27", "2024-12-28"])
+    app._loaded_day = "2024-12-27"
+    calls.clear()
 
-    app._on_day_selector_changed(
-        type("Event", (), {"new": "2024-12-28"})(),  # type: ignore[arg-type]
-    )
+    app.select_day = "2024-12-28"
 
     assert app.select_day == "2024-12-28"
     assert calls == ["2024-12-28"]
@@ -292,6 +342,31 @@ def test_default_stat_slice_falls_back_to_first_finite_cell() -> None:
                 raise AssertionError("fallback should not read SKY")
 
     assert default_stat_slice(stat_map, _Dataset()) == (1, 2)
+
+
+def test_heatmap_hover_source_includes_cell_values() -> None:
+    from bokeh.models import HoverTool
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import (
+        _ZenithHeatmapSelector,
+        _build_heatmap_hover_source,
+    )
+
+    stat_map = np.array([[1.0, np.nan], [3.5, 4.0]])
+    source = _build_heatmap_hover_source(stat_map)
+    assert list(source.data["time_idx"]) == [0, 0, 1, 1]
+    assert list(source.data["freq_idx"]) == [0, 1, 0, 1]
+    assert source.data["value"][0] == 1.0
+    assert np.isnan(source.data["value"][1])
+
+    heatmap = _ZenithHeatmapSelector(
+        stat_map,
+        metric_label="STD",
+        time_idx=0,
+        freq_idx=0,
+        on_select=lambda _t, _f: None,
+    )
+    assert any(isinstance(tool, HoverTool) for tool in heatmap._plot.tools)
 
 
 def test_heatmap_cell_center_and_index_from_coord() -> None:
@@ -418,6 +493,79 @@ def test_zenith_review_panel_slice_updates_status(monkeypatch: pytest.MonkeyPatc
     assert pushed == [1]
 
 
+def test_zenith_slice_push_on_slider_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    import param
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel
+
+    monkeypatch.setattr(
+        ZenithReviewPanel,
+        "_bind_sky_dataset",
+        staticmethod(lambda widget, dataset: None),
+    )
+
+    class _Coord:
+        ra = type("RA", (), {"to_string": lambda self, **kwargs: "12:00:00"})()
+        dec = type("Dec", (), {"to_string": lambda self, **kwargs: "+00:00:00"})()
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zenith_lm_coord",
+        lambda dataset, time_idx: _Coord(),
+    )
+
+    stat_map = np.ones((4, 10))
+    freq_values = np.linspace(70e6, 90e6, 10)
+
+    class _Dataset:
+        sizes = {"time": 4, "frequency": 10}
+        frequency = type("Freq", (), {"values": freq_values})()
+
+    panel = ZenithReviewPanel(
+        _Dataset(),  # type: ignore[arg-type]
+        stat_map,
+        stokes_label="I",
+        metric_label="STD",
+    )
+    pushed: list[int] = []
+    panel.set_push_root(lambda: pushed.append(1))
+
+    with param.parameterized.batch_call_watchers(panel):
+        panel.time_idx = 2
+        panel.freq_idx = 4
+
+    assert pushed == [1]
+
+
+def test_pipeline_qa_app_shows_error_alert(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+
+    app._log_error("Something failed")
+
+    alert = app._error_alert_view()
+    assert isinstance(alert, pn.pane.Alert)
+    assert alert.object == "Something failed"
+
+
+def test_pipeline_qa_app_zenith_loading_indicator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+
+    app.loading_zenith = True
+    app._sync_zenith_loading_indicator()
+
+    assert app._zenith_loading_row.visible is True
+    assert app._zenith_loading_spinner.value is True
+
+    app.loading_zenith = False
+    app._sync_zenith_loading_indicator()
+
+    assert app._zenith_loading_row.visible is False
+    assert app._zenith_loading_spinner.value is False
+
+
 def test_finish_load_day_auto_starts_zenith(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[int] = []
     app = PipelineQAApp()
@@ -446,6 +594,7 @@ def test_auto_load_zenith_if_ready_requires_zarr(monkeypatch: pytest.MonkeyPatch
     calls: list[dict[str, int]] = []
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
@@ -457,7 +606,7 @@ def test_auto_load_zenith_if_ready_requires_zarr(monkeypatch: pytest.MonkeyPatch
         lambda *, load_seq: calls.append({"load_seq": load_seq}),
     )
     app._load_seq = 4
-    app.select_day = "2024-12-27"
+    _set_select_day(app, "2024-12-27")
     app._loaded_day = "2024-12-27"
 
     app._auto_load_zenith_if_ready(4)
@@ -471,6 +620,7 @@ def test_auto_load_zenith_if_ready_starts_when_zarr_exists(
     calls: list[dict[str, int]] = []
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
@@ -482,7 +632,7 @@ def test_auto_load_zenith_if_ready_starts_when_zarr_exists(
         lambda *, load_seq: calls.append({"load_seq": load_seq}),
     )
     app._load_seq = 5
-    app.select_day = "2024-12-27"
+    _set_select_day(app, "2024-12-27")
     app._loaded_day = "2024-12-27"
 
     app._auto_load_zenith_if_ready(5)
@@ -493,8 +643,9 @@ def test_auto_load_zenith_if_ready_starts_when_zarr_exists(
 def test_begin_zenith_load_rejects_stale_load_seq(monkeypatch: pytest.MonkeyPatch) -> None:
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app._load_seq = 2
-    app.select_day = "2024-12-27"
+    _set_select_day(app, "2024-12-27")
     app._loaded_day = "2024-12-27"
 
     app._begin_zenith_load(load_seq=1)
