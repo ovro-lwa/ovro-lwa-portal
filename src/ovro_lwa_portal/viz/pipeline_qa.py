@@ -6,6 +6,7 @@ import os
 import re
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -41,6 +42,56 @@ FITS_KEY_PATTERN = re.compile(
 )
 
 LogFn = Callable[[str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineQAConfig:
+    """Notebook-overridable paths and FITS discovery patterns for pipeline QA."""
+
+    pipeline_root: Path
+    symlink_root: Path
+    zarr_root: Path
+    i_fits_glob: str
+    v_fits_glob: str
+
+    @classmethod
+    def default(cls) -> PipelineQAConfig:
+        """Return module-default pipeline, staging, Zarr, and FITS glob settings."""
+        return cls(
+            pipeline_root=PIPELINE_ROOT,
+            symlink_root=SYMLINK_ROOT,
+            zarr_root=ZARR_ROOT,
+            i_fits_glob=I_FITS_GLOB,
+            v_fits_glob=V_FITS_GLOB,
+        )
+
+
+def resolve_pipeline_qa_config(
+    *,
+    config: PipelineQAConfig | None = None,
+    pipeline_root: Path | str | None = None,
+    symlink_root: Path | str | None = None,
+    zarr_root: Path | str | None = None,
+    i_fits_glob: str | None = None,
+    v_fits_glob: str | None = None,
+) -> PipelineQAConfig:
+    """Build a :class:`PipelineQAConfig`, applying only the arguments that are set."""
+    base = config or PipelineQAConfig.default()
+    if (
+        pipeline_root is None
+        and symlink_root is None
+        and zarr_root is None
+        and i_fits_glob is None
+        and v_fits_glob is None
+    ):
+        return base
+    return PipelineQAConfig(
+        pipeline_root=Path(pipeline_root) if pipeline_root is not None else base.pipeline_root,
+        symlink_root=Path(symlink_root) if symlink_root is not None else base.symlink_root,
+        zarr_root=Path(zarr_root) if zarr_root is not None else base.zarr_root,
+        i_fits_glob=i_fits_glob if i_fits_glob is not None else base.i_fits_glob,
+        v_fits_glob=v_fits_glob if v_fits_glob is not None else base.v_fits_glob,
+    )
 
 
 def run_sort_key(run_dir: Path) -> str:
@@ -79,9 +130,14 @@ def discover_hour_bins(root: Path) -> list[str]:
     )
 
 
-def scan_coverage(root: Path | None = None) -> pd.DataFrame:
+def scan_coverage(
+    root: Path | str | None = None,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> pd.DataFrame:
     """Build one row per (LST hour bin, observation day) from directory names."""
-    scan_root = PIPELINE_ROOT if root is None else root
+    cfg = config or PipelineQAConfig.default()
+    scan_root = Path(root) if root is not None else cfg.pipeline_root
     rows: list[dict[str, object]] = []
 
     for hour in discover_hour_bins(scan_root):
@@ -135,28 +191,42 @@ def qa_days(coverage: pd.DataFrame) -> list[str]:
     )
 
 
-def qa_zarr_path(pol: str, select_day: str) -> Path:
+def qa_zarr_path(
+    pol: str,
+    select_day: str,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> Path:
     """Output Zarr path for pipeline QA products on one observation day."""
+    cfg = config or PipelineQAConfig.default()
     day_tag = select_day.replace("-", "")
     stem = I_QA_ZARR_STEM if pol == "I" else V_QA_ZARR_STEM
-    return ZARR_ROOT / f"{stem}-{day_tag}.zarr"
+    return cfg.zarr_root / f"{stem}-{day_tag}.zarr"
 
 
-def zarr_status(select_day: str) -> dict[str, bool]:
+def zarr_status(
+    select_day: str,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> dict[str, bool]:
     """Return whether Stokes I/V QA Zarr stores exist for one day."""
     return {
-        "I": qa_zarr_path("I", select_day).exists(),
-        "V": qa_zarr_path("V", select_day).exists(),
+        "I": qa_zarr_path("I", select_day, config=config).exists(),
+        "V": qa_zarr_path("V", select_day, config=config).exists(),
     }
 
 
-def default_select_day(coverage: pd.DataFrame) -> str | None:
+def default_select_day(
+    coverage: pd.DataFrame,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> str | None:
     """Earliest QA day with Stokes I Zarr, else earliest QA day."""
     days = qa_days(coverage)
     if not days:
         return None
     for day in days:
-        if qa_zarr_path("I", day).exists():
+        if qa_zarr_path("I", day, config=config).exists():
             return day
     return days[0]
 
@@ -263,9 +333,16 @@ def flux_ratio_grids(flux_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return grids
 
 
-def collect_pol_fits(select_day: str, pol: str, coverage: pd.DataFrame) -> list[Path]:
+def collect_pol_fits(
+    select_day: str,
+    pol: str,
+    coverage: pd.DataFrame,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> list[Path]:
     """Collect deep pbcorr FITS for one Stokes parameter across all hours."""
-    glob_pattern = I_FITS_GLOB if pol == "I" else V_FITS_GLOB
+    cfg = config or PipelineQAConfig.default()
+    glob_pattern = cfg.i_fits_glob if pol == "I" else cfg.v_fits_glob
     fits_paths: list[Path] = []
     for run_path in day_rows(select_day, coverage)["run_path"]:
         run_dir = Path(run_path)
@@ -273,9 +350,15 @@ def collect_pol_fits(select_day: str, pol: str, coverage: pd.DataFrame) -> list[
     return fits_paths
 
 
-def infer_target_size_from_82mhz(select_day: str, coverage: pd.DataFrame) -> int:
+def infer_target_size_from_82mhz(
+    select_day: str,
+    coverage: pd.DataFrame,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> int:
     """Return the square pixel size of the 82 MHz I deep image for this day."""
-    ref_glob = f"{REF_SUBBAND}/I/deep/{I_FITS_GLOB}"
+    cfg = config or PipelineQAConfig.default()
+    ref_glob = f"{REF_SUBBAND}/I/deep/{cfg.i_fits_glob}"
     for run_path in day_rows(select_day, coverage)["run_path"]:
         matches = sorted(Path(run_path).glob(ref_glob))
         if not matches:
@@ -341,15 +424,19 @@ def convert_missing_zarr(
     select_day: str,
     coverage: pd.DataFrame,
     log: LogFn,
+    *,
+    config: PipelineQAConfig | None = None,
 ) -> dict[str, Path]:
     """Convert only missing Stokes I/V Zarr stores for one observation day."""
     if day_rows(select_day, coverage).empty:
         msg = f"No Wideband-qualified runs for {select_day}"
         raise RuntimeError(msg)
 
+    cfg = config or PipelineQAConfig.default()
+
     zarr_paths: dict[str, Path] = {
-        "I": qa_zarr_path("I", select_day),
-        "V": qa_zarr_path("V", select_day),
+        "I": qa_zarr_path("I", select_day, config=cfg),
+        "V": qa_zarr_path("V", select_day, config=cfg),
     }
 
     if zarr_paths["I"].exists() and zarr_paths["V"].exists():
@@ -363,11 +450,11 @@ def convert_missing_zarr(
     day_tag = select_day.replace("-", "")
 
     if not zarr_paths["I"].exists() or not zarr_paths["V"].exists():
-        target_size = infer_target_size_from_82mhz(select_day, coverage)
+        target_size = infer_target_size_from_82mhz(select_day, coverage, config=cfg)
         log(f"LM reference target size from {REF_SUBBAND}: {target_size} px")
         fits_by_pol = {
-            "I": collect_pol_fits(select_day, "I", coverage),
-            "V": collect_pol_fits(select_day, "V", coverage),
+            "I": collect_pol_fits(select_day, "I", coverage, config=cfg),
+            "V": collect_pol_fits(select_day, "V", coverage, config=cfg),
         }
         for pol, paths in fits_by_pol.items():
             log(f"Stokes {pol}: {len(paths)} FITS files")
@@ -379,15 +466,15 @@ def convert_missing_zarr(
             msg = f"No Stokes I FITS found for {select_day}"
             raise FileNotFoundError(msg)
 
-        staging_i = SYMLINK_ROOT / f"{I_QA_ZARR_STEM}-{day_tag}-fits"
+        staging_i = cfg.symlink_root / f"{I_QA_ZARR_STEM}-{day_tag}-fits"
         stage_symlinks(i_paths, staging_i)
         log(f"Staged {len(i_paths)} Stokes I files -> {staging_i}")
 
         zarr_paths["I"] = convert_fits_dir_to_zarr(
             input_dir=staging_i,
-            out_dir=ZARR_ROOT,
+            out_dir=cfg.zarr_root,
             zarr_name=zarr_paths["I"].name,
-            fixed_dir=SYMLINK_ROOT / f"{I_QA_ZARR_STEM}-{day_tag}-fixed",
+            fixed_dir=cfg.symlink_root / f"{I_QA_ZARR_STEM}-{day_tag}-fixed",
             chunk_lm=1024,
             rebuild=True,
             lm_reference_target_size=target_size,
@@ -405,15 +492,15 @@ def convert_missing_zarr(
             msg = f"No Stokes V FITS found for {select_day}"
             raise FileNotFoundError(msg)
 
-        staging_v = SYMLINK_ROOT / f"{V_QA_ZARR_STEM}-{day_tag}-fits"
+        staging_v = cfg.symlink_root / f"{V_QA_ZARR_STEM}-{day_tag}-fits"
         stage_v_fits_with_beam_from_i(v_paths, fits_by_pol["I"], staging_v)
         log(f"Staged {len(v_paths)} Stokes V files -> {staging_v}")
 
         zarr_paths["V"] = convert_fits_dir_to_zarr(
             input_dir=staging_v,
-            out_dir=ZARR_ROOT,
+            out_dir=cfg.zarr_root,
             zarr_name=zarr_paths["V"].name,
-            fixed_dir=SYMLINK_ROOT / f"{V_QA_ZARR_STEM}-{day_tag}-fixed",
+            fixed_dir=cfg.symlink_root / f"{V_QA_ZARR_STEM}-{day_tag}-fixed",
             chunk_lm=1024,
             rebuild=True,
             lm_reference_ds=lm_ref_ds,
@@ -430,14 +517,15 @@ def load_qa_datasets(
     log: LogFn,
     *,
     flush: Callable[[], None] | None = None,
+    config: PipelineQAConfig | None = None,
 ) -> dict[str, xr.Dataset]:
     """Load available Stokes I/V datasets for one day."""
-    status = zarr_status(select_day)
+    status = zarr_status(select_day, config=config)
     datasets: dict[str, xr.Dataset] = {}
     for pol, available in status.items():
         if not available:
             continue
-        zarr_path = qa_zarr_path(pol, select_day)
+        zarr_path = qa_zarr_path(pol, select_day, config=config)
         log(f"Opening Stokes {pol} Zarr at {zarr_path}…")
         if flush is not None:
             flush()

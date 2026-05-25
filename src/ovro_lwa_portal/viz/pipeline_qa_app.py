@@ -29,14 +29,15 @@ from bokeh.plotting import figure
 from ovro_lwa_portal.viz._imports import check_viz_deps
 from ovro_lwa_portal.viz.pipeline_qa import (
     LogFn,
+    PipelineQAConfig,
     convert_button_disabled,
     convert_button_label,
     convert_missing_zarr,
     day_summary_table,
-    default_select_day,
     load_flux_check_hybrid_dataframe,
     load_qa_datasets,
     qa_days,
+    resolve_pipeline_qa_config,
     scan_coverage,
     zarr_status,
 )
@@ -747,17 +748,29 @@ ZENITH_SKY_WIDGET_HEIGHT = 600
 ZENITH_SKY_LABEL_HEIGHT = 22
 ZENITH_SKY_PANE_HEIGHT = ZENITH_SKY_WIDGET_HEIGHT + ZENITH_SKY_LABEL_HEIGHT
 ZENITH_SKY_ROW_MARGIN = (0, 0, 0, 0)
+SKY_SLICE_DEBOUNCE_S = 0.25
+
+_ZENITH_SKY_STATUS_IDLE = (
+    "*Sky view: use the sliders or click a heatmap cell; the status line shows load progress.*"
+)
 
 
 class _StokesReviewHolder(param.Parameterized):
     """Builds Stokes I/V heatmaps and a shared sky view for zenith review."""
 
     sky_stokes = param.Selector(default="I", objects=["I", "V"], doc="Stokes parameter for sky view.")
+    loading_sky = param.Boolean(default=False, doc="True while the sky widget is updating.")
 
     def __init__(self) -> None:
         super().__init__()
         self._datasets: dict[str, xr.Dataset] = {}
         self._sky_widget: SkyWidget | None = None
+        self._sky_update_seq = 0
+        self._sky_debounce_timer: threading.Timer | None = None
+        self._sky_debounce_lock = threading.Lock()
+        self._sky_slice_debounce_s = SKY_SLICE_DEBOUNCE_S
+        self._sky_async = True
+        self._pending_reset_center = False
         self._slice_selection = ZenithSliceSelection()
         self._slice_watcher = self._slice_selection.param.watch(
             self._on_slice_selection_changed,
@@ -807,8 +820,35 @@ class _StokesReviewHolder(param.Parameterized):
             sizing_mode="fixed",
             margin=ZENITH_SKY_ROW_MARGIN,
         )
+        self._sky_status_pane = pn.pane.Markdown(
+            _ZENITH_SKY_STATUS_IDLE,
+            sizing_mode="stretch_width",
+            max_width=ZENITH_REVIEW_ROW_WIDTH,
+        )
+        self._sky_loading_spinner = pn.indicators.LoadingSpinner(
+            value=False,
+            size=20,
+            name="Updating sky view",
+        )
+        self._sky_loading_label = pn.pane.Markdown("", sizing_mode="stretch_width")
+        self._sky_loading_row = pn.Row(
+            self._sky_loading_spinner,
+            self._sky_loading_label,
+            visible=False,
+            sizing_mode="stretch_width",
+            max_width=ZENITH_REVIEW_ROW_WIDTH,
+        )
+        self._sky_error_alert = pn.pane.Alert(
+            alert_type="danger",
+            visible=False,
+            sizing_mode="stretch_width",
+            max_width=ZENITH_REVIEW_ROW_WIDTH,
+        )
         self._zenith_footer = pn.Column(
             self._controls_row,
+            self._sky_status_pane,
+            self._sky_loading_row,
+            self._sky_error_alert,
             self._sky_pane,
             sizing_mode="stretch_width",
             max_width=ZENITH_REVIEW_ROW_WIDTH,
@@ -818,6 +858,7 @@ class _StokesReviewHolder(param.Parameterized):
         }
         self._sky_bound_stokes: str | None = None
         self._skip_sky_watch = False
+        self.param.watch(self._sync_sky_loading_indicator, "loading_sky")
 
     @property
     def zenith_footer(self) -> pn.Column:
@@ -835,14 +876,193 @@ class _StokesReviewHolder(param.Parameterized):
     def set_push_root(self, callback: Callable[[], None] | None) -> None:
         self._slice_selection.set_push_root(callback)
 
+    def _sky_slice_label(self) -> str:
+        return (
+            f"time {int(self._slice_selection.time_idx)}, "
+            f"freq {int(self._slice_selection.freq_idx)}"
+        )
+
+    def _update_sky_status(self, *, phase: str) -> None:
+        """Refresh the sky status markdown (selection vs load state)."""
+        stokes = self.sky_stokes
+        slice_label = self._sky_slice_label()
+        messages = {
+            "idle": _ZENITH_SKY_STATUS_IDLE,
+            "pending": f"**Sky (Stokes {stokes})** · {slice_label} · *queued…*",
+            "loading_dataset": f"**Sky** · opening Stokes {stokes} cube…",
+            "loading_slice": f"**Sky (Stokes {stokes})** · {slice_label} · *loading slice…*",
+            "ready": f"**Sky (Stokes {stokes})** · {slice_label} · ready",
+            "error": f"**Sky (Stokes {stokes})** · {slice_label} · update failed",
+        }
+        self._sky_status_pane.object = messages.get(phase, messages["idle"])
+
+    def _sync_sky_loading_indicator(self, *_events: param.parameterized.Event) -> None:
+        self._sky_loading_row.visible = self.loading_sky
+        self._sky_loading_spinner.value = self.loading_sky
+
+    def _push_sky_ui(self) -> None:
+        _push_panel_layout(
+            self._sky_status_pane,
+            self._sky_loading_row,
+            self._sky_error_alert,
+            self._zenith_footer,
+        )
+
+    def _clear_sky_error(self) -> None:
+        self._sky_error_alert.object = ""
+        self._sky_error_alert.visible = False
+
+    def _show_sky_error(self, message: str) -> None:
+        self._sky_error_alert.object = message
+        self._sky_error_alert.visible = True
+
+    def _cancel_sky_debounce(self) -> None:
+        with self._sky_debounce_lock:
+            if self._sky_debounce_timer is not None:
+                self._sky_debounce_timer.cancel()
+                self._sky_debounce_timer = None
+
+    def _request_sky_update(self, *, debounce: bool = True) -> None:
+        """Queue a sky slice update with immediate status feedback."""
+        if self._sky_widget is None:
+            return
+        if debounce and self._sky_slice_debounce_s > 0:
+            self._update_sky_status(phase="pending")
+            self._push_sky_ui()
+            self._cancel_sky_debounce()
+
+            def _fire() -> None:
+                _run_on_main_thread(self._start_sky_update)
+
+            with self._sky_debounce_lock:
+                self._sky_debounce_timer = threading.Timer(self._sky_slice_debounce_s, _fire)
+                self._sky_debounce_timer.daemon = True
+                self._sky_debounce_timer.start()
+            return
+        self._start_sky_update()
+
+    def _start_sky_update(self) -> None:
+        """Load or refresh the sky widget for the current slice selection."""
+        self._cancel_sky_debounce()
+        if self._sky_widget is None:
+            return
+
+        self._sky_update_seq += 1
+        request_id = self._sky_update_seq
+        reset_center = self._pending_reset_center
+        self._pending_reset_center = False
+        rebind = self._sky_bound_stokes != self.sky_stokes
+        time_idx = int(self._slice_selection.time_idx)
+        freq_idx = int(self._slice_selection.freq_idx)
+        stokes = self.sky_stokes
+
+        self.loading_sky = True
+        self._clear_sky_error()
+        status_phase = "loading_dataset" if rebind else "loading_slice"
+        self._update_sky_status(phase=status_phase)
+        self._sky_loading_label.object = (
+            f"*Opening Stokes {stokes} cube…*"
+            if rebind
+            else f"*Loading slice ({time_idx}, {freq_idx})…*"
+        )
+        self._sync_sky_loading_indicator()
+        self._push_sky_ui()
+
+        def _apply_on_main() -> None:
+            if request_id != self._sky_update_seq:
+                return
+            center: SkyCoord | None = None
+            fov: Any = None
+            try:
+                if reset_center:
+                    dataset = self._datasets.get(stokes)
+                    if dataset is None:
+                        msg = f"No dataset loaded for Stokes {stokes}"
+                        raise ValueError(msg)
+                    center = zenith_lm_coord(dataset, time_idx)
+                    fov = DEFAULT_FOV_DEG * u.deg
+                self._execute_sky_update(
+                    request_id=request_id,
+                    rebind=rebind,
+                    time_idx=time_idx,
+                    freq_idx=freq_idx,
+                    stokes=stokes,
+                    reset_center=reset_center,
+                    center=center,
+                    fov=fov,
+                )
+            except Exception as exc:
+                self._finish_sky_update(request_id, exc)
+                return
+            self._finish_sky_update(request_id, None)
+
+        def _run_job() -> None:
+            if self._sky_async:
+                _run_on_main_thread(_apply_on_main)
+            else:
+                _apply_on_main()
+
+        if self._sky_async:
+            threading.Thread(target=_run_job, daemon=True).start()
+        else:
+            _run_job()
+
+    def _execute_sky_update(
+        self,
+        *,
+        request_id: int,
+        rebind: bool,
+        time_idx: int,
+        freq_idx: int,
+        stokes: str,
+        reset_center: bool,
+        center: SkyCoord | None,
+        fov: Any,
+    ) -> None:
+        if request_id != self._sky_update_seq:
+            return
+        widget = self._sky_widget
+        if widget is None:
+            return
+        dataset = self._datasets.get(stokes)
+        if dataset is None:
+            msg = f"No dataset loaded for Stokes {stokes}"
+            raise ValueError(msg)
+        if rebind or self._sky_bound_stokes != stokes:
+            self._bind_sky_dataset(widget, dataset)
+            self._sky_bound_stokes = stokes
+        kwargs: dict[str, Any] = {
+            "percentile_low": 2,
+            "percentile_high": 98,
+        }
+        if reset_center and center is not None and fov is not None:
+            kwargs["center"] = center
+            kwargs["fov"] = fov
+        widget.update_slice(time_idx, freq_idx, **kwargs)
+
+    def _finish_sky_update(self, request_id: int, error: BaseException | None) -> None:
+        if request_id != self._sky_update_seq:
+            return
+        self.loading_sky = False
+        if error is not None:
+            self._show_sky_error(str(error))
+            self._update_sky_status(phase="error")
+        else:
+            self._clear_sky_error()
+            self._update_sky_status(phase="ready")
+        self._sky_loading_label.object = ""
+        self._sync_sky_loading_indicator()
+        self._push_sky_ui()
+
     def _on_slice_selection_changed(self, *events: param.parameterized.Event) -> None:
         """Sync status and sky view when sliders or heatmap taps change the slice."""
         if self._skip_sky_watch:
             return
         self._sync_zenith_status_lines()
         event = events[0] if events else None
-        reset_center = event is None or getattr(event, "name", None) == "time_idx"
-        self._update_sky_view(reset_center=reset_center)
+        if event is None or getattr(event, "name", None) == "time_idx":
+            self._pending_reset_center = True
+        self._request_sky_update(debounce=True)
 
     def _sync_zenith_status_lines(self) -> None:
         """Refresh per-column status markdown from the shared slice (no Bokeh push)."""
@@ -855,7 +1075,8 @@ class _StokesReviewHolder(param.Parameterized):
     def _on_sky_stokes_changed(self, *_events: param.parameterized.Event) -> None:
         if self._skip_sky_watch:
             return
-        self._update_sky_view(reset_center=True)
+        self._pending_reset_center = True
+        self._request_sky_update(debounce=False)
 
     def select_slice_from_heatmap(self, stokes: str, time_idx: int, freq_idx: int) -> None:
         """Set shared time/frequency and switch sky view to the clicked heatmap's Stokes."""
@@ -874,7 +1095,8 @@ class _StokesReviewHolder(param.Parameterized):
                     self._slice_selection.time_idx = time_idx
                     self._slice_selection.freq_idx = freq_idx
                 self._sync_zenith_status_lines()
-                self._update_sky_view(reset_center=True)
+                self._pending_reset_center = True
+                self._request_sky_update(debounce=False)
             finally:
                 self._skip_sky_watch = False
 
@@ -884,17 +1106,6 @@ class _StokesReviewHolder(param.Parameterized):
     def _bind_sky_dataset(widget: SkyWidget, dataset: xr.Dataset) -> None:
         """Load cube only; first frame comes from :meth:`update_slice`."""
         widget.set_dataset(dataset, max_size=1024, defer_display=True)
-
-    def _rebind_sky_dataset_if_needed(self) -> xr.Dataset | None:
-        if self._sky_widget is None:
-            return None
-        dataset = self._datasets.get(self.sky_stokes)
-        if dataset is None:
-            return None
-        if self._sky_bound_stokes != self.sky_stokes:
-            self._bind_sky_dataset(self._sky_widget, dataset)
-            self._sky_bound_stokes = self.sky_stokes
-        return dataset
 
     def bind_datasets(self, datasets: dict[str, xr.Dataset]) -> None:
         """Remember loaded Stokes datasets and constrain the sky-view toggle."""
@@ -935,29 +1146,22 @@ class _StokesReviewHolder(param.Parameterized):
             self._sky_widget,
         ]
         self._sky_bound_stokes = None
-        self._update_sky_view(reset_center=True)
+        self._pending_reset_center = True
+        self._update_sky_status(phase="idle")
+        self._request_sky_update(debounce=False)
 
     def reset_sky(self) -> None:
         """Restore the sky-view placeholder."""
+        self._cancel_sky_debounce()
+        self._sky_update_seq += 1
+        self.loading_sky = False
         self._sky_widget = None
         self._sky_bound_stokes = None
+        self._clear_sky_error()
+        self._update_sky_status(phase="idle")
+        self._sky_loading_label.object = ""
+        self._sync_sky_loading_indicator()
         self._sky_container.children = [widgets.HTML(_ZENITH_SKY_PLACEHOLDER)]
-
-    def _update_sky_view(self, *, reset_center: bool = False) -> None:
-        """Push one slice via astrowidget (same path as :class:`astrowidget.SkyViewer`)."""
-        dataset = self._rebind_sky_dataset_if_needed()
-        if dataset is None or self._sky_widget is None:
-            return
-        time_idx = int(self._slice_selection.time_idx)
-        freq_idx = int(self._slice_selection.freq_idx)
-        kwargs: dict[str, Any] = {
-            "percentile_low": 2,
-            "percentile_high": 98,
-        }
-        if reset_center:
-            kwargs["center"] = zenith_lm_coord(dataset, time_idx)
-            kwargs["fov"] = DEFAULT_FOV_DEG * u.deg
-        self._sky_widget.update_slice(time_idx, freq_idx, **kwargs)
 
     def _configure_slice_selection(self) -> None:
         """Set shared slider bounds and default slice from the first loaded panel."""
@@ -1178,8 +1382,14 @@ class PipelineQAApp(param.Parameterized):
     loading_day = param.Boolean(default=False)
     loading_zenith = param.Boolean(default=False)
 
-    def __init__(self, **params: Any) -> None:
+    def __init__(
+        self,
+        *,
+        qa_config: PipelineQAConfig | None = None,
+        **params: Any,
+    ) -> None:
         super().__init__(**params)
+        self._qa_config = qa_config or PipelineQAConfig.default()
         self._coverage: pd.DataFrame = pd.DataFrame()
         self._scroll_log = ScrollLog()
         self._summary_df: pd.DataFrame = pd.DataFrame()
@@ -1410,7 +1620,7 @@ class PipelineQAApp(param.Parameterized):
         if self.select_day is None:
             self._zenith_load_button.disabled = True
             return
-        status = zarr_status(self.select_day)
+        status = zarr_status(self.select_day, config=self._qa_config)
         has_zarr = status["I"] or status["V"]
         day_ready = self._loaded_day == self.select_day
         self._zenith_load_button.disabled = (
@@ -1462,7 +1672,7 @@ class PipelineQAApp(param.Parameterized):
             self._convert_button.disabled = True
             self._convert_button.button_type = "default"
             return
-        status = zarr_status(self.select_day)
+        status = zarr_status(self.select_day, config=self._qa_config)
         zarr_complete = status["I"] and status["V"]
         self._convert_button.name = convert_button_label(status)
         self._convert_button.disabled = convert_button_disabled(
@@ -1480,9 +1690,8 @@ class PipelineQAApp(param.Parameterized):
 
         def _run() -> None:
             try:
-                coverage = scan_coverage()
+                coverage = scan_coverage(config=self._qa_config)
                 days = qa_days(coverage)
-                default_day = default_select_day(coverage)
 
                 def _apply() -> None:
                     self._coverage = coverage
@@ -1492,10 +1701,10 @@ class PipelineQAApp(param.Parameterized):
                         self._sync_day_selector([], None)
                     else:
                         self._clear_error()
-                        self._sync_day_selector(days, default_day)
+                        self._sync_day_selector(days, None)
                         self._log(
                             f"Found {len(days)} Wideband QA day(s). "
-                            f"Loading {default_day}…"
+                            "Select a day from the dropdown to load QA data."
                         )
                     self._sync_log()
 
@@ -1530,7 +1739,7 @@ class PipelineQAApp(param.Parameterized):
             return
         if self.select_day is None or self._loaded_day != self.select_day:
             return
-        status = zarr_status(self.select_day)
+        status = zarr_status(self.select_day, config=self._qa_config)
         if not (status["I"] or status["V"]):
             return
         self._begin_zenith_load(load_seq=load_seq)
@@ -1563,7 +1772,7 @@ class PipelineQAApp(param.Parameterized):
             try:
                 if not self._is_current_load(load_seq):
                     raise _LoadSuperseded
-                status = zarr_status(select_day)
+                status = zarr_status(select_day, config=self._qa_config)
                 if not (status["I"] or status["V"]):
                     section_contents = self._stokes_review.build_no_zarr_contents()
                     banner = _NO_QA_ZARR_MESSAGE
@@ -1572,6 +1781,7 @@ class PipelineQAApp(param.Parameterized):
                         select_day,
                         self._log,
                         flush=self._flush_log,
+                        config=self._qa_config,
                     )
                     if not self._is_current_load(load_seq):
                         raise _LoadSuperseded
@@ -1667,7 +1877,7 @@ class PipelineQAApp(param.Parameterized):
         if not self._is_current_load(load_seq):
             raise _LoadSuperseded
 
-        status = zarr_status(select_day)
+        status = zarr_status(select_day, config=self._qa_config)
         if status["I"] or status["V"]:
             self._log(
                 f"QA Zarr available for {select_day}. "
@@ -1788,20 +1998,25 @@ class PipelineQAApp(param.Parameterized):
                     select_day,
                     self._coverage,
                     lambda msg: self._log(msg, sync=True, defer=True),
+                    config=self._qa_config,
                 )
-                self._execute(lambda: self._load_day(silent=False))
             except Exception as exc:
+
                 def _fail() -> None:
-                    self._log_error(f"Conversion failed: {exc}")
-
-                self._execute(_fail)
-            finally:
-
-                def _finish() -> None:
                     self.converting = False
+                    self._log_error(f"Conversion failed: {exc}")
                     self._sync_log()
 
-                self._execute(_finish)
+                _schedule_ipython_main(_fail)
+                return
+
+            def _after_convert() -> None:
+                # Clear converting before refresh so _auto_load_zenith_if_ready is not blocked.
+                self.converting = False
+                self._load_day(silent=False)
+                self._sync_log()
+
+            _schedule_ipython_main(_after_convert)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -1853,8 +2068,34 @@ class PipelineQAApp(param.Parameterized):
         return self._layout
 
 
-def display_pipeline_qa_app(app: PipelineQAApp | None = None) -> PipelineQAApp:
-    """Display the QA dashboard in JupyterLab (single Panel document + embedded sky view)."""
+def display_pipeline_qa_app(
+    app: PipelineQAApp | None = None,
+    *,
+    qa_config: PipelineQAConfig | None = None,
+    pipeline_root: Path | str | None = None,
+    symlink_root: Path | str | None = None,
+    zarr_root: Path | str | None = None,
+    i_fits_glob: str | None = None,
+    v_fits_glob: str | None = None,
+) -> PipelineQAApp:
+    """Display the QA dashboard in JupyterLab (single Panel document + embedded sky view).
+
+    Parameters
+    ----------
+    app
+        Existing app instance. When omitted, a new :class:`PipelineQAApp` is created.
+    qa_config
+        Full configuration object. Individual path/glob arguments override fields on
+        ``qa_config`` when both are provided.
+    pipeline_root
+        Root of the exopipe phase1 tree to scan for Wideband QA runs.
+    symlink_root
+        Directory for FITS symlink staging and fixed-header side products during conversion.
+    zarr_root
+        Directory where per-day Stokes I/V QA Zarr stores are written and loaded from.
+    i_fits_glob, v_fits_glob
+        Glob patterns (under ``{run}/*/{I|V}/deep/``) used for FITS→Zarr conversion.
+    """
     from IPython.display import display
 
     try:
@@ -1862,7 +2103,15 @@ def display_pipeline_qa_app(app: PipelineQAApp | None = None) -> PipelineQAApp:
     except Exception as exc:
         logger.debug("Panel ipywidgets extension unavailable: %s", exc)
 
-    app = app or PipelineQAApp()
+    resolved_config = resolve_pipeline_qa_config(
+        config=qa_config,
+        pipeline_root=pipeline_root,
+        symlink_root=symlink_root,
+        zarr_root=zarr_root,
+        i_fits_glob=i_fits_glob,
+        v_fits_glob=v_fits_glob,
+    )
+    app = app or PipelineQAApp(qa_config=resolved_config)
     app._build_layouts()
 
     if not app._scan_started:

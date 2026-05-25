@@ -121,6 +121,64 @@ def test_build_thermal_noise_grid(tmp_path: Path) -> None:
     assert len(row.objects) == 2
 
 
+def test_scan_coverage_uses_config_pipeline_root(tmp_path: Path) -> None:
+    _write_qa_tree(tmp_path)
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+    )
+    coverage = pq.scan_coverage(config=cfg)
+    assert coverage.iloc[0]["latest_run"] == "Run_20241228_120000"
+
+
+def test_collect_pol_fits_uses_config_glob(tmp_path: Path) -> None:
+    _write_qa_tree(tmp_path)
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob="*Robust-0.75-image*.pbcorr.fits",
+        v_fits_glob=pq.V_FITS_GLOB,
+    )
+    coverage = pq.scan_coverage(config=cfg)
+    paths = pq.collect_pol_fits("2024-12-28", "I", coverage, config=cfg)
+    assert len(paths) == 1
+    assert paths[0].name.endswith(".pbcorr.fits")
+
+
+def test_resolve_pipeline_qa_config_overrides_fields() -> None:
+    custom_root = Path("/custom/root")
+    custom_stage = Path("/custom/stage")
+    custom_zarr = Path("/custom/zarr")
+    cfg = pq.resolve_pipeline_qa_config(
+        pipeline_root=custom_root,
+        symlink_root=custom_stage,
+        zarr_root=custom_zarr,
+        i_fits_glob="*custom-I*.fits",
+    )
+    assert cfg.pipeline_root == custom_root
+    assert cfg.symlink_root == custom_stage
+    assert cfg.zarr_root == custom_zarr
+    assert cfg.i_fits_glob == "*custom-I*.fits"
+    assert cfg.v_fits_glob == pq.V_FITS_GLOB
+
+
+def test_qa_zarr_path_uses_config_zarr_root(tmp_path: Path) -> None:
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+    )
+    path = pq.qa_zarr_path("I", "2024-12-28", config=cfg)
+    assert path.parent == tmp_path / "zarr"
+    assert path.name == "pipelineQA-I-Deep-Taper-Robust-0.75-20241228.zarr"
+
+
 def test_scan_coverage_finds_wideband_runs(tmp_path: Path) -> None:
     _write_qa_tree(tmp_path)
     coverage = pq.scan_coverage(tmp_path)
@@ -294,7 +352,7 @@ def test_refresh_convert_button_uses_primary_when_zarr_missing(
     app._coverage = pd.DataFrame({"obs_date": ["2024-12-27"]})
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
-        lambda _day: {"I": False, "V": False},
+        lambda _day, **kwargs: {"I": False, "V": False},
     )
     _set_select_day(app, "2024-12-27")
 
@@ -314,7 +372,7 @@ def test_refresh_convert_button_uses_default_when_zarr_complete(
     app._coverage = pd.DataFrame({"obs_date": ["2024-12-27"]})
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
-        lambda _day: {"I": True, "V": True},
+        lambda _day, **kwargs: {"I": True, "V": True},
     )
     _set_select_day(app, "2024-12-27")
 
@@ -322,6 +380,42 @@ def test_refresh_convert_button_uses_default_when_zarr_complete(
 
     assert app._convert_button.button_type == "default"
     assert app._convert_button.disabled is True
+
+
+def test_initial_scan_does_not_auto_select_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+    monkeypatch.setattr(app, "_execute", lambda callback: callback())
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+
+    load_calls: list[str] = []
+    monkeypatch.setattr(app, "_begin_load_day", lambda: load_calls.append("load"))
+
+    app._start_initial_scan()
+
+    assert app.select_day is None
+    assert "2024-12-28" in app.param.select_day.objects
+    assert load_calls == []
+    assert "Select a day" in app.log_text
 
 
 def test_day_selector_triggers_load_day(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -711,7 +805,7 @@ def test_heatmap_click_sets_sky_stokes(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(
         _StokesReviewHolder,
-        "_update_sky_view",
+        "_request_sky_update",
         lambda self, **kwargs: None,
     )
     monkeypatch.setattr(
@@ -782,7 +876,7 @@ def test_zenith_slice_syncs_status_on_slider_change(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(
         _StokesReviewHolder,
-        "_update_sky_view",
+        "_request_sky_update",
         lambda self, **kwargs: None,
     )
 
@@ -880,7 +974,7 @@ def test_auto_load_zenith_if_ready_requires_zarr(monkeypatch: pytest.MonkeyPatch
     app.scanning = False
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
-        lambda _day: {"I": False, "V": False},
+        lambda _day, **kwargs: {"I": False, "V": False},
     )
     monkeypatch.setattr(
         app,
@@ -906,7 +1000,7 @@ def test_auto_load_zenith_if_ready_starts_when_zarr_exists(
     app.scanning = False
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
-        lambda _day: {"I": True, "V": False},
+        lambda _day, **kwargs: {"I": True, "V": False},
     )
     monkeypatch.setattr(
         app,
@@ -935,6 +1029,66 @@ def test_begin_zenith_load_rejects_stale_load_seq(monkeypatch: pytest.MonkeyPatc
     assert app.loading_zenith is False
 
 
+def test_begin_zenith_load_skipped_while_converting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Post-convert day refresh must clear converting before zenith auto-load runs."""
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
+    _set_select_day(app, "2024-12-27")
+    app._loaded_day = "2024-12-27"
+    app.converting = True
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day, **kwargs: {"I": True, "V": True},
+    )
+
+    app._begin_zenith_load()
+
+    assert app.loading_zenith is False
+
+
+def test_convert_success_schedules_refresh_after_clearing_converting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[bool] = []
+    scheduled: list[Callable[[], None]] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    _set_select_day(app, "2024-12-27")
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.convert_missing_zarr",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._schedule_ipython_main",
+        lambda callback: scheduled.append(callback),
+    )
+
+    def _load_day(*, silent: bool) -> None:
+        observed.append(app.converting)
+
+    monkeypatch.setattr(app, "_load_day", _load_day)
+
+    app._on_convert_click(None)
+    while scheduled:
+        scheduled.pop(0)()
+
+    assert observed == [False]
+
+
+def _configure_sky_holder_for_sync_tests(
+    holder: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run sky updates synchronously without slider debounce (unit tests)."""
+    holder._sky_async = False  # type: ignore[attr-defined]
+    holder._sky_slice_debounce_s = 0.0  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
+        lambda callback: callback(),
+    )
+
+
 def test_slider_freq_change_keeps_sky_view(monkeypatch: pytest.MonkeyPatch) -> None:
     import astropy.units as u
 
@@ -958,6 +1112,7 @@ def test_slider_freq_change_keeps_sky_view(monkeypatch: pytest.MonkeyPatch) -> N
         sizes = {"time": 4, "frequency": 10}
 
     holder = _StokesReviewHolder()
+    _configure_sky_holder_for_sync_tests(holder, monkeypatch)
     holder._sky_widget = fake  # type: ignore[assignment]
     holder._sky_bound_stokes = "I"
     holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
@@ -1002,6 +1157,7 @@ def test_slider_time_change_recenters_sky_view(monkeypatch: pytest.MonkeyPatch) 
         sizes = {"time": 4, "frequency": 10}
 
     holder = _StokesReviewHolder()
+    _configure_sky_holder_for_sync_tests(holder, monkeypatch)
     holder._sky_widget = fake  # type: ignore[assignment]
     holder._sky_bound_stokes = "I"
     holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
@@ -1060,14 +1216,10 @@ def test_stokes_toggle_updates_sky_once(monkeypatch: pytest.MonkeyPatch) -> None
         sizes = {"time": 4, "frequency": 10}
 
     holder = _StokesReviewHolder()
+    _configure_sky_holder_for_sync_tests(holder, monkeypatch)
     holder._sky_widget = fake  # type: ignore[assignment]
     holder.bind_datasets({"I": _Dataset(), "V": _Dataset()})  # type: ignore[arg-type]
     holder._configure_slice_selection()
-
-    monkeypatch.setattr(
-        "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
-        lambda callback: callback(),
-    )
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.zenith_lm_coord",
         lambda dataset, time_idx: type(
@@ -1087,6 +1239,149 @@ def test_stokes_toggle_updates_sky_once(monkeypatch: pytest.MonkeyPatch) -> None
     assert fake.set_dataset_calls[0]["defer_display"] is True
     assert len(fake.update_slice_calls) == 1
     assert fake.update_slice_calls[0]["fov"] == 25.0 * u.deg
+
+
+def test_stokes_review_sky_loading_indicator(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    class _FakeSky:
+        def set_dataset(self, dataset, **kwargs) -> None:
+            return None
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            return None
+
+    class _Dataset:
+        sizes = {"time": 2, "frequency": 3}
+
+    holder = _StokesReviewHolder()
+    _configure_sky_holder_for_sync_tests(holder, monkeypatch)
+    holder._sky_widget = _FakeSky()  # type: ignore[assignment]
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder._sky_bound_stokes = "I"
+    holder.slice_selection.configure(
+        n_times=2,
+        n_freqs=3,
+        default_time=0,
+        default_freq=0,
+    )
+
+    holder.loading_sky = True
+    holder._sync_sky_loading_indicator()
+
+    assert holder._sky_loading_row.visible is True
+    assert holder._sky_loading_spinner.value is True
+
+    holder.loading_sky = False
+    holder._sync_sky_loading_indicator()
+
+    assert holder._sky_loading_row.visible is False
+    assert holder._sky_loading_spinner.value is False
+
+
+def test_sky_update_sets_ready_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    class _FakeSky:
+        def set_dataset(self, dataset, **kwargs) -> None:
+            return None
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            return None
+
+    class _Dataset:
+        sizes = {"time": 2, "frequency": 3}
+
+    holder = _StokesReviewHolder()
+    _configure_sky_holder_for_sync_tests(holder, monkeypatch)
+    holder._sky_widget = _FakeSky()  # type: ignore[assignment]
+    holder._sky_bound_stokes = "I"
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder.slice_selection.configure(
+        n_times=2,
+        n_freqs=3,
+        default_time=0,
+        default_freq=0,
+    )
+    holder.slice_selection.freq_idx = 1
+
+    assert "ready" in holder._sky_status_pane.object
+    assert holder.loading_sky is False
+
+
+def test_sky_update_shows_error_alert(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    class _FakeSky:
+        def set_dataset(self, dataset, **kwargs) -> None:
+            return None
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            msg = "slice failed"
+            raise RuntimeError(msg)
+
+    class _Dataset:
+        sizes = {"time": 2, "frequency": 3}
+
+    holder = _StokesReviewHolder()
+    _configure_sky_holder_for_sync_tests(holder, monkeypatch)
+    holder._sky_widget = _FakeSky()  # type: ignore[assignment]
+    holder._sky_bound_stokes = "I"
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder.slice_selection.configure(
+        n_times=2,
+        n_freqs=3,
+        default_time=0,
+        default_freq=0,
+    )
+    holder._request_sky_update(debounce=False)
+
+    assert holder._sky_error_alert.visible is True
+    assert "slice failed" in holder._sky_error_alert.object
+    assert "failed" in holder._sky_status_pane.object
+
+
+def test_sky_slider_debounce_coalesces_updates(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    calls: list[int] = []
+
+    class _FakeSky:
+        def set_dataset(self, dataset, **kwargs) -> None:
+            return None
+
+        def update_slice(self, time_idx, freq_idx, **kwargs) -> None:
+            calls.append(int(freq_idx))
+
+    class _Dataset:
+        sizes = {"time": 4, "frequency": 4}
+
+    holder = _StokesReviewHolder()
+    holder._sky_async = False
+    holder._sky_slice_debounce_s = 0.05
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._run_on_main_thread",
+        lambda callback: callback(),
+    )
+    holder._sky_widget = _FakeSky()  # type: ignore[assignment]
+    holder._sky_bound_stokes = "I"
+    holder.bind_datasets({"I": _Dataset()})  # type: ignore[arg-type]
+    holder.slice_selection.configure(
+        n_times=4,
+        n_freqs=4,
+        default_time=0,
+        default_freq=0,
+    )
+
+    import time
+
+    holder.slice_selection.freq_idx = 1
+    holder.slice_selection.freq_idx = 2
+    holder.slice_selection.freq_idx = 3
+    time.sleep(0.12)
+
+    assert calls == [3]
+    assert "ready" in holder._sky_status_pane.object
 
 
 def test_stokes_review_holder_mount_sky_updates_container(
@@ -1114,7 +1409,7 @@ def test_stokes_review_holder_mount_sky_updates_container(
     )
     monkeypatch.setattr(
         _StokesReviewHolder,
-        "_update_sky_view",
+        "_request_sky_update",
         lambda self, **kwargs: None,
     )
 
@@ -1125,6 +1420,8 @@ def test_stokes_review_holder_mount_sky_updates_container(
     holder.mount_sky()
 
     assert len(holder._sky_container.children) == 2
+    assert holder._sky_status_pane in holder._zenith_footer.objects
+    assert holder._sky_loading_row in holder._zenith_footer.objects
     assert isinstance(holder._sky_container.children[1], _FakeSky)
     assert holder.sky_widget is not None
     assert holder._sky_pane.width == 1048
