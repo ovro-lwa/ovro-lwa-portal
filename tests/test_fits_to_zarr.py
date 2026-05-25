@@ -1901,6 +1901,87 @@ def test_fix_headers_leaves_crval_without_image_timestamp_in_name(tmp_path: Path
     assert hdr["CRVAL2"] == pytest.approx(2.5)
 
 
+def test_collapse_wcs_header_str_when_ra_dec_have_no_frequency_dim():
+    """Single-subband combine can leave wcs_header_str on (frequency,) while RA/Dec are (l, m)."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    hdr_a, hdr_b = b"hdr-a", b"hdr-b"
+    ds = xr.Dataset(
+        {
+            "SKY": (("l", "m"), np.ones((4, 5))),
+            "wcs_header_str": (("frequency",), np.array([np.bytes_(hdr_a), np.bytes_(hdr_b)])),
+        },
+        coords={
+            "frequency": np.array([45e6, 55e6]),
+            "l": np.linspace(-0.1, 0.1, 4),
+            "m": np.linspace(-0.1, 0.1, 5),
+            "right_ascension": (("l", "m"), np.full((4, 5), 100.0)),
+            "declination": (("l", "m"), np.full((4, 5), 40.0)),
+        },
+    )
+    out = mod._harmonize_celestial_coords_independent_of_frequency(ds)
+    assert out["wcs_header_str"].dims == ()
+    assert bytes(out["wcs_header_str"].values.item()) == hdr_a
+
+
+def test_align_time_dimension_broadcasts_scalar_wcs_to_time_frequency_schema():
+    """Scalar per-step WCS must align when an existing store uses (time, frequency)."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    hdr = np.bytes_(b"NAXIS = 2\nCRVAL1 = 180.0\nCRVAL2 = 45.0\n")
+    schema = xr.Dataset(
+        {
+            "SKY": (("time", "frequency", "m", "l"), np.zeros((2, 3, 4, 4))),
+            "wcs_header_str": (
+                ("time", "frequency"),
+                np.array([[hdr] * 3, [hdr] * 3], dtype=object),
+            ),
+        },
+        coords={
+            "time": [60000.0, 60001.0],
+            "frequency": [45e6, 55e6, 65e6],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    incoming = xr.Dataset(
+        {
+            "SKY": (("frequency", "m", "l"), np.zeros((3, 4, 4))),
+            "wcs_header_str": ((), hdr),
+        },
+        coords={
+            "time": np.array([60002.0]),
+            "frequency": schema.coords["frequency"],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    aligned = mod._align_time_dimension_for_zarr_write(incoming, schema=schema)
+    assert aligned["wcs_header_str"].dims == ("time", "frequency")
+    assert aligned["wcs_header_str"].sizes["time"] == 1
+    assert bytes(aligned["wcs_header_str"].isel(time=0, frequency=0).values.item()) == bytes(hdr)
+
+
+def test_assert_nonempty_wcs_header_str_before_zarr_write_raises():
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    ds = xr.Dataset(
+        {
+            "SKY": (("time", "frequency", "m", "l"), np.zeros((1, 2, 4, 4))),
+            "wcs_header_str": (("time",), np.array([np.bytes_(b"")])),
+        },
+        coords={"time": [60000.0], "frequency": [45e6, 55e6], "l": np.arange(4), "m": np.arange(4)},
+    )
+    with pytest.raises(RuntimeError, match="wcs_header_str is empty"):
+        mod._assert_nonempty_wcs_header_str_before_zarr_write(ds)
+
+
 def test_harmonize_celestial_coords_collapses_frequency_dim():
     """After combine, RA/Dec should be ``(l, m)`` only when slices share one WCS."""
     import numpy as np

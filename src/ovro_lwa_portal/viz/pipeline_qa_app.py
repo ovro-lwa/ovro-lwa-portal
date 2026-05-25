@@ -41,12 +41,51 @@ from ovro_lwa_portal.viz.pipeline_qa import (
     scan_coverage,
     zarr_status,
 )
+from ovro_lwa_portal.accessor import _has_per_time_wcs_header_str, _read_wcs_header_str
 from ovro_lwa_portal.viz.flux_check_plots import (
     build_flux_ratio_figures,
     build_flux_ratio_panel_grid,
 )
 
 check_viz_deps()
+
+
+def _patch_astrowidget_get_wcs() -> None:
+    """Use strict per-time WCS lookup so late time indices do not fall back to time 0."""
+    import astrowidget.wcs as awcs
+
+    if getattr(awcs.get_wcs, "_ovro_portal_patched", False):
+        return
+
+    original_get_wcs = awcs.get_wcs
+
+    def get_wcs(ds: xr.Dataset, var: str = "SKY", time_idx: int = 0):
+        from astropy.io.fits import Header
+        from astropy.wcs import WCS
+
+        if _has_per_time_wcs_header_str(ds):
+            hdr_str = _read_wcs_header_str(ds, var=var, time_idx=int(time_idx))
+            if hdr_str is None:
+                n_time = int(ds.sizes.get("time", 0))
+                msg = (
+                    f"Missing WCS metadata for time index {time_idx} "
+                    f"(dataset has {n_time} time steps with per-time wcs_header_str). "
+                    "Re-run FITS→Zarr conversion for this day so each time step stores "
+                    "a WCS header."
+                )
+                raise ValueError(msg)
+            wcs = WCS(Header.fromstring(hdr_str, sep="\n"))
+            if not wcs.has_celestial:
+                msg = "WCS header has no celestial axes (RA/Dec)"
+                raise ValueError(msg)
+            return wcs.celestial
+        return original_get_wcs(ds, var=var, time_idx=time_idx)
+
+    get_wcs._ovro_portal_patched = True  # type: ignore[attr-defined]
+    awcs.get_wcs = get_wcs
+
+
+_patch_astrowidget_get_wcs()
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +116,14 @@ def _schedule_ipython_main(callback: Callable[[], None]) -> None:
 def _run_on_main_thread(callback: Callable[[], None]) -> None:
     """Run a callback on the active notebook/UI thread when possible."""
     try:
+        from panel.io.state import state
+
+        if state.curdoc is not None:
+            callback()
+            return
+    except Exception:
+        pass
+    try:
         pn.state.execute(callback)
     except Exception:
         _schedule_ipython_main(callback)
@@ -91,10 +138,9 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
         return
 
     pushed_docs: set[int] = set()
+    pushed_roots: set[str] = set()
     for view in views:
         if not view._models:
-            continue
-        if not any(ref in state._views for ref in view._models):
             continue
         for ref in view._models:
             if ref not in state._views:
@@ -109,9 +155,10 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
                     pushed_docs.add(doc_id)
                 except Exception as exc:
                     logger.debug("Panel notebook push failed: %s", exc, exc_info=True)
-            else:
+            elif ref not in pushed_roots:
                 try:
                     push_on_root(ref)
+                    pushed_roots.add(ref)
                 except Exception as exc:
                     logger.debug("Panel push_on_root failed: %s", exc, exc_info=True)
 
@@ -268,6 +315,25 @@ def zenith_lm_coord(dataset: xr.Dataset, time_idx: int) -> SkyCoord:
     l_idx, m_idx = dataset.radport.nearest_lm_idx(ZENITH_L, ZENITH_M)
     ra_deg, dec_deg = dataset.radport.pixel_to_coords(l_idx, m_idx, time_idx=int(time_idx))
     return SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="fk5")
+
+
+def sky_view_center(dataset: xr.Dataset, time_idx: int) -> SkyCoord:
+    """View center for :class:`~astrowidget.SkyWidget` at one time index.
+
+    When the Zarr store has per-time ``wcs_header_str`` (incremental ingest), use
+    that slice's FITS WCS phase center so the sphere matches the displayed image.
+    Otherwise use :func:`zenith_lm_coord` (analytical SIN at zenith).
+    """
+    from astrowidget.wcs import get_wcs
+
+    if _has_per_time_wcs_header_str(dataset):
+        wcs = get_wcs(dataset, time_idx=int(time_idx))
+        return SkyCoord(
+            ra=float(wcs.wcs.crval[0]) * u.deg,
+            dec=float(wcs.wcs.crval[1]) * u.deg,
+            frame="fk5",
+        )
+    return zenith_lm_coord(dataset, time_idx)
 
 
 def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIUS) -> np.ndarray:
@@ -635,17 +701,8 @@ class ZenithReviewPanel(param.Parameterized):
         self._header = pn.pane.Markdown(
             f"**Click on heatmap or use sliders below to update time/frequency/Stokes view**"
         )
-        self._status_pane = pn.pane.Markdown(
-            pn.bind(
-                self._format_slice_status,
-                time_idx=self._slice_selection.param.time_idx,
-                freq_idx=self._slice_selection.param.freq_idx,
-            ),
-            sizing_mode="stretch_width",
-        )
         self._layout = pn.Column(
             self._header,
-            self._status_pane,
             self._heatmap.pane,
             width=ZENITH_REVIEW_COLUMN_WIDTH,
             sizing_mode="fixed",
@@ -662,17 +719,33 @@ class ZenithReviewPanel(param.Parameterized):
 
     def _format_slice_status(self, time_idx: int, freq_idx: int) -> str:
         """Slice summary shown above the heatmap (bound to shared slice params)."""
-        coord = zenith_lm_coord(self._dataset, int(time_idx))
-        metric_val = float(self._stat_map[int(time_idx), int(freq_idx)])
-        time_day = float(_zenith_heatmap_time_days(self._dataset)[int(time_idx)])
-        freq_mhz = float(_zenith_heatmap_freq_mhz(self._dataset)[int(freq_idx)])
-        return (
-            f"**Stokes {self.stokes_label}** | time={time_day:.3f} d ({int(time_idx)}), "
-            f"freq={freq_mhz:.1f} MHz ({int(freq_idx)})"
-            f" | center RA={coord.ra.to_string(unit=u.hour, precision=1)}, "
-            f"Dec={coord.dec.to_string(unit=u.deg, precision=1)}"
-            f" | patch {self.metric_label}={metric_val:.3g}"
-        )
+        time_idx = int(time_idx)
+        freq_idx = int(freq_idx)
+        try:
+            coord = sky_view_center(self._dataset, time_idx)
+            metric_val = float(self._stat_map[time_idx, freq_idx])
+            time_day = float(_zenith_heatmap_time_days(self._dataset)[time_idx])
+            freq_mhz = float(_zenith_heatmap_freq_mhz(self._dataset)[freq_idx])
+            return (
+                f"**Stokes {self.stokes_label}** | time={time_day:.3f} d ({time_idx}), "
+                f"freq={freq_mhz:.1f} MHz ({freq_idx})"
+                f" | center RA={coord.ra.to_string(unit=u.hour, precision=1)}, "
+                f"Dec={coord.dec.to_string(unit=u.deg, precision=1)}"
+                f" | patch {self.metric_label}={metric_val:.3g}"
+            )
+        except Exception as exc:
+            logger.warning(
+                "Zenith status update failed for Stokes %s slice (%s, %s): %s",
+                self.stokes_label,
+                time_idx,
+                freq_idx,
+                exc,
+                exc_info=True,
+            )
+            return (
+                f"**Stokes {self.stokes_label}** | time_idx={time_idx}, "
+                f"freq_idx={freq_idx} | status unavailable ({exc})"
+            )
 
     def _select_slice(self, time_idx: int, freq_idx: int) -> None:
         """Heatmap tap handler: update shared slice (and sky Stokes when wired)."""
@@ -689,7 +762,7 @@ class ZenithReviewPanel(param.Parameterized):
 
     @property
     def heatmap_column(self) -> pn.Column:
-        """Header, status, and heatmap for side-by-side zenith review layout."""
+        """Header and heatmap for side-by-side zenith review layout."""
         return self._layout
 
     def dispose(self) -> None:
@@ -748,7 +821,6 @@ ZENITH_SKY_WIDGET_HEIGHT = 600
 ZENITH_SKY_LABEL_HEIGHT = 22
 ZENITH_SKY_PANE_HEIGHT = ZENITH_SKY_WIDGET_HEIGHT + ZENITH_SKY_LABEL_HEIGHT
 ZENITH_SKY_ROW_MARGIN = (0, 0, 0, 0)
-SKY_SLICE_DEBOUNCE_S = 0.25
 
 _ZENITH_SKY_STATUS_IDLE = (
     "*Sky view: use the sliders or click a heatmap cell; the status line shows load progress.*"
@@ -766,12 +838,13 @@ class _StokesReviewHolder(param.Parameterized):
         self._datasets: dict[str, xr.Dataset] = {}
         self._sky_widget: SkyWidget | None = None
         self._sky_update_seq = 0
-        self._sky_debounce_timer: threading.Timer | None = None
-        self._sky_debounce_lock = threading.Lock()
-        self._sky_slice_debounce_s = SKY_SLICE_DEBOUNCE_S
-        self._sky_async = True
         self._pending_reset_center = False
         self._slice_selection = ZenithSliceSelection()
+        self._extra_push_views: Callable[[], list[pn.viewable.Viewable]] | None = None
+        self._slice_push_watcher = self._slice_selection.param.watch(
+            self._on_slice_indices_changed,
+            ["time_idx", "freq_idx"],
+        )
         self._slice_watcher = self._slice_selection.param.watch(
             self._on_slice_selection_changed,
             ["time_idx", "freq_idx"],
@@ -823,20 +896,18 @@ class _StokesReviewHolder(param.Parameterized):
         self._sky_status_pane = pn.pane.Markdown(
             _ZENITH_SKY_STATUS_IDLE,
             sizing_mode="stretch_width",
-            max_width=ZENITH_REVIEW_ROW_WIDTH,
         )
-        self._sky_loading_spinner = pn.indicators.LoadingSpinner(
+        self._sky_status_spinner = pn.indicators.LoadingSpinner(
             value=False,
             size=20,
-            name="Updating sky view",
+            name="",
         )
-        self._sky_loading_label = pn.pane.Markdown("", sizing_mode="stretch_width")
-        self._sky_loading_row = pn.Row(
-            self._sky_loading_spinner,
-            self._sky_loading_label,
-            visible=False,
+        self._sky_status_row = pn.Row(
+            self._sky_status_spinner,
+            self._sky_status_pane,
             sizing_mode="stretch_width",
             max_width=ZENITH_REVIEW_ROW_WIDTH,
+            margin=(0, 0, 4, 0),
         )
         self._sky_error_alert = pn.pane.Alert(
             alert_type="danger",
@@ -846,8 +917,7 @@ class _StokesReviewHolder(param.Parameterized):
         )
         self._zenith_footer = pn.Column(
             self._controls_row,
-            self._sky_status_pane,
-            self._sky_loading_row,
+            self._sky_status_row,
             self._sky_error_alert,
             self._sky_pane,
             sizing_mode="stretch_width",
@@ -856,14 +926,41 @@ class _StokesReviewHolder(param.Parameterized):
         self._panels: dict[str, ZenithReviewPanel | None] = {
             spec.stokes: None for spec in _STOKES_SECTIONS
         }
+        self._heatmap_status_panes: dict[str, pn.pane.Markdown] = {}
+        for index, spec in enumerate(_STOKES_SECTIONS):
+            column_margin = (
+                (0, ZENITH_REVIEW_COLUMN_GAP, 0, 0) if index == 0 else (0, 0, 0, 0)
+            )
+            self._heatmap_status_panes[spec.stokes] = pn.pane.Markdown(
+                "",
+                sizing_mode="fixed",
+                width=ZENITH_REVIEW_COLUMN_WIDTH,
+                margin=column_margin,
+            )
+        self._heatmap_status_row = pn.Row(
+            *[self._heatmap_status_panes[spec.stokes] for spec in _STOKES_SECTIONS],
+            sizing_mode="stretch_width",
+            max_width=ZENITH_REVIEW_ROW_WIDTH,
+            visible=False,
+            margin=(0, 0, 4, 0),
+        )
         self._sky_bound_stokes: str | None = None
         self._skip_sky_watch = False
+        self._ignore_slice_watcher_for_sky = False
+        self._suppress_post_heatmap_sky_watchers = False
+        self._sky_last_time_idx: int | None = None
+        self._sky_last_stokes: str | None = None
         self.param.watch(self._sync_sky_loading_indicator, "loading_sky")
 
     @property
     def zenith_footer(self) -> pn.Column:
         """Shared slice controls and sky view below the heatmap row."""
         return self._zenith_footer
+
+    @property
+    def heatmap_status_row(self) -> pn.Row:
+        """Per-Stokes slice summary above heatmaps (hoisted for JupyterLab push)."""
+        return self._heatmap_status_row
 
     @property
     def slice_selection(self) -> ZenithSliceSelection:
@@ -875,6 +972,34 @@ class _StokesReviewHolder(param.Parameterized):
 
     def set_push_root(self, callback: Callable[[], None] | None) -> None:
         self._slice_selection.set_push_root(callback)
+
+    def set_extra_push_views(
+        self, callback: Callable[[], list[pn.viewable.Viewable]] | None
+    ) -> None:
+        """Register zenith row/slot views for notebook push (nested panes may lack comms)."""
+        self._extra_push_views = callback
+
+    def _refresh_heatmap_status_row(self) -> None:
+        """Update hoisted per-Stokes status markdown from shared slice indices."""
+        time_idx = int(self._slice_selection.time_idx)
+        freq_idx = int(self._slice_selection.freq_idx)
+        for spec in _STOKES_SECTIONS:
+            panel = self._panels.get(spec.stokes)
+            pane = self._heatmap_status_panes[spec.stokes]
+            if panel is not None:
+                pane.object = panel._format_slice_status(time_idx, freq_idx)
+            else:
+                pane.object = ""
+
+    def _push_zenith_ui(self) -> None:
+        """Push hoisted heatmap status row and dashboard root (JupyterLab embedded layout)."""
+        push_views: list[pn.viewable.Viewable] = [self._heatmap_status_row]
+        if self._extra_push_views is not None:
+            push_views.extend(self._extra_push_views())
+        _push_panel_layout(*push_views)
+        push = self._slice_selection._push_root
+        if push is not None:
+            push()
 
     def _sky_slice_label(self) -> str:
         return (
@@ -888,7 +1013,6 @@ class _StokesReviewHolder(param.Parameterized):
         slice_label = self._sky_slice_label()
         messages = {
             "idle": _ZENITH_SKY_STATUS_IDLE,
-            "pending": f"**Sky (Stokes {stokes})** · {slice_label} · *queued…*",
             "loading_dataset": f"**Sky** · opening Stokes {stokes} cube…",
             "loading_slice": f"**Sky (Stokes {stokes})** · {slice_label} · *loading slice…*",
             "ready": f"**Sky (Stokes {stokes})** · {slice_label} · ready",
@@ -897,13 +1021,12 @@ class _StokesReviewHolder(param.Parameterized):
         self._sky_status_pane.object = messages.get(phase, messages["idle"])
 
     def _sync_sky_loading_indicator(self, *_events: param.parameterized.Event) -> None:
-        self._sky_loading_row.visible = self.loading_sky
-        self._sky_loading_spinner.value = self.loading_sky
+        self._sky_status_spinner.visible = self.loading_sky
+        self._sky_status_spinner.value = self.loading_sky
 
     def _push_sky_ui(self) -> None:
         _push_panel_layout(
-            self._sky_status_pane,
-            self._sky_loading_row,
+            self._sky_status_row,
             self._sky_error_alert,
             self._zenith_footer,
         )
@@ -916,96 +1039,74 @@ class _StokesReviewHolder(param.Parameterized):
         self._sky_error_alert.object = message
         self._sky_error_alert.visible = True
 
-    def _cancel_sky_debounce(self) -> None:
-        with self._sky_debounce_lock:
-            if self._sky_debounce_timer is not None:
-                self._sky_debounce_timer.cancel()
-                self._sky_debounce_timer = None
-
-    def _request_sky_update(self, *, debounce: bool = True) -> None:
-        """Queue a sky slice update with immediate status feedback."""
+    def _request_sky_update(self) -> None:
+        """Refresh the sky widget for the current slice selection."""
         if self._sky_widget is None:
-            return
-        if debounce and self._sky_slice_debounce_s > 0:
-            self._update_sky_status(phase="pending")
-            self._push_sky_ui()
-            self._cancel_sky_debounce()
-
-            def _fire() -> None:
-                _run_on_main_thread(self._start_sky_update)
-
-            with self._sky_debounce_lock:
-                self._sky_debounce_timer = threading.Timer(self._sky_slice_debounce_s, _fire)
-                self._sky_debounce_timer.daemon = True
-                self._sky_debounce_timer.start()
             return
         self._start_sky_update()
 
     def _start_sky_update(self) -> None:
         """Load or refresh the sky widget for the current slice selection."""
-        self._cancel_sky_debounce()
         if self._sky_widget is None:
             return
 
         self._sky_update_seq += 1
         request_id = self._sky_update_seq
-        reset_center = self._pending_reset_center
-        self._pending_reset_center = False
-        rebind = self._sky_bound_stokes != self.sky_stokes
         time_idx = int(self._slice_selection.time_idx)
         freq_idx = int(self._slice_selection.freq_idx)
         stokes = self.sky_stokes
+        rebind = self._sky_bound_stokes != self.sky_stokes
+        reset_center = self._pending_reset_center
+        self._pending_reset_center = False
+        widget = self._sky_widget
+        if reset_center and widget is not None:
+            # Compare to the widget's displayed slice, not _sky_last_time_idx (can be
+            # ahead of the frontend after a partial sync — high-LST clicks then skip
+            # recenter and the new image lands off-screen).
+            reset_center = (
+                int(getattr(widget, "time_idx", -1)) != time_idx
+                or stokes != self._sky_last_stokes
+                or rebind
+            )
 
         self.loading_sky = True
         self._clear_sky_error()
         status_phase = "loading_dataset" if rebind else "loading_slice"
         self._update_sky_status(phase=status_phase)
-        self._sky_loading_label.object = (
-            f"*Opening Stokes {stokes} cube…*"
-            if rebind
-            else f"*Loading slice ({time_idx}, {freq_idx})…*"
-        )
         self._sync_sky_loading_indicator()
         self._push_sky_ui()
 
-        def _apply_on_main() -> None:
-            if request_id != self._sky_update_seq:
-                return
-            center: SkyCoord | None = None
-            fov: Any = None
-            try:
-                if reset_center:
-                    dataset = self._datasets.get(stokes)
-                    if dataset is None:
-                        msg = f"No dataset loaded for Stokes {stokes}"
-                        raise ValueError(msg)
-                    center = zenith_lm_coord(dataset, time_idx)
-                    fov = DEFAULT_FOV_DEG * u.deg
-                self._execute_sky_update(
-                    request_id=request_id,
-                    rebind=rebind,
-                    time_idx=time_idx,
-                    freq_idx=freq_idx,
-                    stokes=stokes,
-                    reset_center=reset_center,
-                    center=center,
-                    fov=fov,
-                )
-            except Exception as exc:
-                self._finish_sky_update(request_id, exc)
-                return
-            self._finish_sky_update(request_id, None)
-
-        def _run_job() -> None:
-            if self._sky_async:
-                _run_on_main_thread(_apply_on_main)
-            else:
-                _apply_on_main()
-
-        if self._sky_async:
-            threading.Thread(target=_run_job, daemon=True).start()
-        else:
-            _run_job()
+        if request_id != self._sky_update_seq:
+            return
+        center: SkyCoord | None = None
+        fov: Any = None
+        try:
+            if reset_center:
+                dataset = self._datasets.get(stokes)
+                if dataset is None:
+                    msg = f"No dataset loaded for Stokes {stokes}"
+                    raise ValueError(msg)
+                center = sky_view_center(dataset, time_idx)
+                fov = DEFAULT_FOV_DEG * u.deg
+            updated = self._execute_sky_update(
+                request_id=request_id,
+                rebind=rebind,
+                time_idx=time_idx,
+                freq_idx=freq_idx,
+                stokes=stokes,
+                reset_center=reset_center,
+                center=center,
+                fov=fov,
+            )
+        except Exception as exc:
+            self._finish_sky_update(request_id, exc)
+            return
+        if not updated:
+            if request_id == self._sky_update_seq:
+                msg = "Sky update was skipped (stale request)"
+                self._finish_sky_update(request_id, RuntimeError(msg))
+            return
+        self._finish_sky_update(request_id, None)
 
     def _execute_sky_update(
         self,
@@ -1018,12 +1119,12 @@ class _StokesReviewHolder(param.Parameterized):
         reset_center: bool,
         center: SkyCoord | None,
         fov: Any,
-    ) -> None:
+    ) -> bool:
         if request_id != self._sky_update_seq:
-            return
+            return False
         widget = self._sky_widget
         if widget is None:
-            return
+            return False
         dataset = self._datasets.get(stokes)
         if dataset is None:
             msg = f"No dataset loaded for Stokes {stokes}"
@@ -1031,14 +1132,55 @@ class _StokesReviewHolder(param.Parameterized):
         if rebind or self._sky_bound_stokes != stokes:
             self._bind_sky_dataset(widget, dataset)
             self._sky_bound_stokes = stokes
+            self._sky_last_time_idx = None
         kwargs: dict[str, Any] = {
             "percentile_low": 2,
             "percentile_high": 98,
         }
-        if reset_center and center is not None and fov is not None:
+        widget_time = getattr(widget, "time_idx", None)
+        time_changed = (
+            widget_time is not None and int(widget_time) != int(time_idx)
+        )
+        need_recenter = reset_center or time_changed
+        if need_recenter:
+            if center is None:
+                center = sky_view_center(dataset, time_idx)
+            if fov is None:
+                fov = DEFAULT_FOV_DEG * u.deg
             kwargs["center"] = center
             kwargs["fov"] = fov
+        revision_before = int(getattr(widget, "image_revision", 0))
         widget.update_slice(time_idx, freq_idx, **kwargs)
+        if int(widget.time_idx) != int(time_idx) or int(widget.freq_idx) != int(freq_idx):
+            msg = (
+                f"SkyWidget slice indices ({widget.time_idx}, {widget.freq_idx}) "
+                f"do not match requested ({time_idx}, {freq_idx})"
+            )
+            raise RuntimeError(msg)
+        revision_after = int(getattr(widget, "image_revision", 0))
+        if revision_after <= revision_before:
+            msg = (
+                f"SkyWidget did not refresh image data for slice "
+                f"({time_idx}, {freq_idx})"
+            )
+            raise RuntimeError(msg)
+        self._sky_last_time_idx = time_idx
+        self._sky_last_stokes = stokes
+        self._notify_sky_widget()
+        return True
+
+    def _notify_sky_widget(self) -> None:
+        """Push SkyWidget state to the Jupyter frontend after a slice change."""
+        widget = self._sky_widget
+        if widget is None:
+            return
+        send_state = getattr(widget, "send_state", None)
+        if callable(send_state):
+            try:
+                send_state()
+            except Exception as exc:
+                logger.debug("SkyWidget send_state failed: %s", exc, exc_info=True)
+        _push_panel_layout(self._sky_pane)
 
     def _finish_sky_update(self, request_id: int, error: BaseException | None) -> None:
         if request_id != self._sky_update_seq:
@@ -1050,33 +1192,53 @@ class _StokesReviewHolder(param.Parameterized):
         else:
             self._clear_sky_error()
             self._update_sky_status(phase="ready")
-        self._sky_loading_label.object = ""
         self._sync_sky_loading_indicator()
         self._push_sky_ui()
 
+    def _sky_widget_shows_slice(self, time_idx: int, freq_idx: int, *, stokes: str) -> bool:
+        """True when the sky widget already displays the requested slice."""
+        widget = self._sky_widget
+        if widget is None or self._sky_bound_stokes != stokes:
+            return False
+        if int(getattr(widget, "image_revision", 0)) <= 0:
+            return False
+        return int(widget.time_idx) == int(time_idx) and int(widget.freq_idx) == int(freq_idx)
+
     def _on_slice_selection_changed(self, *events: param.parameterized.Event) -> None:
         """Sync status and sky view when sliders or heatmap taps change the slice."""
+        if self._suppress_post_heatmap_sky_watchers or self._ignore_slice_watcher_for_sky:
+            return
         if self._skip_sky_watch:
             return
-        self._sync_zenith_status_lines()
+        time_idx = int(self._slice_selection.time_idx)
+        freq_idx = int(self._slice_selection.freq_idx)
         event = events[0] if events else None
         if event is None or getattr(event, "name", None) == "time_idx":
             self._pending_reset_center = True
-        self._request_sky_update(debounce=True)
+        if self._sky_widget_shows_slice(time_idx, freq_idx, stokes=self.sky_stokes):
+            return
+        self._request_sky_update()
 
-    def _sync_zenith_status_lines(self) -> None:
-        """Refresh per-column status markdown from the shared slice (no Bokeh push)."""
-        time_idx = int(self._slice_selection.time_idx)
-        freq_idx = int(self._slice_selection.freq_idx)
-        for panel in self._panels.values():
-            if panel is not None:
-                panel._status_pane.object = panel._format_slice_status(time_idx, freq_idx)
+    def _on_slice_indices_changed(self, *_events: param.parameterized.Event) -> None:
+        """Refresh heatmap status text and push to the JupyterLab frontend."""
+        if not self._heatmap_status_row.visible:
+            return
+        self._refresh_heatmap_status_row()
+        self._push_zenith_ui()
+
+    def _sync_zenith_status_lines(self, *, push: bool = True) -> None:
+        """Refresh hoisted heatmap status markdown and push to the JupyterLab frontend."""
+        if not self._heatmap_status_row.visible:
+            return
+        self._refresh_heatmap_status_row()
+        if push:
+            self._push_zenith_ui()
 
     def _on_sky_stokes_changed(self, *_events: param.parameterized.Event) -> None:
-        if self._skip_sky_watch:
+        if self._skip_sky_watch or self._suppress_post_heatmap_sky_watchers:
             return
         self._pending_reset_center = True
-        self._request_sky_update(debounce=False)
+        self._request_sky_update()
 
     def select_slice_from_heatmap(self, stokes: str, time_idx: int, freq_idx: int) -> None:
         """Set shared time/frequency and switch sky view to the clicked heatmap's Stokes."""
@@ -1087,6 +1249,8 @@ class _StokesReviewHolder(param.Parameterized):
 
         def _apply() -> None:
             self._skip_sky_watch = True
+            self._ignore_slice_watcher_for_sky = True
+            self._suppress_post_heatmap_sky_watchers = True
             try:
                 with param.parameterized.batch_call_watchers(self):
                     if stokes in self.param.sky_stokes.objects:
@@ -1094,11 +1258,12 @@ class _StokesReviewHolder(param.Parameterized):
                 with param.parameterized.batch_call_watchers(self._slice_selection):
                     self._slice_selection.time_idx = time_idx
                     self._slice_selection.freq_idx = freq_idx
-                self._sync_zenith_status_lines()
                 self._pending_reset_center = True
-                self._request_sky_update(debounce=False)
+                self._request_sky_update()
             finally:
                 self._skip_sky_watch = False
+                self._suppress_post_heatmap_sky_watchers = False
+                self._ignore_slice_watcher_for_sky = False
 
         _run_on_main_thread(_apply)
 
@@ -1148,18 +1313,20 @@ class _StokesReviewHolder(param.Parameterized):
         self._sky_bound_stokes = None
         self._pending_reset_center = True
         self._update_sky_status(phase="idle")
-        self._request_sky_update(debounce=False)
+        self._request_sky_update()
 
     def reset_sky(self) -> None:
         """Restore the sky-view placeholder."""
-        self._cancel_sky_debounce()
         self._sky_update_seq += 1
         self.loading_sky = False
         self._sky_widget = None
         self._sky_bound_stokes = None
+        self._sky_last_time_idx = None
+        self._sky_last_stokes = None
+        self._ignore_slice_watcher_for_sky = False
+        self._suppress_post_heatmap_sky_watchers = False
         self._clear_sky_error()
         self._update_sky_status(phase="idle")
-        self._sky_loading_label.object = ""
         self._sync_sky_loading_indicator()
         self._sky_container.children = [widgets.HTML(_ZENITH_SKY_PLACEHOLDER)]
 
@@ -1174,6 +1341,7 @@ class _StokesReviewHolder(param.Parameterized):
 
         if primary is None:
             self._controls_row.visible = False
+            self._heatmap_status_row.visible = False
             return
 
         default_time, default_freq = default_stat_slice(primary._stat_map, primary._dataset)
@@ -1184,6 +1352,7 @@ class _StokesReviewHolder(param.Parameterized):
             default_freq=default_freq,
         )
         self._controls_row.visible = True
+        self._heatmap_status_row.visible = True
 
     @staticmethod
     def _build_section(spec: _StokesSectionSpec, content: pn.viewable.Viewable) -> pn.Column:
@@ -1200,6 +1369,10 @@ class _StokesReviewHolder(param.Parameterized):
                 panel.dispose()
                 self._panels[stokes] = None
         self._controls_row.visible = False
+        self._heatmap_status_row.visible = False
+        for pane in self._heatmap_status_panes.values():
+            pane.object = ""
+        self.set_extra_push_views(None)
         self.reset_sky()
         self._datasets.clear()
 
@@ -1433,6 +1606,7 @@ class PipelineQAApp(param.Parameterized):
         self._zenith_slot = pn.Column(
             self._zenith_banner,
             self._zenith_loading_row,
+            self._stokes_review.heatmap_status_row,
             self._zenith_review_row,
             self._stokes_review.zenith_footer,
             sizing_mode="stretch_width",
@@ -1576,8 +1750,15 @@ class PipelineQAApp(param.Parameterized):
     ) -> None:
         """Populate stable zenith section slots and mount sky widgets below."""
         self._zenith_banner.object = banner
-        push_root = lambda: self._execute(self._push_panel_roots)
-        self._stokes_review.set_push_root(push_root)
+        # Push zenith row + full layout (nested status panes may not have their own comms).
+        self._stokes_review.set_push_root(self._push_zenith_root)
+        self._stokes_review.set_extra_push_views(
+            lambda: [
+                self._stokes_review.heatmap_status_row,
+                self._zenith_review_row,
+                self._zenith_slot,
+            ]
+        )
         for spec in _STOKES_SECTIONS:
             self._zenith_section_content[spec.stokes].objects = [
                 section_contents[spec.stokes],

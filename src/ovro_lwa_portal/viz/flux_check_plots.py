@@ -65,8 +65,8 @@ def _hover_source(
     ratios = ratio_map[lst_idx, freq_idx]
     return ColumnDataSource(
         data={
-            "x": freq_idx.ravel() + 0.5,
-            "y": lst_idx.ravel() + 0.5,
+            "x": lst_idx.ravel() + 0.5,
+            "y": freq_idx.ravel() + 0.5,
             "frequency_mhz": np.asarray(freq_mhz)[freq_idx.ravel()],
             "lst_hour": [lst_labels.get(int(n), f"{int(n)}h") for n in np.asarray(lst_hour_nums)[lst_idx.ravel()]],
             "lst_hour_num": np.asarray(lst_hour_nums)[lst_idx.ravel()],
@@ -83,7 +83,7 @@ def build_flux_ratio_figure(
     width: int = FLUX_RATIO_PLOT_WIDTH,
     height: int = FLUX_RATIO_PLOT_HEIGHT,
 ) -> figure:
-    """Build a Bokeh heatmap of flux ratio (imfit/model) vs frequency and LST."""
+    """Build a Bokeh heatmap of flux ratio (imfit/model) vs LST and frequency."""
     if grid.empty:
         plot = figure(
             width=width,
@@ -108,17 +108,17 @@ def build_flux_ratio_figure(
         width=width,
         height=height,
         title=f"{source}: imfit / model flux ratio",
-        x_range=(0, n_freqs),
-        y_range=(0, n_lsts),
+        x_range=(0, n_lsts),
+        y_range=(0, n_freqs),
         tools="pan,wheel_zoom,reset",
         active_drag="pan",
     )
     plot.image(
-        image=[ratio_map],
+        image=[ratio_map.T],
         x=0,
         y=0,
-        dw=n_freqs,
-        dh=n_lsts,
+        dw=n_lsts,
+        dh=n_freqs,
         color_mapper=color_mapper,
     )
     hover_renderer = plot.rect(
@@ -157,17 +157,17 @@ def build_flux_ratio_figure(
     )
     plot.add_layout(color_bar, "right")
 
-    x_ticks, x_labels = _axis_ticks(
+    x_ticks, x_labels = _axis_ticks(n_lsts, labels)
+    y_ticks, y_labels = _axis_ticks(
         n_freqs,
         {index: f"{freq:g}" for index, freq in enumerate(freq_mhz)},
     )
-    y_ticks, y_labels = _axis_ticks(n_lsts, labels)
     plot.xaxis.ticker = FixedTicker(ticks=x_ticks)
     plot.yaxis.ticker = FixedTicker(ticks=y_ticks)
     plot.xaxis.major_label_overrides = x_labels
     plot.yaxis.major_label_overrides = y_labels
-    plot.xaxis.axis_label = "Frequency (MHz)"
-    plot.yaxis.axis_label = "LST hour"
+    plot.xaxis.axis_label = "LST hour"
+    plot.yaxis.axis_label = "Frequency (MHz)"
     return plot
 
 

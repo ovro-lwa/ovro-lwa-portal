@@ -55,6 +55,16 @@ def _decode_wcs_header_bytes(raw: object) -> str:
     return str(raw).rstrip("\x00")
 
 
+def _has_per_time_wcs_header_str(ds: xr.Dataset) -> bool:
+    """True when ``wcs_header_str`` is stored along the dataset ``time`` axis."""
+    if "wcs_header_str" not in ds:
+        return False
+    wcs_var = ds["wcs_header_str"]
+    return bool(
+        wcs_var.ndim == 1 and "time" in wcs_var.dims and int(wcs_var.sizes.get("time", 0)) > 0
+    )
+
+
 def _read_wcs_header_str(
     ds: xr.Dataset,
     *,
@@ -65,13 +75,16 @@ def _read_wcs_header_str(
 
     When ``wcs_header_str`` is stored per ``time`` step (incremental Zarr),
     that header is preferred over static ``fits_wcs_header`` attrs so each
-    slice keeps its own phase-center CRVAL. Otherwise falls back to attrs,
-    then scalar ``wcs_header_str``.
+    slice keeps its own phase-center CRVAL. Empty per-time entries do **not**
+    fall back to static attrs (that would mis-register late time slices).
+    Otherwise falls back to attrs, then scalar ``wcs_header_str``.
     """
-    if "wcs_header_str" in ds:
+    if _has_per_time_wcs_header_str(ds):
         wcs_var = ds["wcs_header_str"]
-        if wcs_var.ndim == 1 and "time" in wcs_var.dims and wcs_var.sizes["time"] > 0:
-            return _decode_wcs_header_bytes(wcs_var.isel(time=time_idx).values)
+        hdr = _decode_wcs_header_bytes(wcs_var.isel(time=time_idx).values)
+        if hdr.strip():
+            return hdr
+        return None
 
     hdr_str = None
     if var in ds.data_vars:

@@ -1899,6 +1899,63 @@ def _sky_sep_max_vs_ref_arcsec(
     return worst
 
 
+def _decode_wcs_header_payload(raw: object) -> str:
+    """Decode a scalar ``wcs_header_str`` payload to a stripped UTF-8 string."""
+    if isinstance(raw, np.ndarray):
+        raw = raw.item() if raw.ndim == 0 else np.ravel(raw)[0]
+    if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
+        return raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
+    return str(raw).rstrip("\x00").strip()
+
+
+def _collapse_wcs_header_str_variable(
+    xds: xr.Dataset,
+    *,
+    ref_freq_idx: int = 0,
+) -> xr.Dataset:
+    """Reduce ``wcs_header_str`` to a scalar (one header per time step before Zarr write)."""
+    if "wcs_header_str" not in xds.data_vars:
+        return xds
+    wh = xds["wcs_header_str"]
+    if "frequency" not in wh.dims:
+        return xds
+    nf = int(xds.sizes.get("frequency", 1))
+    ri = int(np.clip(ref_freq_idx, 0, max(0, nf - 1)))
+    return xds.assign(wcs_header_str=wh.isel(frequency=ri, drop=True))
+
+
+def _assert_nonempty_wcs_header_str_before_zarr_write(xds: xr.Dataset) -> None:
+    """Fail fast when a time step would be written without a usable celestial WCS header."""
+    if "wcs_header_str" not in xds.data_vars:
+        msg = (
+            "Dataset is missing wcs_header_str before Zarr write; each time step "
+            "must persist the FITS celestial WCS from _load_for_combine."
+        )
+        raise RuntimeError(msg)
+
+    wh = xds["wcs_header_str"]
+    if "time" in wh.dims:
+        for ti in range(int(wh.sizes["time"])):
+            hdr = _decode_wcs_header_payload(wh.isel(time=ti).values)
+            if hdr:
+                continue
+            msg = (
+                f"wcs_header_str is empty for time index {ti} before Zarr write. "
+                "Re-run conversion for this time step or repair from FITS with "
+                "ovro-ingest repair --fits-dir."
+            )
+            raise RuntimeError(msg)
+        return
+
+    hdr = _decode_wcs_header_payload(wh.values)
+    if not hdr:
+        msg = (
+            "wcs_header_str is empty before Zarr write. Re-run conversion for this "
+            "time step or repair from FITS with ovro-ingest repair --fits-dir."
+        )
+        raise RuntimeError(msg)
+
+
 def _harmonize_celestial_coords_independent_of_frequency(
     xds: xr.Dataset,
     *,
@@ -1916,9 +1973,9 @@ def _harmonize_celestial_coords_independent_of_frequency(
     ra_c = xds.coords.get("right_ascension")
     dec_c = xds.coords.get("declination")
     if ra_c is None or dec_c is None:
-        return xds
+        return _collapse_wcs_header_str_variable(xds, ref_freq_idx=ref_freq_idx)
     if "frequency" not in ra_c.dims:
-        return xds
+        return _collapse_wcs_header_str_variable(xds, ref_freq_idx=ref_freq_idx)
 
     nf = int(xds.sizes["frequency"])
     ri = int(np.clip(ref_freq_idx, 0, nf - 1))
@@ -2601,6 +2658,7 @@ def _combine_time_step(
         xds_t[v].encoding = {}
 
     xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
+    xds_t = _collapse_wcs_header_str_variable(xds_t)
 
     xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
 
@@ -2833,6 +2891,15 @@ def _align_time_dimension_for_zarr_write(
     out = ds
     for name, target_dims in target_dims_by_name.items():
         da = out[name]
+        if name == "wcs_header_str" and "frequency" in da.dims:
+            da = da.isel(frequency=0, drop=True)
+        if (
+            name == "wcs_header_str"
+            and da.dims == ()
+            and target_dims == ("time", "frequency")
+            and "frequency" in out.coords
+        ):
+            da = da.expand_dims(frequency=out.coords["frequency"])
         if target_dims == ("time",) and "frequency" in da.dims:
             da = da.isel(frequency=0, drop=True)
         expanded = _expand_leading_time_dim(
@@ -2882,12 +2949,14 @@ def _write_or_append_zarr(
     """
     from shutil import rmtree
 
+    xds_t = _collapse_wcs_header_str_variable(xds_t)
     if first_write or not out_zarr.exists():
         to_write = _align_time_dimension_for_zarr_write(xds_t)
     else:
         with xr.open_zarr(str(out_zarr), consolidated=False) as existing:
             to_write = _align_time_dimension_for_zarr_write(xds_t, schema=existing)
 
+    _assert_nonempty_wcs_header_str_before_zarr_write(to_write)
     to_write = _rechunk_lm_for_zarr(to_write, chunk_lm)
     to_write = _ensure_append_friendly_time_chunks(to_write)
     to_write = _prepare_time_only_vars_for_zarr_write(to_write)
