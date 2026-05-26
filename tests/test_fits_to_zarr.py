@@ -1146,6 +1146,60 @@ def test_filter_invalid_beam_files_logs_unreadable_files(tmp_path: Path, caplog)
     assert "could not read primary header" in caplog.text
 
 
+def test_truncated_fits_reason_detects_short_file(tmp_path: Path) -> None:
+    """Partial files must be flagged before image data is read."""
+    import numpy as np
+
+    mod = _import_module()
+    full = tmp_path / "full.fits"
+    data = np.zeros((8, 8), dtype=np.float32)
+    fits.PrimaryHDU(
+        data=data,
+        header=fits.Header({"BMAJ": 0.1, "BMIN": 0.1, "BITPIX": -32, "NAXIS": 2, "NAXIS1": 8, "NAXIS2": 8}),
+    ).writeto(full)
+    assert mod._truncated_fits_reason(full) is None
+
+    with fits.open(full, memmap=True) as hdul:
+        required = int(hdul[0]._data_offset) + int(hdul[0].size)
+    short = tmp_path / "short.fits"
+    short.write_bytes(full.read_bytes()[: required - 100])
+    reason = mod._truncated_fits_reason(short)
+    assert reason is not None
+    assert "truncated" in reason.lower()
+
+
+def test_truncated_fits_reason_detects_empty_file(tmp_path: Path) -> None:
+    """Zero-byte paths are treated as corrupt."""
+    mod = _import_module()
+    empty = tmp_path / "empty.fits"
+    empty.write_bytes(b"")
+    assert mod._truncated_fits_reason(empty) == "empty file (0 bytes)"
+
+
+def test_filter_invalid_beam_files_drops_truncated(tmp_path: Path, caplog) -> None:
+    """Truncated FITS must be dropped during discovery with a clear warning."""
+    import logging
+    import numpy as np
+
+    mod = _import_module()
+    good = tmp_path / "good.fits"
+    fits.PrimaryHDU(
+        data=np.zeros((4, 4), dtype=np.float32),
+        header=fits.Header({"BMAJ": 0.1, "BMIN": 0.1, "BITPIX": -32, "NAXIS": 2, "NAXIS1": 4, "NAXIS2": 4}),
+    ).writeto(good)
+    with fits.open(good, memmap=True) as hdul:
+        required = int(hdul[0]._data_offset) + int(hdul[0].size)
+    bad = tmp_path / "bad.fits"
+    bad.write_bytes(good.read_bytes()[: required - 100])
+
+    caplog.set_level(logging.WARNING, logger="ovro_lwa_portal.fits_to_zarr_xradio")
+    filtered = mod._filter_invalid_beam_files({"20240524_050009": [good, bad]})
+
+    assert filtered == {"20240524_050009": [good]}
+    assert "bad.fits" in caplog.text
+    assert "truncated" in caplog.text.lower()
+
+
 def test_fix_headers_raises_invalid_beam_error_on_missing_beam(tmp_path: Path):
     """``_fix_headers`` must refuse to invent a placeholder beam for unfit images."""
     import numpy as _np
@@ -1457,7 +1511,11 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
     by_time = {"20241218_063336": [f1], "20241218_063337": [f2]}
     monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
     monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
-    monkeypatch.setattr(mod, "_existing_time_keys_from_zarr", lambda _p: {"20241218_063336"})
+    monkeypatch.setattr(
+        mod,
+        "_filter_completed_time_keys",
+        lambda by_time, _out, **_: {k: v for k, v in by_time.items() if k != "20241218_063336"},
+    )
     monkeypatch.setattr(
         mod,
         "_global_frequency_coord_hz",
@@ -1485,6 +1543,13 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
         lambda _xds, _out, *, first_write, chunk_lm: write_calls.append(first_write),
     )
 
+    consolidate_calls: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_consolidate_zarr_metadata",
+        lambda path: consolidate_calls.append(path),
+    )
+
     result = mod.convert_fits_dir_to_zarr(
         input_dir=tmp_path,
         out_dir=out_dir,
@@ -1495,6 +1560,58 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
     assert result == out_zarr
     assert len(write_calls) == 1
     assert write_calls == [False]
+    assert consolidate_calls == [out_zarr]
+
+
+def test_convert_skips_consolidate_when_disabled(monkeypatch, tmp_path: Path):
+    """Per-time ingest callers can defer consolidation until the full batch finishes."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out_zarr = out_dir / "ovro_lwa_full_lm_only.zarr"
+
+    f1 = tmp_path / "a.fits"
+    f1.touch()
+    by_time = {"20241218_063336": [f1]}
+    monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
+    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
+    monkeypatch.setattr(
+        mod,
+        "_global_frequency_coord_hz",
+        lambda *_args, **_kwargs: np.asarray([4.1e7], dtype=np.float64),
+    )
+
+    ref = xr.Dataset(coords={"l": ("l", np.array([0.0, 1.0])), "m": ("m", np.array([0.0, 1.0]))})
+    monkeypatch.setattr(mod, "_load_global_lm_reference_dataset", lambda *_args, **_kwargs: ref)
+
+    xds_t = xr.Dataset(
+        {"SKY": (("time", "m", "l"), np.zeros((1, 2, 2), dtype=np.float32))},
+        coords={
+            "time": np.array(["2024-12-18T06:33:37"], dtype="datetime64[s]"),
+            "m": np.array([0.0, 1.0]),
+            "l": np.array([0.0, 1.0]),
+            "frequency": np.array([4.1e7]),
+        },
+    )
+    monkeypatch.setattr(mod, "_combine_time_step", lambda *_args, **_kwargs: (xds_t, [4.1e7], []))
+    monkeypatch.setattr(mod, "_write_or_append_zarr", lambda *_args, **_kwargs: None)
+
+    consolidate_calls: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_consolidate_zarr_metadata",
+        lambda path: consolidate_calls.append(path),
+    )
+
+    mod.convert_fits_dir_to_zarr(
+        input_dir=tmp_path,
+        out_dir=out_dir,
+        consolidate_metadata_at_end=False,
+    )
+    assert consolidate_calls == []
 
 
 def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Path):
@@ -1514,7 +1631,11 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
     by_time = {"20241218_063336": [f1]}
     monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
     monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
-    monkeypatch.setattr(mod, "_existing_time_keys_from_zarr", lambda _p: {"20241218_063336"})
+    monkeypatch.setattr(
+        mod,
+        "_filter_completed_time_keys",
+        lambda _by_time, _out, **_: {},
+    )
 
     ref = xr.Dataset(coords={"l": ("l", np.array([0.0, 1.0])), "m": ("m", np.array([0.0, 1.0]))})
     monkeypatch.setattr(mod, "_load_global_lm_reference_dataset", lambda *_args, **_kwargs: ref)
@@ -1531,6 +1652,12 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
         "_write_or_append_zarr",
         lambda *_args, **_kwargs: write_calls.append(True),  # pragma: no cover
     )
+    consolidate_calls: list[Path] = []
+    monkeypatch.setattr(
+        mod,
+        "_consolidate_zarr_metadata",
+        lambda path: consolidate_calls.append(path),
+    )
 
     result = mod.convert_fits_dir_to_zarr(
         input_dir=tmp_path,
@@ -1542,6 +1669,42 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
     assert result == out_zarr
     assert combine_calls == []
     assert write_calls == []
+    assert consolidate_calls == [out_zarr]
+
+
+def test_read_wcs_header_str_from_time_promoted_zarr(tmp_path: Path) -> None:
+    """Resume must read WCS from stores where ``wcs_header_str`` spans ``time``."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    hdr = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+    hdr_encoded = hdr.encode("utf-8")
+    hdr_bytes = np.bytes_(hdr_encoded)
+    n_time = 4
+    nl = nm = 8
+    out_zarr = tmp_path / "resume_probe.zarr"
+    wcs_per_time = np.array([hdr_encoded] * n_time, dtype=f"S{len(hdr_encoded)}")
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "m", "l"),
+                np.zeros((n_time, 2, nm, nl), dtype=np.float32),
+            ),
+            "wcs_header_str": (("time",), wcs_per_time),
+        },
+        coords={
+            "time": ("time", np.linspace(59000.0, 59000.0 + n_time - 1, n_time)),
+            "frequency": ("frequency", np.array([55e6, 65e6])),
+            "l": ("l", np.linspace(-0.1, 0.1, nl)),
+            "m": ("m", np.linspace(-0.1, 0.1, nm)),
+        },
+    )
+    ds.to_zarr(out_zarr, mode="w", consolidated=False)
+
+    ref = mod._lm_reference_from_existing_zarr(out_zarr)
+    assert ref.attrs.get("fits_wcs_header") == hdr
+    assert ref.sizes == {"l": nl, "m": nm}
 
 
 def test_fix_headers_relabels_singleton_axis_to_stokes_for_4d(tmp_path: Path) -> None:
@@ -1738,6 +1901,87 @@ def test_fix_headers_leaves_crval_without_image_timestamp_in_name(tmp_path: Path
     assert hdr["CRVAL2"] == pytest.approx(2.5)
 
 
+def test_collapse_wcs_header_str_when_ra_dec_have_no_frequency_dim():
+    """Single-subband combine can leave wcs_header_str on (frequency,) while RA/Dec are (l, m)."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    hdr_a, hdr_b = b"hdr-a", b"hdr-b"
+    ds = xr.Dataset(
+        {
+            "SKY": (("l", "m"), np.ones((4, 5))),
+            "wcs_header_str": (("frequency",), np.array([np.bytes_(hdr_a), np.bytes_(hdr_b)])),
+        },
+        coords={
+            "frequency": np.array([45e6, 55e6]),
+            "l": np.linspace(-0.1, 0.1, 4),
+            "m": np.linspace(-0.1, 0.1, 5),
+            "right_ascension": (("l", "m"), np.full((4, 5), 100.0)),
+            "declination": (("l", "m"), np.full((4, 5), 40.0)),
+        },
+    )
+    out = mod._harmonize_celestial_coords_independent_of_frequency(ds)
+    assert out["wcs_header_str"].dims == ()
+    assert bytes(out["wcs_header_str"].values.item()) == hdr_a
+
+
+def test_align_time_dimension_broadcasts_scalar_wcs_to_time_frequency_schema():
+    """Scalar per-step WCS must align when an existing store uses (time, frequency)."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    hdr = np.bytes_(b"NAXIS = 2\nCRVAL1 = 180.0\nCRVAL2 = 45.0\n")
+    schema = xr.Dataset(
+        {
+            "SKY": (("time", "frequency", "m", "l"), np.zeros((2, 3, 4, 4))),
+            "wcs_header_str": (
+                ("time", "frequency"),
+                np.array([[hdr] * 3, [hdr] * 3], dtype=object),
+            ),
+        },
+        coords={
+            "time": [60000.0, 60001.0],
+            "frequency": [45e6, 55e6, 65e6],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    incoming = xr.Dataset(
+        {
+            "SKY": (("frequency", "m", "l"), np.zeros((3, 4, 4))),
+            "wcs_header_str": ((), hdr),
+        },
+        coords={
+            "time": np.array([60002.0]),
+            "frequency": schema.coords["frequency"],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    aligned = mod._align_time_dimension_for_zarr_write(incoming, schema=schema)
+    assert aligned["wcs_header_str"].dims == ("time", "frequency")
+    assert aligned["wcs_header_str"].sizes["time"] == 1
+    assert bytes(aligned["wcs_header_str"].isel(time=0, frequency=0).values.item()) == bytes(hdr)
+
+
+def test_assert_nonempty_wcs_header_str_before_zarr_write_raises():
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    ds = xr.Dataset(
+        {
+            "SKY": (("time", "frequency", "m", "l"), np.zeros((1, 2, 4, 4))),
+            "wcs_header_str": (("time",), np.array([np.bytes_(b"")])),
+        },
+        coords={"time": [60000.0], "frequency": [45e6, 55e6], "l": np.arange(4), "m": np.arange(4)},
+    )
+    with pytest.raises(RuntimeError, match="wcs_header_str is empty"):
+        mod._assert_nonempty_wcs_header_str_before_zarr_write(ds)
+
+
 def test_harmonize_celestial_coords_collapses_frequency_dim():
     """After combine, RA/Dec should be ``(l, m)`` only when slices share one WCS."""
     import numpy as np
@@ -1854,3 +2098,62 @@ def test_harmonize_celestial_coords_samples_dask_backed_coords(monkeypatch):
     out = mod._harmonize_celestial_coords_independent_of_frequency(ds)
     assert captured["shape"] == (nf, 1, mod._CELESTIAL_DRIFT_SAMPLE_MAX_POINTS)
     assert "frequency" not in out.right_ascension.dims
+
+
+def test_align_zarr_velocity_coord_expands_when_schema_has_time_dimension():
+    """Append path: velocity only on ``frequency`` in coords vs store ``(time, frequency)``."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    nf = 4
+    freq = np.linspace(30e6, 78e6, nf)
+    time_schema = np.array([58400.0])
+    velocity_on_disk = np.arange(nf * 1, dtype=np.float64).reshape(1, nf)
+    schema = xr.Dataset(
+        coords={
+            "time": ("time", time_schema),
+            "frequency": ("frequency", freq),
+            "velocity": (("time", "frequency"), velocity_on_disk),
+        },
+    )
+    incoming = xr.Dataset(
+        coords={
+            "time": ("time", [58401.5]),
+            "frequency": ("frequency", freq),
+            "velocity": ("frequency", np.arange(nf, dtype=np.float64) + 1.0),
+        },
+    )
+
+    aligned = mod._align_time_dimension_for_zarr_write(incoming, schema=schema)
+    assert aligned.coords["velocity"].dims == ("time", "frequency")
+    np.testing.assert_array_equal(
+        aligned.coords["velocity"].values,
+        np.broadcast_to(np.arange(nf, dtype=np.float64) + 1.0, (1, nf)),
+    )
+    assert aligned.coords["frequency"].dims == ("frequency",)
+
+
+def test_align_zarr_first_write_keeps_dimension_coords_1d():
+    """First write: frequency / l stays 1D; frequency-only auxiliary coords gain ``time``."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    nf = 3
+    freq = np.linspace(55e6, 65e6, nf)
+    nl = 2
+    l = np.linspace(-0.1, 0.1, nl)
+    ds = xr.Dataset(
+        coords={
+            "time": ("time", [59000.0]),
+            "frequency": ("frequency", freq),
+            "l": ("l", l),
+            "velocity": ("frequency", np.zeros(nf, dtype=np.float32)),
+        },
+    )
+    aligned = mod._align_time_dimension_for_zarr_write(ds)
+
+    assert aligned.coords["frequency"].dims == ("frequency",)
+    assert aligned.coords["l"].dims == ("l",)
+    assert aligned.coords["velocity"].dims == ("time", "frequency")

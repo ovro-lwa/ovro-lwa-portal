@@ -16,10 +16,13 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
     _canonical_stack_frequency_hz,
     _combine_time_step,
-    _discover_groups,
     _obstime_from_fits_filename,
     _time_key_from_filename,
     _time_key_from_header,
+)
+from ovro_lwa_portal.ingest.discovery import (
+    IngestDiscoveryConfig,
+    discover_time_grouped_fits,
 )
 
 __all__ = [
@@ -321,6 +324,7 @@ def audit_directory(
     *,
     staging_dir: Path | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
     discovery_freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
     probe_combine: bool = False,
     fixed_dir: Path | None = None,
@@ -328,11 +332,12 @@ def audit_directory(
 ) -> list[TimeGroupAuditReport]:
     """Discover and audit observation-time groups under *input_dir*."""
     input_dir = Path(input_dir)
-    by_time = _discover_groups(
-        input_dir,
+    discovery = IngestDiscoveryConfig(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
     )
+    by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
     if not by_time:
         msg = f"No groupable FITS files found in {input_dir}"
         raise FileNotFoundError(msg)

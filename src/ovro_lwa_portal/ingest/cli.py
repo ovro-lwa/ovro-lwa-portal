@@ -28,10 +28,13 @@ from rich.prompt import Prompt
 
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
-    _discover_groups,
     fix_fits_headers,
     repair_zarr_store,
     validate_zarr_store,
+)
+from ovro_lwa_portal.ingest.discovery import (
+    IngestDiscoveryConfig,
+    discover_time_grouped_fits,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
 from ovro_lwa_portal.ingest.dewarp_convert import (
@@ -48,6 +51,15 @@ def _cli_group_metadata_source(value: str) -> Literal["fits", "filename"]:
         raise typer.BadParameter(
             f'expected "fits" or "filename", got {value!r}',
             param_hint="--discovery-metadata-source",
+        )
+    return value  # type: ignore[return-value]
+
+
+def _cli_time_key_source(value: str) -> Literal["header", "filename"]:
+    if value not in ("header", "filename"):
+        raise typer.BadParameter(
+            f'expected "header" or "filename", got {value!r}',
+            param_hint="--discovery-time-key-source",
         )
     return value  # type: ignore[return-value]
 
@@ -255,10 +267,22 @@ def convert(
         "-r",
         help="Overwrite existing Zarr store instead of appending",
     ),
-    resume: bool = typer.Option(
+    no_resume: bool = typer.Option(
         False,
-        "--resume",
-        help="Skip time steps already present in the existing output Zarr time coordinate",
+        "--no-resume",
+        help=(
+            "Reprocess every discovered time step even when the output Zarr already exists "
+            "(default: skip times already present unless --rebuild)"
+        ),
+    ),
+    target_size: Optional[int] = typer.Option(
+        None,
+        "--target-size",
+        help=(
+            "Reproject the global LM reference onto this square grid size (pixels) before "
+            "combining subbands; use the same value as dewarp target_size when applicable"
+        ),
+        min=1,
     ),
     skip_header_fixing: bool = typer.Option(
         False,
@@ -291,6 +315,15 @@ def convert(
             'headers (with filename fallbacks; default). "filename" uses only basename '
             "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, avoiding FITS header reads "
             "during discovery and frequency ordering."
+        ),
+    ),
+    discovery_time_key_source: str = typer.Option(
+        "filename",
+        "--discovery-time-key-source",
+        help=(
+            'When --discovery-metadata-source is "fits", how to choose the observation time '
+            'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
+            "DATE-OBS only."
         ),
     ),
     log_level: LogLevel = typer.Option(
@@ -334,6 +367,7 @@ def convert(
     verbose = log_level == LogLevel.DEBUG
 
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
+    time_key_source = _cli_time_key_source(discovery_time_key_source)
 
     # Build configuration
     config = ConversionConfig(
@@ -343,13 +377,15 @@ def convert(
         fixed_dir=fixed_dir,
         chunk_lm=chunk_lm,
         rebuild=rebuild,
-        resume=resume,
+        resume=not no_resume,
         fix_headers_on_demand=not skip_header_fixing,  # Invert the flag
         cleanup_fixed_fits=cleanup_fixed_fits,
         duplicate_resolver=None,
         discovery_freq_bin_hz=discovery_freq_bin_hz,
         verbose=verbose,
         group_metadata_source=group_metadata_source,
+        discovery_time_key_source=time_key_source,
+        lm_reference_target_size=target_size,
     )
 
     # Display configuration
@@ -360,10 +396,13 @@ def convert(
     console.print(f"  Fixed FITS dir:   {config.fixed_dir}")
     console.print(f"  Chunk size (l,m): {chunk_lm}")
     console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
-    console.print(f"  Resume mode:      {'ON' if resume else 'OFF'}")
+    console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
+    if target_size is not None:
+        console.print(f"  Target size (px): {target_size}")
     console.print(f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}")
     console.print(f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits else 'NO'}")
     console.print(f"  Discovery meta:   {group_metadata_source}")
+    console.print(f"  Time key source:  {time_key_source}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
@@ -414,6 +453,14 @@ def dewarp_convert(
         "-r",
         help="Overwrite existing Zarr store instead of appending",
     ),
+    no_resume: bool = typer.Option(
+        False,
+        "--no-resume",
+        help=(
+            "Reprocess every discovered time step even when the output Zarr already exists "
+            "(default: skip times already present unless --rebuild)"
+        ),
+    ),
     skip_header_fixing: bool = typer.Option(
         False,
         "--skip-header-fixing",
@@ -454,6 +501,15 @@ def dewarp_convert(
             'FITS headers (with filename fallbacks; default). "filename" uses only basename '
             "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, avoiding FITS header reads "
             "during discovery and frequency ordering."
+        ),
+    ),
+    discovery_time_key_source: str = typer.Option(
+        "filename",
+        "--discovery-time-key-source",
+        help=(
+            'When --discovery-metadata-source is "fits", how to choose the observation time '
+            'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
+            "DATE-OBS only."
         ),
     ),
     cascade_parent: Optional[Path] = typer.Option(
@@ -550,6 +606,8 @@ def dewarp_convert(
     _configure_logging(log_level)
     verbose = log_level == LogLevel.DEBUG
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
+    time_key_source = _cli_time_key_source(discovery_time_key_source)
+    resume = not no_resume
 
     output_dir.mkdir(parents=True, exist_ok=True)
     cascade_root = cascade_parent or (output_dir / "cascade73MHz")
@@ -566,6 +624,8 @@ def dewarp_convert(
     if append_after_each_time:
         console.print("  Append after each time: YES (staging + per-time cascade cleaned after each append)")
     console.print(f"  Discovery meta:      {group_metadata_source}")
+    console.print(f"  Time key source:     {time_key_source}")
+    console.print(f"  Resume mode:         {'OFF' if no_resume else 'ON'}")
     console.print(f"  Log level:           {log_level.value.upper()}\n")
 
     fixed_resolved = fixed_dir or (output_dir / "fixed_fits")
@@ -595,9 +655,11 @@ def dewarp_convert(
                 verbose=verbose,
                 progress_callback=None,
                 group_metadata_source=group_metadata_source,
+                time_key_source=time_key_source,
+                resume=resume,
             )
         else:
-            n_staged, time_keys = run_cascade_per_time_group(
+            n_staged, time_keys, lm_ref_ds = run_cascade_per_time_group(
                 input_dir,
                 cascade_root,
                 staging,
@@ -610,8 +672,13 @@ def dewarp_convert(
                 write=write,
                 target_size=target_size,
                 group_metadata_source=group_metadata_source,
+                time_key_source=time_key_source,
                 out_zarr=output_dir / zarr_name,
                 rebuild=rebuild,
+                resume=resume,
+                fixed_dir=fixed_resolved,
+                chunk_lm=chunk_lm,
+                fix_headers_on_demand=not skip_header_fixing,
             )
     except ImportError as e:
         console.print(f"\n[bold red]✗[/bold red] {e}", style="red")
@@ -655,19 +722,26 @@ def dewarp_convert(
         f"from {len(time_keys)} time step(s) for conversion.\n"
     )
 
+    out_zarr_path = output_dir / zarr_name
+    convert_rebuild = rebuild and not out_zarr_path.exists()
+
     config = ConversionConfig(
         input_dir=staging,
         output_dir=output_dir,
         zarr_name=zarr_name,
         fixed_dir=fixed_dir,
         chunk_lm=chunk_lm,
-        rebuild=rebuild,
+        rebuild=convert_rebuild,
+        resume=resume,
         fix_headers_on_demand=not skip_header_fixing,
         cleanup_fixed_fits=cleanup_fixed_fits,
         duplicate_resolver=None,
         discovery_freq_bin_hz=discovery_freq_bin_hz,
         verbose=verbose,
         group_metadata_source=group_metadata_source,
+        discovery_time_key_source=time_key_source,
+        lm_reference_ds=lm_ref_ds,
+        lm_reference_target_size=target_size,
     )
 
     console.print("[bold cyan]OVRO-LWA FITS → Zarr Conversion[/bold cyan]")
@@ -676,10 +750,12 @@ def dewarp_convert(
     console.print(f"  Zarr store name:  {zarr_name}")
     console.print(f"  Fixed FITS dir:   {config.fixed_dir}")
     console.print(f"  Chunk size (l,m): {chunk_lm}")
-    console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
+    console.print(f"  Mode:             {'REBUILD' if convert_rebuild else 'APPEND'}")
+    console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
     console.print(f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}")
     console.print(f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits else 'NO'}")
     console.print(f"  Discovery meta:   {group_metadata_source}")
+    console.print(f"  Time key source:  {time_key_source}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
@@ -745,6 +821,14 @@ def audit_metadata(
         "--discovery-metadata-source",
         help='Discovery mode: "fits" (headers + filename fallbacks) or "filename"',
     ),
+    discovery_time_key_source: str = typer.Option(
+        "filename",
+        "--discovery-time-key-source",
+        help=(
+            'When --discovery-metadata-source is "fits", observation time key from '
+            '"filename" (default) or "header" (DATE-OBS only)'
+        ),
+    ),
     strict: bool = typer.Option(
         False,
         "--strict",
@@ -779,13 +863,15 @@ def audit_metadata(
     """
     _configure_logging(log_level)
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
-
-    input_dir = Path(input_dir)
-    by_time = _discover_groups(
-        input_dir,
+    time_key_source = _cli_time_key_source(discovery_time_key_source)
+    discovery = IngestDiscoveryConfig(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
     )
+
+    input_dir = Path(input_dir)
+    by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
     by_time_keys = sorted(by_time.keys())
 
     if not by_time_keys:
@@ -819,6 +905,7 @@ def audit_metadata(
             keys,
             staging_dir=staging_dir,
             group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
             discovery_freq_bin_hz=discovery_freq_bin_hz,
             probe_combine=probe_combine,
             fixed_dir=fixed_dir,

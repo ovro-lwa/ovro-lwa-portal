@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import warnings
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import matplotlib.pyplot as plt
@@ -45,6 +46,67 @@ _MAX_PIXEL_TRACK_PLANE_ELEMENTS = 72_000_000
 _MAX_PIXEL_TRACK_CHUNK_ELEMENTS = 40_000_000
 
 
+def _decode_wcs_header_bytes(raw: object) -> str:
+    """Decode a scalar WCS header payload from Zarr (bytes or str)."""
+    if isinstance(raw, np.ndarray):
+        raw = raw.item()
+    if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
+    return str(raw).rstrip("\x00")
+
+
+def _has_per_time_wcs_header_str(ds: xr.Dataset) -> bool:
+    """True when ``wcs_header_str`` is stored along the dataset ``time`` axis."""
+    if "wcs_header_str" not in ds:
+        return False
+    wcs_var = ds["wcs_header_str"]
+    return bool(
+        wcs_var.ndim == 1 and "time" in wcs_var.dims and int(wcs_var.sizes.get("time", 0)) > 0
+    )
+
+
+def _read_wcs_header_str(
+    ds: xr.Dataset,
+    *,
+    var: str = "SKY",
+    time_idx: int = 0,
+) -> str | None:
+    """Return the persisted FITS WCS header string from *ds*, if any.
+
+    When ``wcs_header_str`` is stored per ``time`` step (incremental Zarr),
+    that header is preferred over static ``fits_wcs_header`` attrs so each
+    slice keeps its own phase-center CRVAL. Empty per-time entries do **not**
+    fall back to static attrs (that would mis-register late time slices).
+    Otherwise falls back to attrs, then scalar ``wcs_header_str``.
+    """
+    if _has_per_time_wcs_header_str(ds):
+        wcs_var = ds["wcs_header_str"]
+        hdr = _decode_wcs_header_bytes(wcs_var.isel(time=time_idx).values)
+        if hdr.strip():
+            return hdr
+        return None
+
+    hdr_str = None
+    if var in ds.data_vars:
+        hdr_str = ds[var].attrs.get("fits_wcs_header")
+    if not hdr_str:
+        hdr_str = ds.attrs.get("fits_wcs_header")
+    if hdr_str is not None:
+        return str(hdr_str)
+
+    if "wcs_header_str" not in ds:
+        return None
+
+    wcs_var = ds["wcs_header_str"]
+    if wcs_var.ndim == 0:
+        return _decode_wcs_header_bytes(wcs_var.values)
+
+    raw_arr = np.asarray(wcs_var.values)
+    if raw_arr.size == 0:
+        return None
+    return _decode_wcs_header_bytes(np.ravel(raw_arr)[time_idx])
+
+
 def _maybe_load(da: xr.DataArray) -> xr.DataArray:
     """Eagerly load a dask-backed DataArray if it is below the size threshold."""
     if hasattr(da, "nbytes") and da.nbytes < _EAGER_LOAD_THRESHOLD:
@@ -67,6 +129,416 @@ def _dask_progress(label: str = "Computing") -> Generator[None, None, None]:
             yield
     except ImportError:
         yield
+
+
+PatchStatisticName = Literal["std", "max", "min", "mean", "mad"]
+PatchStatisticComparison = Literal["gt", "ge", "lt", "le"]
+
+
+def _reduce_spatial_statistic(values: np.ndarray, statistic: PatchStatisticName) -> float:
+    """Reduce a 2D spatial patch to one scalar."""
+    flat = np.asarray(values, dtype=np.float64).ravel()
+    finite = flat[np.isfinite(flat)]
+    if finite.size == 0:
+        return float("nan")
+    if statistic == "std":
+        return float(np.std(finite))
+    if statistic == "max":
+        return float(np.max(finite))
+    if statistic == "min":
+        return float(np.min(finite))
+    if statistic == "mean":
+        return float(np.mean(finite))
+    if statistic == "mad":
+        med = float(np.median(finite))
+        return float(np.median(np.abs(finite - med)))
+    msg = f"Unsupported statistic {statistic!r}"
+    raise ValueError(msg)
+
+
+def _reduce_patch_cube_statistics(
+    patch: np.ndarray,
+    statistic: PatchStatisticName,
+) -> np.ndarray:
+    """Apply a spatial statistic to each frequency plane in ``(frequency, l, m)``."""
+    patch_arr = np.asarray(patch)
+    if patch_arr.ndim != 3:
+        msg = f"Expected patch with shape (frequency, l, m), got {patch_arr.shape}"
+        raise ValueError(msg)
+    return np.array(
+        [_reduce_spatial_statistic(patch_arr[fi], statistic) for fi in range(patch_arr.shape[0])],
+        dtype=np.float64,
+    )
+
+
+# FWHM (pixels) = _FWHM_TO_SIGMA * sigma for a 2D Gaussian profile.
+_FWHM_TO_SIGMA = 2.0 * np.sqrt(2.0 * np.log(2.0))
+
+
+def _gaussian_predict(
+    params: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> np.ndarray:
+    """Evaluate a centred 2D Gaussian model on a pixel grid."""
+    peak, widthx, widthy, background = params
+    sx = max(float(widthx) / _FWHM_TO_SIGMA, 1e-6)
+    sy = max(float(widthy) / _FWHM_TO_SIGMA, 1e-6)
+    return background + peak * np.exp(-0.5 * ((x / sx) ** 2 + (y / sy) ** 2))
+
+
+def _reduced_chi_squared(
+    observed: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    n_params: int = 4,
+) -> float:
+    """Compute reduced chi-squared for a 2D patch fit."""
+    obs = np.asarray(observed, dtype=np.float64)
+    pred = np.asarray(predicted, dtype=np.float64)
+    finite = np.isfinite(obs) & np.isfinite(pred)
+    if not np.any(finite):
+        return float("nan")
+    residuals = obs[finite] - pred[finite]
+    chi2 = float(np.sum(residuals**2))
+    dof = int(np.sum(finite)) - n_params
+    if dof <= 0:
+        return float("nan")
+    return chi2 / dof
+
+
+def _fit_spatial_gaussian(
+    values: np.ndarray,
+    *,
+    default_fwhm: float = 3.0,
+) -> tuple[float, float, float, float, float]:
+    """Fit a centred 2D Gaussian to a spatial patch.
+
+    The model is ``background + peak * exp(-0.5 * ((x/sx)**2 + (y/sy)**2))`` with
+    the peak centred on the patch centre.  ``widthx`` and ``widthy`` are returned
+    as full width at half maximum (FWHM) in pixels.
+
+    Initial guesses use ``peak = max(patch)``, ``widthx = widthy = default_fwhm``,
+    and ``background = min(patch)``.
+    """
+    nan5 = (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim != 2:
+        msg = f"Expected 2D patch, got shape {arr.shape}"
+        raise ValueError(msg)
+
+    ny, nx = arr.shape
+    if ny < 2 or nx < 2:
+        return nan5
+
+    if not np.any(np.isfinite(arr)):
+        return nan5
+
+    cy = (ny - 1) / 2.0
+    cx = (nx - 1) / 2.0
+    yy, xx = np.indices((ny, nx))
+    y = yy - cy
+    x = xx - cx
+
+    peak0 = float(np.nanmax(arr))
+    bg0 = float(np.nanmin(arr))
+    width0 = float(default_fwhm)
+    if not np.isfinite(peak0):
+        return nan5
+
+    def residual(params: np.ndarray) -> np.ndarray:
+        return (_gaussian_predict(params, x, y) - arr).ravel()
+
+    x0 = np.array([peak0, width0, width0, bg0], dtype=np.float64)
+    lower = np.array([0.0, 0.5, 0.5, -np.inf], dtype=np.float64)
+    upper = np.array([np.inf, max(nx, ny) * 4.0, max(nx, ny) * 4.0, np.inf], dtype=np.float64)
+
+    try:
+        res = least_squares(
+            residual,
+            x0=x0,
+            bounds=(lower, upper),
+            method="trf",
+            ftol=1e-8,
+            xtol=1e-8,
+            max_nfev=300,
+        )
+    except (ValueError, RuntimeError):
+        return nan5
+
+    if not res.success:
+        return nan5
+
+    peak, widthx, widthy, background = res.x
+    predicted = _gaussian_predict(res.x, x, y)
+    chi2_red = _reduced_chi_squared(arr, predicted)
+    return float(peak), float(widthx), float(widthy), float(background), chi2_red
+
+
+def _fit_patch_cube_gaussian(
+    patch: np.ndarray,
+    *,
+    default_fwhm: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit a 2D Gaussian on each frequency plane in ``(frequency, l, m)``."""
+    patch_arr = np.asarray(patch)
+    if patch_arr.ndim != 3:
+        msg = f"Expected patch with shape (frequency, l, m), got {patch_arr.shape}"
+        raise ValueError(msg)
+
+    peaks = []
+    widthxs = []
+    widthys = []
+    backgrounds = []
+    chi2_reds = []
+    for fi in range(patch_arr.shape[0]):
+        peak, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch_arr[fi],
+            default_fwhm=default_fwhm,
+        )
+        peaks.append(peak)
+        widthxs.append(widthx)
+        widthys.append(widthy)
+        backgrounds.append(background)
+        chi2_reds.append(chi2_red)
+
+    return (
+        np.array(peaks, dtype=np.float64),
+        np.array(widthxs, dtype=np.float64),
+        np.array(widthys, dtype=np.float64),
+        np.array(backgrounds, dtype=np.float64),
+        np.array(chi2_reds, dtype=np.float64),
+    )
+
+
+def _mask_patch_fit_by_chi2(
+    peaks: np.ndarray,
+    widthxs: np.ndarray,
+    widthys: np.ndarray,
+    backgrounds: np.ndarray,
+    chi2_red: np.ndarray,
+    *,
+    max_reduced_chi_squared: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Set fit parameters to NaN where reduced chi-squared exceeds the threshold."""
+    bad = np.isfinite(chi2_red) & (chi2_red > max_reduced_chi_squared)
+    peaks = np.asarray(peaks, dtype=np.float64).copy()
+    widthxs = np.asarray(widthxs, dtype=np.float64).copy()
+    widthys = np.asarray(widthys, dtype=np.float64).copy()
+    backgrounds = np.asarray(backgrounds, dtype=np.float64).copy()
+    peaks[bad] = np.nan
+    widthxs[bad] = np.nan
+    widthys[bad] = np.nan
+    backgrounds[bad] = np.nan
+    return peaks, widthxs, widthys, backgrounds
+
+
+def _threshold_patch_selection(
+    stat_values: np.ndarray,
+    *,
+    threshold: float,
+    comparison: PatchStatisticComparison,
+) -> np.ndarray:
+    """Build a boolean ``(time, frequency)`` mask from a statistic map.
+
+    Returns ``True`` where the statistic passes the threshold test and is
+    finite; ``False`` elsewhere (including NaN cells).
+    """
+    if stat_values.ndim != 2:
+        msg = f"stat_values must be 2D (time, frequency), got shape {stat_values.shape}"
+        raise ValueError(msg)
+
+    stats = np.asarray(stat_values, dtype=np.float64)
+    finite = np.isfinite(stats)
+    if comparison == "gt":
+        passed = stats > threshold
+    elif comparison == "ge":
+        passed = stats >= threshold
+    elif comparison == "lt":
+        passed = stats < threshold
+    elif comparison == "le":
+        passed = stats <= threshold
+    else:
+        msg = f"Unsupported comparison {comparison!r}"
+        raise ValueError(msg)
+    return np.asarray(finite & passed, dtype=bool)
+
+
+@dataclass
+class PatchStatisticResult:
+    """Statistic map and threshold selection for follow-up 1D/2D extractions.
+
+    Returned by :meth:`RadportAccessor.patch_statistic`.  The ``selection``
+    mask is ``True`` where the statistic passes the threshold test.
+    Use :meth:`light_curve`, :meth:`dynamic_spectrum`, or :meth:`spectrum` to
+    extract data with unselected cells masked to NaN.
+    """
+
+    stat_map: xr.DataArray
+    selection: xr.DataArray | None
+    threshold: float | None
+    comparison: PatchStatisticComparison | None
+    statistic: PatchStatisticName
+    radius: int
+    _accessor: Any
+    _ra: float | None
+    _dec: float | None
+    _l: float | None
+    _m: float | None
+    _var: Literal["SKY", "BEAM"]
+    _pol: int
+    _track_freq_idx: int | None
+    _track_freq_mhz: float | None
+    _observatory: Any
+
+    def _apply_selection_time(
+        self,
+        da: xr.DataArray,
+        *,
+        freq_idx: int,
+        freq_mhz: float | None,
+        apply_selection: bool,
+    ) -> xr.DataArray:
+        if not apply_selection or self.selection is None:
+            return da
+        if freq_mhz is not None:
+            sel = self.selection.sel(frequency=freq_mhz, method="nearest")
+        else:
+            sel = self.selection.isel(frequency=int(freq_idx))
+        return da.where(sel)
+
+    def _apply_selection_frequency(
+        self,
+        da: xr.DataArray,
+        *,
+        time_idx: int,
+        time_mjd: float | None,
+        apply_selection: bool,
+    ) -> xr.DataArray:
+        if not apply_selection or self.selection is None:
+            return da
+        if time_mjd is not None:
+            sel = self.selection.sel(time=time_mjd, method="nearest")
+        else:
+            sel = self.selection.isel(time=int(time_idx))
+        return da.where(sel)
+
+    def light_curve(
+        self,
+        *,
+        freq_idx: int = 0,
+        freq_mhz: float | None = None,
+        apply_selection: bool = True,
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """Light curve at the tracked location, masked by ``selection``."""
+        fi = int(self._accessor.nearest_freq_idx(freq_mhz)) if freq_mhz is not None else freq_idx
+        lc = self._accessor.light_curve(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            freq_idx=fi,
+            freq_mhz=freq_mhz,
+            var=self._var,
+            pol=self._pol,
+            observatory=self._observatory,
+            **kwargs,
+        )
+        return self._apply_selection_time(
+            lc,
+            freq_idx=fi,
+            freq_mhz=freq_mhz,
+            apply_selection=apply_selection,
+        )
+
+    def dynamic_spectrum(
+        self,
+        *,
+        apply_selection: bool = True,
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """Time–frequency dynamic spectrum with unselected cells masked to NaN."""
+        dynspec = self._accessor.dynamic_spectrum(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            var=self._var,
+            pol=self._pol,
+            freq_idx=self._track_freq_idx,
+            freq_mhz=self._track_freq_mhz,
+            observatory=self._observatory,
+            **kwargs,
+        )
+        if apply_selection and self.selection is not None:
+            dynspec = dynspec.where(self.selection)
+        return dynspec
+
+    def spectrum(
+        self,
+        *,
+        time_idx: int = 0,
+        time_mjd: float | None = None,
+        apply_selection: bool = True,
+        **kwargs: Any,
+    ) -> xr.DataArray:
+        """Frequency spectrum at one time, masked by ``selection``."""
+        ti = (
+            int(self._accessor.nearest_time_idx(time_mjd))
+            if time_mjd is not None
+            else time_idx
+        )
+        spec = self._accessor.spectrum(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            time_idx=ti,
+            time_mjd=time_mjd,
+            var=self._var,
+            pol=self._pol,
+            freq_idx=self._track_freq_idx,
+            freq_mhz=self._track_freq_mhz,
+            **kwargs,
+        )
+        return self._apply_selection_frequency(
+            spec,
+            time_idx=ti,
+            time_mjd=time_mjd,
+            apply_selection=apply_selection,
+        )
+
+
+@dataclass
+class PatchFitResult:
+    """Gaussian fit parameters on a tracked patch for each time/frequency cell.
+
+    Returned by :meth:`RadportAccessor.patch_fit`.  Each parameter map has
+    dimensions ``(time, frequency)``.  ``widthx`` and ``widthy`` are full width
+    at half maximum in pixels.  ``reduced_chi_squared_map`` stores the fit
+    quality; parameter maps are NaN where reduced chi-squared exceeds
+    ``max_reduced_chi_squared``.
+    """
+
+    peak_map: xr.DataArray
+    widthx_map: xr.DataArray
+    widthy_map: xr.DataArray
+    background_map: xr.DataArray
+    reduced_chi_squared_map: xr.DataArray
+    radius: int
+    default_fwhm: float
+    max_reduced_chi_squared: float
+    _accessor: Any
+    _ra: float | None
+    _dec: float | None
+    _l: float | None
+    _m: float | None
+    _var: Literal["SKY", "BEAM"]
+    _pol: int
+    _track_freq_idx: int | None
+    _track_freq_mhz: float | None
+    _observatory: Any
 
 
 @xr.register_dataset_accessor("radport")
@@ -601,6 +1073,55 @@ class RadportAccessor:
 
         return l_indices, m_indices, visible
 
+    def _use_persisted_wcs_for_pixel_mapping(self) -> bool:
+        """True when RA/Dec should map via stored FITS WCS rather than SIN drift."""
+        obj = self._obj
+        n_times = int(obj.sizes.get("time", 1))
+        if "wcs_header_str" in obj:
+            wv = obj["wcs_header_str"]
+            if wv.ndim == 1 and "time" in wv.dims and n_times > 1:
+                return True
+        if n_times <= 1 and _read_wcs_header_str(obj, time_idx=0) is not None:
+            return True
+        return False
+
+    def _coords_to_pixel_via_wcs(
+        self,
+        ra: float,
+        dec: float,
+        time_idx: int,
+        *,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> tuple[int, int] | None:
+        """Map (RA, Dec) with the persisted FITS WCS at *time_idx*, if available.
+
+        Matches astrowidget ``get_wcs(ds, time_idx)`` / ``all_world2pix`` on the
+        full-resolution image grid. Returns ``None`` when no WCS header is stored.
+        """
+        if _read_wcs_header_str(self._obj, var=var, time_idx=time_idx) is None:
+            return None
+
+        wcs = self._get_wcs(var=var, time_idx=time_idx)
+        xp, yp = wcs.all_world2pix(float(ra), float(dec), 0)
+        xp_f = float(np.asarray(xp).ravel()[0])
+        yp_f = float(np.asarray(yp).ravel()[0])
+        if not (np.isfinite(xp_f) and np.isfinite(yp_f)):
+            raise ValueError(
+                f"Source (RA={ra}, Dec={dec}) is outside the image footprint "
+                f"at time index {time_idx}."
+            )
+
+        n_l = int(self._obj.sizes["l"])
+        n_m = int(self._obj.sizes["m"])
+        l_idx = int(np.round(xp_f))
+        m_idx = int(np.round(yp_f))
+        if not (0 <= l_idx < n_l and 0 <= m_idx < n_m):
+            raise ValueError(
+                f"Source (RA={ra}, Dec={dec}) maps outside the image FOV "
+                f"at time index {time_idx}."
+            )
+        return l_idx, m_idx
+
     def _compute_pixel_at_time(
         self,
         ra: float,
@@ -613,15 +1134,16 @@ class RadportAccessor:
     ) -> tuple[int, int]:
         """Compute the pixel index for (RA, Dec) at a single time step.
 
-        When the dataset provides ``right_ascension`` and ``declination``
-        coordinates that include a ``time`` dimension (or the cube has only one
-        time step), this method finds the nearest sky pixel by minimizing
-        angular distance on the stored RA/Dec grids. If those coordinates also
-        carry ``frequency`` and/or ``polarization`` dimensions, the slice at
-        ``freq_idx`` / ``pol`` is taken first so the minimization is only over
-        ``(l, m)``. Otherwise it falls back to the closed-form SIN projection
-        using mean sidereal time at the dataset timestamp (the analytical branch
-        used when :meth:`coords_to_pixel` does not use stored RA/Dec grids).
+        When a FITS WCS header is stored (``fits_wcs_header`` or per-time
+        ``wcs_header_str``), this method uses :meth:`_get_wcs` and
+        ``all_world2pix`` so pixel indices match astrowidget and
+        :meth:`plot_wcs`. Otherwise, when the dataset provides
+        ``right_ascension`` and ``declination`` coordinates that include a
+        ``time`` dimension (or the cube has only one time step), it finds the
+        nearest sky pixel by minimizing angular distance on those grids. If those
+        coordinates also carry ``frequency`` and/or ``polarization`` dimensions,
+        the slice at ``freq_idx`` / ``pol`` is taken first. Otherwise it falls
+        back to the closed-form SIN projection using mean sidereal time.
 
         Parameters
         ----------
@@ -658,6 +1180,11 @@ class RadportAccessor:
             observatory = EarthLocation(
                 lat=37.2339 * u.deg, lon=-118.2817 * u.deg, height=1222 * u.m
             )
+
+        if self._use_persisted_wcs_for_pixel_mapping():
+            wcs_pixel = self._coords_to_pixel_via_wcs(ra, dec, time_idx)
+            if wcs_pixel is not None:
+                return wcs_pixel
 
         lst_deg = self._lst_deg_for_time_index(time_idx, observatory=observatory)
 
@@ -1690,6 +2217,512 @@ class RadportAccessor:
         )
 
         return da
+
+    # =========================================================================
+    # Patch Statistic Methods
+    # =========================================================================
+
+    def _extract_tracked_patch_cubes(
+        self,
+        *,
+        l_indices: np.ndarray,
+        m_indices: np.ndarray,
+        visible: np.ndarray,
+        var: str,
+        pol: int,
+        radius: int,
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Load ``(frequency, l, m)`` patches for visible tracked time steps.
+
+        Uses one batched ``dask.compute`` call to avoid per-iteration scheduler
+        overhead on large time series.
+        """
+        data_var = self._obj[var].isel(polarization=pol)
+        n_l = int(self._obj.sizes["l"])
+        n_m = int(self._obj.sizes["m"])
+
+        vis_times = np.asarray(np.where(visible)[0], dtype=int)
+        vis_l = np.asarray(l_indices, dtype=int)[visible]
+        vis_m = np.asarray(m_indices, dtype=int)[visible]
+
+        patch_arrays = []
+        for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True):
+            l_sl = slice(max(0, int(li) - radius), min(n_l, int(li) + radius + 1))
+            m_sl = slice(max(0, int(mi) - radius), min(n_m, int(mi) + radius + 1))
+            patch_arrays.append(data_var.isel(time=int(t), l=l_sl, m=m_sl))
+
+        if not patch_arrays:
+            return vis_times, []
+
+        if hasattr(data_var, "chunks") and data_var.chunks is not None:
+            import dask
+
+            with _dask_progress("Extracting tracked patches"):
+                results = dask.compute(*patch_arrays)
+        else:
+            results = [np.asarray(p.values) for p in patch_arrays]
+
+        return vis_times, [np.asarray(r) for r in results]
+
+    def patch_statistic(
+        self,
+        *,
+        ra: float | None = None,
+        dec: float | None = None,
+        l: float | None = None,
+        m: float | None = None,
+        radius: int = 5,
+        statistic: PatchStatisticName = "std",
+        var: Literal["SKY", "BEAM"] = "SKY",
+        pol: int = 0,
+        freq_idx: int | None = None,
+        freq_mhz: float | None = None,
+        observatory: Any = None,
+        threshold: float | None = None,
+        comparison: PatchStatisticComparison = "gt",
+    ) -> PatchStatisticResult:
+        """Compute a spatial statistic on a tracked patch for each time/frequency cell.
+
+        For each time step the patch is centred on the pixel nearest to the
+        given celestial or direction-cosine coordinates.  A statistic is
+        applied to all pixels in the patch independently for every frequency
+        channel, producing a 2D ``(time, frequency)`` map.
+
+        When ``threshold`` is set, a boolean ``selection`` mask marks cells
+        where the statistic passes the comparison test.  Unselected cells are
+        ``False``; NaN statistic values are always ``False``.  Use
+        :meth:`PatchStatisticResult.light_curve`,
+        :meth:`PatchStatisticResult.dynamic_spectrum`, or
+        :meth:`PatchStatisticResult.spectrum` to extract data with unselected
+        cells masked to NaN.
+
+        Parameters
+        ----------
+        ra, dec : float, optional
+            Celestial coordinates in degrees (FK5/J2000).  Requires tracking
+            across time when both are provided.
+        l, m : float, optional
+            Direction-cosine coordinates for a fixed patch centre.
+        radius : int, default 5
+            Patch half-width in pixels.  The patch spans
+            ``[center - radius, center + radius]`` along ``l`` and ``m``.
+        statistic : {'std', 'max', 'min', 'mean', 'mad'}, default 'std'
+            Spatial reducer applied within each patch.  ``mad`` is the
+            median absolute deviation from the patch median.
+        var : {'SKY', 'BEAM'}, default 'SKY'
+            Data variable to analyse.
+        pol : int, default 0
+            Polarization index.
+        freq_idx, freq_mhz : optional
+            Passed to coordinate tracking for RA/Dec pixel mapping.
+        observatory : astropy.coordinates.EarthLocation, optional
+            Observatory location for RA/Dec tracking.
+        threshold : float, optional
+            Statistic threshold for the ``selection`` mask.  When omitted,
+            ``selection`` is ``None``.
+        comparison : {'gt', 'ge', 'lt', 'le'}, default 'gt'
+            Comparison applied at each ``(time, frequency)`` cell.  The
+            cell is selected (``True``) when the statistic satisfies the
+            comparison against ``threshold``.  For example, ``comparison='le'``
+            selects cells with statistic less than or equal to ``threshold``;
+            cells above the threshold are ``False``.
+
+        Returns
+        -------
+        PatchStatisticResult
+            Container with ``stat_map``, optional ``selection`` mask, and
+            convenience methods for downstream extractions.
+
+        Examples
+        --------
+        >>> result = ds.radport.patch_statistic(
+        ...     ra=299.868, dec=40.734, statistic="std", threshold=0.5, comparison="gt"
+        ... )
+        >>> dynspec = result.dynamic_spectrum()
+        >>> lc = result.light_curve(freq_idx=0)
+        """
+        if var not in self._obj.data_vars:
+            available = sorted(self._obj.data_vars)
+            raise ValueError(f"Variable '{var}' not found. Available: {available}")
+        if radius < 0:
+            msg = f"radius must be non-negative, got {radius}"
+            raise ValueError(msg)
+
+        track_freq_idx = freq_idx
+        if freq_mhz is not None:
+            track_freq_idx = int(self.nearest_freq_idx(freq_mhz))
+
+        resolved = self._resolve_coordinates(
+            ra=ra,
+            dec=dec,
+            l=l,
+            m=m,
+            observatory=observatory,
+            freq_idx=track_freq_idx,
+            freq_mhz=freq_mhz,
+            pol=pol,
+        )
+
+        n_times = int(self._obj.sizes["time"])
+        n_freqs = int(self._obj.sizes["frequency"])
+        stat_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        tracking = ra is not None and dec is not None
+
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            l_idx, m_idx = resolved
+            visible = np.ones(n_times, dtype=bool)
+            l_indices = np.full(n_times, int(l_idx), dtype=int)
+            m_indices = np.full(n_times, int(m_idx), dtype=int)
+        else:
+            l_indices, m_indices, visible = resolved
+
+        vis_times, patches = self._extract_tracked_patch_cubes(
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+            var=var,
+            pol=pol,
+            radius=radius,
+        )
+        for ti, patch in zip(vis_times, patches, strict=True):
+            stat_values[int(ti)] = _reduce_patch_cube_statistics(patch, statistic)
+
+        selection_array: np.ndarray | None
+        if threshold is not None:
+            selection_array = _threshold_patch_selection(
+                stat_values,
+                threshold=threshold,
+                comparison=comparison,
+            )
+        else:
+            selection_array = None
+
+        attrs: dict[str, Any] = {
+            "statistic": statistic,
+            "radius": radius,
+            "variable": var,
+            "pol": pol,
+            "tracking": tracking,
+        }
+        if threshold is not None:
+            attrs["threshold"] = threshold
+            attrs["comparison"] = comparison
+        if ra is not None:
+            attrs["ra"] = ra
+            attrs["dec"] = dec
+        if l is not None:
+            attrs["l"] = l
+            attrs["m"] = m
+
+        stat_map = xr.DataArray(
+            stat_values,
+            dims=["time", "frequency"],
+            coords={
+                "time": self._obj.coords["time"].values,
+                "frequency": self._obj.coords["frequency"].values,
+            },
+            attrs=attrs,
+            name=f"{var}_patch_{statistic}",
+        )
+
+        selection: xr.DataArray | None = None
+        if selection_array is not None:
+            selection = xr.DataArray(
+                selection_array,
+                dims=["time", "frequency"],
+                coords={
+                    "time": self._obj.coords["time"].values,
+                    "frequency": self._obj.coords["frequency"].values,
+                },
+                attrs={
+                    "threshold": threshold,
+                    "comparison": comparison,
+                },
+                name="selection",
+            )
+
+        return PatchStatisticResult(
+            stat_map=stat_map,
+            selection=selection,
+            threshold=threshold,
+            comparison=comparison if threshold is not None else None,
+            statistic=statistic,
+            radius=radius,
+            _accessor=self,
+            _ra=ra,
+            _dec=dec,
+            _l=l,
+            _m=m,
+            _var=var,
+            _pol=pol,
+            _track_freq_idx=track_freq_idx,
+            _track_freq_mhz=freq_mhz,
+            _observatory=observatory,
+        )
+
+    def patch_fit(
+        self,
+        *,
+        ra: float | None = None,
+        dec: float | None = None,
+        l: float | None = None,
+        m: float | None = None,
+        radius: int = 5,
+        default_fwhm: float = 3.0,
+        max_reduced_chi_squared: float = 3.0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+        pol: int = 0,
+        freq_idx: int | None = None,
+        freq_mhz: float | None = None,
+        observatory: Any = None,
+    ) -> PatchFitResult:
+        """Fit a 2D Gaussian to a tracked patch for each time/frequency cell.
+
+        For each time step the patch is centred on the pixel nearest to the
+        given celestial or direction-cosine coordinates.  A centred Gaussian
+        with parameters ``peak``, ``widthx``, ``widthy``, and ``background`` is
+        fit independently on every frequency channel, producing four
+        ``(time, frequency)`` maps plus a reduced chi-squared quality map.
+
+        The Gaussian is centred on the patch centre.  ``widthx`` and ``widthy``
+        are full width at half maximum in pixels.  Initial guesses use
+        ``peak = max(patch)``, ``widthx = widthy = default_fwhm`` (3 pixels by
+        default), and ``background = min(patch)``.
+
+        When reduced chi-squared exceeds ``max_reduced_chi_squared`` (default
+        3), the fit parameters for that cell are set to NaN.  The reduced
+        chi-squared value is always retained in ``reduced_chi_squared_map``.
+
+        Parameters
+        ----------
+        ra, dec : float, optional
+            Celestial coordinates in degrees (FK5/J2000).  Requires tracking
+            across time when both are provided.
+        l, m : float, optional
+            Direction-cosine coordinates for a fixed patch centre.
+        radius : int, default 5
+            Patch half-width in pixels.  The patch spans
+            ``[center - radius, center + radius]`` along ``l`` and ``m``.
+        default_fwhm : float, default 3.0
+            Initial full width at half maximum in pixels for ``widthx`` and
+            ``widthy``.
+        max_reduced_chi_squared : float, default 3.0
+            Maximum acceptable reduced chi-squared.  Cells above this threshold
+            have ``peak``, ``widthx``, ``widthy``, and ``background`` set to
+            NaN.
+        var : {'SKY', 'BEAM'}, default 'SKY'
+            Data variable to analyse.
+        pol : int, default 0
+            Polarization index.
+        freq_idx, freq_mhz : optional
+            Passed to coordinate tracking for RA/Dec pixel mapping.
+        observatory : astropy.coordinates.EarthLocation, optional
+            Observatory location for RA/Dec tracking.
+
+        Returns
+        -------
+        PatchFitResult
+            Container with parameter maps, ``reduced_chi_squared_map``, and
+            ``max_reduced_chi_squared``.
+
+        Examples
+        --------
+        >>> result = ds.radport.patch_fit(ra=299.868, dec=40.734, radius=5)
+        >>> peaks = result.peak_map
+        """
+        if var not in self._obj.data_vars:
+            available = sorted(self._obj.data_vars)
+            raise ValueError(f"Variable '{var}' not found. Available: {available}")
+        if radius < 0:
+            msg = f"radius must be non-negative, got {radius}"
+            raise ValueError(msg)
+        if default_fwhm <= 0:
+            msg = f"default_fwhm must be positive, got {default_fwhm}"
+            raise ValueError(msg)
+        if max_reduced_chi_squared <= 0:
+            msg = f"max_reduced_chi_squared must be positive, got {max_reduced_chi_squared}"
+            raise ValueError(msg)
+
+        track_freq_idx = freq_idx
+        if freq_mhz is not None:
+            track_freq_idx = int(self.nearest_freq_idx(freq_mhz))
+
+        resolved = self._resolve_coordinates(
+            ra=ra,
+            dec=dec,
+            l=l,
+            m=m,
+            observatory=observatory,
+            freq_idx=track_freq_idx,
+            freq_mhz=freq_mhz,
+            pol=pol,
+        )
+
+        n_times = int(self._obj.sizes["time"])
+        n_freqs = int(self._obj.sizes["frequency"])
+        peak_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        widthx_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        widthy_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        background_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        chi2_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        tracking = ra is not None and dec is not None
+
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            l_idx, m_idx = resolved
+            visible = np.ones(n_times, dtype=bool)
+            l_indices = np.full(n_times, int(l_idx), dtype=int)
+            m_indices = np.full(n_times, int(m_idx), dtype=int)
+        else:
+            l_indices, m_indices, visible = resolved
+
+        vis_times, patches = self._extract_tracked_patch_cubes(
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+            var=var,
+            pol=pol,
+            radius=radius,
+        )
+        for ti, patch in zip(vis_times, patches, strict=True):
+            peaks, widthxs, widthys, backgrounds, chi2_red = _fit_patch_cube_gaussian(
+                patch,
+                default_fwhm=default_fwhm,
+            )
+            peaks, widthxs, widthys, backgrounds = _mask_patch_fit_by_chi2(
+                peaks,
+                widthxs,
+                widthys,
+                backgrounds,
+                chi2_red,
+                max_reduced_chi_squared=max_reduced_chi_squared,
+            )
+            ti_int = int(ti)
+            peak_values[ti_int] = peaks
+            widthx_values[ti_int] = widthxs
+            widthy_values[ti_int] = widthys
+            background_values[ti_int] = backgrounds
+            chi2_values[ti_int] = chi2_red
+
+        attrs: dict[str, Any] = {
+            "radius": radius,
+            "default_fwhm": default_fwhm,
+            "max_reduced_chi_squared": max_reduced_chi_squared,
+            "variable": var,
+            "pol": pol,
+            "tracking": tracking,
+        }
+        if ra is not None:
+            attrs["ra"] = ra
+            attrs["dec"] = dec
+        if l is not None:
+            attrs["l"] = l
+            attrs["m"] = m
+
+        coords = {
+            "time": self._obj.coords["time"].values,
+            "frequency": self._obj.coords["frequency"].values,
+        }
+
+        peak_map = xr.DataArray(
+            peak_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_peak",
+        )
+        widthx_map = xr.DataArray(
+            widthx_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_widthx",
+        )
+        widthy_map = xr.DataArray(
+            widthy_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_widthy",
+        )
+        background_map = xr.DataArray(
+            background_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_background",
+        )
+        reduced_chi_squared_map = xr.DataArray(
+            chi2_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_reduced_chi_squared",
+        )
+
+        return PatchFitResult(
+            peak_map=peak_map,
+            widthx_map=widthx_map,
+            widthy_map=widthy_map,
+            background_map=background_map,
+            reduced_chi_squared_map=reduced_chi_squared_map,
+            radius=radius,
+            default_fwhm=default_fwhm,
+            max_reduced_chi_squared=max_reduced_chi_squared,
+            _accessor=self,
+            _ra=ra,
+            _dec=dec,
+            _l=l,
+            _m=m,
+            _var=var,
+            _pol=pol,
+            _track_freq_idx=track_freq_idx,
+            _track_freq_mhz=freq_mhz,
+            _observatory=observatory,
+        )
+
+    def select_patch_statistic(
+        self,
+        stat_map: xr.DataArray,
+        *,
+        threshold: float,
+        comparison: PatchStatisticComparison = "gt",
+    ) -> xr.DataArray:
+        """Build a boolean ``(time, frequency)`` selection mask from a statistic map.
+
+        Parameters
+        ----------
+        stat_map : xr.DataArray
+            2D ``(time, frequency)`` array, e.g. from
+            :meth:`patch_statistic` ``.stat_map``.
+        threshold : float
+            Statistic threshold.
+        comparison : {'gt', 'ge', 'lt', 'le'}, default 'gt'
+            Comparison for selection.  Cells where the statistic satisfies
+            the comparison are ``True``; others are ``False``.
+
+        Returns
+        -------
+        xr.DataArray
+            Boolean mask with dimensions ``(time, frequency)``.
+        """
+        if set(stat_map.dims) != {"time", "frequency"}:
+            msg = f"stat_map must have dims ('time', 'frequency'), got {stat_map.dims}"
+            raise ValueError(msg)
+        mask = _threshold_patch_selection(
+            np.asarray(stat_map.values, dtype=np.float64),
+            threshold=threshold,
+            comparison=comparison,
+        )
+        return xr.DataArray(
+            mask,
+            dims=["time", "frequency"],
+            coords={
+                "time": stat_map.coords["time"].values,
+                "frequency": stat_map.coords["frequency"].values,
+            },
+            attrs={"threshold": threshold, "comparison": comparison},
+            name="selection",
+        )
 
     def plot_dynamic_spectrum(
         self,
@@ -3403,25 +4436,34 @@ class RadportAccessor:
     # WCS & Coordinate Methods
     # =========================================================================
 
-    def _get_wcs(self, var: Literal["SKY", "BEAM"] = "SKY"):
+    def _get_wcs(
+        self,
+        var: Literal["SKY", "BEAM"] = "SKY",
+        *,
+        time_idx: int = 0,
+    ):
         """Get WCS object from the dataset.
 
         Parameters
         ----------
         var : {'SKY', 'BEAM'}, default 'SKY'
             Data variable to get WCS from (checks attrs first).
+        time_idx : int, default 0
+            Time index when ``wcs_header_str`` is stored per time step (common
+            after incremental Zarr writes).
 
         Returns
         -------
         astropy.wcs.WCS
-            The WCS object for coordinate transformations.
+            The 2D celestial (RA/Dec) WCS, matching astrowidget ``get_wcs``.
 
         Raises
         ------
         ImportError
             If astropy is not installed.
         ValueError
-            If no WCS header is found in the dataset.
+            If no WCS header is found in the dataset, or the header has no
+            celestial axes.
         """
         try:
             from astropy.io.fits import Header
@@ -3432,34 +4474,17 @@ class RadportAccessor:
                 "Install with: pip install astropy"
             ) from e
 
-        # Try to get WCS header string from various locations
-        hdr_str = None
-
-        # 1. Check variable attrs
-        if var in self._obj.data_vars:
-            hdr_str = self._obj[var].attrs.get("fits_wcs_header")
-
-        # 2. Check dataset attrs
-        if not hdr_str:
-            hdr_str = self._obj.attrs.get("fits_wcs_header")
-
-        # 3. Check wcs_header_str variable
-        if not hdr_str and "wcs_header_str" in self._obj:
-            val = self._obj["wcs_header_str"].values
-            if isinstance(val, np.ndarray):
-                val = val.item()
-            if isinstance(val, (bytes, bytearray)) or type(val).__name__ == "bytes_":
-                hdr_str = val.decode("utf-8", errors="replace")
-            else:
-                hdr_str = str(val)
-
+        hdr_str = _read_wcs_header_str(self._obj, var=var, time_idx=time_idx)
         if not hdr_str:
             raise ValueError(
                 "No WCS header found in dataset. Expected 'fits_wcs_header' "
                 "attribute on variable/dataset or 'wcs_header_str' variable."
             )
 
-        return WCS(Header.fromstring(hdr_str, sep="\n"))
+        wcs = WCS(Header.fromstring(hdr_str, sep="\n"))
+        if not wcs.has_celestial:
+            raise ValueError("WCS header has no celestial axes (RA/Dec)")
+        return wcs.celestial
 
     @property
     def has_wcs(self) -> bool:

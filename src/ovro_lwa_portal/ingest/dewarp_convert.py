@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ovro_lwa_portal.fits_to_zarr_xradio import (
-    _discover_groups,
-    _filter_completed_time_keys,
-    _filter_invalid_beam_files,
+    _consolidate_zarr_metadata,
     _load_global_lm_reference_dataset,
+)
+from ovro_lwa_portal.ingest.discovery import (
+    IngestDiscoveryConfig,
+    discover_time_grouped_fits,
+    prepare_ingest_time_groups,
 )
 
 __all__ = [
@@ -240,9 +243,14 @@ def run_cascade_per_time_group(
     target_size: int | None = None,
     clear_staging: bool = True,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
     out_zarr: Path | None = None,
-    rebuild: bool = True,
-) -> tuple[int, list[str]]:
+    rebuild: bool = False,
+    resume: bool = True,
+    fixed_dir: Path | None = None,
+    chunk_lm: int = 1024,
+    fix_headers_on_demand: bool = True,
+) -> tuple[int, list[str], Any | None]:
     """Run ``flow_cascade73MHz`` once per observation-time group and stage outputs.
 
     FITS under *input_dir* are grouped like :func:`convert_fits_dir_to_zarr`. With the
@@ -277,14 +285,14 @@ def run_cascade_per_time_group(
     ----------
     input_dir, cascade_parent, staging_dir
         Input FITS directory, per-time cascade output parent, and flat staging dir.
-    discovery_freq_bin_hz, duplicate_resolver
-        Passed to :func:`ovro_lwa_portal.fits_to_zarr_xradio._discover_groups` (with
-        ``time_key_source="filename"`` so basename image times drive groups when
-        ``group_metadata_source`` is ``"fits"``).
-    group_metadata_source
-        ``"fits"`` or ``"filename"`` for :func:`~ovro_lwa_portal.fits_to_zarr_xradio._discover_groups`.
-        Use ``"filename"`` to avoid FITS header reads during discovery when basenames carry
-        ``-image-`` time and ``_NNNMHz_`` subband tags.
+    discovery_freq_bin_hz, duplicate_resolver, group_metadata_source, time_key_source
+        Shared discovery settings (same as ``convert``); see
+        :class:`~ovro_lwa_portal.ingest.discovery.IngestDiscoveryConfig`.
+    resume
+        When True (default) and ``rebuild`` is False, skip time keys already in *out_zarr*.
+    fixed_dir, chunk_lm, fix_headers_on_demand
+        When *fixed_dir* is set, build a global LM reference from raw FITS (before the
+        resume filter) and return it as the third tuple element for the downstream convert step.
     cascade_fn
         Callable with the same keyword interface as
         ``image_plane_correction.flow.flow_cascade73MHz``.
@@ -298,24 +306,18 @@ def run_cascade_per_time_group(
         If True (default), remove *staging_dir* before running. If False, caller manages
         staging (used when interleaving Zarr conversion after each time key).
     out_zarr
-        Optional path to the downstream Zarr store. When provided together with
-        ``rebuild=False`` (and the store exists), time keys already present in the
-        Zarr are skipped so an interrupted ``dewarp-convert`` re-run only dewarps
-        the not-yet-written observation times. Defaults to ``None`` (no resume
-        check; every discovered time key is dewarped).
+        Downstream Zarr path used with ``resume`` to skip completed observation times.
     rebuild
-        Mirrors the ``dewarp-convert`` CLI ``--rebuild`` flag. When True, the
-        resume filter is bypassed even if *out_zarr* exists (since the downstream
-        convert step is about to overwrite that store). Defaults to ``True`` so
-        existing direct library callers retain their pre-resume behavior.
+        When True, dewarp every discovered time key and ignore resume.
 
     Returns
     -------
     n_staged : int
         Number of FITS linked or copied into *staging_dir*.
     time_keys : list of str
-        Sorted time keys that were processed (an empty list when every discovered
-        key was filtered out by the resume check).
+        Sorted time keys that were processed.
+    lm_reference_ds
+        Global LM reference when *fixed_dir* was provided, else ``None``.
 
     Raises
     ------
@@ -333,48 +335,65 @@ def run_cascade_per_time_group(
         staging_dir.mkdir(parents=True, exist_ok=True)
     cascade_parent.mkdir(parents=True, exist_ok=True)
 
-    by_time = _discover_groups(
-        input_dir,
-        duplicate_resolver=duplicate_resolver,
+    discovery = IngestDiscoveryConfig(
         freq_bin_hz=discovery_freq_bin_hz,
-        time_key_source="filename",
         group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
     )
-    # Drop raw FITS with missing/zero BMAJ/BMIN before invoking the cascade so we
-    # don't burn dewarp compute on inputs whose results would be filtered out later
-    # by the per-time-step convert call.
-    by_time = _filter_invalid_beam_files(by_time)
+    by_time = discover_time_grouped_fits(
+        input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
+    )
+    by_time = prepare_ingest_time_groups(
+        by_time,
+        rebuild=True,
+        resume=False,
+        require_73mhz=False,
+        context="dewarp-convert",
+    )
     if not by_time:
         msg = f"No groupable FITS files found in {input_dir}"
         raise FileNotFoundError(msg)
 
-    # Skip whole time groups that lack a 73 MHz reference image: ``flow_cascade73MHz``
-    # locates peers by substring-replacing ``73MHz`` in each path, so a group without
-    # that subband cannot be cascaded. Drop these here with a warning before any
-    # cascade work runs.
-    by_time = _filter_time_groups_without_cascade_reference(by_time)
+    by_time = prepare_ingest_time_groups(
+        by_time,
+        rebuild=True,
+        resume=False,
+        require_73mhz=True,
+        context="dewarp-convert",
+    )
     if not by_time:
         logger.warning(
-            "No time group in %s contains a 73 MHz reference image; "
-            "nothing to dewarp.",
+            "No time group in %s contains a 73 MHz reference image; nothing to dewarp.",
             input_dir,
         )
-        return 0, []
+        return 0, [], None
 
-    # Resume: skip raw time keys already covered by the downstream Zarr so an
-    # interrupted dewarp-convert run can be re-invoked on the same input without
-    # re-doing the cascade for already-written observation times.
-    if out_zarr is not None:
-        by_time = _filter_completed_time_keys(
-            by_time, out_zarr, rebuild=rebuild, context="dewarp-convert"
+    lm_ref_ds = None
+    if fixed_dir is not None:
+        lm_ref_ds = _load_global_lm_reference_dataset(
+            by_time,
+            fixed_dir,
+            chunk_lm=chunk_lm,
+            fix_headers_on_demand=fix_headers_on_demand,
+            target_size=target_size,
+            group_metadata_source=group_metadata_source,
+        ).copy(deep=True)
+
+    by_time = prepare_ingest_time_groups(
+        by_time,
+        out_zarr=out_zarr,
+        rebuild=rebuild,
+        resume=resume,
+        require_73mhz=False,
+        context="dewarp-convert",
+    )
+    if not by_time:
+        logger.info(
+            "Nothing to dewarp: every discovered time key is already present in %s. "
+            "Pass --rebuild to start over, or --no-resume to reprocess all times.",
+            out_zarr,
         )
-        if not by_time:
-            logger.info(
-                "Nothing to dewarp: every discovered time key is already present in %s. "
-                "Pass --rebuild to start over.",
-                out_zarr,
-            )
-            return 0, []
+        return 0, [], lm_ref_ds
 
     time_keys_sorted = sorted(by_time.keys())
     n_staged = 0
@@ -393,7 +412,7 @@ def run_cascade_per_time_group(
             write=write,
             target_size=target_size,
         )
-    return n_staged, time_keys_sorted
+    return n_staged, time_keys_sorted, lm_ref_ds
 
 
 def dewarp_and_convert_append_each_time(
@@ -420,6 +439,8 @@ def dewarp_and_convert_append_each_time(
     verbose: bool = False,
     progress_callback: Callable[[str, int, int, str], None] | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
+    resume: bool = True,
 ) -> tuple[int, list[str]]:
     """Dewarp each time group, append its Zarr slice, then clean staging/cascade for that time.
 
@@ -465,40 +486,39 @@ def dewarp_and_convert_append_each_time(
     output_dir.mkdir(parents=True, exist_ok=True)
     fixed_dir.mkdir(parents=True, exist_ok=True)
 
-    by_time = _discover_groups(
-        input_dir,
-        duplicate_resolver=duplicate_resolver,
+    discovery = IngestDiscoveryConfig(
         freq_bin_hz=discovery_freq_bin_hz,
-        time_key_source="filename",
         group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
     )
-    # Drop raw FITS with missing/zero BMAJ/BMIN before invoking the cascade so we
-    # don't burn dewarp compute on inputs whose results would be filtered out later
-    # by the per-time-step convert call.
-    by_time = _filter_invalid_beam_files(by_time)
+    by_time = discover_time_grouped_fits(
+        input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
+    )
+    by_time = prepare_ingest_time_groups(
+        by_time,
+        rebuild=True,
+        resume=False,
+        require_73mhz=False,
+        context="dewarp-convert",
+    )
     if not by_time:
         msg = f"No groupable FITS files found in {input_dir}"
         raise FileNotFoundError(msg)
 
-    # Skip whole time groups that lack a 73 MHz reference image: ``flow_cascade73MHz``
-    # locates peers by substring-replacing ``73MHz`` in each path. Filter here before
-    # the LM-reference scan so a half-band time step does not influence the chosen
-    # pixel grid for the rest of the run.
-    by_time = _filter_time_groups_without_cascade_reference(by_time)
+    by_time = prepare_ingest_time_groups(
+        by_time,
+        rebuild=True,
+        resume=False,
+        require_73mhz=True,
+        context="dewarp-convert",
+    )
     if not by_time:
         logger.warning(
-            "No time group in %s contains a 73 MHz reference image; "
-            "nothing to dewarp.",
+            "No time group in %s contains a 73 MHz reference image; nothing to dewarp.",
             input_dir,
         )
         return 0, []
 
-    # Build the global LM reference from the post-skip discovery set (after the
-    # 73 MHz / invalid-beam filters but before the resume filter) so the
-    # appended slices line up with the pixel grid that was already chosen for
-    # the times already in the store. Filtering before this call could pick a
-    # different "largest shape" on resume and silently disagree with the
-    # existing store.
     lm_ref_ds = _load_global_lm_reference_dataset(
         by_time,
         fixed_dir,
@@ -509,16 +529,21 @@ def dewarp_and_convert_append_each_time(
     ).copy(deep=True)
 
     out_zarr = output_dir / zarr_name
-    # Resume: skip raw time keys already covered by the existing Zarr.
-    by_time = _filter_completed_time_keys(
-        by_time, out_zarr, rebuild=rebuild, context="dewarp-convert"
+    by_time = prepare_ingest_time_groups(
+        by_time,
+        out_zarr=out_zarr,
+        rebuild=rebuild,
+        resume=resume,
+        require_73mhz=False,
+        context="dewarp-convert",
     )
     if not by_time:
         logger.info(
             "Nothing to do: every discovered time key is already present in %s. "
-            "Pass --rebuild to start over.",
+            "Pass --rebuild to start over, or --no-resume to reprocess all times.",
             out_zarr,
         )
+        _consolidate_zarr_metadata(out_zarr)
         return 0, []
 
     first_zarr_write = not (out_zarr.exists() and not rebuild)
@@ -548,6 +573,7 @@ def dewarp_and_convert_append_each_time(
             fixed_dir=fixed_dir,
             chunk_lm=chunk_lm,
             rebuild=first_zarr_write,
+            resume=False,
             fix_headers_on_demand=fix_headers_on_demand,
             cleanup_fixed_fits=cleanup_fixed_fits,
             duplicate_resolver=duplicate_resolver,
@@ -556,6 +582,9 @@ def dewarp_and_convert_append_each_time(
             time_keys_only=(tkey,),
             lm_reference_ds=lm_ref_ds,
             group_metadata_source=group_metadata_source,
+            discovery_time_key_source=time_key_source,
+            lm_reference_target_size=target_size,
+            consolidate_metadata_at_end=False,
         )
         FITSToZarrConverter(config, progress_callback=progress_callback).convert()
         first_zarr_write = False
@@ -571,4 +600,5 @@ def dewarp_and_convert_append_each_time(
                 f"Completed dewarp+Zarr for time {idx + 1}/{total_steps} ({tkey})",
             )
 
+    _consolidate_zarr_metadata(out_zarr)
     return n_staged_total, time_keys_sorted

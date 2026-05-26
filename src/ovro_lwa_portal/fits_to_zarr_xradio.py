@@ -660,6 +660,14 @@ def _zarr_store_exists(out_zarr: Path) -> bool:
     return True
 
 
+def _consolidate_zarr_metadata(out_zarr: Path) -> None:
+    """Write ``.zmetadata`` so ``xr.open_zarr(consolidated=True)`` opens quickly."""
+    if not _zarr_store_exists(out_zarr):
+        return
+    logger.info("Consolidating Zarr metadata for %s", out_zarr)
+    zarr.consolidate_metadata(str(out_zarr))
+
+
 def _time_axis_length_buckets(out_zarr: Path) -> Dict[int, List[str]]:
     """Return mapping of time-axis length -> array names."""
     zg = zarr.open_group(str(out_zarr), mode="r")
@@ -785,7 +793,7 @@ def repair_zarr_store(
                 wcs_arr[ti, :] = row
                 rewritten_wcs_rows += 1
 
-    zarr.consolidate_metadata(str(out_zarr))
+    _consolidate_zarr_metadata(out_zarr)
     post = validate_zarr_store(out_zarr)
     return {
         "store": str(out_zarr),
@@ -1688,7 +1696,12 @@ def _read_wcs_header_str(ds: xr.Dataset) -> Optional[str]:
     """
     s = ds.attrs.get("fits_wcs_header")
     if s is None and "wcs_header_str" in ds:
-        raw = ds["wcs_header_str"].values.item()
+        raw_arr = np.asarray(ds["wcs_header_str"].values)
+        if raw_arr.size == 0:
+            return None
+        # After incremental Zarr appends, ``wcs_header_str`` is promoted to ``(time,)``
+        # (or ``(time, frequency)``); use any representative row for the LM grid WCS.
+        raw = np.ravel(raw_arr)[0]
         s = raw.decode("utf-8") if isinstance(raw, (bytes, np.bytes_)) else str(raw)
     if s is None:
         return None
@@ -1886,6 +1899,63 @@ def _sky_sep_max_vs_ref_arcsec(
     return worst
 
 
+def _decode_wcs_header_payload(raw: object) -> str:
+    """Decode a scalar ``wcs_header_str`` payload to a stripped UTF-8 string."""
+    if isinstance(raw, np.ndarray):
+        raw = raw.item() if raw.ndim == 0 else np.ravel(raw)[0]
+    if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
+        return raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
+    return str(raw).rstrip("\x00").strip()
+
+
+def _collapse_wcs_header_str_variable(
+    xds: xr.Dataset,
+    *,
+    ref_freq_idx: int = 0,
+) -> xr.Dataset:
+    """Reduce ``wcs_header_str`` to a scalar (one header per time step before Zarr write)."""
+    if "wcs_header_str" not in xds.data_vars:
+        return xds
+    wh = xds["wcs_header_str"]
+    if "frequency" not in wh.dims:
+        return xds
+    nf = int(xds.sizes.get("frequency", 1))
+    ri = int(np.clip(ref_freq_idx, 0, max(0, nf - 1)))
+    return xds.assign(wcs_header_str=wh.isel(frequency=ri, drop=True))
+
+
+def _assert_nonempty_wcs_header_str_before_zarr_write(xds: xr.Dataset) -> None:
+    """Fail fast when a time step would be written without a usable celestial WCS header."""
+    if "wcs_header_str" not in xds.data_vars:
+        msg = (
+            "Dataset is missing wcs_header_str before Zarr write; each time step "
+            "must persist the FITS celestial WCS from _load_for_combine."
+        )
+        raise RuntimeError(msg)
+
+    wh = xds["wcs_header_str"]
+    if "time" in wh.dims:
+        for ti in range(int(wh.sizes["time"])):
+            hdr = _decode_wcs_header_payload(wh.isel(time=ti).values)
+            if hdr:
+                continue
+            msg = (
+                f"wcs_header_str is empty for time index {ti} before Zarr write. "
+                "Re-run conversion for this time step or repair from FITS with "
+                "ovro-ingest repair --fits-dir."
+            )
+            raise RuntimeError(msg)
+        return
+
+    hdr = _decode_wcs_header_payload(wh.values)
+    if not hdr:
+        msg = (
+            "wcs_header_str is empty before Zarr write. Re-run conversion for this "
+            "time step or repair from FITS with ovro-ingest repair --fits-dir."
+        )
+        raise RuntimeError(msg)
+
+
 def _harmonize_celestial_coords_independent_of_frequency(
     xds: xr.Dataset,
     *,
@@ -1903,9 +1973,9 @@ def _harmonize_celestial_coords_independent_of_frequency(
     ra_c = xds.coords.get("right_ascension")
     dec_c = xds.coords.get("declination")
     if ra_c is None or dec_c is None:
-        return xds
+        return _collapse_wcs_header_str_variable(xds, ref_freq_idx=ref_freq_idx)
     if "frequency" not in ra_c.dims:
-        return xds
+        return _collapse_wcs_header_str_variable(xds, ref_freq_idx=ref_freq_idx)
 
     nf = int(xds.sizes["frequency"])
     ri = int(np.clip(ref_freq_idx, 0, nf - 1))
@@ -1999,13 +2069,56 @@ def _invalid_beam_reason(header: fits.Header) -> Optional[str]:
     return None
 
 
+def _min_primary_hdu_file_bytes(header: fits.Header) -> int:
+    """Minimum on-disk bytes for an uncompressed primary image HDU (header blocks + data)."""
+    header_size = ((len(header) * 80 + 2879) // 2880) * 2880
+    bitpix = abs(int(header.get("BITPIX", 8)))
+    naxis = int(header.get("NAXIS", 0))
+    nelem = 1
+    for i in range(1, naxis + 1):
+        nelem *= int(header[f"NAXIS{i}"])
+    bps = max(1, bitpix // 8)
+    return header_size + nelem * bps
+
+
+def _truncated_fits_reason(fp: Path) -> Optional[str]:
+    """Return a short reason when *fp* is empty or shorter than its primary HDU data.
+
+    Covers zero-byte files and partial copies where the on-disk size is less than the
+    minimum required for the primary HDU header and uncompressed image array (typical for
+    broken lustre symlinks). Without this check, combine fails later with opaque NumPy
+    errors such as ``buffer is too small for requested array``.
+    """
+    try:
+        file_size = fp.stat().st_size
+    except OSError as exc:
+        return f"cannot stat file ({exc})"
+    if file_size == 0:
+        return "empty file (0 bytes)"
+    try:
+        # Parse header from raw bytes so a truncated file does not leave astropy file
+        # handles open (``getheader`` can leak on validation failure).
+        with fp.open("rb") as f:
+            raw = f.read(min(file_size, 2880 * 64))
+        hdr = fits.Header.fromstring(raw, sep="")
+        required = _min_primary_hdu_file_bytes(hdr)
+    except Exception as exc:
+        return f"truncated or unreadable FITS ({exc})"
+    if file_size < required:
+        return (
+            f"truncated FITS ({file_size} bytes on disk, "
+            f"{required} bytes required for primary HDU data)"
+        )
+    return None
+
+
 def _filter_invalid_beam_files(
     by_time: Dict[str, List[Path]],
 ) -> Dict[str, List[Path]]:
-    """Drop FITS files whose primary header has a missing or non-positive beam.
+    """Drop FITS files with truncated data or a missing/non-positive synthesized beam.
 
-    Files surviving this filter have a real, finite, strictly positive ``BMAJ`` and
-    ``BMIN``. Skipped files are *omitted* from the returned grouping so downstream
+    Files surviving this filter are complete on disk and have a real, finite, strictly
+    positive ``BMAJ`` and ``BMIN``. Skipped files are *omitted* from the returned grouping so downstream
     combine and Zarr append leave their ``(time, frequency)`` cells unwritten; on
     append, :func:`xarray.concat` outer-joins the frequency axis and fills missing
     cells with the float ``NaN`` fill value. Time keys whose entire bucket fails the
@@ -2028,6 +2141,17 @@ def _filter_invalid_beam_files(
     for tkey, files in by_time.items():
         kept: List[Path] = []
         for fp in files:
+            trunc_reason = _truncated_fits_reason(fp)
+            if trunc_reason is not None:
+                logger.warning(
+                    "Skipping %s: %s; its (time=%s, frequency=*) slot will be filled "
+                    "with NaN in Zarr.",
+                    fp.name,
+                    trunc_reason,
+                    tkey,
+                )
+                n_dropped_files += 1
+                continue
             try:
                 hdr = fits.getheader(fp, ext=0)
             except Exception as exc:
@@ -2062,7 +2186,8 @@ def _filter_invalid_beam_files(
             )
     if n_dropped_files:
         logger.info(
-            "Beam-validity filter dropped %d file(s) across %d remaining time step(s).",
+            "Discovery quality filter dropped %d file(s) (truncated or invalid beam) "
+            "across %d remaining time step(s).",
             n_dropped_files,
             len(filtered),
         )
@@ -2533,6 +2658,7 @@ def _combine_time_step(
         xds_t[v].encoding = {}
 
     xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
+    xds_t = _collapse_wcs_header_str_variable(xds_t)
 
     xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
 
@@ -2694,6 +2820,14 @@ def _time_coord_as_dimension(ds: xr.Dataset) -> xr.DataArray | None:
     return xr.DataArray(np.atleast_1d(np.asarray(t.values)), dims=("time",))
 
 
+def _is_simple_index_coordinate(ds: xr.Dataset, name: str) -> bool:
+    """True when *name* is a 1D dimension coordinate indexed by itself (e.g. ``frequency``, ``l``)."""
+    if name not in ds.coords or name not in ds.dims:
+        return False
+    dims = ds.variables[name].dims
+    return len(dims) == 1 and dims[0] == name
+
+
 def _expand_leading_time_dim(
     da: xr.DataArray,
     *,
@@ -2722,8 +2856,9 @@ def _align_time_dimension_for_zarr_write(
     time steps in the same store may have been written with a leading ``time``
     dimension on those variables; ``to_zarr(..., append_dim='time')`` then rejects
     mismatched dimension names. When *schema* is given (append to an existing
-    store), variables are expanded to match on-disk dims. On the first write,
-    frequency-only aux vars are promoted to ``(time, frequency)`` when ``time`` is
+    store), any variable overlapping the on-disk store (data vars or coords) is
+    expanded to match *schema*. On the first write, frequency-only aux vars are
+    promoted to ``(time, frequency)`` when ``time`` is
     a coordinate so later appends stay compatible. Scalar metadata such as
     ``wcs_header_str`` are promoted to ``(time,)`` so incremental appends do not
     leave stale ``encoding['chunks']`` on a length-1 slice that disagrees with the
@@ -2735,11 +2870,19 @@ def _align_time_dimension_for_zarr_write(
 
     target_dims_by_name: dict[str, tuple[str, ...]] = {}
     if schema is not None:
-        for name in ds.data_vars:
-            if name in schema.data_vars:
-                target_dims_by_name[name] = tuple(schema[name].dims)
+        for name in ds.variables:
+            if name not in schema.variables:
+                continue
+            incoming_dims = tuple(ds.variables[name].dims)
+            if "time" in incoming_dims:
+                continue
+            schema_dims = tuple(schema.variables[name].dims)
+            if schema_dims and schema_dims[0] == "time":
+                target_dims_by_name[name] = schema_dims
     else:
-        for name, da in ds.data_vars.items():
+        for name, da in ds.variables.items():
+            if _is_simple_index_coordinate(ds, name):
+                continue
             if "frequency" in da.dims and "time" not in da.dims:
                 target_dims_by_name[name] = ("time", *tuple(da.dims))
             elif da.dims == ():
@@ -2748,13 +2891,25 @@ def _align_time_dimension_for_zarr_write(
     out = ds
     for name, target_dims in target_dims_by_name.items():
         da = out[name]
+        if name == "wcs_header_str" and "frequency" in da.dims:
+            da = da.isel(frequency=0, drop=True)
+        if (
+            name == "wcs_header_str"
+            and da.dims == ()
+            and target_dims == ("time", "frequency")
+            and "frequency" in out.coords
+        ):
+            da = da.expand_dims(frequency=out.coords["frequency"])
         if target_dims == ("time",) and "frequency" in da.dims:
             da = da.isel(frequency=0, drop=True)
         expanded = _expand_leading_time_dim(
             da, time_coord=time_coord, target_dims=target_dims
         )
         if expanded is not da:
-            out = out.assign({name: expanded})
+            if name in out.data_vars:
+                out = out.assign({name: expanded})
+            else:
+                out = out.assign_coords({name: expanded})
     return out
 
 
@@ -2794,12 +2949,14 @@ def _write_or_append_zarr(
     """
     from shutil import rmtree
 
+    xds_t = _collapse_wcs_header_str_variable(xds_t)
     if first_write or not out_zarr.exists():
         to_write = _align_time_dimension_for_zarr_write(xds_t)
     else:
         with xr.open_zarr(str(out_zarr), consolidated=False) as existing:
             to_write = _align_time_dimension_for_zarr_write(xds_t, schema=existing)
 
+    _assert_nonempty_wcs_header_str_before_zarr_write(to_write)
     to_write = _rechunk_lm_for_zarr(to_write, chunk_lm)
     to_write = _ensure_append_friendly_time_chunks(to_write)
     to_write = _prepare_time_only_vars_for_zarr_write(to_write)
@@ -2883,7 +3040,7 @@ def convert_fits_dir_to_zarr(
     fixed_dir: str | Path = "fixed_fits",
     chunk_lm: int = 1024,
     rebuild: bool = False,
-    resume: bool = False,
+    resume: bool = True,
     fix_headers_on_demand: bool = True,
     cleanup_fixed_fits: bool = False,
     progress_callback: Optional[Callable[[str, int, int, str], None]] = None,
@@ -2893,6 +3050,8 @@ def convert_fits_dir_to_zarr(
     lm_reference_ds: Optional[xr.Dataset] = None,
     lm_reference_target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
+    consolidate_metadata_at_end: bool = True,
 ) -> Path:
     """Convert all matching FITS in a directory into a single LM-only Zarr store.
 
@@ -2944,6 +3103,19 @@ def convert_fits_dir_to_zarr(
         (with filename fallbacks) as in :func:`_discover_groups`. ``"filename"``: group
         and order files using only basename ``-image-`` time and ``_NNNMHz_`` tokens,
         avoiding ``fits.getheader`` during discovery and frequency sorting.
+    time_key_source
+        Used when ``group_metadata_source`` is ``"fits"``. ``"filename"`` (default):
+        prefer ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS``.
+        ``"header"``: use ``DATE-OBS`` only.
+    consolidate_metadata_at_end
+        When True (default), write a consolidated ``.zmetadata`` file after all
+        pending time steps in this run are written (or when resume finds nothing
+        left to do). Set False for intermediate per-time calls (e.g. dewarp
+        append-each-time) and consolidate once after the full batch.
+    resume
+        When True (default) and *rebuild* is False, skip time keys already present in
+        an existing output Zarr via :func:`_filter_completed_time_keys`. Set False to
+        reprocess every discovered time (overwriting rows with the same MJD).
 
     After discovery, files whose primary FITS header is missing or has a zero/negative
     ``BMAJ``/``BMIN`` are dropped via :func:`_filter_invalid_beam_files`. Their
@@ -2951,16 +3123,14 @@ def convert_fits_dir_to_zarr(
     join fills them with the float ``NaN`` fill value instead of contaminating the
     store with placeholder zeros.
 
-    When *rebuild* is False and ``out_dir / zarr_name`` already exists, time keys
-    that are already present in the store are silently skipped via
-    :func:`_filter_completed_time_keys`. An interrupted prior run can therefore be
-    resumed by re-invoking with the same arguments; only the not-yet-written time
-    steps are read, combined, and appended. If every discovered time key is already
-    present, the function returns the existing Zarr path without writing.
+    When *resume* is True (default) and *rebuild* is False, time keys already present
+    in the store are skipped via :func:`_filter_completed_time_keys`. Re-invoking
+    with the same arguments therefore continues an interrupted run. Pass
+    ``resume=False`` to reprocess every discovered time. Use ``rebuild=True`` to
+    replace the entire Zarr store. If every discovered time key is already present,
+    the function returns the existing Zarr path without writing.
     :func:`_write_or_append_zarr` overwrites an existing ``time`` row in-place when
-    the same MJD timestamp is written again (``keep='last'`` semantics), so an
-    explicit re-run that bypasses the resume filter can repair a time step without
-    growing the ``time`` dimension twice.
+    the same MJD timestamp is written again (``keep='last'`` semantics).
 
     Within each observation time step, after subbands are stacked along ``frequency``,
     ``right_ascension`` / ``declination`` are reduced to a single ``(l, m)`` celestial
@@ -3004,6 +3174,7 @@ def convert_fits_dir_to_zarr(
         input_dir,
         duplicate_resolver=duplicate_resolver,
         freq_bin_hz=discovery_freq_bin_hz,
+        time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
     )
     if time_keys_only is not None:
@@ -3034,27 +3205,18 @@ def convert_fits_dir_to_zarr(
 
     by_time_for_global_freq = dict(by_time)
 
-    # Resume: skip time keys already present in the output store.
-    if resume and out_zarr.exists() and not rebuild:
-        existing_time_keys = _existing_time_keys_from_zarr(out_zarr)
-        by_time = {k: v for k, v in by_time.items() if k not in existing_time_keys}
-        if not by_time:
-            logger.info(
-                "Nothing to do: every discovered time key is already present in %s. "
-                "Pass rebuild=True to overwrite.",
-                out_zarr,
-            )
-            return out_zarr
-    elif not rebuild:
+    if resume and not rebuild:
         by_time = _filter_completed_time_keys(
-            by_time, out_zarr, rebuild=rebuild, context="convert"
+            by_time, out_zarr, rebuild=False, context="convert"
         )
         if not by_time:
             logger.info(
                 "Nothing to do: every discovered time key is already present in %s. "
-                "Pass rebuild=True to overwrite.",
+                "Pass rebuild=True to overwrite the store, or resume=False to reprocess all times.",
                 out_zarr,
             )
+            if consolidate_metadata_at_end:
+                _consolidate_zarr_metadata(out_zarr)
             return out_zarr
 
     if _zarr_store_exists(out_zarr) and not rebuild:
@@ -3138,4 +3300,6 @@ def convert_fits_dir_to_zarr(
             )
 
     logger.info(f"[done] All times appended into: {out_zarr}")
+    if consolidate_metadata_at_end:
+        _consolidate_zarr_metadata(out_zarr)
     return out_zarr

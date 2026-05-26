@@ -54,7 +54,9 @@ class TestCLI:
         assert result.exit_code == 0
         assert "Convert OVRO-LWA FITS files to a single Zarr store" in plain_output
         assert "largest grid" in plain_output
-        assert "--resume" in plain_output
+        assert "--no-resume" in plain_output
+        assert "discovery-time-key" in plain_output
+        assert "--target-size" in plain_output
 
     def test_validate_help(self) -> None:
         """Test validate command help."""
@@ -164,7 +166,7 @@ class TestCLI:
             assert kwargs.get("discovery_freq_bin_hz") is not None
             staging_dir.mkdir(parents=True, exist_ok=True)
             (staging_dir / "placeholder.fits").touch()
-            return (1, ["20240601_120000"])
+            return (1, ["20240601_120000"], None)
 
         def fake_convert(config: ConversionConfig, *, log_level: Any) -> Path:
             convert_snap.append(config.input_dir)
@@ -206,11 +208,11 @@ class TestCLI:
             cascade_parent: Path,
             staging_dir: Path,
             **_kw: object,
-        ) -> tuple[int, list[str]]:
+        ) -> tuple[int, list[str], None]:
             captured.append((input_dir, cascade_parent, staging_dir))
             staging_dir.mkdir(parents=True, exist_ok=True)
             (staging_dir / "x.fits").touch()
-            return (1, ["tk"])
+            return (1, ["tk"], None)
 
         with (
             patch(
@@ -251,11 +253,11 @@ class TestCLI:
             _cascade_parent: Path,
             staging_dir: Path,
             **kwargs: object,
-        ) -> tuple[int, list[str]]:
+        ) -> tuple[int, list[str], None]:
             seen.append(kwargs.get("target_size"))
             staging_dir.mkdir(parents=True, exist_ok=True)
             (staging_dir / "placeholder.fits").touch()
-            return (1, ["20240601_120000"])
+            return (1, ["20240601_120000"], None)
 
         with (
             patch(

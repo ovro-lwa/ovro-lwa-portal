@@ -85,7 +85,7 @@ def test_run_cascade_per_time_group_fake_cascade(tmp_path: Path) -> None:
         raw / "b_82MHz.fits", restfreq_hz=82e6, date_obs="2024-06-01T12:00:00.0"
     )
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         cascade_parent,
         staging,
@@ -166,7 +166,7 @@ def test_run_cascade_per_time_group_passes_absolute_paths_and_outroot(tmp_path: 
         raw / "high_73MHz.fits", restfreq_hz=73e6, date_obs="2024-06-01T12:00:00.0"
     )
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         cascade_parent,
         staging,
@@ -230,7 +230,7 @@ def test_run_cascade_per_time_group_multiple_time_keys(tmp_path: Path) -> None:
         raw / "day2_73MHz.fits", restfreq_hz=73e6, date_obs="2024-06-02T12:00:00.0"
     )
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -314,7 +314,7 @@ def test_run_cascade_groups_by_basename_image_time_not_header(tmp_path: Path) ->
         date_obs="2024-12-22T23:00:00.0",
     )
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -367,7 +367,7 @@ def test_dewarp_and_convert_append_each_time_calls_zarr_per_step(tmp_path: Path,
             "20240602_120000": [raw / "b_73MHz.fits"],
         }
 
-    monkeypatch.setattr(dewarp_convert_mod, "_discover_groups", fake_discover)
+    monkeypatch.setattr(dewarp_convert_mod, "discover_time_grouped_fits", fake_discover)
     mref = MagicMock()
     mref.copy = MagicMock(return_value=mref)
     monkeypatch.setattr(
@@ -467,7 +467,7 @@ def test_run_cascade_per_time_group_skips_files_with_invalid_beam(tmp_path: Path
     hdu.header["BMIN"] = 0.0
     hdu.writeto(bad_zero, overwrite=True)
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         cascade_parent,
         staging,
@@ -503,7 +503,7 @@ def test_run_cascade_per_time_group_forwards_target_size(tmp_path: Path) -> None
         raw / "one_73MHz.fits", restfreq_hz=73e6, date_obs="2024-06-01T12:00:00.0"
     )
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -561,7 +561,7 @@ def test_run_cascade_per_time_group_skips_completed_time_keys(tmp_path: Path) ->
     out_zarr.parent.mkdir(parents=True, exist_ok=True)
     _seed_zarr_with_time_keys(out_zarr, ["20240601_120000"])
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -591,7 +591,7 @@ def test_run_cascade_per_time_group_resume_full_is_noop(tmp_path: Path) -> None:
     out_zarr.parent.mkdir(parents=True, exist_ok=True)
     _seed_zarr_with_time_keys(out_zarr, ["20240601_120000"])
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -625,7 +625,7 @@ def test_run_cascade_per_time_group_rebuild_ignores_resume(tmp_path: Path) -> No
     out_zarr.parent.mkdir(parents=True, exist_ok=True)
     _seed_zarr_with_time_keys(out_zarr, ["20240601_120000"])
 
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -664,7 +664,7 @@ def test_dewarp_and_convert_append_each_time_skips_completed_time_keys(
             "20240602_120000": [raw / "b_73MHz.fits"],
         }
 
-    monkeypatch.setattr(dewarp_convert_mod, "_discover_groups", fake_discover)
+    monkeypatch.setattr(dewarp_convert_mod, "discover_time_grouped_fits", fake_discover)
     mref = MagicMock()
     mref.copy = MagicMock(return_value=mref)
     monkeypatch.setattr(
@@ -738,7 +738,7 @@ def test_dewarp_and_convert_append_each_time_resume_full_is_noop(
 
     monkeypatch.setattr(
         dewarp_convert_mod,
-        "_discover_groups",
+        "discover_time_grouped_fits",
         lambda *a, **k: {"20240601_120000": [raw / "a_73MHz.fits"]},
     )
     mref = MagicMock()
@@ -888,7 +888,7 @@ def test_run_cascade_per_time_group_skips_groups_without_73mhz(
     )
 
     caplog.set_level(logging.WARNING, logger="ovro_lwa_portal.ingest.dewarp_convert")
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -922,7 +922,7 @@ def test_run_cascade_per_time_group_returns_empty_when_no_group_has_73mhz(
     )
 
     caplog.set_level(logging.WARNING, logger="ovro_lwa_portal.ingest.dewarp_convert")
-    n, keys = run_cascade_per_time_group(
+    n, keys, _lm_ref = run_cascade_per_time_group(
         raw,
         tmp_path / "cascade",
         tmp_path / "staging",
@@ -958,7 +958,7 @@ def test_dewarp_and_convert_append_each_time_skips_groups_without_73mhz(
             "20240602_120000": [raw / "b_82MHz.fits"],   # drop (no 73 MHz)
         }
 
-    monkeypatch.setattr(dewarp_convert_mod, "_discover_groups", fake_discover)
+    monkeypatch.setattr(dewarp_convert_mod, "discover_time_grouped_fits", fake_discover)
     mref = MagicMock()
     mref.copy = MagicMock(return_value=mref)
     monkeypatch.setattr(
@@ -1030,7 +1030,7 @@ def test_dewarp_and_convert_append_each_time_returns_when_no_group_has_73mhz(
 
     monkeypatch.setattr(
         dewarp_convert_mod,
-        "_discover_groups",
+        "discover_time_grouped_fits",
         lambda *a, **k: {
             "20240601_120000": [raw / "a_41MHz.fits", raw / "a_82MHz.fits"]
         },
