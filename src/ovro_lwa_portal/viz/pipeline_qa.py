@@ -22,10 +22,12 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 )
 
 PIPELINE_ROOT = Path("/lustre/pipeline/exopipe/phase1/")
+PIPELINE_ROOT_PHASE2 = Path("/lustre/pipeline/exopipe/phase2/")
 SYMLINK_ROOT = Path("/lustre/claw")
 ZARR_ROOT = Path("/fast/claw")
 
 RUN_PATTERN = re.compile(r"Run_(\d{8})_(\d{6})")
+SCIENCE_RUN_PATTERN = re.compile(r"Science_(\d{8})_(\d{6})")
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HOUR_PATTERN = re.compile(r"^\d{2}h$")
 
@@ -33,13 +35,15 @@ WIDEBAND_QA = Path("Wideband/thermal_noise_vs_subband.png")
 FLUX_CHECK_HYBRID_CSV = Path("QA/flux_check_hybrid.csv")
 I_FITS_GLOB = "*I-Deep-Taper-Robust-0.75-image*.pbcorr.fits"
 V_FITS_GLOB = "*V-Taper-Deep-image*.pbcorr.fits"
+I_FITS_GLOB_PHASE2 = "*I-NoTaper-*-Robust-0-*-image.pbcorr_dewarped.fits"
+V_FITS_GLOB_PHASE2 = "*V-Taper-*-Robust-0-*-image.pbcorr_dewarped.fits"
 REF_SUBBAND = "82MHz"
 I_QA_ZARR_STEM = "pipelineQA-I-Deep-Taper-Robust-0.75"
 V_QA_ZARR_STEM = "pipelineQA-V-Taper-Deep"
+I_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-I-NoTaper-Robust-0"
+V_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-V-Taper-Robust-0"
 
-FITS_KEY_PATTERN = re.compile(
-    r"^(?P<subband>\d+MHz)-.*-image-(?P<stamp>\d{8}_\d{6})"
-)
+FITS_KEY_PATTERN = re.compile(r"^(?P<subband>\d+MHz)-.*?(?P<stamp>\d{8}_\d{6})")
 
 LogFn = Callable[[str], None]
 
@@ -53,16 +57,53 @@ class PipelineQAConfig:
     zarr_root: Path
     i_fits_glob: str
     v_fits_glob: str
+    run_dir_prefix: str = "Run_"
+    run_dir_pattern: str = r"Run_(\d{8})_(\d{6})"
+    qa_thermal_noise_glob: str = "Wideband/thermal_noise_vs_subband.png"
+    flux_check_csv_glob: str = "*MHz/QA/flux_check_hybrid.csv"
+    flux_check_csv_per_run: bool = False
+    ref_subband: str = REF_SUBBAND
+    i_qa_zarr_stem: str = I_QA_ZARR_STEM
+    v_qa_zarr_stem: str = V_QA_ZARR_STEM
+    thermal_noise_grid_cols: int = 4
+    thermal_noise_plot_name: str = "thermal_noise_vs_subband"
+    qa_run_label: str = "Wideband"
 
     @classmethod
     def default(cls) -> PipelineQAConfig:
-        """Return module-default pipeline, staging, Zarr, and FITS glob settings."""
+        """Return phase1 module-default pipeline, staging, Zarr, and FITS settings."""
+        return cls.phase1_default()
+
+    @classmethod
+    def phase1_default(cls) -> PipelineQAConfig:
+        """Exopipe phase1: ``Run_*`` dirs, per-subband flux CSV, Wideband thermal-noise grid."""
         return cls(
             pipeline_root=PIPELINE_ROOT,
             symlink_root=SYMLINK_ROOT,
             zarr_root=ZARR_ROOT,
             i_fits_glob=I_FITS_GLOB,
             v_fits_glob=V_FITS_GLOB,
+        )
+
+    @classmethod
+    def phase2_default(cls) -> PipelineQAConfig:
+        """Exopipe phase2: ``Science_*`` dirs, run-level QA CSV/PNG, dewarped FITS."""
+        return cls(
+            pipeline_root=PIPELINE_ROOT_PHASE2,
+            symlink_root=SYMLINK_ROOT,
+            zarr_root=ZARR_ROOT,
+            i_fits_glob=I_FITS_GLOB_PHASE2,
+            v_fits_glob=V_FITS_GLOB_PHASE2,
+            run_dir_prefix="Science_",
+            run_dir_pattern=r"Science_(\d{8})_(\d{6})",
+            qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
+            flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
+            flux_check_csv_per_run=True,
+            i_qa_zarr_stem=I_QA_ZARR_STEM_PHASE2,
+            v_qa_zarr_stem=V_QA_ZARR_STEM_PHASE2,
+            thermal_noise_grid_cols=1,
+            thermal_noise_plot_name="thermal_noise_vs_freq",
+            qa_run_label="Science",
         )
 
 
@@ -94,24 +135,56 @@ def resolve_pipeline_qa_config(
     )
 
 
-def run_sort_key(run_dir: Path) -> str:
-    """Sort key from Run_YYYYMMDD_HHMMSS directory name."""
-    match = RUN_PATTERN.match(run_dir.name)
+def _run_pattern(config: PipelineQAConfig) -> re.Pattern[str]:
+    return re.compile(config.run_dir_pattern)
+
+
+def run_sort_key(run_dir: Path, *, config: PipelineQAConfig | None = None) -> str:
+    """Sort key from ``Run_`` or ``Science_`` YYYYMMDD_HHMMSS directory names."""
+    cfg = config or PipelineQAConfig.default()
+    match = _run_pattern(cfg).match(run_dir.name)
     if match is None:
         return run_dir.name
     return match.group(1) + match.group(2)
 
 
-def select_run_dir(day_dir: Path) -> Path | None:
-    """Pick the newest Run_* that has Wideband thermal-noise QA."""
+def thermal_noise_png_for_run(
+    run_dir: Path,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> Path | None:
+    """Resolve the thermal-noise QA PNG for one pipeline run directory."""
+    cfg = config or PipelineQAConfig.default()
+    matches = sorted(run_dir.glob(cfg.qa_thermal_noise_glob))
+    return matches[0] if matches else None
+
+
+def run_has_thermal_noise_qa(
+    run_dir: Path,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> bool:
+    """Return whether a run directory contains the configured thermal-noise QA plot."""
+    return thermal_noise_png_for_run(run_dir, config=config) is not None
+
+
+def select_run_dir(
+    day_dir: Path,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> Path | None:
+    """Pick the newest run directory that has thermal-noise QA for this product."""
+    cfg = config or PipelineQAConfig.default()
     runs = [
         path
         for path in day_dir.iterdir()
-        if path.is_dir() and path.name.startswith("Run_") and (path / WIDEBAND_QA).is_file()
+        if path.is_dir()
+        and path.name.startswith(cfg.run_dir_prefix)
+        and run_has_thermal_noise_qa(path, config=cfg)
     ]
     if not runs:
         return None
-    return max(runs, key=run_sort_key)
+    return max(runs, key=lambda path: run_sort_key(path, config=cfg))
 
 
 def list_subbands(run_dir: Path) -> list[str]:
@@ -146,9 +219,14 @@ def scan_coverage(
             if not day_dir.is_dir() or not DATE_PATTERN.match(day_dir.name):
                 continue
 
-            all_runs = [p for p in day_dir.iterdir() if p.is_dir() and p.name.startswith("Run_")]
-            selected = select_run_dir(day_dir)
+            all_runs = [
+                p for p in day_dir.iterdir() if p.is_dir() and p.name.startswith(cfg.run_dir_prefix)
+            ]
+            selected = select_run_dir(day_dir, config=cfg)
             subbands = list_subbands(selected) if selected is not None else []
+            thermal_png = (
+                thermal_noise_png_for_run(selected, config=cfg) if selected is not None else None
+            )
 
             rows.append(
                 {
@@ -156,15 +234,13 @@ def scan_coverage(
                     "obs_date": day_dir.name,
                     "n_runs": len(all_runs),
                     "n_wideband_runs": sum(
-                        1 for p in all_runs if (p / WIDEBAND_QA).is_file()
+                        1 for p in all_runs if run_has_thermal_noise_qa(p, config=cfg)
                     ),
                     "latest_run": selected.name if selected is not None else pd.NA,
                     "n_subbands": len(subbands),
                     "subbands": ", ".join(subbands),
                     "run_path": str(selected) if selected is not None else pd.NA,
-                    "thermal_noise_png": str(selected / WIDEBAND_QA)
-                    if selected is not None
-                    else pd.NA,
+                    "thermal_noise_png": str(thermal_png) if thermal_png is not None else pd.NA,
                 }
             )
 
@@ -200,7 +276,7 @@ def qa_zarr_path(
     """Output Zarr path for pipeline QA products on one observation day."""
     cfg = config or PipelineQAConfig.default()
     day_tag = select_day.replace("-", "")
-    stem = I_QA_ZARR_STEM if pol == "I" else V_QA_ZARR_STEM
+    stem = cfg.i_qa_zarr_stem if pol == "I" else cfg.v_qa_zarr_stem
     return cfg.zarr_root / f"{stem}-{day_tag}.zarr"
 
 
@@ -257,38 +333,52 @@ def frequency_mhz_from_subdir(subdir_name: str) -> float:
     return float(subdir_name.removesuffix("MHz"))
 
 
-def collect_flux_check_hybrid_paths(run_dir: Path) -> list[Path]:
-    """Return ``flux_check_hybrid.csv`` files under each frequency subband in one run."""
-    return sorted(run_dir.glob(f"*MHz/{FLUX_CHECK_HYBRID_CSV.as_posix()}"))
+def collect_flux_check_hybrid_paths(
+    run_dir: Path,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> list[Path]:
+    """Return flux-check CSV paths for one run (per subband or single run-level file)."""
+    cfg = config or PipelineQAConfig.default()
+    return sorted(run_dir.glob(cfg.flux_check_csv_glob))
 
 
 def load_flux_check_hybrid_dataframe(
     select_day: str,
     coverage: pd.DataFrame,
+    *,
+    config: PipelineQAConfig | None = None,
 ) -> pd.DataFrame:
     """Load and combine all ``flux_check_hybrid.csv`` files for one observation day.
 
     Each CSV row is augmented with ``lst_hour``, ``frequency_mhz``, ``obs_date``,
     and ``flux_ratio`` (= ``imfit_flux`` / ``model_flux``).
     """
+    cfg = config or PipelineQAConfig.default()
     chunks: list[pd.DataFrame] = []
     for _, row in day_rows(select_day, coverage).iterrows():
         run_dir = Path(str(row["run_path"]))
         if not run_dir.is_dir():
             continue
-        for csv_path in collect_flux_check_hybrid_paths(run_dir):
-            subband = csv_path.parent.parent.name
-            freq_from_dir = frequency_mhz_from_subdir(subband)
+        for csv_path in collect_flux_check_hybrid_paths(run_dir, config=cfg):
             chunk = pd.read_csv(csv_path)
             chunk["lst_hour"] = row["lst_hour"]
             chunk["lst_hour_num"] = int(row["lst_hour_num"])
             chunk["obs_date"] = select_day
             chunk["run_path"] = str(run_dir)
-            chunk["subband"] = subband
+            if cfg.flux_check_csv_per_run:
+                chunk["subband"] = chunk["freq"].map(
+                    lambda f: f"{float(f):.0f}MHz" if pd.notna(f) else ""
+                )
+            else:
+                subband = csv_path.parent.parent.name
+                chunk["subband"] = subband
             if "freq" in chunk.columns:
                 chunk["frequency_mhz"] = chunk["freq"].astype(float)
+            elif not cfg.flux_check_csv_per_run:
+                chunk["frequency_mhz"] = frequency_mhz_from_subdir(str(chunk["subband"].iloc[0]))
             else:
-                chunk["frequency_mhz"] = freq_from_dir
+                chunk["frequency_mhz"] = np.nan
             chunks.append(chunk)
 
     if not chunks:
@@ -358,7 +448,7 @@ def infer_target_size_from_82mhz(
 ) -> int:
     """Return the square pixel size of the 82 MHz I deep image for this day."""
     cfg = config or PipelineQAConfig.default()
-    ref_glob = f"{REF_SUBBAND}/I/deep/{cfg.i_fits_glob}"
+    ref_glob = f"{cfg.ref_subband}/I/deep/{cfg.i_fits_glob}"
     for run_path in day_rows(select_day, coverage)["run_path"]:
         matches = sorted(Path(run_path).glob(ref_glob))
         if not matches:
@@ -366,7 +456,7 @@ def infer_target_size_from_82mhz(
         with fits.open(matches[0]) as hdul:
             shape = hdul[0].data.shape
             return int(max(shape[-2], shape[-1]))
-    msg = f"No {REF_SUBBAND} I deep image found for {select_day}"
+    msg = f"No {cfg.ref_subband} I deep image found for {select_day}"
     raise FileNotFoundError(msg)
 
 
@@ -451,7 +541,7 @@ def convert_missing_zarr(
 
     if not zarr_paths["I"].exists() or not zarr_paths["V"].exists():
         target_size = infer_target_size_from_82mhz(select_day, coverage, config=cfg)
-        log(f"LM reference target size from {REF_SUBBAND}: {target_size} px")
+        log(f"LM reference target size from {cfg.ref_subband}: {target_size} px")
         fits_by_pol = {
             "I": collect_pol_fits(select_day, "I", coverage, config=cfg),
             "V": collect_pol_fits(select_day, "V", coverage, config=cfg),
@@ -466,7 +556,7 @@ def convert_missing_zarr(
             msg = f"No Stokes I FITS found for {select_day}"
             raise FileNotFoundError(msg)
 
-        staging_i = cfg.symlink_root / f"{I_QA_ZARR_STEM}-{day_tag}-fits"
+        staging_i = cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fits"
         stage_symlinks(i_paths, staging_i)
         log(f"Staged {len(i_paths)} Stokes I files -> {staging_i}")
 
@@ -474,7 +564,7 @@ def convert_missing_zarr(
             input_dir=staging_i,
             out_dir=cfg.zarr_root,
             zarr_name=zarr_paths["I"].name,
-            fixed_dir=cfg.symlink_root / f"{I_QA_ZARR_STEM}-{day_tag}-fixed",
+            fixed_dir=cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fixed",
             chunk_lm=1024,
             rebuild=True,
             lm_reference_target_size=target_size,
@@ -492,7 +582,7 @@ def convert_missing_zarr(
             msg = f"No Stokes V FITS found for {select_day}"
             raise FileNotFoundError(msg)
 
-        staging_v = cfg.symlink_root / f"{V_QA_ZARR_STEM}-{day_tag}-fits"
+        staging_v = cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fits"
         stage_v_fits_with_beam_from_i(v_paths, fits_by_pol["I"], staging_v)
         log(f"Staged {len(v_paths)} Stokes V files -> {staging_v}")
 
@@ -500,7 +590,7 @@ def convert_missing_zarr(
             input_dir=staging_v,
             out_dir=cfg.zarr_root,
             zarr_name=zarr_paths["V"].name,
-            fixed_dir=cfg.symlink_root / f"{V_QA_ZARR_STEM}-{day_tag}-fixed",
+            fixed_dir=cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fixed",
             chunk_lm=1024,
             rebuild=True,
             lm_reference_ds=lm_ref_ds,
