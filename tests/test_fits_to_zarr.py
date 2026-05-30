@@ -89,6 +89,46 @@ def test_mhz_from_name_hyphen_after_mhz_like_dewarp_staging(tmp_path: Path) -> N
     assert "frequency-from-filename" in notes
 
 
+def test_mhz_from_name_leading_subband_token() -> None:
+    """Phase2 dewarped basenames start with ``NNMHz-`` (no leading underscore)."""
+    mod = _import_module()
+    assert mod._mhz_from_name(Path("82MHz-I-NoTaper-3581s-Robust-0-image.fits")) == 82
+
+
+def test_time_key_from_phase2_dewarped_basename(tmp_path: Path) -> None:
+    """Phase2 products encode time as ``YYYYMMDD_HHMMSS-image`` before the suffix."""
+    mod = _import_module()
+    name = "82MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    fpath = tmp_path / name
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"DATE-OBS": "2024-12-18T00:00:00", "RESTFREQ": 82e6}),
+    ).writeto(fpath)
+
+    time_key, frequency_hz, notes = mod._extract_group_metadata(fpath)
+
+    assert time_key == "20241218_033402"
+    assert frequency_hz == pytest.approx(82e6)
+    assert "time-from-filename" in notes
+
+
+def test_discover_groups_phase2_dewarped_basename_merges_subbands(tmp_path: Path) -> None:
+    """Subbands sharing the same phase2 image-time token belong to one time step."""
+    mod = _import_module()
+    a = tmp_path / "18MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    b = tmp_path / "82MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    for path, mhz in ((a, 18e6), (b, 82e6)):
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"DATE-OBS": "2024-12-18T01:00:00", "RESTFREQ": mhz}),
+        ).writeto(path)
+
+    groups = mod._discover_groups(tmp_path)
+
+    assert list(groups.keys()) == ["20241218_033402"]
+    assert {p.name for p in groups["20241218_033402"]} == {a.name, b.name}
+
+
 def test_module_can_be_imported():
     """Test that the fits_to_zarr_xradio module can be imported."""
     fits_to_zarr_xradio = _import_module()

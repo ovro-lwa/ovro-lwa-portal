@@ -34,6 +34,7 @@ from ovro_lwa_portal.viz.pipeline_qa import (
     convert_button_label,
     convert_missing_zarr,
     day_summary_table,
+    load_dewarp_summary_dataframe,
     load_flux_check_hybrid_dataframe,
     load_qa_datasets,
     qa_days,
@@ -42,6 +43,7 @@ from ovro_lwa_portal.viz.pipeline_qa import (
     zarr_status,
 )
 from ovro_lwa_portal.accessor import _has_per_time_wcs_header_str, _read_wcs_header_str
+from ovro_lwa_portal.viz.dewarp_summary_plots import build_dewarp_shift_panel
 from ovro_lwa_portal.viz.flux_check_plots import (
     build_flux_ratio_figures,
     build_flux_ratio_panel_grid,
@@ -114,15 +116,12 @@ def _schedule_ipython_main(callback: Callable[[], None]) -> None:
 
 
 def _run_on_main_thread(callback: Callable[[], None]) -> None:
-    """Run a callback on the active notebook/UI thread when possible."""
-    try:
-        from panel.io.state import state
+    """Run a callback on the IPython/Panel notebook UI thread.
 
-        if state.curdoc is not None:
-            callback()
-            return
-    except Exception:
-        pass
+    Do not run synchronously when ``state.curdoc`` is set: Bokeh heatmap tap handlers
+    execute with the heatmap pane's document active, and an in-place callback there
+    updates Param objects without refreshing the embedded Panel sliders.
+    """
     try:
         pn.state.execute(callback)
     except Exception:
@@ -253,7 +252,11 @@ def build_thermal_noise_grid(
         grid_rows.append(
             pn.Row(*tiles[start : start + n_cols], sizing_mode="stretch_width")
         )
-    return pn.Column(*grid_rows, sizing_mode="stretch_width")
+    return pn.Column(
+        *grid_rows,
+        sizing_mode="stretch_width",
+        max_width=ZENITH_REVIEW_ROW_WIDTH,
+    )
 
 
 class ScrollLog:
@@ -597,7 +600,12 @@ class _ZenithHeatmapSelector:
         n_times, n_freqs = self._stat_map.shape
         time_idx = _heatmap_index_from_coord(event.x, n_times)
         freq_idx = _heatmap_index_from_coord(event.y, n_freqs)
-        self._on_select(time_idx, freq_idx)
+
+        def _dispatch() -> None:
+            self._on_select(time_idx, freq_idx)
+
+        # Bokeh tap callbacks run on the heatmap document; schedule on the kernel loop.
+        _schedule_ipython_main(_dispatch)
 
     def set_data(
         self,
@@ -993,6 +1001,27 @@ class _StokesReviewHolder(param.Parameterized):
             else:
                 pane.object = ""
 
+    def _sync_slice_controls_to_ui(self) -> None:
+        """Mirror shared slice params on sliders and push embedded Panel views."""
+        time_idx = int(self._slice_selection.time_idx)
+        freq_idx = int(self._slice_selection.freq_idx)
+        if int(self._time_slider.value) != time_idx:
+            self._time_slider.value = time_idx
+        if int(self._freq_slider.value) != freq_idx:
+            self._freq_slider.value = freq_idx
+        if self._heatmap_status_row.visible:
+            self._refresh_heatmap_status_row()
+        _push_panel_layout(
+            self._controls_row,
+            self._time_slider,
+            self._freq_slider,
+            self._heatmap_status_row,
+            self._zenith_footer,
+        )
+        push = self._slice_selection._push_root
+        if push is not None:
+            push()
+
     def _push_zenith_ui(self) -> None:
         """Push hoisted heatmap status row and dashboard root (JupyterLab embedded layout)."""
         push_views: list[pn.viewable.Viewable] = [self._heatmap_status_row]
@@ -1222,11 +1251,10 @@ class _StokesReviewHolder(param.Parameterized):
         self._request_sky_update()
 
     def _on_slice_indices_changed(self, *_events: param.parameterized.Event) -> None:
-        """Refresh heatmap status text and push to the JupyterLab frontend."""
-        if not self._heatmap_status_row.visible:
+        """Refresh heatmap status text and push sliders to the JupyterLab frontend."""
+        if not self._controls_row.visible:
             return
-        self._refresh_heatmap_status_row()
-        self._push_zenith_ui()
+        self._sync_slice_controls_to_ui()
 
     def _sync_zenith_status_lines(self, *, push: bool = True) -> None:
         """Refresh hoisted heatmap status markdown and push to the JupyterLab frontend."""
@@ -1262,6 +1290,7 @@ class _StokesReviewHolder(param.Parameterized):
                     self._slice_selection.freq_idx = freq_idx
                 self._pending_reset_center = True
                 self._request_sky_update()
+                self._sync_slice_controls_to_ui()
             finally:
                 self._skip_sky_watch = False
                 self._suppress_post_heatmap_sky_watchers = False
@@ -1620,7 +1649,10 @@ class PipelineQAApp(param.Parameterized):
         )
         self._zenith_load_button.on_click(self._on_zenith_load_click)
         self._qa_grid = pn.Column(
-            pn.pane.Markdown("*Select an observation day to build the thermal-noise QA grid.*"),
+            pn.pane.Markdown(
+                "*Select an observation day to build the thermal-noise PNG grid "
+                "and dewarp summary heatmap.*"
+            ),
             sizing_mode="stretch_width",
         )
         self._flux_ratio_grid = pn.Column(
@@ -1634,7 +1666,8 @@ class PipelineQAApp(param.Parameterized):
             name="Observation day",
             width=220,
         )
-        self.param.watch(self._on_select_day_changed, "select_day")
+        self._day_selector.param.watch(self._on_day_selector_value, "value")
+        self._programmatic_day_sync = False
         self._convert_button = pn.widgets.Button(
             name="Convert FITS → Zarr",
             button_type="primary",
@@ -1694,7 +1727,8 @@ class PipelineQAApp(param.Parameterized):
     )
     def _sync_action_controls(self) -> None:
         """Keep day selector and action buttons aligned with Param state."""
-        self._day_selector.disabled = self.busy
+        # Keep the day dropdown interactive while QA/zenith loads run in the background.
+        self._day_selector.disabled = self.scanning or self.converting
         self._sync_convert_button()
         self._sync_zenith_button()
 
@@ -1709,6 +1743,15 @@ class PipelineQAApp(param.Parameterized):
         if self._layout is not None:
             _push_panel_layout(self._layout)
 
+    def _reset_thermal_qa_section(self) -> None:
+        """Restore thermal-noise PNG grid and dewarp summary placeholders."""
+        self._qa_grid.objects = [
+            pn.pane.Markdown(
+                "*Select an observation day to build the thermal-noise PNG grid "
+                "and dewarp summary heatmap.*"
+            ),
+        ]
+
     def _reset_flux_ratio_grid(self) -> None:
         """Restore flux ratio placeholder content."""
         self._flux_ratio_grid.objects = [
@@ -1716,6 +1759,33 @@ class PipelineQAApp(param.Parameterized):
                 "*Hybrid flux ratio plots (imfit / model) appear after a day is loaded.*"
             ),
         ]
+
+    def _build_thermal_qa_section(self, select_day: str) -> pn.Column:
+        """Thermal-noise PNG tile grid with dewarp median-shift heatmap below."""
+        thermal_grid = build_thermal_noise_grid(
+            self._summary_df,
+            select_day,
+            n_cols=self._qa_config.thermal_noise_grid_cols,
+            thermal_noise_plot_name=self._qa_config.thermal_noise_plot_name,
+            open_full_size=self._open_modal,
+        )
+        dewarp_df = load_dewarp_summary_dataframe(
+            select_day,
+            self._coverage,
+            config=self._qa_config,
+        )
+        dewarp_panel = build_dewarp_shift_panel(dewarp_df)
+        if not dewarp_df.empty:
+            self._log(
+                f"Built dewarp median-shift heatmap from {len(dewarp_df)} row(s) "
+                f"({self._qa_config.dewarp_summary_csv_glob})."
+            )
+        return pn.Column(
+            thermal_grid,
+            pn.pane.Markdown("#### Dewarp median shift (LST × frequency)"),
+            dewarp_panel,
+            sizing_mode="stretch_width",
+        )
 
     def _build_flux_ratio_grid(self, select_day: str) -> pn.Column:
         """Load flux-check CSVs and build the Bokeh heatmap grid for one day."""
@@ -1775,30 +1845,70 @@ class PipelineQAApp(param.Parameterized):
 
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
         """Update day options and selection from scan results."""
-        with param.parameterized.batch_call_watchers(self):
-            self.param.select_day.objects = days
-            self.select_day = value
+        normalized_days = [str(day) for day in days]
+        normalized_value = str(value) if value is not None else None
+        self._programmatic_day_sync = True
+        try:
+            with param.parameterized.batch_call_watchers(self):
+                self.param.select_day.objects = normalized_days
+                self.select_day = normalized_value
+        finally:
+            self._programmatic_day_sync = False
 
-    def _on_select_day_changed(self, event: param.parameterized.Event) -> None:
+    def _supersede_inflight_work(self) -> None:
+        """Cancel in-flight zenith/day work so a new observation day can load."""
+        self._load_seq += 1
+        self.loading_zenith = False
+        self.loading_day = False
+
+    def _on_day_selector_value(self, event: param.parameterized.Event) -> None:
+        """Handle user-driven changes from the Panel day dropdown."""
+        if self._programmatic_day_sync:
+            return
         new_day = event.new
         if new_day is None:
             return
-        old_day = event.old
-        if old_day not in (None, param.Undefined) and old_day == new_day:
+        self._handle_day_selection(str(new_day), previous=event.old)
+
+    def _handle_day_selection(self, new_day: str, *, previous: Any = None) -> None:
+        """Load QA content for one observation day selected in the dropdown."""
+        if self.scanning or self._coverage.empty:
+            return
+        old_day = previous
+        if (
+            old_day not in (None, param.Undefined)
+            and str(old_day) == new_day
+            and self._loaded_day == new_day
+        ):
             return
         if self._loaded_day != new_day:
+            self._supersede_inflight_work()
             self._release_active_datasets()
             self._reset_zenith_sections()
             self._reset_flux_ratio_grid()
+            self._reset_thermal_qa_section()
             self._qa_grid.objects = [
-                pn.pane.Markdown("*Loading thermal-noise QA grid…*"),
+                pn.pane.Markdown("*Loading thermal-noise QA grid and dewarp summary…*"),
             ]
 
             def _push() -> None:
                 self._push_panel_roots()
 
             self._execute(_push)
+        if self.select_day != new_day:
+            self._programmatic_day_sync = True
+            try:
+                with param.parameterized.batch_call_watchers(self):
+                    self.select_day = new_day
+            finally:
+                self._programmatic_day_sync = False
         self._begin_load_day()
+
+    def _on_select_day_changed(self, event: param.parameterized.Event) -> None:
+        """Backward-compatible alias; prefer :meth:`_handle_day_selection`."""
+        if event.new is None:
+            return
+        self._handle_day_selection(str(event.new), previous=event.old)
 
     def _on_zenith_load_click(self, _event: Any) -> None:
         self._begin_zenith_load()
@@ -1882,6 +1992,7 @@ class PipelineQAApp(param.Parameterized):
                 days = qa_days(coverage)
 
                 def _apply() -> None:
+                    pending_day = self.select_day
                     self._coverage = coverage
                     self.scanning = False
                     if not days:
@@ -1891,11 +2002,21 @@ class PipelineQAApp(param.Parameterized):
                         self._sync_day_selector([], None)
                     else:
                         self._clear_error()
-                        self._sync_day_selector(days, None)
-                        self._log(
-                            f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
-                            "Select a day from the dropdown to load QA data."
+                        preferred = (
+                            pending_day if pending_day in days else None
                         )
+                        self._sync_day_selector(days, preferred)
+                        if preferred is not None:
+                            self._begin_load_day()
+                            self._log(
+                                f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
+                                f"Loading QA data for {preferred}…"
+                            )
+                        else:
+                            self._log(
+                                f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
+                                "Select a day from the dropdown to load QA data."
+                            )
                     self._sync_log()
 
                 self._execute(_apply)
@@ -1910,7 +2031,11 @@ class PipelineQAApp(param.Parameterized):
 
     def _begin_load_day(self) -> None:
         """Load thermal-noise summary and QA grid for the selected day."""
-        if self.converting or self.loading_zenith or self.select_day is None or self._coverage.empty:
+        if self.converting:
+            return
+        if self.select_day is None:
+            return
+        if self._coverage.empty:
             return
 
         select_day = self.select_day
@@ -1921,7 +2046,15 @@ class PipelineQAApp(param.Parameterized):
         self._flush_log()
         self._release_active_datasets()
         self._stokes_review.dispose()
-        self._run_day_load(select_day, load_seq)
+        self._start_day_load_thread(select_day, load_seq)
+
+    def _start_day_load_thread(self, select_day: str, load_seq: int) -> None:
+        """Run day QA loading off the notebook UI thread."""
+
+        def _run() -> None:
+            self._run_day_load(select_day, load_seq)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _auto_load_zenith_if_ready(self, load_seq: int) -> None:
         """Start zenith review automatically after a successful day load."""
@@ -2022,9 +2155,9 @@ class PipelineQAApp(param.Parameterized):
 
     def _finish_zenith_load(self, *, load_seq: int | None = None) -> None:
         """Clear zenith loading state and refresh controls."""
+        self.loading_zenith = False
         if load_seq is not None and not self._is_current_load(load_seq):
             return
-        self.loading_zenith = False
         self._flush_log()
         self._execute(self._push_zenith_root)
 
@@ -2099,14 +2232,7 @@ class PipelineQAApp(param.Parameterized):
         self._active_datasets.clear()
         self._reset_zenith_sections()
         self._summary_df = payload.summary_df
-        thermal_grid = build_thermal_noise_grid(
-            payload.summary_df,
-            select_day,
-            n_cols=self._qa_config.thermal_noise_grid_cols,
-            thermal_noise_plot_name=self._qa_config.thermal_noise_plot_name,
-            open_full_size=self._open_modal,
-        )
-        self._qa_grid.objects = [thermal_grid]
+        self._qa_grid.objects = [self._build_thermal_qa_section(select_day)]
         self._flux_ratio_grid.objects = [self._build_flux_ratio_grid(select_day)]
         self._clear_error()
         self._log(
@@ -2142,9 +2268,9 @@ class PipelineQAApp(param.Parameterized):
         load_seq: int | None = None,
         auto_zenith: bool = False,
     ) -> None:
+        self.loading_day = False
         if load_seq is not None and not self._is_current_load(load_seq):
             return
-        self.loading_day = False
         if auto_zenith and load_seq is not None:
             self._auto_load_zenith_if_ready(load_seq)
 
@@ -2161,7 +2287,7 @@ class PipelineQAApp(param.Parameterized):
             self._log(f"Refreshing QA data for {select_day}…")
             self._flush_log()
         self._release_active_datasets()
-        self._run_day_load(select_day, load_seq)
+        self._start_day_load_thread(select_day, load_seq)
 
     def _open_modal(self, png_path: str, title: str) -> None:
         self._modal_container.objects = [
@@ -2205,7 +2331,14 @@ class PipelineQAApp(param.Parameterized):
             def _after_convert() -> None:
                 # Clear converting before refresh so _auto_load_zenith_if_ready is not blocked.
                 self.converting = False
-                self._load_day(silent=False)
+                status = zarr_status(select_day, config=self._qa_config)
+                if not (status["I"] or status["V"]):
+                    self._log_error(
+                        "Conversion finished but no QA Zarr store was created. "
+                        "Check the notebook/kernel log for errors after the staging line."
+                    )
+                else:
+                    self._load_day(silent=False)
                 self._sync_log()
 
             _schedule_ipython_main(_after_convert)
@@ -2220,7 +2353,7 @@ class PipelineQAApp(param.Parameterized):
         header = pn.pane.Markdown(
             "# Pipeline QA check\n\n"
             "Scan finds available days automatically. Select a day to load Stokes I/V "
-            "zenith review, hybrid flux ratio plots, and the thermal-noise QA grid. "
+            "zenith review, hybrid flux ratio plots, thermal-noise PNG grid, and dewarp summary. "
             "A shared sky view appears below the heatmaps."
         )
         log_section = pn.Column(
@@ -2242,7 +2375,7 @@ class PipelineQAApp(param.Parameterized):
             self._zenith_slot,
             pn.pane.Markdown("### Hybrid flux ratio (imfit / model)"),
             self._flux_ratio_grid,
-            pn.pane.Markdown("### Thermal-noise QA by LST hour"),
+            pn.pane.Markdown("### Thermal-noise QA (PNG grid & dewarp summary)"),
             self._qa_grid,
             self._modal_container,
             sizing_mode="stretch_width",
@@ -2252,12 +2385,21 @@ class PipelineQAApp(param.Parameterized):
         """Return the JupyterLab dashboard layout."""
         self._build_layouts()
 
-        if not self._scan_started:
-            self._scan_started = True
-            pn.state.onload(self._start_initial_scan)
+        _schedule_initial_scan(self)
 
         assert self._layout is not None
         return self._layout
+
+
+def _schedule_initial_scan(app: PipelineQAApp) -> None:
+    """Start the pipeline scan once, even if ``pn.state.onload`` never fires."""
+    if app._scan_started:
+        return
+    app._scan_started = True
+    if pn.state.loaded:
+        app._start_initial_scan()
+    else:
+        pn.state.onload(app._start_initial_scan)
 
 
 def display_pipeline_qa_app(
@@ -2306,9 +2448,7 @@ def display_pipeline_qa_app(
     app = app or PipelineQAApp(qa_config=resolved_config)
     app._build_layouts()
 
-    if not app._scan_started:
-        app._scan_started = True
-        pn.state.onload(app._start_initial_scan)
+    _schedule_initial_scan(app)
 
     assert app._layout is not None
     display(app._layout)

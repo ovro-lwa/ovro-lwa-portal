@@ -210,8 +210,113 @@ def test_zarr_status_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     i_zarr = pq.qa_zarr_path("I", "2024-12-28")
     i_zarr.mkdir(parents=True)
     (i_zarr / ".zgroup").write_text("{}")
+    monkeypatch.setattr(
+        pq,
+        "_zarr_store_exists",
+        lambda path: path.name.endswith("20241228.zarr"),
+    )
     status = pq.zarr_status("2024-12-28")
     assert status == {"I": True, "V": False}
+
+
+def test_stage_symlinks_avoids_basename_collisions(tmp_path: Path) -> None:
+    run_a = tmp_path / "08h" / "2024-12-28" / "Science_20241228_120000" / "82MHz" / "I" / "deep"
+    run_b = tmp_path / "09h" / "2024-12-28" / "Science_20241228_130000" / "82MHz" / "I" / "deep"
+    run_a.mkdir(parents=True)
+    run_b.mkdir(parents=True)
+    name = "82MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    file_a = run_a / name
+    file_b = run_b / name
+    file_a.write_bytes(b"fits-a")
+    file_b.write_bytes(b"fits-b")
+
+    staging = tmp_path / "stage"
+    pq.stage_symlinks([file_a, file_b], staging)
+
+    assert (staging / name).is_symlink()
+    assert (staging / f"Science_20241228_130000__{name}").is_symlink()
+
+
+def test_fits_group_key_strips_run_prefix() -> None:
+    name = (
+        "Science_20241228_130000__"
+        "82MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    )
+    assert pq.fits_group_key(Path(name)) == ("82MHz", "20241218_033402")
+
+
+def test_convert_missing_zarr_cleans_up_staging_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_root = tmp_path / "stage"
+    zarr_root = tmp_path / "zarr"
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=stage_root,
+        zarr_root=zarr_root,
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+    )
+    _write_qa_tree(tmp_path)
+    v_subband = (
+        tmp_path
+        / "08h"
+        / "2024-12-28"
+        / "Run_20241228_120000"
+        / "82MHz"
+        / "V"
+        / "deep"
+    )
+    v_subband.mkdir(parents=True)
+    v_name = "82MHz-V-Taper-Deep-image-20241228_120000.pbcorr.fits"
+    (v_subband / v_name).write_bytes(b"fits")
+
+    day_tag = "20241228"
+    staging_i = stage_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fits"
+    fixed_i = stage_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fixed"
+    staging_v = stage_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fits"
+    fixed_v = stage_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fixed"
+
+    def _fake_convert(*, input_dir: Path, out_dir: Path, zarr_name: str, **kwargs: object) -> Path:
+        out = out_dir / zarr_name
+        out.mkdir(parents=True, exist_ok=True)
+        (out / ".zgroup").write_text("{}")
+        fixed_dir = kwargs.get("fixed_dir")
+        if isinstance(fixed_dir, Path):
+            fixed_dir.mkdir(parents=True, exist_ok=True)
+            (fixed_dir / "stub_fixed.fits").write_bytes(b"fixed")
+        return out
+
+    def _fake_stage_symlinks(fits_paths: list[Path], staging_dir: Path) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in fits_paths:
+            (staging_dir / src.name).write_bytes(b"fits")
+        return staging_dir
+
+    def _fake_stage_v(
+        v_paths: list[Path],
+        _i_paths: list[Path],
+        staging_dir: Path,
+    ) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in v_paths:
+            (staging_dir / src.name).write_bytes(b"fits")
+        return staging_dir
+
+    monkeypatch.setattr(pq, "infer_target_size_from_82mhz", lambda *_args, **_kwargs: 64)
+    monkeypatch.setattr(pq, "convert_fits_dir_to_zarr", _fake_convert)
+    monkeypatch.setattr(pq, "stage_symlinks", _fake_stage_symlinks)
+    monkeypatch.setattr(pq, "stage_v_fits_with_beam_from_i", _fake_stage_v)
+    monkeypatch.setattr(pq, "_lm_reference_from_existing_zarr", lambda _path: object())
+
+    calls: list[str] = []
+    coverage = pq.scan_coverage(config=cfg)
+    pq.convert_missing_zarr("2024-12-28", coverage, calls.append, config=cfg)
+
+    for path in (staging_i, fixed_i, staging_v, fixed_v):
+        assert not path.exists(), f"expected staging dir removed: {path}"
+    assert any("Removed staging directory" in line for line in calls)
 
 
 def test_convert_missing_zarr_skips_existing(
@@ -422,22 +527,126 @@ def test_initial_scan_does_not_auto_select_day(monkeypatch: pytest.MonkeyPatch) 
     assert "Select a day" in app.log_text
 
 
+def test_initial_scan_loads_day_selected_during_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+    monkeypatch.setattr(app, "_execute", lambda callback: callback())
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+
+    load_calls: list[str] = []
+    monkeypatch.setattr(app, "_begin_load_day", lambda: load_calls.append("load"))
+    app.select_day = "2024-12-28"
+
+    app._start_initial_scan()
+
+    assert app.select_day == "2024-12-28"
+    assert load_calls == ["load"]
+    assert "Loading QA data for 2024-12-28" in app.log_text
+
+
 def test_day_selector_triggers_load_day(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
-    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
     app._coverage = pd.DataFrame({"obs_date": ["2024-12-27", "2024-12-28"]})
-    monkeypatch.setattr(app, "_begin_load_day", lambda: calls.append(app.select_day or ""))
+    monkeypatch.setattr(
+        app,
+        "_start_day_load_thread",
+        lambda select_day, load_seq: calls.append(select_day),
+    )
     _set_select_day(app, "2024-12-27", days=["2024-12-27", "2024-12-28"])
     app._loaded_day = "2024-12-27"
     calls.clear()
 
-    app.select_day = "2024-12-28"
+    app._handle_day_selection("2024-12-28", previous="2024-12-27")
 
     assert app.select_day == "2024-12-28"
     assert calls == ["2024-12-28"]
+
+
+def test_reselect_same_day_skips_when_already_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    app = PipelineQAApp()
+    app.scanning = False
+    app._coverage = _sample_coverage()
+    monkeypatch.setattr(app, "_begin_load_day", lambda: calls.append("load"))
+    _set_select_day(app, "2024-12-28", days=["2024-12-28"])
+    app._loaded_day = "2024-12-28"
+    calls.clear()
+
+    app._handle_day_selection("2024-12-28", previous="2024-12-28")
+
+    assert calls == []
+
+
+def test_finish_zenith_load_clears_flag_when_superseded() -> None:
+    app = PipelineQAApp()
+    app._load_seq = 2
+    app.loading_zenith = True
+
+    app._finish_zenith_load(load_seq=1)
+
+    assert app.loading_zenith is False
+
+
+def test_day_change_during_zenith_load_starts_new_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    load_calls: list[str] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(
+        app,
+        "_start_day_load_thread",
+        lambda select_day, load_seq: load_calls.append(select_day),
+    )
+    app.scanning = False
+    app._coverage = _sample_coverage()
+    app._loaded_day = "2024-12-19"
+    app.loading_zenith = True
+    _set_select_day(app, "2024-12-19", days=["2024-12-19", "2024-12-20"])
+    load_calls.clear()
+
+    app._handle_day_selection("2024-12-20", previous="2024-12-19")
+
+    assert load_calls == ["2024-12-20"]
+    assert app.loading_zenith is False
+
+
+def test_day_selector_stays_enabled_during_zenith_load() -> None:
+    app = PipelineQAApp()
+    app.scanning = False
+    app.converting = False
+    app.loading_zenith = True
+    app.loading_day = True
+
+    app._sync_action_controls()
+
+    assert app._day_selector.disabled is False
 
 
 def test_stokes_review_holder_builds_both_sections(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1889,6 +2098,12 @@ def _write_phase2_qa_tree(root: Path, *, obs_date: str = "2025-01-11", hour: str
         "15.0,1.0,45.0,7.5,3C147,55.0\n",
         encoding="utf-8",
     )
+    (qa_dir / "20250111_05h_dewarp_summary.csv").write_text(
+        "freq_mhz,median_shift_arcmin\n"
+        "55,0.12\n"
+        "82,0.34\n",
+        encoding="utf-8",
+    )
     subband = run_dir / "55MHz" / "I" / "deep"
     subband.mkdir(parents=True)
     fits_name = (
@@ -1990,3 +2205,59 @@ def test_flux_ratio_grids_and_figures(tmp_path: Path) -> None:
     assert isinstance(panel_grid, pn.Column)
     assert len(panel_grid.objects) == 1
     assert panel_grid.max_width == FLUX_RATIO_GRID_TOTAL_WIDTH
+
+
+def _phase2_test_config(tmp_path: Path) -> pq.PipelineQAConfig:
+    return pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB_PHASE2,
+        v_fits_glob=pq.V_FITS_GLOB_PHASE2,
+        run_dir_prefix="Science_",
+        run_dir_pattern=r"Science_(\d{8})_(\d{6})",
+        qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
+        flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
+        flux_check_csv_per_run=True,
+        dewarp_summary_csv_glob="QA/*dewarp_summary.csv",
+    )
+
+
+def test_load_dewarp_summary_dataframe_phase2(tmp_path: Path) -> None:
+    _write_phase2_qa_tree(tmp_path)
+    cfg = _phase2_test_config(tmp_path)
+    coverage = pq.scan_coverage(config=cfg)
+    dewarp_df = pq.load_dewarp_summary_dataframe("2025-01-11", coverage, config=cfg)
+
+    assert len(dewarp_df) == 2
+    assert set(dewarp_df["frequency_mhz"]) == {55.0, 82.0}
+    assert dewarp_df["median_shift"].tolist() == [0.12, 0.34]
+    assert dewarp_df["lst_hour"].iloc[0] == "05h"
+
+
+def test_dewarp_shift_grid_and_figure(tmp_path: Path) -> None:
+    from bokeh.models import ColorBar, HoverTool
+
+    from ovro_lwa_portal.viz.dewarp_summary_plots import (
+        build_dewarp_shift_figure,
+        build_dewarp_shift_panel,
+    )
+
+    _write_phase2_qa_tree(tmp_path)
+    cfg = _phase2_test_config(tmp_path)
+    coverage = pq.scan_coverage(config=cfg)
+    dewarp_df = pq.load_dewarp_summary_dataframe("2025-01-11", coverage, config=cfg)
+    grid = pq.dewarp_shift_grid(dewarp_df)
+
+    lst_num = int(coverage.iloc[0]["lst_hour_num"])
+    assert grid.loc[lst_num, 55.0] == 0.12
+    assert grid.loc[lst_num, 82.0] == 0.34
+
+    figure = build_dewarp_shift_figure(grid)
+    assert figure.select_one({"type": ColorBar}) is not None
+    hover_tools = [tool for tool in figure.tools if isinstance(tool, HoverTool)]
+    assert len(hover_tools) == 1
+
+    panel = build_dewarp_shift_panel(dewarp_df)
+    assert isinstance(panel, pn.Column)
+    assert len(panel.objects) == 1

@@ -51,18 +51,19 @@ def _color_mapper_for_values(values: np.ndarray) -> tuple[LinearColorMapper, flo
 
 
 def _hover_source(
-    ratio_map: np.ndarray,
+    value_map: np.ndarray,
     *,
     freq_mhz: list[float],
     lst_hour_nums: list[int],
     lst_labels: dict[int, str],
+    value_field: str = "metric_value",
 ) -> ColumnDataSource:
     lst_idx, freq_idx = np.meshgrid(
         np.arange(len(lst_hour_nums), dtype=int),
         np.arange(len(freq_mhz), dtype=int),
         indexing="ij",
     )
-    ratios = ratio_map[lst_idx, freq_idx]
+    values = value_map[lst_idx, freq_idx]
     return ColumnDataSource(
         data={
             "x": lst_idx.ravel() + 0.5,
@@ -70,25 +71,28 @@ def _hover_source(
             "frequency_mhz": np.asarray(freq_mhz)[freq_idx.ravel()],
             "lst_hour": [lst_labels.get(int(n), f"{int(n)}h") for n in np.asarray(lst_hour_nums)[lst_idx.ravel()]],
             "lst_hour_num": np.asarray(lst_hour_nums)[lst_idx.ravel()],
-            "flux_ratio": ratios.ravel(),
+            value_field: values.ravel(),
         }
     )
 
 
-def build_flux_ratio_figure(
-    source: str,
+def build_lst_freq_heatmap_figure(
+    title: str,
     grid: pd.DataFrame,
     *,
+    value_label: str,
+    hover_value_label: str,
     lst_labels: dict[int, str] | None = None,
+    extra_tooltips: list[tuple[str, str]] | None = None,
     width: int = FLUX_RATIO_PLOT_WIDTH,
     height: int = FLUX_RATIO_PLOT_HEIGHT,
 ) -> figure:
-    """Build a Bokeh heatmap of flux ratio (imfit/model) vs LST and frequency."""
+    """Build a Bokeh LST × frequency heatmap from a pivoted metric grid."""
     if grid.empty:
         plot = figure(
             width=width,
             height=height,
-            title=f"{source}: no flux-check data",
+            title=f"{title}: no data",
             x_range=(0, 1),
             y_range=(0, 1),
             tools="pan,wheel_zoom,reset",
@@ -97,24 +101,24 @@ def build_flux_ratio_figure(
 
     freq_mhz = [float(value) for value in grid.columns]
     lst_hour_nums = [int(value) for value in grid.index]
-    ratio_map = grid.to_numpy(dtype=float)
+    value_map = grid.to_numpy(dtype=float)
     n_freqs = len(freq_mhz)
     n_lsts = len(lst_hour_nums)
 
     labels = lst_labels or {num: f"{num:02d}h" for num in lst_hour_nums}
-    color_mapper, _clim_lo, _clim_hi = _color_mapper_for_values(ratio_map)
+    color_mapper, _clim_lo, _clim_hi = _color_mapper_for_values(value_map)
 
     plot = figure(
         width=width,
         height=height,
-        title=f"{source}: imfit / model flux ratio",
+        title=title,
         x_range=(0, n_lsts),
         y_range=(0, n_freqs),
         tools="pan,wheel_zoom,reset",
         active_drag="pan",
     )
     plot.image(
-        image=[ratio_map.T],
+        image=[value_map.T],
         x=0,
         y=0,
         dw=n_lsts,
@@ -127,7 +131,7 @@ def build_flux_ratio_figure(
         width=1,
         height=1,
         source=_hover_source(
-            ratio_map,
+            value_map,
             freq_mhz=freq_mhz,
             lst_hour_nums=lst_hour_nums,
             lst_labels=labels,
@@ -137,23 +141,20 @@ def build_flux_ratio_figure(
         hover_fill_alpha=0,
         hover_line_alpha=0,
     )
-    plot.add_tools(
-        HoverTool(
-            renderers=[hover_renderer],
-            tooltips=[
-                ("Source", source),
-                ("Frequency (MHz)", "@frequency_mhz{0.0}"),
-                ("LST hour", "@lst_hour"),
-                ("imfit/model", "@flux_ratio{0.3g}"),
-            ],
-        )
-    )
+    tooltips: list[tuple[str, str]] = [
+        ("Frequency (MHz)", "@frequency_mhz{0.0}"),
+        ("LST hour", "@lst_hour"),
+        (hover_value_label, "@metric_value{0.3g}"),
+    ]
+    if extra_tooltips:
+        tooltips = extra_tooltips + tooltips
+    plot.add_tools(HoverTool(renderers=[hover_renderer], tooltips=tooltips))
     color_bar = ColorBar(
         color_mapper=color_mapper,
         ticker=BasicTicker(desired_num_ticks=5),
         label_standoff=8,
         border_line_color=None,
-        title="imfit/model",
+        title=value_label,
     )
     plot.add_layout(color_bar, "right")
 
@@ -169,6 +170,27 @@ def build_flux_ratio_figure(
     plot.xaxis.axis_label = "LST hour"
     plot.yaxis.axis_label = "Frequency (MHz)"
     return plot
+
+
+def build_flux_ratio_figure(
+    source: str,
+    grid: pd.DataFrame,
+    *,
+    lst_labels: dict[int, str] | None = None,
+    width: int = FLUX_RATIO_PLOT_WIDTH,
+    height: int = FLUX_RATIO_PLOT_HEIGHT,
+) -> figure:
+    """Build a Bokeh heatmap of flux ratio (imfit/model) vs LST and frequency."""
+    return build_lst_freq_heatmap_figure(
+        f"{source}: imfit / model flux ratio",
+        grid,
+        value_label="imfit/model",
+        hover_value_label="imfit/model",
+        lst_labels=lst_labels,
+        extra_tooltips=[("Source", source)],
+        width=width,
+        height=height,
+    )
 
 
 def lst_hour_label_map(flux_df: pd.DataFrame) -> dict[int, str]:

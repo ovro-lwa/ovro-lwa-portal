@@ -211,12 +211,14 @@ _OVRO_LWA_DEFAULT_HEIGHT_M = 1188.6
 _SKY_COORD_CACHE: Dict[Tuple[int, int, str], Tuple[NDArray[np.floating], NDArray[np.floating], str]] = {}
 
 
-# Subband MHz in OVRO-style basenames, e.g. ``..._41MHz_...``, ``...__18MHz-I-...``
-# (dewarp staging uses ``{time_key}__{original_name}``; product tags use a hyphen after MHz).
-MHZ_RE = re.compile(r"_(\d+)MHz(?:_|-|\.|$)")
+# Subband MHz in OVRO-style basenames, e.g. ``82MHz-I-...``, ``..._41MHz_...``,
+# ``...__18MHz-I-...`` (dewarp staging uses ``{time_key}__{original_name}``).
+MHZ_RE = re.compile(r"(?:^|_)(\d+)MHz(?:_|-|\.|$)")
 
-# OVRO-LWA ``...-image-YYYYMMDD_HHMMSS...`` segment (UTC wall-clock for the map).
+# OVRO-LWA observation-time tokens in basenames (UTC wall-clock for the map).
+# Phase1: ``...-image-YYYYMMDD_HHMMSS...``; phase2 dewarped: ``...YYYYMMDD_HHMMSS-image...``.
 _IMAGE_TIME_RE = re.compile(r"-image-(\d{8})_(\d{6})")
+_IMAGE_TIME_BEFORE_IMAGE_RE = re.compile(r"(\d{8})_(\d{6})-image", re.IGNORECASE)
 
 
 def _mhz_from_name(p: Path) -> int:
@@ -828,24 +830,28 @@ def _earth_location_from_header(hdr: fits.Header) -> EarthLocation:
 
 
 def _obstime_from_fits_filename(path: Path) -> Optional[Time]:
-    """Parse ``-image-YYYYMMDD_HHMMSS`` from a FITS basename as UTC :class:`~astropy.time.Time`.
+    """Parse an observation-time token from a FITS basename as UTC :class:`~astropy.time.Time`.
 
-    Returns ``None`` if the pattern is missing or digits are not a valid civil time.
+    Supports phase1 ``-image-YYYYMMDD_HHMMSS`` and phase2 dewarped
+    ``YYYYMMDD_HHMMSS-image`` segments. Returns ``None`` when no pattern matches or
+    digits are not a valid civil time.
     """
-    m = _IMAGE_TIME_RE.search(path.name)
-    if not m:
-        return None
-    ymd, hms = m.group(1), m.group(2)
-    try:
-        naive = datetime.strptime(ymd + hms, "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-    utc = naive.replace(tzinfo=timezone.utc)
-    return Time(utc)
+    for pattern in (_IMAGE_TIME_RE, _IMAGE_TIME_BEFORE_IMAGE_RE):
+        match = pattern.search(path.name)
+        if match is None:
+            continue
+        ymd, hms = match.group(1), match.group(2)
+        try:
+            naive = datetime.strptime(ymd + hms, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        utc = naive.replace(tzinfo=timezone.utc)
+        return Time(utc)
+    return None
 
 
 def _time_key_from_filename(fp: Path) -> Optional[str]:
-    """Observation time key from ``-image-YYYYMMDD_HHMMSS`` in the basename.
+    """Observation time key from a basename image-time token when present.
 
     Same ``%Y%m%d_%H%M%S`` formatting as :func:`_time_key_from_header`. Returns ``None``
     when the filename pattern is absent or not parseable.
