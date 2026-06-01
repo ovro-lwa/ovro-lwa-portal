@@ -41,17 +41,26 @@ def valid_ovro_dataset() -> xr.Dataset:
         time, frequency, polarization, l, m.
     """
     np.random.seed(42)
+    beam_meta = np.empty((2, 3, 2, 3), dtype=np.float64)
+    beam_meta[..., 0] = 0.02  # major (deg)
+    beam_meta[..., 1] = 0.01  # minor (deg)
+    beam_meta[..., 2] = 0.0  # position angle (deg)
     return xr.Dataset(
         data_vars={
             "SKY": (
                 ["time", "frequency", "polarization", "l", "m"],
                 np.random.rand(2, 3, 2, 50, 50) * 10,
             ),
+            "BEAM": (
+                ["time", "frequency", "polarization", "beam_param"],
+                beam_meta,
+            ),
         },
         coords={
             "time": [60000.0, 60000.1],  # MJD values
             "frequency": [46e6, 50e6, 54e6],  # Hz
             "polarization": [0, 1],
+            "beam_param": ["major", "minor", "pa"],
             "l": np.linspace(-1, 1, 50),
             "m": np.linspace(-1, 1, 50),
         },
@@ -222,17 +231,26 @@ CUNIT2  = 'deg'
 RADESYS = 'FK5'
 EQUINOX =               2000.0"""
 
+    beam_meta = np.empty((n_times, 3, 2, 3), dtype=np.float64)
+    beam_meta[..., 0] = 0.02
+    beam_meta[..., 1] = 0.01
+    beam_meta[..., 2] = 0.0
     ds = xr.Dataset(
         data_vars={
             "SKY": (
                 ["time", "frequency", "polarization", "l", "m"],
                 np.random.rand(n_times, 3, 2, 50, 50) * 10,
             ),
+            "BEAM": (
+                ["time", "frequency", "polarization", "beam_param"],
+                beam_meta,
+            ),
         },
         coords={
             "time": times,
             "frequency": [46e6, 50e6, 54e6],
             "polarization": [0, 1],
+            "beam_param": ["major", "minor", "pa"],
             "l": np.linspace(-1, 1, 50),
             "m": np.linspace(-1, 1, 50),
         },

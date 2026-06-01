@@ -18,6 +18,7 @@ from ovro_lwa_portal.accessor import (
     PatchStatisticResult,
     RadportAccessor,
     _fit_spatial_gaussian,
+    _gaussian_parameters_from_patch_statistics,
     _reduce_spatial_statistic,
 )
 
@@ -97,9 +98,10 @@ class TestRadportValidation:
 class TestRadportHasBeam:
     """Tests for has_beam property."""
 
-    def test_has_beam_false_when_no_beam(self, valid_ovro_dataset: xr.Dataset) -> None:
+    def test_has_beam_false_when_no_beam(self, dataset_missing_sky_variable: xr.Dataset) -> None:
         """has_beam returns False when dataset has no BEAM variable."""
-        assert not valid_ovro_dataset.radport.has_beam
+        ds = dataset_missing_sky_variable.rename({"OTHER": "SKY"})
+        assert not ds.radport.has_beam
 
     def test_has_beam_true_when_beam_present(
         self, valid_ovro_dataset_with_beam: xr.Dataset
@@ -641,7 +643,7 @@ class TestRadportPatchStatistic:
         result = ds.radport.patch_statistic(
             l=0.0,
             m=0.0,
-            radius=3,
+            scale=5.0,
             statistic="max",
             threshold=500.0,
             comparison="gt",
@@ -658,7 +660,7 @@ class TestRadportPatchStatistic:
         result_le = ds.radport.patch_statistic(
             l=0.0,
             m=0.0,
-            radius=3,
+            scale=5.0,
             statistic="max",
             threshold=500.0,
             comparison="le",
@@ -706,7 +708,7 @@ class TestRadportPatchStatistic:
         result = ds.radport.patch_statistic(
             l=0.0,
             m=0.0,
-            radius=3,
+            scale=5.0,
             statistic="max",
             threshold=500.0,
             comparison="gt",
@@ -731,12 +733,12 @@ class TestRadportPatchStatistic:
         with pytest.raises(ValueError, match="Unsupported statistic"):
             _reduce_spatial_statistic(np.ones((3, 3)), "invalid")  # type: ignore[arg-type]
 
-    def test_patch_statistic_negative_radius_raises(
+    def test_patch_statistic_nonpositive_scale_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
-        """Negative radius raises ValueError."""
-        with pytest.raises(ValueError, match="radius must be non-negative"):
-            valid_ovro_dataset.radport.patch_statistic(l=0.0, m=0.0, radius=-1)
+        """Non-positive scale raises ValueError."""
+        with pytest.raises(ValueError, match="scale must be positive"):
+            valid_ovro_dataset.radport.patch_statistic(l=0.0, m=0.0, scale=0.0)
 
     def test_patch_statistic_radec_tracking(
         self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
@@ -746,7 +748,7 @@ class TestRadportPatchStatistic:
         result = ds.radport.patch_statistic(
             ra=180.0,
             dec=37.0,
-            radius=2,
+            scale=2.0,
             statistic="mean",
             threshold=0.0,
             comparison="gt",
@@ -770,9 +772,129 @@ class TestRadportPatchFit:
             result.widthy_map,
             result.background_map,
             result.reduced_chi_squared_map,
+            result.x_offset_map,
+            result.y_offset_map,
+            result.center_flux_map,
+            result.patch_max_map,
+            result.fit_accepted_map,
         ):
             assert set(da.dims) == {"time", "frequency"}
             assert da.shape == (2, 3)
+        diag = result.cell_diagnostics(time_idx=0, frequency_idx=0)
+        assert "fit_accepted" in diag
+        assert "patch_max" in diag
+
+    def test_gaussian_parameters_use_patch_max_for_peak(self) -> None:
+        """Peak estimate uses patch maximum minus median background."""
+        patch = np.array(
+            [
+                [10.0, 10.0, 10.0],
+                [10.0, 20.0, 10.0],
+                [10.0, 10.0, 10.0],
+            ],
+            dtype=np.float64,
+        )
+        ny, nx = patch.shape
+        yy, xx = np.indices((ny, nx))
+        y = yy - (ny - 1) / 2.0
+        x = xx - (nx - 1) / 2.0
+        peak, *_rest = _gaussian_parameters_from_patch_statistics(
+            patch,
+            x,
+            y,
+            beam_widthx=3.0,
+            beam_widthy=3.0,
+            max_width=10.0,
+            max_offset=1.0,
+        )
+        assert peak == pytest.approx(10.0)
+
+    def test_gaussian_parameters_from_patch_statistics_bright_source(self) -> None:
+        """Statistical defaults separate bright peak from high background."""
+        ny, nx = 11, 11
+        true_peak = 500.0
+        true_bg = 4800.0
+        true_fwhm = 3.0
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = true_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = true_bg + true_peak * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        y = yy - cy
+        x = xx - cx
+        peak, x_off, y_off, widthx, widthy, background = (
+            _gaussian_parameters_from_patch_statistics(
+                patch,
+                x,
+                y,
+                beam_widthx=true_fwhm,
+                beam_widthy=true_fwhm,
+                max_width=40.0,
+                max_offset=5.0,
+            )
+        )
+        np.testing.assert_allclose(background, true_bg, rtol=0.05)
+        np.testing.assert_allclose(peak, true_peak, rtol=0.25)
+        assert abs(x_off) < 0.5
+        assert abs(y_off) < 0.5
+        assert 1.0 <= widthx <= 10.0
+        assert 1.0 <= widthy <= 10.0
+
+    def test_fit_spatial_gaussian_returns_statistics_when_optimizer_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed least_squares still returns finite patch-statistic estimates."""
+
+        def _raise(*_args: object, **_kwargs: object) -> None:
+            msg = "forced optimizer failure"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            "ovro_lwa_portal.accessor.least_squares",
+            _raise,
+        )
+        ny, nx = 11, 11
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = 3.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = 4800.0 + 500.0 * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        peak, _x_off, _y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, beam_widthx=3.0, beam_widthy=3.0
+        )
+        assert np.isfinite(peak)
+        assert np.isfinite(widthx)
+        assert np.isfinite(widthy)
+        assert np.isfinite(background)
+        assert np.isfinite(chi2_red)
+        assert peak > 0
+        assert background > 4000
+
+    def test_fit_spatial_gaussian_recovers_off_center_peak(self) -> None:
+        """Shifted Gaussian fit recovers an off-centre bright peak."""
+        ny, nx = 11, 11
+        true_peak = 40.0
+        true_bg = 5.0
+        true_fwhm = 2.5
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        y_off_true, x_off_true = 4.0, -2.0
+        yy, xx = np.indices((ny, nx))
+        y = yy - cy
+        x = xx - cx
+        sigma = true_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = true_bg + true_peak * np.exp(
+            -0.5 * (((y - y_off_true) / sigma) ** 2 + ((x - x_off_true) / sigma) ** 2)
+        )
+        peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, beam_widthx=true_fwhm, beam_widthy=true_fwhm
+        )
+        assert chi2_red < 3.0
+        np.testing.assert_allclose(peak, true_peak, rtol=0.2)
+        np.testing.assert_allclose(x_off, x_off_true, atol=0.75)
+        np.testing.assert_allclose(y_off, y_off_true, atol=0.75)
+        np.testing.assert_allclose(background, true_bg, atol=2.0)
 
     def test_fit_spatial_gaussian_recovers_synthetic_peak(
         self,
@@ -788,8 +910,8 @@ class TestRadportPatchFit:
         patch = true_bg + true_peak * np.exp(
             -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
         )
-        peak, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
-            patch, default_fwhm=3.0
+        peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, beam_widthx=true_fwhm, beam_widthy=true_fwhm
         )
         assert np.isfinite(peak)
         assert chi2_red < 3.0
@@ -797,6 +919,8 @@ class TestRadportPatchFit:
         np.testing.assert_allclose(widthx, true_fwhm, rtol=0.2)
         np.testing.assert_allclose(widthy, true_fwhm, rtol=0.2)
         np.testing.assert_allclose(background, true_bg, atol=1.0)
+        assert abs(x_off) < 0.5
+        assert abs(y_off) < 0.5
 
     def test_patch_fit_on_injected_gaussian(
         self, valid_ovro_dataset: xr.Dataset
@@ -804,7 +928,9 @@ class TestRadportPatchFit:
         """patch_fit() returns finite peaks on a centred Gaussian bump with low chi2."""
         ds = valid_ovro_dataset.copy(deep=True)
         l_idx, m_idx = ds.radport._resolve_coordinates(l=0.0, m=0.0)
-        radius = 5
+        scale = 25.0
+        radius = ds.radport.patch_radius_pixels(time_idx=0, scale=scale)
+        assert radius >= 5
         sky = np.zeros(ds["SKY"].shape, dtype=float)
         ny = nx = 2 * radius + 1
         cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
@@ -818,26 +944,28 @@ class TestRadportPatchFit:
         )
         ds["SKY"].values[:] = sky
 
-        result = ds.radport.patch_fit(l=0.0, m=0.0, radius=radius)
+        result = ds.radport.patch_fit(l=0.0, m=0.0, scale=scale)
+        assert int(result.patch_radius_map.isel(time=0).values) == radius
         peaks = result.peak_map.sel(time=ds.coords["time"][0])
         chi2 = result.reduced_chi_squared_map.sel(time=ds.coords["time"][0])
         assert np.all(np.isfinite(peaks.values))
         assert np.all(peaks.values > 50.0)
         assert np.all(chi2.values <= result.max_reduced_chi_squared)
 
-    def test_patch_fit_negative_radius_raises(
+    def test_patch_fit_nonpositive_scale_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
-        """Negative radius raises ValueError."""
-        with pytest.raises(ValueError, match="radius must be non-negative"):
-            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, radius=-1)
+        """Non-positive scale raises ValueError."""
+        with pytest.raises(ValueError, match="scale must be positive"):
+            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, scale=-1.0)
 
-    def test_patch_fit_invalid_default_fwhm_raises(
+    def test_patch_fit_missing_beam_metadata_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
-        """Non-positive default_fwhm raises ValueError."""
-        with pytest.raises(ValueError, match="default_fwhm must be positive"):
-            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, default_fwhm=0.0)
+        """patch_fit() requires synthesized beam BMAJ/BMIN metadata."""
+        ds = valid_ovro_dataset.drop_vars("BEAM")
+        with pytest.raises(ValueError, match="Synthesized beam metadata unavailable"):
+            ds.radport.patch_fit(l=0.0, m=0.0)
 
     def test_patch_fit_masks_poor_chi2_fits(
         self, valid_ovro_dataset: xr.Dataset
@@ -863,9 +991,96 @@ class TestRadportPatchFit:
     ) -> None:
         """RA/Dec patch_fit uses tracked pixels and records reduced chi-squared."""
         ds = valid_ovro_dataset_with_tracking_wcs
-        result = ds.radport.patch_fit(ra=180.0, dec=37.0, radius=2)
+        result = ds.radport.patch_fit(ra=180.0, dec=37.0, scale=2.0)
         assert result.peak_map.attrs["tracking"] is True
         assert np.any(np.isfinite(result.reduced_chi_squared_map.values))
+        assert np.any(np.isfinite(result.patch_radius_map.values))
+
+    def test_patch_radius_pixels_scales_with_beam(self) -> None:
+        """patch_radius_pixels grows with scale and beam FWHM."""
+        from ovro_lwa_portal.accessor import patch_half_width_pixels
+
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], np.zeros((1, 2, 1, 50, 50))),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    np.array([[[[0.02, 0.01, 0.0]], [[0.04, 0.02, 0.0]]]]),
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        _wx_lo, _wy_lo = ds.radport.beam_fwhm_pixels(time_idx=0, frequency_idx=0)
+        wx_hi, wy_hi = ds.radport.beam_fwhm_pixels(time_idx=0, frequency_idx=1)
+        r1 = ds.radport.patch_radius_pixels(time_idx=0, scale=2.0)
+        r2 = ds.radport.patch_radius_pixels(time_idx=0, scale=4.0)
+        assert r2 > r1
+        assert r1 == patch_half_width_pixels(2.0, wx_hi, wy_hi)
+
+    def test_beam_fwhm_pixels_from_beam_param(self) -> None:
+        """beam_fwhm_pixels reads major/minor from BEAM beam_param."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], np.zeros((1, 1, 1, 50, 50))),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    np.array([[[[0.02, 0.01, 30.0]]]]),
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [50e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        wx, wy = ds.radport.beam_fwhm_pixels(time_idx=0, frequency_idx=0)
+        assert wx > 1.0
+        assert wy > 1.0
+
+    def test_format_radec_sexagesimal(self) -> None:
+        """Sexagesimal RA/Dec strings use hh:mm:ss.s and signed dd:mm:ss."""
+        from ovro_lwa_portal.accessor import format_radec_sexagesimal
+
+        ra_s, dec_s = format_radec_sexagesimal(299.868, 40.734)
+        assert ra_s.count(":") == 2
+        assert dec_s.count(":") == 2
+        assert dec_s.startswith("+") or dec_s.startswith("-")
+
+    def test_patch_fit_peak_radec_maps(
+        self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
+    ) -> None:
+        """peak_radec_maps() returns finite coordinates when the fit is accepted."""
+        ds = valid_ovro_dataset_with_tracking_wcs
+        result = ds.radport.patch_fit(ra=180.0, dec=37.0, scale=5.0)
+        ra_map, dec_map = result.peak_radec_maps()
+        assert ra_map.shape == result.peak_map.shape
+        accepted = result.fit_accepted_map.values
+        finite_offsets = np.isfinite(result.x_offset_map.values) & np.isfinite(
+            result.y_offset_map.values
+        )
+        if np.any(accepted & finite_offsets):
+            mask = accepted & finite_offsets
+            assert np.any(np.isfinite(ra_map.values[mask]))
+            assert np.any(np.isfinite(dec_map.values[mask]))
+        diag = result.cell_diagnostics(time_idx=0, frequency_idx=0)
+        assert "peak_ra_deg" in diag
+        assert "peak_dec_deg" in diag
+        assert "peak_ra" in diag
+        assert "peak_dec" in diag
 
 
 class TestRadportPlotDynamicSpectrum:
