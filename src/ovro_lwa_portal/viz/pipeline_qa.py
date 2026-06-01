@@ -367,9 +367,12 @@ def load_flux_check_hybrid_dataframe(
             chunk["obs_date"] = select_day
             chunk["run_path"] = str(run_dir)
             if cfg.flux_check_csv_per_run:
-                chunk["subband"] = chunk["freq"].map(
-                    lambda f: f"{float(f):.0f}MHz" if pd.notna(f) else ""
-                )
+                if "freq" in chunk.columns:
+                    chunk["subband"] = chunk["freq"].map(
+                        lambda f: f"{float(f):.0f}MHz" if pd.notna(f) else ""
+                    )
+                else:
+                    chunk["subband"] = ""
             else:
                 subband = csv_path.parent.parent.name
                 chunk["subband"] = subband
