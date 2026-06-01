@@ -6,7 +6,7 @@ import os
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -126,7 +126,8 @@ def resolve_pipeline_qa_config(
         and v_fits_glob is None
     ):
         return base
-    return PipelineQAConfig(
+    return replace(
+        base,
         pipeline_root=Path(pipeline_root) if pipeline_root is not None else base.pipeline_root,
         symlink_root=Path(symlink_root) if symlink_root is not None else base.symlink_root,
         zarr_root=Path(zarr_root) if zarr_root is not None else base.zarr_root,

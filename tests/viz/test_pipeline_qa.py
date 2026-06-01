@@ -166,6 +166,22 @@ def test_resolve_pipeline_qa_config_overrides_fields() -> None:
     assert cfg.v_fits_glob == pq.V_FITS_GLOB
 
 
+def test_resolve_pipeline_qa_config_preserves_phase2_fields() -> None:
+    base = pq.PipelineQAConfig.phase2_default()
+    cfg = pq.resolve_pipeline_qa_config(config=base, pipeline_root=Path("/custom/root"))
+    assert cfg.pipeline_root == Path("/custom/root")
+    assert cfg.run_dir_prefix == base.run_dir_prefix
+    assert cfg.run_dir_pattern == base.run_dir_pattern
+    assert cfg.qa_thermal_noise_glob == base.qa_thermal_noise_glob
+    assert cfg.flux_check_csv_glob == base.flux_check_csv_glob
+    assert cfg.flux_check_csv_per_run is base.flux_check_csv_per_run
+    assert cfg.i_qa_zarr_stem == base.i_qa_zarr_stem
+    assert cfg.v_qa_zarr_stem == base.v_qa_zarr_stem
+    assert cfg.thermal_noise_grid_cols == base.thermal_noise_grid_cols
+    assert cfg.thermal_noise_plot_name == base.thermal_noise_plot_name
+    assert cfg.qa_run_label == base.qa_run_label
+
+
 def test_qa_zarr_path_uses_config_zarr_root(tmp_path: Path) -> None:
     cfg = pq.PipelineQAConfig(
         pipeline_root=tmp_path,
