@@ -197,15 +197,17 @@ def build_thermal_noise_grid(
     obs_date: str,
     *,
     n_cols: int = THERMAL_NOISE_GRID_COLS,
+    thermal_noise_plot_name: str = "thermal_noise_vs_subband",
     open_full_size: Callable[[str, str], None] | None = None,
 ) -> pn.Column:
-    """Grid of thermal-noise PNGs labeled by LST hour, date, and subband count."""
+    """Thermal-noise QA PNGs labeled by LST hour, date, and subband count."""
     if summary_df.empty:
         return pn.Column(
-            pn.pane.Markdown("*No Wideband QA hours for this day.*"),
+            pn.pane.Markdown("*No QA hours with thermal-noise plots for this day.*"),
             sizing_mode="stretch_width",
         )
 
+    png_height = 360 if n_cols <= 1 else 180
     tiles: list[pn.Column] = []
     for row in summary_df.itertuples(index=False):
         png_path = str(row.thermal_noise_png)
@@ -216,15 +218,15 @@ def build_thermal_noise_grid(
         if Path(png_path).is_file():
             img: Any = pn.pane.PNG(
                 png_path,
-                height=180,
+                height=png_height,
                 sizing_mode="scale_width",
             )
         else:
-            img = pn.pane.Markdown("*thermal_noise_vs_subband.png missing*")
+            img = pn.pane.Markdown(f"*{thermal_noise_plot_name}.png missing*")
 
         footer: list[Any] = [pn.pane.Markdown(label)]
         if open_full_size and Path(png_path).is_file():
-            title = f"thermal_noise_vs_subband — {obs_date} {lst_hour}"
+            title = f"{thermal_noise_plot_name} — {obs_date} {lst_hour}"
 
             def _open(
                 _event: Any,
@@ -1717,11 +1719,16 @@ class PipelineQAApp(param.Parameterized):
 
     def _build_flux_ratio_grid(self, select_day: str) -> pn.Column:
         """Load flux-check CSVs and build the Bokeh heatmap grid for one day."""
-        flux_df = load_flux_check_hybrid_dataframe(select_day, self._coverage)
+        flux_df = load_flux_check_hybrid_dataframe(
+            select_day,
+            self._coverage,
+            config=self._qa_config,
+        )
         if flux_df.empty:
             return pn.Column(
                 pn.pane.Markdown(
-                    "*No flux_check_hybrid.csv files found under frequency subbands for this day.*"
+                    f"*No flux_check_hybrid.csv files found "
+                    f"({self._qa_config.flux_check_csv_glob}) for this day.*"
                 ),
                 sizing_mode="stretch_width",
             )
@@ -1878,13 +1885,15 @@ class PipelineQAApp(param.Parameterized):
                     self._coverage = coverage
                     self.scanning = False
                     if not days:
-                        self._log_error("No Wideband QA days found under the pipeline root.")
+                        self._log_error(
+                            f"No {self._qa_config.qa_run_label} QA days found under the pipeline root."
+                        )
                         self._sync_day_selector([], None)
                     else:
                         self._clear_error()
                         self._sync_day_selector(days, None)
                         self._log(
-                            f"Found {len(days)} Wideband QA day(s). "
+                            f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
                             "Select a day from the dropdown to load QA data."
                         )
                     self._sync_log()
@@ -2093,6 +2102,8 @@ class PipelineQAApp(param.Parameterized):
         thermal_grid = build_thermal_noise_grid(
             payload.summary_df,
             select_day,
+            n_cols=self._qa_config.thermal_noise_grid_cols,
+            thermal_noise_plot_name=self._qa_config.thermal_noise_plot_name,
             open_full_size=self._open_modal,
         )
         self._qa_grid.objects = [thermal_grid]
@@ -2269,7 +2280,7 @@ def display_pipeline_qa_app(
         Full configuration object. Individual path/glob arguments override fields on
         ``qa_config`` when both are provided.
     pipeline_root
-        Root of the exopipe phase1 tree to scan for Wideband QA runs.
+        Root of the exopipe tree to scan for QA runs (phase1 Wideband or phase2 Science).
     symlink_root
         Directory for FITS symlink staging and fixed-header side products during conversion.
     zarr_root

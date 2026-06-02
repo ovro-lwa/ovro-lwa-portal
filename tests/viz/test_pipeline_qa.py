@@ -166,6 +166,22 @@ def test_resolve_pipeline_qa_config_overrides_fields() -> None:
     assert cfg.v_fits_glob == pq.V_FITS_GLOB
 
 
+def test_resolve_pipeline_qa_config_preserves_phase2_fields() -> None:
+    base = pq.PipelineQAConfig.phase2_default()
+    cfg = pq.resolve_pipeline_qa_config(config=base, pipeline_root=Path("/custom/root"))
+    assert cfg.pipeline_root == Path("/custom/root")
+    assert cfg.run_dir_prefix == base.run_dir_prefix
+    assert cfg.run_dir_pattern == base.run_dir_pattern
+    assert cfg.qa_thermal_noise_glob == base.qa_thermal_noise_glob
+    assert cfg.flux_check_csv_glob == base.flux_check_csv_glob
+    assert cfg.flux_check_csv_per_run is base.flux_check_csv_per_run
+    assert cfg.i_qa_zarr_stem == base.i_qa_zarr_stem
+    assert cfg.v_qa_zarr_stem == base.v_qa_zarr_stem
+    assert cfg.thermal_noise_grid_cols == base.thermal_noise_grid_cols
+    assert cfg.thermal_noise_plot_name == base.thermal_noise_plot_name
+    assert cfg.qa_run_label == base.qa_run_label
+
+
 def test_qa_zarr_path_uses_config_zarr_root(tmp_path: Path) -> None:
     cfg = pq.PipelineQAConfig(
         pipeline_root=tmp_path,
@@ -1876,6 +1892,76 @@ def _write_flux_check_tree(root: Path, *, obs_date: str = "2024-12-28") -> None:
     wideband2 = run_dir2 / "Wideband"
     wideband2.mkdir(parents=True, exist_ok=True)
     (wideband2 / "thermal_noise_vs_subband.png").write_bytes(b"png")
+
+
+def _write_phase2_qa_tree(root: Path, *, obs_date: str = "2025-01-11", hour: str = "05h") -> None:
+    run_dir = root / hour / obs_date / "Science_20260527_173819"
+    qa_dir = run_dir / "QA"
+    qa_dir.mkdir(parents=True)
+    (qa_dir / f"{obs_date}_{hour}_thermal_noise_vs_freq.png").write_bytes(b"png")
+    (qa_dir / f"{obs_date}_{hour}_flux_check_hybrid.csv").write_text(
+        "imfit_flux,imfit_err,elevation,model_flux,source,freq\n"
+        "20.0,1.0,45.0,10.0,3C48,55.0\n"
+        "15.0,1.0,45.0,7.5,3C147,55.0\n",
+        encoding="utf-8",
+    )
+    subband = run_dir / "55MHz" / "I" / "deep"
+    subband.mkdir(parents=True)
+    fits_name = (
+        "55MHz-I-NoTaper-3581s-Robust-0-20250111_055900-image.pbcorr_dewarped.fits"
+    )
+    (subband / fits_name).write_bytes(b"fits")
+    v_subband = run_dir / "55MHz" / "V" / "deep"
+    v_subband.mkdir(parents=True)
+    v_name = "55MHz-V-Taper-3581s-Robust-0-20250111_055900-image.pbcorr_dewarped.fits"
+    (v_subband / v_name).write_bytes(b"fits")
+
+
+def test_scan_coverage_phase2_science_runs(tmp_path: Path) -> None:
+    _write_phase2_qa_tree(tmp_path)
+    cfg = pq.PipelineQAConfig.phase2_default()
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=cfg.i_fits_glob,
+        v_fits_glob=cfg.v_fits_glob,
+        run_dir_prefix=cfg.run_dir_prefix,
+        run_dir_pattern=cfg.run_dir_pattern,
+        qa_thermal_noise_glob=cfg.qa_thermal_noise_glob,
+        flux_check_csv_glob=cfg.flux_check_csv_glob,
+        flux_check_csv_per_run=cfg.flux_check_csv_per_run,
+        i_qa_zarr_stem=cfg.i_qa_zarr_stem,
+        v_qa_zarr_stem=cfg.v_qa_zarr_stem,
+        thermal_noise_grid_cols=cfg.thermal_noise_grid_cols,
+        thermal_noise_plot_name=cfg.thermal_noise_plot_name,
+        qa_run_label=cfg.qa_run_label,
+    )
+    coverage = pq.scan_coverage(config=cfg)
+    assert coverage.iloc[0]["latest_run"] == "Science_20260527_173819"
+    png = coverage.iloc[0]["thermal_noise_png"]
+    assert png.endswith("_thermal_noise_vs_freq.png")
+
+
+def test_load_flux_check_hybrid_dataframe_phase2(tmp_path: Path) -> None:
+    _write_phase2_qa_tree(tmp_path)
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB_PHASE2,
+        v_fits_glob=pq.V_FITS_GLOB_PHASE2,
+        run_dir_prefix="Science_",
+        run_dir_pattern=r"Science_(\d{8})_(\d{6})",
+        qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
+        flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
+        flux_check_csv_per_run=True,
+    )
+    coverage = pq.scan_coverage(config=cfg)
+    flux_df = pq.load_flux_check_hybrid_dataframe("2025-01-11", coverage, config=cfg)
+    assert len(flux_df) == 2
+    assert set(flux_df["source"]) == {"3C48", "3C147"}
+    assert flux_df.loc[flux_df["source"] == "3C48", "flux_ratio"].iloc[0] == 2.0
 
 
 def test_load_flux_check_hybrid_dataframe(tmp_path: Path) -> None:
