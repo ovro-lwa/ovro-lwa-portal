@@ -545,11 +545,18 @@ def test_load_global_lm_reference_selects_largest_shape(monkeypatch, tmp_path: P
     by_time = {"20240101_120000": [f_small, f_large]}
 
     monkeypatch.setattr(mod, "fix_fits_headers", lambda files, fd, skip_existing=True: list(files))
-    monkeypatch.setattr(
-        mod,
-        "_peek_lm_shape",
-        lambda fp: (32, 32) if fp.name.startswith("small") else (64, 64),
-    )
+
+    def fake_getheader(fp: Path) -> fits.Header:
+        hdr = fits.Header()
+        hdr["NAXIS"] = 2
+        n = 32 if fp.name.startswith("small") else 64
+        hdr["NAXIS1"] = n
+        hdr["NAXIS2"] = n
+        hdr["BMAJ"] = 0.1
+        hdr["BMIN"] = 0.1
+        return hdr
+
+    monkeypatch.setattr(mod, "_getheader_for_ingest", fake_getheader)
 
     loaded: list[Path] = []
 
@@ -602,11 +609,18 @@ def test_load_global_lm_reference_passes_target_size_to_resample(monkeypatch, tm
     by_time = {"20240101_120000": [f_small, f_large]}
 
     monkeypatch.setattr(mod, "fix_fits_headers", lambda files, fd, skip_existing=True: list(files))
-    monkeypatch.setattr(
-        mod,
-        "_peek_lm_shape",
-        lambda fp: (32, 32) if fp.name.startswith("small") else (64, 64),
-    )
+
+    def fake_getheader(fp: Path) -> fits.Header:
+        hdr = fits.Header()
+        hdr["NAXIS"] = 2
+        n = 32 if fp.name.startswith("small") else 64
+        hdr["NAXIS1"] = n
+        hdr["NAXIS2"] = n
+        hdr["BMAJ"] = 0.1
+        hdr["BMIN"] = 0.1
+        return hdr
+
+    monkeypatch.setattr(mod, "_getheader_for_ingest", fake_getheader)
 
     def fake_load(fp: Path, chunk_lm: int = 1024) -> xr.Dataset:
         n = 64
@@ -649,6 +663,71 @@ def test_load_global_lm_reference_passes_target_size_to_resample(monkeypatch, tm
     assert len(calls) == 1
     assert calls[0][1] == 4096
     assert calls[0][0].name == f_large.name
+
+
+def test_load_global_lm_reference_respects_max_time_groups(monkeypatch, tmp_path: Path) -> None:
+    """Only the first *max_time_groups* observation times are header-scanned."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    by_time = {
+        "20240101_120000": [tmp_path / "t1.fits"],
+        "20240101_120100": [tmp_path / "t2.fits"],
+        "20240101_120200": [tmp_path / "t3.fits"],
+    }
+    for files in by_time.values():
+        files[0].touch()
+
+    peeked: list[str] = []
+
+    def fake_peek(fp: Path) -> tuple[int, int]:
+        peeked.append(fp.name)
+        return (64, 64)
+
+    monkeypatch.setattr(mod, "fix_fits_headers", lambda files, fd, skip_existing=True: list(files))
+    monkeypatch.setattr(mod, "_peek_lm_shape", fake_peek)
+
+    def fake_load(fp: Path, chunk_lm: int = 1024) -> xr.Dataset:
+        n = 64
+        l_ = np.linspace(-1.0, 1.0, n)
+        m_ = np.linspace(-1.0, 1.0, n)
+        hdr = "SIMPLE  =                   T\nNAXIS   =                    2"
+        return (
+            xr.Dataset(
+                {"SKY": (("m", "l"), np.zeros((n, n)))},
+                coords={"l": ("l", l_), "m": ("m", m_), "frequency": ("frequency", np.array([1.4e8]))},
+                attrs={"fits_wcs_header": hdr},
+            )
+            .assign(wcs_header_str=((), np.bytes_(hdr.encode("utf-8"))))
+        )
+
+    monkeypatch.setattr(mod, "_load_for_combine", fake_load)
+
+    mod._load_global_lm_reference_dataset(
+        by_time,
+        tmp_path / "fixed",
+        chunk_lm=0,
+        fix_headers_on_demand=False,
+        max_time_groups=2,
+    )
+
+    assert len(peeked) == 2
+    assert all("t3" not in name for name in peeked)
+
+
+def test_lm_shape_from_header_reads_naxis(tmp_path: Path) -> None:
+    import numpy as np
+
+    mod = _import_module()
+    data = np.zeros((5, 7), dtype=np.float32)
+    hdr = fits.Header()
+    hdr["NAXIS"] = 2
+    hdr["NAXIS1"] = 7
+    hdr["NAXIS2"] = 5
+    fpath = tmp_path / "shape.fits"
+    fits.writeto(fpath, data, hdr, overwrite=True)
+    assert mod._lm_shape_from_header(fits.getheader(fpath)) == (7, 5)
 
 
 def test_assert_same_lm_clear_error_on_length_mismatch():
@@ -1110,6 +1189,88 @@ def test_invalid_beam_reason_valid_beam_returns_none():
     assert mod._invalid_beam_reason(fits.Header({"BMAJ": 1e-6, "BMIN": 1e-6})) is None
 
 
+def test_fix_headers_reads_image_hdu_when_primary_empty(tmp_path: Path) -> None:
+    """Fpacked-style empty primary + image extension must expose BMAJ/BMIN to header fix."""
+    mod = _import_module()
+
+    img_hdr = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 8,
+            "NAXIS2": 8,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CRVAL1": 180.0,
+            "CRVAL2": 45.0,
+            "CRPIX1": 4.0,
+            "CRPIX2": 4.0,
+            "CDELT1": -0.1,
+            "CDELT2": 0.1,
+            "BMAJ": 0.2,
+            "BMIN": 0.1,
+            "BPA": 15.0,
+        }
+    )
+    primary = fits.PrimaryHDU(header=fits.Header({"SIMPLE": True, "BITPIX": -32, "NAXIS": 0}))
+    image = fits.ImageHDU(data=np.ones((8, 8), dtype=np.float32), header=img_hdr)
+    src = tmp_path / "64MHz-Clean-Snapshot-20250120_040013-image.fits.fs"
+    fits.HDUList([primary, image]).writeto(src)
+
+    fixed_dir = tmp_path / "fixed"
+    fixed = mod.fix_fits_headers([src], fixed_dir)
+    assert len(fixed) == 1
+    with fits.open(fixed[0]) as hdul:
+        hdr = hdul[0].header
+    assert float(hdr["BMAJ"]) == 0.2
+    assert float(hdr["BMIN"]) == 0.1
+
+
+def test_repair_zero_beam_from_nearby_time_same_frequency(tmp_path: Path) -> None:
+    """Placeholder beam should be filled from the nearest other time at the same MHz."""
+    mod = _import_module()
+
+    donor_time = "20250120_040000"
+    zero_time = "20250120_040343"
+    donor = tmp_path / f"55MHz-Clean-Snapshot-{donor_time}-image.fits"
+    zero_src = tmp_path / f"55MHz-Clean-Snapshot-{zero_time}-image.fits"
+    other_band = tmp_path / f"18MHz-Clean-Snapshot-{donor_time}-image.fits"
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"BMAJ": 0.2, "BMIN": 0.1, "BPA": 30.0}),
+    ).writeto(donor)
+    fits.PrimaryHDU(
+        data=[[2.0]],
+        header=fits.Header({"BMAJ": 0.0, "BMIN": 0.0, "BPA": 0.0}),
+    ).writeto(zero_src)
+    fits.PrimaryHDU(
+        data=[[3.0]],
+        header=fits.Header({"BMAJ": 0.5, "BMIN": 0.4, "BPA": 10.0}),
+    ).writeto(other_band)
+
+    zero_out = tmp_path / "out_zero.fits"
+    fits.PrimaryHDU(
+        data=[[2.0]],
+        header=fits.Header({"BMAJ": 0.0, "BMIN": 0.0, "BPA": 0.0}),
+    ).writeto(zero_out, overwrite=True)
+
+    by_time = {
+        donor_time: [donor, other_band],
+        zero_time: [zero_src],
+    }
+    n = mod.repair_zero_beam_from_nearby_time(
+        [zero_src],
+        [zero_out],
+        zero_time,
+        by_time,
+    )
+    assert n == 1
+    with fits.open(zero_out) as hdul:
+        hdr = hdul[0].header
+    assert float(hdr["BMAJ"]) == 0.2
+    assert float(hdr["BMIN"]) == 0.1
+    assert float(hdr["BPA"]) == 30.0
+
+
 def test_filter_invalid_beam_files_drops_zero_and_missing(tmp_path: Path, caplog):
     """Files with missing or zero BMAJ/BMIN must be dropped with a warning."""
     import logging
@@ -1530,6 +1691,130 @@ def test_reindex_time_step_to_expected_frequencies_fills_missing_with_nan():
     assert np.allclose(out["frequency"].values, [41_000_000.0, 48_000_000.0, 55_000_000.0])
     # Added frequency plane is all NaN in data variables.
     assert np.isnan(out["SKY"].isel(frequency=1).values).all()
+
+
+def test_sky_coord_cache_is_bounded_and_clearable() -> None:
+    """Sky-coord LRU must not grow without bound across many WCS variants."""
+    from astropy.wcs import WCS
+
+    mod = _import_module()
+    mod._clear_sky_coord_cache()
+
+    base = fits.Header()
+    base.update(
+        {
+            "SIMPLE": True,
+            "BITPIX": -32,
+            "NAXIS": 2,
+            "NAXIS1": 8,
+            "NAXIS2": 8,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CRVAL1": 180.0,
+            "CRVAL2": 37.0,
+            "CRPIX1": 4.5,
+            "CRPIX2": 4.5,
+            "CDELT1": -0.1,
+            "CDELT2": 0.1,
+            "CUNIT1": "deg",
+            "CUNIT2": "deg",
+        }
+    )
+    for i in range(60):
+        hdr = base.copy()
+        hdr["CRVAL1"] = 180.0 + i
+        hdr_str = WCS(hdr).celestial.to_header().tostring(sep="\n")
+        ra, dec = mod._compute_sky_coord_arrays(8, 8, hdr_str)
+        assert ra.shape == (8, 8)
+        assert dec.shape == (8, 8)
+    assert mod._sky_coord_cache_size() <= mod._SKY_COORD_CACHE_MAXSIZE
+    mod._clear_sky_coord_cache()
+    assert mod._sky_coord_cache_size() == 0
+
+
+def test_discovery_completed_matches_mjd_when_filename_differs(tmp_path: Path) -> None:
+    """Resume must treat a group as done when DATE-OBS MJD is already in the Zarr."""
+    import numpy as np
+    import xarray as xr
+    from astropy.time import Time
+
+    mod = _import_module()
+    obs = Time("2025-01-20T04:00:18", scale="utc")
+    mjd = float(obs.mjd)
+
+    out_zarr = tmp_path / "store.zarr"
+    xr.Dataset(
+        {"SKY": (("time",), np.array([0.0]))},
+        coords={"time": ("time", np.array([mjd], dtype=np.float64))},
+    ).to_zarr(out_zarr, mode="w")
+
+    completed_keys, completed_mjds = mod._completed_times_in_zarr(out_zarr, rebuild=False)
+    assert obs.to_datetime().strftime("%Y%m%d_%H%M%S") in completed_keys
+
+    data = np.zeros((4, 4), dtype=np.float32)
+    img_hdr = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 4,
+            "NAXIS2": 4,
+            "DATE-OBS": "2025-01-20T04:00:18",
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+        }
+    )
+    primary = fits.PrimaryHDU(header=fits.Header({"SIMPLE": True, "BITPIX": -32, "NAXIS": 0}))
+    image = fits.ImageHDU(data=data, header=img_hdr)
+    fpath = tmp_path / "50MHz-Clean-Snapshot-20250120_040333-image.fits.fs"
+    fits.HDUList([primary, image]).writeto(fpath, overwrite=True)
+
+    discovery_key = "20250120_040333"
+    assert discovery_key not in completed_keys
+    assert mod._discovery_time_key_completed_in_zarr(
+        discovery_key, [fpath], completed_keys, completed_mjds
+    )
+
+
+def test_write_or_append_skips_duplicate_mjd_by_default(tmp_path: Path, caplog) -> None:
+    """Duplicate observation times must not overwrite existing Zarr rows by default."""
+    import logging
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    caplog.set_level(logging.INFO, logger="ovro_lwa_portal.fits_to_zarr_xradio")
+
+    out_zarr = tmp_path / "store.zarr"
+    mjd = 60695.17
+    l_ = np.linspace(-1.0, 1.0, 8)
+    m_ = np.linspace(-1.0, 1.0, 8)
+    wcs_hdr = np.bytes_(b"SIMPLE  = T\nNAXIS   = 2\n")
+    base = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "m", "l"),
+                np.zeros((1, 1, 1, 8, 8), dtype=np.float32),
+            ),
+            "wcs_header_str": (("time",), np.array([wcs_hdr])),
+        },
+        coords={
+            "time": ("time", np.array([mjd], dtype=np.float64)),
+            "frequency": ("frequency", np.array([5.0e7])),
+            "polarization": ("polarization", np.array(["I"])),
+            "l": ("l", l_),
+            "m": ("m", m_),
+        },
+    )
+    mod._write_or_append_zarr(base, out_zarr, first_write=True, chunk_lm=4)
+
+    dup = base.copy(deep=True)
+    dup["SKY"].values[...] = 99.0
+    mod._write_or_append_zarr(dup, out_zarr, first_write=False, chunk_lm=4)
+
+    with xr.open_zarr(out_zarr, consolidated=False) as ds:
+        assert int(ds.sizes["time"]) == 1
+        assert float(ds["SKY"].values[0, 0, 0, 0, 0]) == 0.0
+    assert "Skipping write: time row" in caplog.text
+    assert "Overwriting existing time row" not in caplog.text
 
 
 def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path):
