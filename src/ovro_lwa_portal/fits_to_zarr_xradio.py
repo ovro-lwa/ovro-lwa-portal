@@ -51,8 +51,8 @@ Notes
   a mismatch raises a RuntimeError.
 * Within a single time step, mixed LM shapes are regridded onto the reference grid before combine.
   The reference contributes only the *pixel grid* (``CRPIX``/``CDELT``/projection); per-time
-  ``CRVAL1``/``CRVAL2`` (FK5 zenith stamped by :func:`_fix_headers`) is taken from each source
-  subband so all subbands at one time step share identical ``right_ascension``/``declination``.
+  ``CRVAL1``/``CRVAL2`` from each source FITS header is taken from that source subband so all
+  subbands at one time step share identical ``right_ascension``/``declination``.
 * After stacking subbands along ``frequency``, ``right_ascension`` / ``declination`` are
   collapsed to a single ``(l, m)`` frame taken from the lowest-frequency slice. If sampled
   sky positions differ from that reference by more than ~one arcminute between slices, a
@@ -77,7 +77,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 import xarray as xr
@@ -93,6 +93,7 @@ __all__ = [
     "InvalidBeamError",
     "convert_fits_dir_to_zarr",
     "fix_fits_headers",
+    "repair_zarr_crval_from_fits",
     "repair_zarr_store",
     "validate_zarr_store",
 ]
@@ -212,7 +213,7 @@ _OVRO_LWA_DEFAULT_HEIGHT_M = 1188.6
 
 # LRU cache for RA/Dec ``all_pix2world`` grids within one time step (~15 subbands).
 # Cleared after each :func:`_combine_time_step` so multi-hour ingest runs do not retain
-# one entry per observation epoch (WCS zenith changes every time group).
+# one entry per observation epoch (per-time CRVAL may differ across time groups).
 _SKY_COORD_CACHE_MAXSIZE = 48
 
 
@@ -849,6 +850,329 @@ def repair_zarr_store(
     }
 
 
+def _patch_celestial_crval_in_header_str(ref_hdr_str: str, src_hdr: fits.Header) -> str:
+    """Keep the pixel grid in *ref_hdr_str* but adopt celestial reference keys from *src_hdr*."""
+    ref_hdr = fits.Header.fromstring(ref_hdr_str, sep="\n")
+    new_hdr = ref_hdr.copy()
+    for key in ("CRVAL1", "CRVAL2", "RADESYS", "EQUINOX", "DATE-OBS", "MJD-OBS"):
+        if key in src_hdr:
+            new_hdr[key] = src_hdr[key]
+    if "CRVAL2" in src_hdr:
+        new_hdr["LATPOLE"] = float(src_hdr["CRVAL2"])
+    return WCS(new_hdr).celestial.to_header(relax=True).tostring(sep="\n")
+
+
+def _crval_pair_from_header_str(hdr_str: str) -> Optional[Tuple[float, float]]:
+    if not hdr_str.strip():
+        return None
+    hdr = fits.Header.fromstring(hdr_str, sep="\n")
+    if "CRVAL1" not in hdr or "CRVAL2" not in hdr:
+        return None
+    return float(hdr["CRVAL1"]), float(hdr["CRVAL2"])
+
+
+def _seconds_between_time_keys(left: str, right: str) -> float:
+    """Absolute UTC seconds between two ``YYYYMMDD_HHMMSS`` keys."""
+    fmt = "%Y%m%d_%H%M%S"
+    ldt = datetime.strptime(left, fmt).replace(tzinfo=timezone.utc)
+    rdt = datetime.strptime(right, fmt).replace(tzinfo=timezone.utc)
+    return abs((ldt - rdt).total_seconds())
+
+
+def _resolve_discovery_keys_for_zarr_times(
+    z_time: np.ndarray,
+    by_time: Dict[str, Sequence[Path]],
+    *,
+    max_delta_sec: float = 6.0,
+) -> Tuple[List[Optional[str]], Dict[str, int]]:
+    """Map each Zarr time index to a filename discovery key in *by_time*.
+
+    Ingest groups files by the basename ``-image-YYYYMMDD_HHMMSS`` stamp while
+    ``xradio`` writes the Zarr ``time`` coordinate from ``DATE-OBS`` (see
+    :func:`_discovery_time_key_completed_in_zarr`). Those one-second keys can
+    differ by a few seconds on OVRO-LWA products, so exact string equality is
+    not reliable for repair lookups.
+    """
+    zarr_keys = [_normalize_time_key(v) for v in np.atleast_1d(z_time)]
+    discovery_keys = sorted(by_time.keys())
+    n_z = len(zarr_keys)
+    n_d = len(discovery_keys)
+
+    index_aligned = (
+        n_z == n_d
+        and n_z > 0
+        and all(
+            zk is not None
+            and _seconds_between_time_keys(zk, discovery_keys[i]) <= max_delta_sec
+            for i, zk in enumerate(zarr_keys)
+        )
+    )
+
+    stats = {"exact": 0, "index": 0, "nearest": 0, "unresolved": 0}
+    resolved: List[Optional[str]] = []
+    for i, zk in enumerate(zarr_keys):
+        if zk is None:
+            stats["unresolved"] += 1
+            resolved.append(None)
+            continue
+        if zk in by_time:
+            stats["exact"] += 1
+            resolved.append(zk)
+            continue
+        if index_aligned:
+            stats["index"] += 1
+            resolved.append(discovery_keys[i])
+            continue
+
+        best: Optional[str] = None
+        best_delta = max_delta_sec + 1.0
+        for dk in discovery_keys:
+            delta = _seconds_between_time_keys(zk, dk)
+            if delta <= max_delta_sec and delta < best_delta:
+                best_delta = delta
+                best = dk
+        if best is None:
+            stats["unresolved"] += 1
+        else:
+            stats["nearest"] += 1
+        resolved.append(best)
+
+    if index_aligned and stats["index"] > 0:
+        logger.info(
+            "Zarr time keys differ from filename stamps; using index-aligned pairing "
+            "for %d step(s) (max delta %.1f s)",
+            stats["index"],
+            max_delta_sec,
+        )
+    return resolved, stats
+
+
+class _FitsPathsResolver(Protocol):
+    def __call__(self, discovery_key: str) -> Sequence[Path]:
+        """Return uncompressed ``.fits`` paths for one filename discovery key."""
+
+
+def repair_zarr_crval_from_fits(
+    out_zarr: str | Path,
+    by_time: Dict[str, Sequence[Path]],
+    *,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    backup_suffix: str = ".backup-before-crval-repair",
+    skip_backup: bool = False,
+    dry_run: bool = False,
+    max_time_delta_sec: float = 6.0,
+    resolve_fits_paths: _FitsPathsResolver | None = None,
+) -> Dict[str, object]:
+    """Patch ``wcs_header_str`` CRVAL rows from native FITS headers (no re-ingest).
+
+    For each Zarr time index, resolves the matching filename discovery group in
+    *by_time* (exact key, index-aligned, or nearest within *max_time_delta_sec*),
+    reads the native celestial reference from the corresponding pipeline FITS files,
+    and updates the stored header strings while preserving the existing LM pixel
+    grid (``CRPIX``/``CDELT``/projection).
+
+    Parameters
+    ----------
+    out_zarr
+        Existing Zarr store with ``time`` and ``wcs_header_str`` arrays.
+    by_time
+        Mapping of ``YYYYMMDD_HHMMSS`` time keys to uncompressed ``.fits`` paths for
+        that integration (lowest-frequency file used when only one header row exists).
+    group_metadata_source
+        Passed to :func:`_discovery_frequency_sort_tuple` when ordering subbands.
+    backup_suffix
+        Suffix for a full-store copy created before in-place writes (skipped when
+        *dry_run* is true or *skip_backup* is true).
+    skip_backup
+        When true, patch ``wcs_header_str`` in place without copying the full store.
+        Use when disk cannot hold a duplicate of a large Zarr (CRVAL repair only
+        touches small metadata arrays).
+    dry_run
+        When true, report planned CRVAL deltas without modifying the store.
+    max_time_delta_sec
+        Maximum UTC separation allowed when pairing Zarr ``DATE-OBS`` times with
+        filename ``-image-`` discovery keys.
+    resolve_fits_paths
+        Optional callback mapping a filename discovery key to uncompressed FITS
+        paths for that step (e.g. funpack-on-demand). When omitted, *by_time* must
+        already contain readable ``.fits`` paths.
+
+    Returns
+    -------
+    dict
+        Summary with counts, max CRVAL delta, and optional backup path.
+    """
+    out_zarr = Path(out_zarr)
+    if not out_zarr.exists():
+        msg = f"Zarr store does not exist: {out_zarr}"
+        raise FileNotFoundError(msg)
+
+    zg_read = zarr.open_group(str(out_zarr), mode="r")
+    if "wcs_header_str" not in zg_read:
+        msg = f"{out_zarr} has no wcs_header_str array"
+        raise KeyError(msg)
+    if "time" not in zg_read:
+        msg = f"{out_zarr} has no time coordinate"
+        raise KeyError(msg)
+
+    z_time = np.atleast_1d(np.asarray(zg_read["time"][:], dtype=np.float64))
+    wcs_arr = zg_read["wcs_header_str"]
+    n_time = int(z_time.size)
+    if int(wcs_arr.shape[0]) != n_time:
+        msg = (
+            f"wcs_header_str length {wcs_arr.shape[0]} != time length {n_time}; "
+            f"shape={wcs_arr.shape}"
+        )
+        raise ValueError(msg)
+
+    n_freq = int(wcs_arr.shape[1]) if wcs_arr.ndim >= 2 else 1
+    sort_key = lambda p: _discovery_frequency_sort_tuple(p, group_metadata_source=group_metadata_source)
+
+    backup_path: Optional[Path] = None
+    if not dry_run and not skip_backup:
+        backup_path = out_zarr.with_name(out_zarr.name + backup_suffix)
+        if backup_path.exists():
+            msg = (
+                f"Backup path already exists: {backup_path}. Remove it or pass "
+                "skip_backup=True to patch wcs_header_str without a full copy."
+            )
+            raise FileExistsError(msg)
+        shutil.copytree(out_zarr, backup_path)
+        zg = zarr.open_group(str(out_zarr), mode="a")
+        wcs_arr = zg["wcs_header_str"]
+    elif dry_run:
+        zg = zg_read
+    else:
+        zg = zarr.open_group(str(out_zarr), mode="a")
+        wcs_arr = zg["wcs_header_str"]
+
+    discovery_keys, match_stats = _resolve_discovery_keys_for_zarr_times(
+        z_time,
+        by_time,
+        max_delta_sec=max_time_delta_sec,
+    )
+
+    patched_rows = 0
+    skipped_no_fits = 0
+    skipped_empty = 0
+    max_dra = 0.0
+    max_ddec = 0.0
+    samples: List[Dict[str, object]] = []
+
+    for ti in range(n_time):
+        zarr_key = _normalize_time_key(z_time[ti])
+        discovery_key = discovery_keys[ti]
+        if zarr_key is None:
+            skipped_empty += 1
+            continue
+        if discovery_key is None:
+            skipped_no_fits += 1
+            logger.warning(
+                "No discovery group for Zarr time index %d (zarr_key=%s)",
+                ti,
+                zarr_key,
+            )
+            continue
+
+        if resolve_fits_paths is not None:
+            files = sorted(resolve_fits_paths(discovery_key), key=sort_key)
+        else:
+            files = sorted(by_time.get(discovery_key, ()), key=sort_key)
+        if not files:
+            skipped_no_fits += 1
+            logger.warning(
+                "No FITS files for Zarr time index %d (zarr_key=%s discovery_key=%s)",
+                ti,
+                zarr_key,
+                discovery_key,
+            )
+            continue
+
+        row_changed = False
+        if wcs_arr.ndim >= 2:
+            row = wcs_arr[ti, :].copy()
+            for fi in range(n_freq):
+                fp = files[min(fi, len(files) - 1)]
+                raw = row[fi]
+                old_hdr = _decode_wcs_header_payload(raw)
+                if not old_hdr.strip():
+                    skipped_empty += 1
+                    continue
+                src_hdr = _getheader_for_ingest(fp)
+                new_hdr = _patch_celestial_crval_in_header_str(old_hdr, src_hdr)
+                old_crval = _crval_pair_from_header_str(old_hdr)
+                new_crval = _crval_pair_from_header_str(new_hdr)
+                if old_crval and new_crval:
+                    max_dra = max(max_dra, abs(new_crval[0] - old_crval[0]))
+                    max_ddec = max(max_ddec, abs(new_crval[1] - old_crval[1]))
+                if new_hdr != old_hdr:
+                    row[fi] = np.bytes_(new_hdr.encode("utf-8"))
+                    row_changed = True
+                    if len(samples) < 5:
+                        samples.append(
+                            {
+                                "time_idx": ti,
+                                "zarr_time_key": zarr_key,
+                                "discovery_time_key": discovery_key,
+                                "freq_idx": fi,
+                                "fits": fp.name,
+                                "old_crval": old_crval,
+                                "new_crval": new_crval,
+                            }
+                        )
+            if row_changed and not dry_run:
+                wcs_arr[ti, :] = row
+        else:
+            raw = wcs_arr[ti]
+            old_hdr = _decode_wcs_header_payload(raw)
+            if not old_hdr.strip():
+                skipped_empty += 1
+                continue
+            fp = files[0]
+            src_hdr = _getheader_for_ingest(fp)
+            new_hdr = _patch_celestial_crval_in_header_str(old_hdr, src_hdr)
+            old_crval = _crval_pair_from_header_str(old_hdr)
+            new_crval = _crval_pair_from_header_str(new_hdr)
+            if old_crval and new_crval:
+                max_dra = max(max_dra, abs(new_crval[0] - old_crval[0]))
+                max_ddec = max(max_ddec, abs(new_crval[1] - old_crval[1]))
+            if new_hdr != old_hdr:
+                row_changed = True
+                if not dry_run:
+                    wcs_arr[ti] = np.bytes_(new_hdr.encode("utf-8"))
+                if len(samples) < 5:
+                    samples.append(
+                        {
+                            "time_idx": ti,
+                            "zarr_time_key": zarr_key,
+                            "discovery_time_key": discovery_key,
+                            "freq_idx": None,
+                            "fits": fp.name,
+                            "old_crval": old_crval,
+                            "new_crval": new_crval,
+                        }
+                    )
+
+        if row_changed:
+            patched_rows += 1
+
+    if not dry_run:
+        _consolidate_zarr_metadata(out_zarr)
+
+    return {
+        "store": str(out_zarr),
+        "backup": str(backup_path) if backup_path is not None else None,
+        "dry_run": dry_run,
+        "time_steps": n_time,
+        "patched_rows": patched_rows,
+        "skipped_no_fits": skipped_no_fits,
+        "skipped_empty": skipped_empty,
+        "time_match_stats": match_stats,
+        "max_crval_delta_deg": {"ra": max_dra, "dec": max_ddec},
+        "samples": samples,
+    }
+
+
 def _frequency_sort_tuple(fp: Path) -> Tuple[float, str]:
     """Sort key for deterministic frequency ordering with fallback."""
     return _discovery_frequency_sort_tuple(fp, group_metadata_source="fits")
@@ -964,10 +1288,9 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
       via :func:`_filter_invalid_beam_files` so this path is only reachable when
       callers invoke :func:`_fix_headers` (or :func:`fix_fits_headers`) directly on
       an unfiltered set.
-      For celestial ``RA``/``DEC`` axes, ``CRVAL1``/``CRVAL2`` are set to the FK5
-      zenith at the UTC instant parsed from ``-image-YYYYMMDD_HHMMSS`` in the input
-      filename. If that pattern is absent, ``CRVAL1``/``CRVAL2`` are left unchanged.
-      Geodetic position comes from ``OBSGEO-*`` when present, otherwise OVRO-LWA defaults.
+      Celestial ``CRVAL1``/``CRVAL2`` (and ``LATPOLE`` when present) are preserved from
+      the input FITS. Filename ``-image-YYYYMMDD_HHMMSS`` tokens are used only for
+      discovery/grouping, not to overwrite the phase center.
 
     Parameters
     ----------
@@ -1066,14 +1389,6 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         phdu = fits.PrimaryHDU(data=data, header=hdr)
         H = phdu.header
 
-        obs_time = _obstime_from_fits_filename(path_in)
-        if obs_time is None:
-            logger.warning(
-                "No -image-YYYYMMDD_HHMMSS timestamp in filename %s; "
-                "leaving CRVAL1/CRVAL2 unchanged.",
-                path_in.name,
-            )
-
         # Spectral / frame basics (do not treat Stokes CRVAL4 as a rest frequency)
         ct3 = str(H.get("CTYPE3", "")).strip().upper()
         if "CRVAL3" in H and (
@@ -1084,20 +1399,11 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         H["SPECSYS"] = "LSRK"
         H["TIMESYS"] = "UTC"
         H["RADESYS"] = "FK5"
-        H["LATPOLE"] = 90.0
-
-        if obs_time is not None:
-            zc = _zenith_fk5_crvals_deg(H, obs_time)
-            if zc is not None:
-                cr1, cr2 = zc
-                H["CRVAL1"] = cr1
-                H["CRVAL2"] = cr2
-                logger.debug(
-                    "Set CRVAL1/CRVAL2 to FK5 zenith at filename time for %s: %.6f, %.6f deg",
-                    path_in.name,
-                    cr1,
-                    cr2,
-                )
+        if "LATPOLE" not in H:
+            if "CRVAL2" in H:
+                H["LATPOLE"] = float(H["CRVAL2"])
+            else:
+                H["LATPOLE"] = 90.0
 
         # Identity PC for LM axes
         H["PC1_1"] = 1.0
@@ -1366,15 +1672,17 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
     if chunk_lm and {"l", "m"} <= set(xds.dims):
         xds = xds.chunk({"l": chunk_lm, "m": chunk_lm})
 
-    # ---- persist the exact celestial WCS header redundantly ----
+    # ---- persist celestial WCS for combine/regrid (in-memory only) ----
+    # Zarr export uses wcs_header_str(time) only; strip_redundant_fits_wcs_header_attrs
+    # removes fits_wcs_header attrs before write (see AGENTS.md Per-Time WCS).
     # 2) 0-D variable that always survives (NumPy ≥ 2.0: use np.bytes_)
     xds = xds.assign(wcs_header_str=((), np.bytes_(hdr_str.encode("utf-8"))))
 
-    # 3) per-variable attrs (survive merges)
+    # 3) per-variable attrs (in-memory merges; not written to multi-time Zarr)
     for dv in xds.data_vars:
         xds[dv].attrs["fits_wcs_header"] = hdr_str
 
-    # 4) also stash on coords for convenience
+    # 4) also stash on coords for convenience (in-memory only)
     xds["right_ascension"].attrs["fits_wcs_header"] = hdr_str
     xds["declination"].attrs["fits_wcs_header"] = hdr_str
 
@@ -1821,8 +2129,8 @@ def _wcs_header_from_ref_grid_and_source_crval(
     """Build a 2D celestial WCS header from ``ref``'s pixel grid + ``xds``'s CRVAL.
 
     The LM reference defines only the pixel grid (CRPIX/CDELT/CTYPE/projection); the
-    per-time celestial reference (CRVAL1/CRVAL2, FK5 zenith at the source's obs time,
-    stamped by :func:`_fix_headers`) lives on each source FITS. Combining them lets
+    per-time celestial reference (CRVAL1/CRVAL2 from each source FITS header) lives on
+    each source FITS. Combining them lets
     every subband at one time step emit identical ``right_ascension``/``declination``
     while keeping the LM reference's role as a grid-shape template across time steps.
 
@@ -1865,7 +2173,7 @@ def _regrid_to_reference_lm(
 
     Uses linear interpolation in ``(l, m)``. The reference contributes **only the
     pixel grid** (``CRPIX``/``CDELT``/projection); per-time celestial reference
-    (``CRVAL1``/``CRVAL2``, FK5 zenith stamped by :func:`_fix_headers`) is taken from
+    (``CRVAL1``/``CRVAL2`` from the source FITS header) is taken from
     ``xds`` so all subbands at one time step end up with identical
     ``right_ascension``/``declination``. No-op when ``xds`` already matches ``ref``'s
     LM shape **and** ``l``/``m`` index coordinates within tolerance — in that case the
@@ -3228,6 +3536,10 @@ def _write_or_append_zarr(
         to_write = to_write.sortby("time")
     if "frequency" in to_write.coords:
         to_write = to_write.sortby("frequency")
+
+    from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
+
+    to_write = strip_redundant_fits_wcs_header_attrs(to_write)
 
     if first_write or not out_zarr.exists():
         if out_zarr.exists():

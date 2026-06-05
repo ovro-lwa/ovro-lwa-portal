@@ -89,6 +89,17 @@ def _patch_astrowidget_get_wcs() -> None:
 
 _patch_astrowidget_get_wcs()
 
+
+def bind_sky_widget_dataset(
+    widget: SkyWidget,
+    dataset: xr.Dataset,
+    *,
+    max_size: int = 1024,
+) -> None:
+    """Load the SKY cube without displaying; call :meth:`~astrowidget.SkyWidget.update_slice` next."""
+    widget.set_dataset(dataset, max_size=max_size, defer_display=True)
+
+
 logger = logging.getLogger(__name__)
 
 ZENITH_L = 0.0
@@ -99,8 +110,37 @@ DEFAULT_FOV_DEG = 25.0
 THERMAL_NOISE_GRID_COLS = 4
 
 
+_IPYTHON_IO_LOOP: Any = None
+
+
+def _capture_ipython_io_loop() -> None:
+    """Cache the IPython kernel ``io_loop`` from the main thread.
+
+    Background worker threads cannot call ``get_ipython()`` reliably in
+    Jupyter. Call this once from a notebook setup cell (after imports).
+    """
+    global _IPYTHON_IO_LOOP
+    _IPYTHON_IO_LOOP = None
+    try:
+        from IPython import get_ipython
+
+        ip = get_ipython()
+        kernel = getattr(ip, "kernel", None) if ip is not None else None
+        if kernel is not None:
+            _IPYTHON_IO_LOOP = getattr(kernel, "io_loop", None)
+    except Exception:
+        pass
+
+
 def _schedule_ipython_main(callback: Callable[[], None]) -> None:
     """Run callback on the IPython kernel event loop."""
+    io_loop = _IPYTHON_IO_LOOP
+    if io_loop is not None:
+        try:
+            io_loop.add_callback(callback)
+            return
+        except Exception:
+            pass
     try:
         from IPython import get_ipython
 
@@ -341,15 +381,34 @@ def sky_view_center(dataset: xr.Dataset, time_idx: int) -> SkyCoord:
     return zenith_lm_coord(dataset, time_idx)
 
 
-def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIUS) -> np.ndarray:
-    """Spatial STD in a fixed (l=0, m=0) patch for each (time, frequency) cell."""
-    result = dataset.radport.patch_statistic(
-        l=ZENITH_L,
-        m=ZENITH_M,
-        statistic="std",
-        radius=radius,
-    )
-    return np.asarray(result.stat_map.values, dtype=np.float64)
+def compute_zenith_std_map(
+    dataset: xr.Dataset,
+    radius: int = ZENITH_PATCH_RADIUS,
+) -> np.ndarray:
+    """Spatial STD in a fixed (l, m) patch for each (time, frequency) cell.
+
+    Uses a fixed pixel half-width so zenith QA works on stores without synthesized
+    beam metadata (common for pipeline QA Zarr until BEAM is populated).
+    """
+    l_idx, m_idx = dataset.radport.nearest_lm_idx(ZENITH_L, ZENITH_M)
+    sky = dataset["SKY"].isel(polarization=0)
+    n_times = int(sky.sizes["time"])
+    n_freqs = int(sky.sizes["frequency"])
+    n_l = int(sky.sizes["l"])
+    n_m = int(sky.sizes["m"])
+    r = max(0, int(radius))
+    stat = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+    li0 = int(l_idx)
+    mi0 = int(m_idx)
+    l_sl = slice(max(0, li0 - r), min(n_l, li0 + r + 1))
+    m_sl = slice(max(0, mi0 - r), min(n_m, mi0 + r + 1))
+    for t in range(n_times):
+        for f in range(n_freqs):
+            patch = sky.isel(time=t, frequency=f, l=l_sl, m=m_sl).values
+            finite = patch[np.isfinite(patch)]
+            if finite.size:
+                stat[t, f] = float(np.std(finite))
+    return stat
 
 
 def _time_days_since_start(time_values: np.ndarray) -> np.ndarray:
@@ -1301,7 +1360,7 @@ class _StokesReviewHolder(param.Parameterized):
     @staticmethod
     def _bind_sky_dataset(widget: SkyWidget, dataset: xr.Dataset) -> None:
         """Load cube only; first frame comes from :meth:`update_slice`."""
-        widget.set_dataset(dataset, max_size=1024, defer_display=True)
+        bind_sky_widget_dataset(widget, dataset)
 
     def bind_datasets(self, datasets: dict[str, xr.Dataset]) -> None:
         """Remember loaded Stokes datasets and constrain the sky-view toggle."""
@@ -2021,9 +2080,11 @@ class PipelineQAApp(param.Parameterized):
 
                 self._execute(_apply)
             except Exception as exc:
-                def _fail() -> None:
+                err = exc
+
+                def _fail(err: BaseException = err) -> None:
                     self.scanning = False
-                    self._log_error(f"Scan failed: {exc}")
+                    self._log_error(f"Scan failed: {err}")
 
                 self._execute(_fail)
 
@@ -2140,12 +2201,15 @@ class PipelineQAApp(param.Parameterized):
             except Exception as exc:
                 import traceback
 
-                def _fail() -> None:
+                err = exc
+                tb = traceback.format_exc()
+
+                def _fail(err: BaseException = err, tb: str = tb) -> None:
                     if not self._is_current_load(load_seq):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
-                    self._log_error(f"Failed to load zenith panels for {select_day}: {exc}")
-                    self._log(traceback.format_exc(), sync=False)
+                    self._log_error(f"Failed to load zenith panels for {select_day}: {err}")
+                    self._log(tb, sync=False)
                     self._reset_zenith_sections()
                     self._finish_zenith_load(load_seq=load_seq)
 
@@ -2319,10 +2383,11 @@ class PipelineQAApp(param.Parameterized):
                     config=self._qa_config,
                 )
             except Exception as exc:
+                err = exc
 
-                def _fail() -> None:
+                def _fail(err: BaseException = err) -> None:
                     self.converting = False
-                    self._log_error(f"Conversion failed: {exc}")
+                    self._log_error(f"Conversion failed: {err}")
                     self._sync_log()
 
                 _schedule_ipython_main(_fail)

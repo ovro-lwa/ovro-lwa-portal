@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -607,6 +609,71 @@ class TestRadportDynamicSpectrum:
         assert "l_idx" in dynspec.attrs
         assert "m_idx" in dynspec.attrs
 
+    def test_dynamic_spectrum_progress_callback(
+        self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
+    ) -> None:
+        """progress_callback reports track and extract stages for RA/Dec tracking."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        valid_ovro_dataset_with_tracking_wcs.radport.dynamic_spectrum(
+            ra=180.0,
+            dec=37.0,
+            progress_callback=_callback,
+        )
+        stages = {stage for stage, *_rest in events}
+        assert "track" in stages
+        assert "extract" in stages
+
+    def test_dynamic_spectrum_extract_progress_updates_regularly(self) -> None:
+        """Extract stage reports start and finish without splitting I/O into batches."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        ds, catalog_ra, catalog_dec = (
+            TestCelestialTimeSeriesTracking._per_time_wcs_dataset(25)
+        )
+        ds.radport.dynamic_spectrum(
+            ra=catalog_ra,
+            dec=catalog_dec,
+            progress_callback=_callback,
+        )
+        extract_events = [
+            (current, total)
+            for stage, current, total, _msg in events
+            if stage == "extract"
+        ]
+        assert len(extract_events) >= 2
+        assert extract_events[0][0] == 0
+        assert extract_events[-1][0] == extract_events[-1][1]
+
+    def test_radport_progress_heartbeat_emits_elapsed_messages(self) -> None:
+        """Elapsed-time heartbeats log without chunking the underlying work."""
+        from ovro_lwa_portal.accessor import _radport_progress_heartbeat
+
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        with _radport_progress_heartbeat(
+            _callback,
+            stage="extract",
+            total=10,
+            message="Extracting 10 tracked pixels",
+            interval_s=0.05,
+        ):
+            time.sleep(0.16)
+
+        assert events
+        assert all(stage == "extract" and current == 0 and total == 10 for stage, current, total, _ in events)
+        assert all("in progress" in message for _stage, _current, _total, message in events)
+        assert len(events) >= 2
+
     def test_dynamic_spectrum_invalid_var_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
@@ -740,6 +807,26 @@ class TestRadportPatchStatistic:
         with pytest.raises(ValueError, match="scale must be positive"):
             valid_ovro_dataset.radport.patch_statistic(l=0.0, m=0.0, scale=0.0)
 
+    def test_patch_statistic_progress_callback(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """progress_callback reports extract and reduce stages through completion."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        valid_ovro_dataset.radport.patch_statistic(
+            l=0.0,
+            m=0.0,
+            statistic="std",
+            progress_callback=_callback,
+        )
+        stages = {stage for stage, *_rest in events}
+        assert "extract" in stages
+        assert "reduce" in stages
+        assert any(current == total and total > 0 for _s, current, total, _m in events)
+
     def test_patch_statistic_radec_tracking(
         self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
     ) -> None:
@@ -760,6 +847,23 @@ class TestRadportPatchStatistic:
 
 class TestRadportPatchFit:
     """Tests for patch_fit() and Gaussian fit helpers."""
+
+    def test_patch_fit_progress_callback(self, valid_ovro_dataset: xr.Dataset) -> None:
+        """progress_callback reports extract and fit stages through completion."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        valid_ovro_dataset.radport.patch_fit(
+            l=0.0,
+            m=0.0,
+            progress_callback=_callback,
+        )
+        stages = {stage for stage, *_rest in events}
+        assert "extract" in stages
+        assert "fit" in stages
+        assert any(current == total and total > 0 for _s, current, total, _m in events)
 
     def test_patch_fit_returns_result(self, valid_ovro_dataset: xr.Dataset) -> None:
         """patch_fit() returns PatchFitResult with parameter and chi-squared maps."""
@@ -1931,6 +2035,38 @@ class TestRadportGetWcsTimePromotedHeader:
         assert w1.wcs.crval[0] == pytest.approx(181.0)
         assert _read_wcs_header_str(ds, time_idx=1) == hdr1
 
+    def test_read_wcs_header_str_time_frequency_dim(self) -> None:
+        """Per-time WCS may be stored as (time, frequency) before frequency collapse."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _read_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=190.0, crval2=50.0)
+        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
+        wcs_arr = np.array(
+            [[np.bytes_(enc0)], [np.bytes_(enc1)]],
+            dtype=f"S{max(len(enc0), len(enc1))}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time", "frequency"), wcs_arr),
+            },
+            coords={
+                "time": ("time", np.arange(2, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+        )
+        assert _read_wcs_header_str(ds, time_idx=1) == hdr1
+        assert ds.radport._use_persisted_wcs_for_pixel_mapping() is True
+
     def test_get_wcs_prefers_per_time_header_over_static_attrs(self) -> None:
         """Static ``fits_wcs_header`` must not mask per-time ``wcs_header_str``."""
         from tests.test_fits_to_zarr import _make_sin_wcs_header_str
@@ -2118,6 +2254,41 @@ class TestRadportPixelToCoords:
             lb, mb = ds.radport.coords_to_pixel(ra_t, dec_t, time_idx=ti)
             assert abs(lb - li) <= 1
             assert abs(mb - mi) <= 1
+
+    def test_pixel_to_coords_uses_per_time_wcs_header_str(self) -> None:
+        """pixel_to_coords must not use time-0 WCS when headers vary per step."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=200.0, crval2=45.0)
+        enc = [h.encode("utf-8") for h in (hdr0, hdr1)]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(enc[0]), len(enc[1]))}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", [55e6]),
+                "polarization": ("polarization", [0]),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        for ti, cr1 in enumerate((180.0, 200.0)):
+            li, mi = ds.radport.coords_to_pixel(cr1, 45.0, time_idx=ti)
+            ra_p, dec_p = ds.radport.pixel_to_coords(li, mi, time_idx=ti)
+            lb, mb = ds.radport.coords_to_pixel(ra_p, dec_p, time_idx=ti)
+            assert abs(lb - li) <= 1
+            assert abs(mb - mi) <= 1
+            assert abs(ra_p - cr1) < 0.1
 
     def test_pixel_to_coords_time_mjd_same_as_time_idx(
         self, valid_ovro_dataset_with_wcs: xr.Dataset
@@ -3837,6 +4008,310 @@ class TestCelestialTimeSeriesTracking:
         dynspec = ds.radport.dynamic_spectrum(ra=lst_deg, dec=37.2339)
         # Should have some finite values (source visible at least at t=0)
         assert np.any(np.isfinite(dynspec.values))
+
+    def test_radec_track_uses_per_time_wcs_not_fixed_pixel(self) -> None:
+        """Fixed catalog (RA, Dec) must follow per-time WCS when CRVAL drifts."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        catalog_ra = 180.0
+        catalog_dec = 45.0
+        n_time = 2
+        # Small CRVAL1 steps: source stays in FOV but maps to different pixels.
+        crvals = (180.0, 180.5)
+        headers = [
+            _make_sin_wcs_header_str(nx=16, ny=16, crval1=c1, crval2=catalog_dec)
+            for c1 in crvals
+        ]
+        enc = [h.encode("utf-8") for h in headers]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(e) for e in enc)}",
+        )
+        times = [60000.0 + 0.01 * i for i in range(n_time)]
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.ones((n_time, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", np.asarray(times, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        ds["SKY"].attrs["fits_wcs_header"] = headers[0]
+
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(catalog_ra, catalog_dec)
+        assert np.all(visible)
+        assert (int(l_idx[0]), int(m_idx[0])) != (int(l_idx[1]), int(m_idx[1]))
+
+        for ti in (0, 1):
+            lb, mb = ds.radport.coords_to_pixel(catalog_ra, catalog_dec, time_idx=ti)
+            assert abs(lb - int(l_idx[ti])) <= 1
+            assert abs(mb - int(m_idx[ti])) <= 1
+
+        dynspec = ds.radport.dynamic_spectrum(ra=catalog_ra, dec=catalog_dec)
+        assert dynspec.attrs["tracking"] is True
+        assert np.all(np.isfinite(dynspec.values))
+
+    @staticmethod
+    def _per_time_wcs_dataset(
+        n_time: int,
+        *,
+        crval1_start: float = 180.0,
+        crval1_step: float = 0.1,
+        catalog_dec: float = 45.0,
+    ) -> tuple[xr.Dataset, float, float]:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        catalog_ra = 180.0
+        headers = [
+            _make_sin_wcs_header_str(
+                nx=16,
+                ny=16,
+                crval1=crval1_start + crval1_step * ti,
+                crval2=catalog_dec,
+            )
+            for ti in range(n_time)
+        ]
+        enc = [h.encode("utf-8") for h in headers]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(e) for e in enc)}",
+        )
+        times = [60000.0 + 0.01 * i for i in range(n_time)]
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.ones((n_time, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", np.asarray(times, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        ds["SKY"].attrs["fits_wcs_header"] = headers[0]
+        return ds, catalog_ra, catalog_dec
+
+    def test_world2pix_from_header_str_matches_get_wcs(self) -> None:
+        from astropy.io.fits import Header
+        from astropy.wcs import WCS
+
+        from ovro_lwa_portal.accessor import _world2pix_from_header_str
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=45.0)
+        wcs = WCS(Header.fromstring(hdr, sep="\n")).celestial
+        sky = wcs.pixel_to_world(4, 4)
+        ra_deg = float(sky.ra.deg)
+        dec_deg = float(sky.dec.deg)
+        li, mi, visible = _world2pix_from_header_str(hdr, ra_deg, dec_deg, 16, 16)
+        assert visible
+        assert li == 4
+        assert mi == 4
+
+    def test_per_time_wcs_track_table_uses_template_for_uniform_headers(self) -> None:
+        from ovro_lwa_portal.accessor import (
+            _build_per_time_wcs_track_table,
+            _bulk_per_time_wcs_header_strings,
+        )
+
+        ds, _, _ = self._per_time_wcs_dataset(4)
+        header_strs = _bulk_per_time_wcs_header_strings(ds, 4)
+        table = _build_per_time_wcs_track_table(header_strs)
+        assert table.use_template
+        assert table.template_header is not None
+        assert np.all(table.header_valid)
+
+    def test_per_time_wcs_track_table_falls_back_when_headers_differ(self) -> None:
+        from ovro_lwa_portal.accessor import _build_per_time_wcs_track_table
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(
+            nx=16, ny=16, crval1=180.0, crval2=45.0, cdelt=0.2
+        )
+        table = _build_per_time_wcs_track_table([hdr0, hdr1])
+        assert not table.use_template
+        assert table.template_header is None
+        assert np.all(table.header_valid)
+
+    def test_per_time_wcs_track_matches_coords_to_pixel(self) -> None:
+        ds, catalog_ra, catalog_dec = self._per_time_wcs_dataset(12)
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(catalog_ra, catalog_dec)
+        assert np.all(visible)
+        assert len({int(v) for v in l_idx}) > 1
+        for ti in range(int(ds.sizes["time"])):
+            lb, mb = ds.radport.coords_to_pixel(
+                catalog_ra, catalog_dec, time_idx=ti
+            )
+            assert abs(lb - int(l_idx[ti])) <= 1
+            assert abs(mb - int(m_idx[ti])) <= 1
+
+    def test_per_time_wcs_track_marks_empty_header_invisible(self) -> None:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _bulk_per_time_wcs_header_strings
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        enc0 = hdr0.encode("utf-8")
+        wcs_per_time = np.array(
+            [np.bytes_(enc0), np.bytes_(b"")],
+            dtype=f"S{len(enc0)}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+        )
+        headers = _bulk_per_time_wcs_header_strings(ds, 2)
+        assert headers[0].strip()
+        assert not headers[1].strip()
+
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(180.0, 45.0)
+        assert visible[0]
+        assert not visible[1]
+        assert l_idx[1] == ds.sizes["l"]
+        assert m_idx[1] == ds.sizes["m"]
+
+    def test_vectorized_tracked_pixel_values_matches_isel_loop(self) -> None:
+        from ovro_lwa_portal.accessor import _vectorized_tracked_pixel_values
+
+        rng = np.random.default_rng(0)
+        n_time, n_freq, n_l, n_m = 5, 3, 8, 8
+        data = rng.random((n_time, n_freq, 1, n_l, n_m), dtype=np.float32)
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "l", "m"),
+                    data,
+                )
+            },
+            coords={
+                "time": np.arange(n_time, dtype=float),
+                "frequency": np.arange(n_freq, dtype=float),
+                "polarization": [0],
+                "l": np.arange(n_l, dtype=float),
+                "m": np.arange(n_m, dtype=float),
+            },
+        )
+        data_var = ds["SKY"].isel(polarization=0)
+        vis_times = np.array([0, 1, 2, 4], dtype=int)
+        vis_l = np.array([1, 2, 3, 4], dtype=int)
+        vis_m = np.array([4, 3, 2, 1], dtype=int)
+        plane = _vectorized_tracked_pixel_values(data_var, vis_times, vis_l, vis_m)
+        loop_rows = [
+            np.asarray(
+                data_var.isel(time=int(t), l=int(li), m=int(mi)).values,
+                dtype=np.float64,
+            )
+            for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True)
+        ]
+        loop_plane = np.stack(loop_rows, axis=0)
+        np.testing.assert_allclose(plane, loop_plane)
+
+    def test_vectorized_tracked_pixel_values_dask_backed(self) -> None:
+        import dask.array as da
+
+        from ovro_lwa_portal.accessor import _vectorized_tracked_pixel_values
+
+        n_time, n_freq, n_l, n_m = 4, 2, 6, 6
+        backing = da.from_array(
+            np.arange(n_time * n_freq * n_l * n_m, dtype=np.float32).reshape(
+                n_time, n_freq, 1, n_l, n_m
+            ),
+            chunks=(1, 1, 1, 3, 3),
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "l", "m"),
+                    backing,
+                )
+            },
+            coords={
+                "time": np.arange(n_time, dtype=float),
+                "frequency": np.arange(n_freq, dtype=float),
+                "polarization": [0],
+                "l": np.arange(n_l, dtype=float),
+                "m": np.arange(n_m, dtype=float),
+            },
+        )
+        data_var = ds["SKY"].isel(polarization=0)
+        vis_times = np.array([0, 2, 3], dtype=int)
+        vis_l = np.array([1, 2, 3], dtype=int)
+        vis_m = np.array([2, 3, 4], dtype=int)
+        plane = _vectorized_tracked_pixel_values(data_var, vis_times, vis_l, vis_m)
+        expected = np.stack(
+            [
+                np.asarray(
+                    data_var.isel(time=int(t), l=int(li), m=int(mi)).compute().values,
+                    dtype=np.float64,
+                )
+                for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True)
+            ],
+            axis=0,
+        )
+        np.testing.assert_allclose(plane, expected)
+
+    def test_per_time_wcs_track_fallback_matches_coords_to_pixel(self) -> None:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        catalog_ra = 180.0
+        catalog_dec = 45.0
+        hdr0 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=catalog_dec)
+        hdr1 = _make_sin_wcs_header_str(
+            nx=16, ny=16, crval1=180.5, crval2=catalog_dec, cdelt=0.2
+        )
+        enc = [h.encode("utf-8") for h in (hdr0, hdr1)]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(e) for e in enc)}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.ones((2, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(catalog_ra, catalog_dec)
+        assert np.all(visible)
+        for ti in (0, 1):
+            lb, mb = ds.radport.coords_to_pixel(catalog_ra, catalog_dec, time_idx=ti)
+            assert abs(lb - int(l_idx[ti])) <= 1
+            assert abs(mb - int(m_idx[ti])) <= 1
 
     def test_below_horizon_nan_in_light_curve(
         self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset

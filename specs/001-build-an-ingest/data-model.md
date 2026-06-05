@@ -258,16 +258,31 @@ class WCSHeader:
   alignment
 - Coordinates MUST be in degrees, FK5/J2000 frame
 
-**Storage in Zarr** (FR-019c redundant storage):
+**Storage in Zarr** (FR-019c; updated for per-time incremental ingest):
 
-The WCS header is stored in 4 redundant locations to survive xarray operations:
+**Canonical on disk** when the store has a `time` dimension:
 
-1. Dataset global attrs: `xds.attrs['fits_wcs_header']`
-2. 0-D variable: `wcs_header_str` (uses `np.bytes_` for NumPy 2.0 compatibility)
-3. Per-variable attrs: `xds[var].attrs['fits_wcs_header']` for each data
-   variable
-4. Coordinate attrs: `xds['right_ascension'].attrs['fits_wcs_header']` and
-   `xds['declination'].attrs['fits_wcs_header']`
+1. **`wcs_header_str(time)`** — one FITS header string per time step (promoted
+   from 0-D per step during `_align_time_dimension_for_zarr_write` / append).
+   This is the only celestial WCS metadata that updates on each
+   `append_dim='time'` write.
+
+**In-memory only** during combine/regrid (`_load_for_combine`); **not** persisted
+to Zarr when `wcs_header_str` is present (stripped by
+`strip_redundant_fits_wcs_header_attrs` before `_write_or_append_zarr` and on
+`open_dataset`):
+
+- Dataset global attrs: `xds.attrs['fits_wcs_header']`
+- Per-variable attrs: `xds[var].attrs['fits_wcs_header']`
+- Coordinate attrs on `right_ascension` / `declination`
+
+**Why:** Zarr array-level attrs (e.g. on `SKY`) do not vary per time slice; writing
+`fits_wcs_header` there after the first append freezes time-0 `CRVAL` and breaks
+QA tools that read attrs instead of `wcs_header_str[time_idx]`. See **Per-Time WCS
+and CRVAL** in `AGENTS.md`.
+
+**Regression tests:** `test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present`,
+`test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str`.
 
 **Relationships**:
 

@@ -1704,12 +1704,13 @@ packages:
 - pypi: ../astrowidget
   name: astrowidget
   version: 0.2.0
-  sha256: 11f0cdfbe510da6085fe5e3b3b3508e428a597ba495ede8a5c4c5551947626e7
+  sha256: 6b308ad66cd5b67ec9b4e4c404cc3d6382a68c2b802a643c63eae219bbef4560
   requires_dist:
   - anywidget>=0.9
   - traitlets>=5.0
   - astropy>=6.0
   - numpy>=1.24
+  - scipy>=1.10
   - xarray>=2024.1
   - zarr>=2.16,<3
   - dask[array]>=2024.1
@@ -6577,14 +6578,15 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev44
-  sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
+  version: 0.1.1.dev64
+  sha256: 0f1f7672c4f99eb1dd4cd6c73fe824e7d6f5d60e03248f23acb09511d1a52324
   requires_dist:
   - astropy>=7.1.0,<8
   - dask>=2025.9.1,<2026
   - matplotlib>=3.8,<4
   - numcodecs>=0.15,<0.16
   - portalocker>=2.8.0
+  - requests>=2.31.0
   - rich>=13.7.0
   - typer>=0.9.0
   - universal-pathlib>=0.2

@@ -31,6 +31,7 @@ dependencies = [
     "portalocker>=2.8.0",
     "universal-pathlib>=0.2",
     "matplotlib>=3.8,<4",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]

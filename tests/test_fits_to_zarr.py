@@ -445,9 +445,8 @@ def test_regrid_to_reference_lm_uses_source_crval_for_radec():
     slice(s)`` warning scenario:
 
     * The global LM reference is built once from the earliest time step → its
-      ``CRVAL1``/``CRVAL2`` reflect the FK5 zenith at *that* instant.
-    * At later time steps, each source FITS gets re-stamped by ``_fix_headers`` with
-      *its own* obs-time zenith ``CRVAL``.
+      ``CRVAL1``/``CRVAL2`` reflect that reference FITS header.
+    * At later time steps, each source FITS carries its own native ``CRVAL``.
     * Sky positions for a single time step must therefore use the source's CRVAL
       (otherwise subbands that fell through the short-circuit and those that were
       actually regridded disagree by the LST advance between the reference time and
@@ -463,7 +462,7 @@ def test_regrid_to_reference_lm_uses_source_crval_for_radec():
     sky_ref = rng.standard_normal((n_ref, n_ref))
 
     ref_crval = (180.0, 45.0)
-    src_crval = (200.0, 40.0)  # later obs time → zenith shifted in RA, slight Dec drift
+    src_crval = (200.0, 40.0)  # later time step → different native phase center
 
     hdr_ref = _make_sin_wcs_header_str(
         nx=n_ref, ny=n_ref, crval1=ref_crval[0], crval2=ref_crval[1]
@@ -1774,6 +1773,56 @@ def test_discovery_completed_matches_mjd_when_filename_differs(tmp_path: Path) -
     )
 
 
+def test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present(
+    tmp_path: Path,
+) -> None:
+    """Zarr must not persist time-0 ``fits_wcs_header`` on SKY when headers vary per time."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    out_zarr = tmp_path / "wcs_attrs.zarr"
+    l_ = np.linspace(-1.0, 1.0, 8)
+    m_ = np.linspace(-1.0, 1.0, 8)
+    hdr0 = np.bytes_(b"SIMPLE  = T\nCRVAL1  = 10.0\n")
+    hdr1 = np.bytes_(b"SIMPLE  = T\nCRVAL1  = 20.0\n")
+    mjd0, mjd1 = 60695.17, 60695.18
+
+    def _step(mjd: float, hdr: bytes, value: float) -> xr.Dataset:
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.full((1, 1, 1, 8, 8), value, dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), np.array([hdr])),
+            },
+            coords={
+                "time": ("time", np.array([mjd], dtype=np.float64)),
+                "frequency": ("frequency", np.array([5.0e7])),
+                "polarization": ("polarization", np.array(["I"])),
+                "l": ("l", l_),
+                "m": ("m", m_),
+            },
+            attrs={"fits_wcs_header": "stale-global"},
+        )
+        ds["SKY"].attrs["fits_wcs_header"] = "stale-sky"
+        ds["right_ascension"] = (("m", "l"), np.zeros((8, 8)))
+        ds["declination"] = (("m", "l"), np.zeros((8, 8)))
+        ds["right_ascension"].attrs["fits_wcs_header"] = "stale-coord"
+        return ds
+
+    mod._write_or_append_zarr(_step(mjd0, hdr0, 1.0), out_zarr, first_write=True, chunk_lm=4)
+    mod._write_or_append_zarr(_step(mjd1, hdr1, 2.0), out_zarr, first_write=False, chunk_lm=4)
+
+    with xr.open_zarr(out_zarr, consolidated=False) as ds:
+        assert int(ds.sizes["time"]) == 2
+        assert "fits_wcs_header" not in ds.attrs
+        assert "fits_wcs_header" not in ds["SKY"].attrs
+        assert "fits_wcs_header" not in ds["right_ascension"].attrs
+        assert bytes(ds["wcs_header_str"].isel(time=1).values.item()) == hdr1
+
+
 def test_write_or_append_skips_duplicate_mjd_by_default(tmp_path: Path, caplog) -> None:
     """Duplicate observation times must not overwrite existing Zarr rows by default."""
     import logging
@@ -2144,8 +2193,8 @@ def test_fix_headers_strips_padded_stokes_ctype_for_xradio(tmp_path: Path) -> No
     assert "SKY" in xds.data_vars
 
 
-def test_fix_headers_sets_crval_to_fk5_zenith_from_filename_image_stamp(tmp_path: Path):
-    """_fix_headers sets CRVAL1/2 from FK5 zenith at ``-image-YYYYMMDD_HHMMSS`` in the basename."""
+def test_fix_headers_preserves_crval_from_input_not_filename(tmp_path: Path):
+    """_fix_headers keeps native CRVAL1/2 even when the basename has an image-time stamp."""
     import numpy as np
 
     mod = _import_module()
@@ -2160,8 +2209,8 @@ def test_fix_headers_sets_crval_to_fk5_zenith_from_filename_image_stamp(tmp_path
             "NAXIS2": 8,
             "CTYPE1": "RA---SIN",
             "CTYPE2": "DEC--SIN",
-            "CRVAL1": 0.0,
-            "CRVAL2": 0.0,
+            "CRVAL1": 12.5,
+            "CRVAL2": 37.2,
             "CRPIX1": 4.5,
             "CRPIX2": 4.5,
             "CDELT1": -0.03,
@@ -2181,9 +2230,9 @@ def test_fix_headers_sets_crval_to_fk5_zenith_from_filename_image_stamp(tmp_path
     with fits.open(out_path) as hdul:
         hdr = hdul[0].header
 
-    # 20241218_030201 → 2024-12-18 03:02:01 UTC (not DATE-OBS).
-    assert hdr["CRVAL1"] == pytest.approx(14.0996845, rel=0, abs=1e-4)
-    assert hdr["CRVAL2"] == pytest.approx(37.0948037, rel=0, abs=1e-4)
+    assert hdr["CRVAL1"] == pytest.approx(12.5)
+    assert hdr["CRVAL2"] == pytest.approx(37.2)
+    assert hdr["LATPOLE"] == pytest.approx(37.2)
     assert hdr["RADESYS"] == "FK5"
 
 
@@ -2224,6 +2273,117 @@ def test_fix_headers_leaves_crval_without_image_timestamp_in_name(tmp_path: Path
 
     assert hdr["CRVAL1"] == pytest.approx(1.25)
     assert hdr["CRVAL2"] == pytest.approx(2.5)
+
+
+def test_patch_celestial_crval_in_header_str_keeps_pixel_grid():
+    """CRVAL repair must preserve CRPIX/CDELT while adopting native FITS phase center."""
+    mod = _import_module()
+    ref_hdr = _make_sin_wcs_header_str(nx=8, ny=8, crval1=99.0, crval2=88.0)
+    src = fits.Header(
+        {
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CRVAL1": 12.5,
+            "CRVAL2": 37.2,
+            "RADESYS": "FK5",
+        }
+    )
+    out = mod._patch_celestial_crval_in_header_str(ref_hdr, src)
+    out_hdr = fits.Header.fromstring(out, sep="\n")
+    ref_parsed = fits.Header.fromstring(ref_hdr, sep="\n")
+    assert out_hdr["CRVAL1"] == pytest.approx(12.5)
+    assert out_hdr["CRVAL2"] == pytest.approx(37.2)
+    assert out_hdr["LATPOLE"] == pytest.approx(37.2)
+    assert out_hdr["CRPIX1"] == pytest.approx(ref_parsed["CRPIX1"])
+    assert out_hdr["CDELT1"] == pytest.approx(ref_parsed["CDELT1"])
+
+
+def test_resolve_discovery_keys_for_zarr_times_handles_date_obs_offset():
+    """Zarr DATE-OBS keys can differ from filename -image- stamps by a few seconds."""
+    import numpy as np
+    from astropy.time import Time
+
+    mod = _import_module()
+    z_time = np.array(
+        [
+            Time("2025-01-20T04:00:08", scale="utc").mjd,
+            Time("2025-01-20T04:00:18", scale="utc").mjd,
+        ],
+        dtype=np.float64,
+    )
+    by_time = {
+        "20250120_040013": [Path("a.fits")],
+        "20250120_040023": [Path("b.fits")],
+    }
+    resolved, stats = mod._resolve_discovery_keys_for_zarr_times(z_time, by_time)
+    assert resolved == ["20250120_040013", "20250120_040023"]
+    assert stats["index"] == 2
+    assert stats["unresolved"] == 0
+
+
+def test_repair_zarr_crval_from_fits_patches_wcs_header_str(tmp_path: Path):
+    """In-place repair replaces stored CRVAL from native FITS without re-ingest."""
+    import numpy as np
+    import zarr
+    from astropy.time import Time
+
+    mod = _import_module()
+    store = tmp_path / "repair_me.zarr"
+    wrong_hdr = _make_sin_wcs_header_str(nx=4, ny=4, crval1=200.0, crval2=50.0)
+    discovery_key = "20250120_040013"
+    zarr_mjd = Time("2025-01-20T04:00:08", scale="utc").mjd
+
+    root = zarr.group(store)
+    root.create_dataset("time", data=np.array([zarr_mjd], dtype=np.float64))
+    root.create_dataset(
+        "wcs_header_str",
+        data=np.array([np.bytes_(wrong_hdr.encode("utf-8"))], dtype="S"),
+        chunks=(1,),
+    )
+    root["wcs_header_str"].attrs["_ARRAY_DIMENSIONS"] = ["time"]
+
+    fits_path = tmp_path / f"18MHz-Clean-Snapshot-{discovery_key}-image.fits"
+    data = np.zeros((4, 4), dtype=np.float32)
+    fits.PrimaryHDU(
+        data=data,
+        header=fits.Header(
+            {
+                "NAXIS": 2,
+                "NAXIS1": 4,
+                "NAXIS2": 4,
+                "CTYPE1": "RA---SIN",
+                "CTYPE2": "DEC--SIN",
+                "CRVAL1": 61.14,
+                "CRVAL2": 37.16,
+                "CRPIX1": 2.5,
+                "CRPIX2": 2.5,
+                "CDELT1": -0.03,
+                "CDELT2": 0.03,
+                "CUNIT1": "deg",
+                "CUNIT2": "deg",
+                "BMAJ": 0.1,
+                "BMIN": 0.1,
+            }
+        ),
+    ).writeto(fits_path)
+
+    result = mod.repair_zarr_crval_from_fits(
+        store,
+        {discovery_key: [fits_path]},
+        group_metadata_source="filename",
+        backup_suffix=".bak",
+    )
+    assert result["patched_rows"] == 1
+    assert result["max_crval_delta_deg"]["ra"] > 100.0
+
+    zg = zarr.open_group(str(store), mode="r")
+    fixed_hdr = fits.Header.fromstring(
+        zg["wcs_header_str"][0].decode("utf-8"),
+        sep="\n",
+    )
+    assert fixed_hdr["CRVAL1"] == pytest.approx(61.14)
+    assert fixed_hdr["CRVAL2"] == pytest.approx(37.16)
+    assert fixed_hdr["CRPIX1"] == pytest.approx((4 + 1) / 2.0)
 
 
 def test_collapse_wcs_header_str_when_ra_dec_have_no_frequency_dim():

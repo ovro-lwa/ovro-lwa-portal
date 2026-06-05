@@ -15,6 +15,13 @@
 #   REBUILD=1 pixi run bash scripts/ingest-I-Clean-Snapshot-20250120-LST4-5.sh
 #
 # Do not run from CI without access to /lustre and /fast.
+#
+# WCS note: ingest preserves native FITS CRVAL1/CRVAL2 per time step in
+# ``wcs_header_str[time]``. Filename ``-image-YYYYMMDD_HHMMSS`` is for grouping only.
+# Audit with:
+#   pixi run python scripts/audit_zarr_wcs_timeline.py "${OUTPUT_DIR}/${ZARR_NAME}"
+# Repair legacy stores that used filename-derived zenith CRVAL:
+#   pixi run bash scripts/repair-I-Clean-Snapshot-20250120-LST4-5-crval.sh
 
 set -euo pipefail
 
