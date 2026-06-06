@@ -2283,6 +2283,56 @@ def _filter_invalid_beam_files(
     return filtered
 
 
+def _filter_lst_color_groups_with_mismatched_header_times(
+    by_time: Dict[str, List[Path]],
+) -> Dict[str, List[Path]]:
+    """Drop lst-color groups whose subbands carry more than one ``DATE-OBS`` time key.
+
+    LST color-band discovery groups by filename (``_YYYYMMDD_LSTNNh_tXXXX``), but xradio
+    assigns each loaded slice a ``time`` coordinate from FITS ``DATE-OBS``. When Blue,
+    Green, and Red in the same group disagree, stacking subbands yields multiple
+    ``time`` indices and :func:`_write_or_append_zarr` fails on append.
+    """
+    filtered: Dict[str, List[Path]] = {}
+    n_dropped_groups = 0
+    for tkey, files in by_time.items():
+        header_times: set[str] = set()
+        for fp in files:
+            try:
+                hdr = fits.getheader(fp, ext=0)
+            except Exception as exc:
+                logger.warning(
+                    "Cannot verify header-time consistency for %s in lst-color group %s: %s",
+                    fp.name,
+                    tkey,
+                    exc,
+                )
+                continue
+            tk = _time_key_from_header(hdr)
+            if tk is not None:
+                header_times.add(tk)
+        if len(header_times) <= 1:
+            filtered[tkey] = files
+            continue
+        n_dropped_groups += 1
+        logger.warning(
+            "Dropping lst-color time group %s: %d file(s) have %d distinct DATE-OBS "
+            "time keys (%s). Stacked subbands would produce multiple ``time`` indices "
+            "and break Zarr append.",
+            tkey,
+            len(files),
+            len(header_times),
+            ", ".join(sorted(header_times)),
+        )
+    if n_dropped_groups:
+        logger.info(
+            "Lst-color header-time filter dropped %d time group(s); %d remaining.",
+            n_dropped_groups,
+            len(filtered),
+        )
+    return filtered
+
+
 def _completed_time_keys_in_zarr(
     out_zarr: Path,
     *,
@@ -3249,6 +3299,11 @@ def convert_fits_dir_to_zarr(
     join fills them with the float ``NaN`` fill value instead of contaminating the
     store with placeholder zeros.
 
+    When ``filename_convention`` is ``"lst-color"``, entire time groups whose subbands
+    carry more than one distinct ``DATE-OBS`` key are dropped via
+    :func:`_filter_lst_color_groups_with_mismatched_header_times` so stacked subbands
+    produce a single ``time`` index for Zarr append.
+
     When *resume* is True (default) and *rebuild* is False, time keys already present
     in the store are skipped via :func:`_filter_completed_time_keys`. Re-invoking
     with the same arguments therefore continues an interrupted run. Pass
@@ -3315,6 +3370,8 @@ def convert_fits_dir_to_zarr(
                 ", ".join(sorted(missing)),
             )
     by_time = _filter_invalid_beam_files(by_time)
+    if filename_convention == "lst-color":
+        by_time = _filter_lst_color_groups_with_mismatched_header_times(by_time)
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
     for k, v in by_time.items():

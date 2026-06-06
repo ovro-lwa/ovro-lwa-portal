@@ -1265,6 +1265,53 @@ def test_filter_invalid_beam_files_drops_truncated(tmp_path: Path, caplog) -> No
     assert "truncated" in caplog.text.lower()
 
 
+def test_filter_lst_color_groups_drops_mismatched_header_times(tmp_path: Path, caplog) -> None:
+    """Lst-color groups with conflicting DATE-OBS across subbands must be excluded."""
+    import logging
+
+    mod = _import_module()
+    stem = "20241218_LST02h_t0002"
+    good_paths = []
+    for color, date_obs in (
+        ("Blue", "2024-12-18T04:09:01.0"),
+        ("Green", "2024-12-18T04:09:01.0"),
+        ("Red", "2024-12-18T04:09:01.0"),
+    ):
+        fp = tmp_path / f"{color}_I_10min_Taper_Robust-0_pbcorr_dewarped_{stem}.fits"
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"DATE-OBS": date_obs, "RESTFRQ": 4.1e7}),
+        ).writeto(fp)
+        good_paths.append(fp)
+
+    bad_paths = []
+    for color, date_obs in (
+        ("Blue", "2024-12-18T04:09:01.0"),
+        ("Green", "2024-12-18T04:18:58.0"),
+        ("Red", "2024-12-18T04:09:01.0"),
+    ):
+        fp = tmp_path / f"{color}_bad_{stem}.fits"
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"DATE-OBS": date_obs, "RESTFRQ": 4.1e7}),
+        ).writeto(fp)
+        bad_paths.append(fp)
+
+    by_time = {
+        "20241218_LST02h_t0001": good_paths,
+        stem: bad_paths,
+    }
+    caplog.set_level(logging.WARNING, logger="ovro_lwa_portal.fits_to_zarr_xradio")
+    filtered = mod._filter_lst_color_groups_with_mismatched_header_times(by_time)
+
+    assert list(filtered.keys()) == ["20241218_LST02h_t0001"]
+    assert filtered["20241218_LST02h_t0001"] == good_paths
+    assert stem not in filtered
+    assert "Dropping lst-color time group" in caplog.text
+    assert "20241218_040901" in caplog.text
+    assert "20241218_041858" in caplog.text
+
+
 def test_fix_headers_raises_invalid_beam_error_on_missing_beam(tmp_path: Path):
     """``_fix_headers`` must refuse to invent a placeholder beam for unfit images."""
     import numpy as _np
