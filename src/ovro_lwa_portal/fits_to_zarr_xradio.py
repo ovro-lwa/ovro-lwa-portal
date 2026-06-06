@@ -1067,8 +1067,8 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 # Pure (RA, DEC) planes: xradio requires both FREQ (so ``helpers['frequency']``
                 # exists) and STOKES. Promote to a 4D (RA, DEC, FREQ, STOKES) singleton cube
                 # matching astropy's axis order NAXIS1=NAXIS2=spatial, NAXIS3=NAXIS4=1.
-                spec_hz = float(hdr.get("RESTFREQ", 6e7))
-                if spec_hz <= 0:
+                spec_hz = _frequency_hz_from_header(hdr)
+                if spec_hz is None or spec_hz <= 0:
                     spec_hz = 6e7
                 data = np.expand_dims(np.expand_dims(data, axis=0), axis=0)
                 hdr["NAXIS"] = 4

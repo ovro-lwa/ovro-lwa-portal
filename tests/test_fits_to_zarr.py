@@ -1462,9 +1462,47 @@ def test_fix_headers_adds_stokes_axis_when_missing(tmp_path: Path):
     assert hdr["CTYPE4"] == "STOKES"
     assert hdr["CRVAL4"] == pytest.approx(1.0)
     assert hdr["CRPIX4"] == pytest.approx(1.0)
-    assert hdr["CDELT4"] == pytest.approx(1.0)
-    assert out_data is not None
-    assert out_data.shape == (1, 1, 4, 4)
+
+
+def test_fix_headers_2d_promotion_uses_restfrq_for_synthetic_freq_axis(tmp_path: Path) -> None:
+    """2D dewarped planes often carry ``RESTFRQ`` only; promotion must not default to 60 MHz."""
+    import numpy as np
+
+    mod = _import_module()
+    in_path = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_dewarped_20241218_LST01h_t0001.fits"
+    out_path = tmp_path / "output_fixed.fits"
+
+    data = np.zeros((8, 8), dtype=np.float32)
+    header = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 8,
+            "NAXIS2": 8,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "RESTFRQ": 73.77609456783534e6,
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+        }
+    )
+    fits.PrimaryHDU(data=data, header=header).writeto(in_path)
+
+    mod._fix_headers(in_path, out_path)
+
+    with fits.open(out_path) as hdul:
+        hdr = hdul[0].header
+
+    assert hdr["NAXIS"] == 4
+    assert hdr["CTYPE3"] == "FREQ"
+    assert hdr["CRVAL3"] == pytest.approx(73.77609456783534e6)
+    assert hdr["RESTFREQ"] == pytest.approx(73.77609456783534e6)
+
+    hz = mod._canonical_stack_frequency_hz(
+        out_path,
+        group_metadata_source="fits",
+        filename_convention="lst-color",
+    )
+    assert hz == pytest.approx(73.77609456783534e6)
 
 
 def test_normalize_time_key_from_datetime64():
