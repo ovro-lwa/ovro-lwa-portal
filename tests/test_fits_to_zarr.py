@@ -886,6 +886,71 @@ def test_discover_groups_skips_file_without_time_or_frequency_metadata(tmp_path:
     assert groups == {}
 
 
+def test_time_key_from_lst_color_filename(tmp_path: Path) -> None:
+    """LST color-band basenames encode date, LST hour, and time bin."""
+    mod = _import_module()
+    name = "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    assert mod._time_key_from_lst_color_filename(tmp_path / name) == "20250508_LST22h_t0001"
+    assert mod._time_key_from_lst_color_filename(tmp_path / "no_match.fits") is None
+
+
+def test_extract_group_metadata_lst_color(tmp_path: Path) -> None:
+    """LST color-band metadata uses basename time and header frequency."""
+    mod = _import_module()
+    fpath = tmp_path / "Green_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0002.fits"
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 55.0e6}),
+    ).writeto(fpath)
+
+    time_key, frequency_hz, notes = mod._extract_group_metadata_lst_color(fpath)
+
+    assert time_key == "20250508_LST22h_t0002"
+    assert frequency_hz == pytest.approx(55.0e6)
+    assert "time-from-lst-color-filename" in notes
+    assert "frequency-from-header" in notes
+
+
+def test_discover_groups_lst_color_groups_subbands_by_time_and_header_mhz(
+    tmp_path: Path,
+) -> None:
+    """Blue/Green/Red at the same LST bin group together; distinct bins stay separate."""
+    mod = _import_module()
+    blue = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    green = tmp_path / "Green_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    red_other_bin = tmp_path / "Red_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0002.fits"
+    for path, hz in ((blue, 41e6), (green, 55e6), (red_other_bin, 73e6)):
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"RESTFREQ": hz}),
+        ).writeto(path)
+
+    groups = mod._discover_groups(tmp_path, filename_convention="lst-color")
+
+    assert set(groups.keys()) == {"20250508_LST22h_t0001", "20250508_LST22h_t0002"}
+    assert {p.name for p in groups["20250508_LST22h_t0001"]} == {blue.name, green.name}
+    assert groups["20250508_LST22h_t0002"] == [red_other_bin]
+
+
+def test_discover_groups_lst_color_header_frequency_jitter_single_plane(tmp_path: Path) -> None:
+    """Header MHz jitter within the discovery bin merges duplicate subbands."""
+    mod = _import_module()
+    f1 = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    f2 = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001_dup.fits"
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 41.0e6}),
+    ).writeto(f1)
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 41.0e6 + 100.0}),
+    ).writeto(f2)
+
+    groups = mod._discover_groups(tmp_path, filename_convention="lst-color")
+
+    assert groups["20250508_LST22h_t0001"] == [f1]
+
+
 def test_rechunk_lm_for_zarr_uniform_spatial_chunks():
     """Irregular dask chunks along l/m must become uniform for Zarr compatibility."""
     import dask.array as da

@@ -1704,12 +1704,13 @@ packages:
 - pypi: ../astrowidget
   name: astrowidget
   version: 0.2.0
-  sha256: 11f0cdfbe510da6085fe5e3b3b3508e428a597ba495ede8a5c4c5551947626e7
+  sha256: 6b308ad66cd5b67ec9b4e4c404cc3d6382a68c2b802a643c63eae219bbef4560
   requires_dist:
   - anywidget>=0.9
   - traitlets>=5.0
   - astropy>=6.0
   - numpy>=1.24
+  - scipy>=1.10
   - xarray>=2024.1
   - zarr>=2.16,<3
   - dask[array]>=2024.1
@@ -6578,6 +6579,65 @@ packages:
 - pypi: ./
   name: ovro-lwa-portal
   version: 0.1.1.dev44
+  sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
+  requires_dist:
+  - astropy>=7.1.0,<8
+  - dask>=2025.9.1,<2026
+  - matplotlib>=3.8,<4
+  - numcodecs>=0.15,<0.16
+  - portalocker>=2.8.0
+  - rich>=13.7.0
+  - typer>=0.9.0
+  - universal-pathlib>=0.2
+  - xarray>=2025.9.1,<2026
+  - xradio[all]>=0.0.59,<0.1
+  - zarr>=2.16,<3
+  - astrowidget>=0.1.1 ; extra == 'all'
+  - bokeh>=3.3,<4 ; extra == 'all'
+  - holoviews>=1.18,<2 ; extra == 'all'
+  - ipyaladin>=0.5.0 ; extra == 'all'
+  - ipympl>=0.9 ; extra == 'all'
+  - ipywidgets-bokeh>=1.5 ; extra == 'all'
+  - ipywidgets>=8.0,<9 ; extra == 'all'
+  - jupyter-bokeh>=4.0 ; extra == 'all'
+  - panel>=1.3,<2 ; extra == 'all'
+  - param>=2.0,<3 ; extra == 'all'
+  - pre-commit ; extra == 'all'
+  - pytest-cov ; extra == 'all'
+  - pytest-mock ; extra == 'all'
+  - pytest-xdist ; extra == 'all'
+  - pytest>=7 ; extra == 'all'
+  - python-dotenv>=1.2.1,<2 ; extra == 'ci'
+  - s3fs>=2024.6.0 ; extra == 'ci'
+  - tqdm>=4.67.1,<5 ; extra == 'ci'
+  - pre-commit ; extra == 'dev'
+  - pytest-cov ; extra == 'dev'
+  - pytest-mock ; extra == 'dev'
+  - pytest-xdist ; extra == 'dev'
+  - pytest>=7 ; extra == 'dev'
+  - mkdocs-material>=9.5.0 ; extra == 'docs'
+  - mkdocs>=1.6.0 ; extra == 'docs'
+  - mkdocstrings[python]>=0.25.0 ; extra == 'docs'
+  - prefect>=3.0.0 ; extra == 'prefect'
+  - caltechdata-api>=1.0.0 ; extra == 'remote'
+  - fsspec>=2024.6.0 ; extra == 'remote'
+  - gcsfs>=2024.6.0 ; extra == 'remote'
+  - requests>=2.31.0 ; extra == 'remote'
+  - s3fs>=2024.6.0 ; extra == 'remote'
+  - astrowidget>=0.1.1 ; extra == 'visualization'
+  - bokeh>=3.3,<4 ; extra == 'visualization'
+  - holoviews>=1.18,<2 ; extra == 'visualization'
+  - ipyaladin>=0.5.0 ; extra == 'visualization'
+  - ipympl>=0.9 ; extra == 'visualization'
+  - ipywidgets-bokeh>=1.5 ; extra == 'visualization'
+  - ipywidgets>=8.0,<9 ; extra == 'visualization'
+  - jupyter-bokeh>=4.0 ; extra == 'visualization'
+  - panel>=1.3,<2 ; extra == 'visualization'
+  - param>=2.0,<3 ; extra == 'visualization'
+  requires_python: '>=3.12,<3.14'
+- pypi: ./
+  name: ovro-lwa-portal
+  version: 0.1.1.dev65
   sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
   requires_dist:
   - astropy>=7.1.0,<8

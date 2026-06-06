@@ -218,6 +218,11 @@ MHZ_RE = re.compile(r"_(\d+)MHz(?:_|-|\.|$)")
 # OVRO-LWA ``...-image-YYYYMMDD_HHMMSS...`` segment (UTC wall-clock for the map).
 _IMAGE_TIME_RE = re.compile(r"-image-(\d{8})_(\d{6})")
 
+# LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
+_LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
+
+DiscoveryFilenameConvention = Literal["image", "lst-color"]
+
 
 def _mhz_from_name(p: Path) -> int:
     """Extract the subband MHz from a filename; return a large sentinel if absent.
@@ -358,14 +363,72 @@ def _extract_group_metadata_filename_only(fp: Path) -> Tuple[Optional[str], Opti
     return time_key, frequency_hz, notes
 
 
+def _time_key_from_lst_color_filename(fp: Path) -> Optional[str]:
+    """Observation time key from ``_YYYYMMDD_LSTNNh_tXXXX`` in the basename.
+
+    Returns keys like ``20250508_LST22h_t0001``. Returns ``None`` when the pattern is absent.
+    """
+    m = _LST_COLOR_TIME_RE.search(fp.name)
+    if m is None:
+        return None
+    ymd, lst_h, t_bin = m.group(1), m.group(2), m.group(3)
+    return f"{ymd}_LST{lst_h}h_{t_bin}"
+
+
+def _extract_group_metadata_lst_color(fp: Path) -> Tuple[Optional[str], Optional[float], List[str]]:
+    """Grouping metadata for LST color-band basenames (Blue/Green/Red subbands).
+
+    Observation time comes from ``_YYYYMMDD_LSTNNh_tXXXX`` in the basename. Subband
+    frequency is read from FITS headers (``RESTFREQ``, etc.); the color prefix does not
+    encode MHz.
+    """
+    notes: List[str] = []
+    time_key = _time_key_from_lst_color_filename(fp)
+    if time_key is not None:
+        notes.append("time-from-lst-color-filename")
+
+    frequency_hz: Optional[float] = None
+    try:
+        header = fits.getheader(fp, ext=0)
+    except Exception as e:
+        logger.warning(f"Could not read FITS header for {fp.name}: {e}")
+        header = None
+
+    if header is not None:
+        frequency_hz = _frequency_hz_from_header(header)
+        if frequency_hz is not None:
+            notes.append("frequency-from-header")
+
+    return time_key, frequency_hz, notes
+
+
+def _extract_group_metadata_for_discovery(
+    fp: Path,
+    *,
+    filename_convention: DiscoveryFilenameConvention = "image",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
+) -> Tuple[Optional[str], Optional[float], List[str]]:
+    """Dispatch discovery metadata extraction by filename convention and source mode."""
+    if filename_convention == "lst-color":
+        return _extract_group_metadata_lst_color(fp)
+    if group_metadata_source == "filename":
+        return _extract_group_metadata_filename_only(fp)
+    return _extract_group_metadata(fp, time_key_source=time_key_source)
+
+
 def _discovery_frequency_sort_tuple(
-    fp: Path, *, group_metadata_source: Literal["fits", "filename"]
+    fp: Path,
+    *,
+    group_metadata_source: Literal["fits", "filename"],
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> Tuple[float, str]:
     """Sort key for deterministic frequency ordering (header+filename vs filename-only)."""
-    if group_metadata_source == "filename":
-        _, frequency_hz, _ = _extract_group_metadata_filename_only(fp)
-    else:
-        _, frequency_hz, _ = _extract_group_metadata(fp)
+    _, frequency_hz, _ = _extract_group_metadata_for_discovery(
+        fp,
+        filename_convention=filename_convention,
+        group_metadata_source=group_metadata_source,
+    )
     if frequency_hz is None:
         return (float(10**15), fp.name)
     return (float(frequency_hz), fp.name)
@@ -376,6 +439,7 @@ def _canonical_stack_frequency_hz(
     *,
     group_metadata_source: Literal["fits", "filename"],
     time_key_source: Literal["header", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> Optional[float]:
     """Hz label to use when stacking single-channel slices along ``frequency``.
 
@@ -385,13 +449,16 @@ def _canonical_stack_frequency_hz(
     require unique ``frequency`` coordinates, so we prefer the MHz token when
     present, then fall back to the same discovery metadata used for ordering.
     """
-    mhz = _mhz_from_name(fp)
-    if mhz != 10**9:
-        return float(mhz * 1_000_000)
-    if group_metadata_source == "filename":
-        _, hz, _ = _extract_group_metadata_filename_only(fp)
-    else:
-        _, hz, _ = _extract_group_metadata(fp, time_key_source=time_key_source)
+    if filename_convention != "lst-color":
+        mhz = _mhz_from_name(fp)
+        if mhz != 10**9:
+            return float(mhz * 1_000_000)
+    _, hz, _ = _extract_group_metadata_for_discovery(
+        fp,
+        filename_convention=filename_convention,
+        group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
+    )
     return hz
 
 
@@ -401,6 +468,7 @@ def _assign_canonical_frequency_for_stack(
     *,
     group_metadata_source: Literal["fits", "filename"],
     time_key_source: Literal["header", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> xr.Dataset:
     """Replace a length-1 ``frequency`` index with :func:`_canonical_stack_frequency_hz` when known."""
     if "frequency" not in xds.dims or int(xds.sizes.get("frequency", 0)) != 1:
@@ -409,6 +477,7 @@ def _assign_canonical_frequency_for_stack(
         fp,
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
+        filename_convention=filename_convention,
     )
     if hz is None:
         return xds
@@ -421,6 +490,7 @@ def _global_frequency_coord_hz(
     by_time: Dict[str, List[Path]],
     *,
     group_metadata_source: Literal["fits", "filename"],
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> np.ndarray:
     """Union of canonical per-file Hz labels across all time groups (sorted ascending)."""
     hz_vals: set[float] = set()
@@ -430,6 +500,7 @@ def _global_frequency_coord_hz(
                 fp,
                 group_metadata_source=group_metadata_source,
                 time_key_source="filename",
+                filename_convention=filename_convention,
             )
             if hz is not None:
                 hz_vals.add(float(hz))
@@ -1117,6 +1188,7 @@ def _get_fixed_paths(
     fixed_dir: Path,
     *,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> List[Path]:
     """Get paths to fixed FITS files, assuming they already exist.
 
@@ -1140,7 +1212,11 @@ def _get_fixed_paths(
         List of paths to fixed FITS files, sorted by frequency.
     """
     fixed_paths: List[Path] = []
-    sort_key = lambda p: _discovery_frequency_sort_tuple(p, group_metadata_source=group_metadata_source)
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
     for f in sorted(files, key=sort_key):
         if f.name.endswith("_fixed.fits"):
             fixed_paths.append(f)
@@ -1156,6 +1232,7 @@ def fix_fits_headers(
     *,
     skip_existing: bool = True,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> List[Path]:
     """Fix FITS headers for a list of files, creating ``*_fixed.fits`` files.
 
@@ -1207,7 +1284,11 @@ def fix_fits_headers(
     fixed_dir.mkdir(parents=True, exist_ok=True)
     fixed_paths: List[Path] = []
 
-    sort_key = lambda p: _discovery_frequency_sort_tuple(p, group_metadata_source=group_metadata_source)
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
     for f in sorted(files, key=sort_key):
         if f.name.endswith("_fixed.fits"):
             # Already fixed, use as-is
@@ -1608,6 +1689,7 @@ def _load_global_lm_reference_dataset(
     fix_headers_on_demand: bool,
     target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> xr.Dataset:
     """Load the dataset whose LM grid has the largest shape across *all* time steps.
 
@@ -1628,11 +1710,18 @@ def _load_global_lm_reference_dataset(
         # the global reference grid and dramatically reduce temporary disk use.
         if fix_headers_on_demand:
             sort_key = lambda p: _discovery_frequency_sort_tuple(
-                p, group_metadata_source=group_metadata_source
+                p,
+                group_metadata_source=group_metadata_source,
+                filename_convention=filename_convention,
             )
             shape_paths = sorted(files, key=sort_key)
         else:
-            shape_paths = _get_fixed_paths(files, fixed_dir, group_metadata_source=group_metadata_source)
+            shape_paths = _get_fixed_paths(
+                files,
+                fixed_dir,
+                group_metadata_source=group_metadata_source,
+                filename_convention=filename_convention,
+            )
         for fp in shape_paths:
             candidates.append((fp, _peek_lm_shape(fp)))
 
@@ -2393,6 +2482,7 @@ def _discover_groups(
     freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
     time_key_source: Literal["header", "filename"] = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> Dict[str, List[Path]]:
     """Group input FITS by observation time and frequency (filename time stamp, header fallback).
 
@@ -2423,6 +2513,11 @@ def _discover_groups(
         grouping **only** from the basename (no FITS I/O); requires ``-image-`` time and
         ``_NNNMHz_`` / ``_NNNMHz-`` tokens when you need frequency-based bins. ``time_key_source``
         is ignored in ``"filename"`` mode.
+    filename_convention
+        ``"image"`` (default): standard OVRO ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_``
+        basename patterns. ``"lst-color"``: LST color-band products
+        (``Blue_..._YYYYMMDD_LSTNNh_tXXXX.fits``); time from basename, frequency from FITS
+        headers (Blue/Green/Red grouped by header MHz with ``freq_bin_hz``).
 
     Returns
     -------
@@ -2436,12 +2531,16 @@ def _discover_groups(
     by_time: Dict[str, List[Path]] = {}
     by_time_freq: Dict[str, Dict[int, List[Path]]] = {}
     for f in sorted(in_dir.glob("*.fits")):
-        if group_metadata_source == "filename":
-            time_key, frequency_hz, notes = _extract_group_metadata_filename_only(f)
-        else:
-            time_key, frequency_hz, notes = _extract_group_metadata(f, time_key_source=time_key_source)
+        time_key, frequency_hz, notes = _extract_group_metadata_for_discovery(
+            f,
+            filename_convention=filename_convention,
+            group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
+        )
         if time_key is None:
-            if group_metadata_source == "filename":
+            if filename_convention == "lst-color":
+                t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
+            elif group_metadata_source == "filename":
                 t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
             elif time_key_source == "filename":
                 t_hint = "-image-YYYYMMDD_HHMMSS in basename or DATE-OBS"
@@ -2484,7 +2583,12 @@ def _discover_groups(
             if group_metadata_source == "filename":
                 _, rep_hz, _ = _extract_group_metadata_filename_only(candidates[0])
             else:
-                _, rep_hz, _ = _extract_group_metadata(candidates[0], time_key_source=time_key_source)
+                _, rep_hz, _ = _extract_group_metadata_for_discovery(
+                    candidates[0],
+                    filename_convention=filename_convention,
+                    group_metadata_source=group_metadata_source,
+                    time_key_source=time_key_source,
+                )
             resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
             selected = duplicate_resolver(time_key, resolver_hz, candidates.copy())
             if selected not in candidates:
@@ -2515,7 +2619,11 @@ def _discover_groups(
             logger.warning(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
         by_time.setdefault(time_key, []).append(f)
 
-    sort_key = lambda p: _discovery_frequency_sort_tuple(p, group_metadata_source=group_metadata_source)
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
     for time_key, files in by_time.items():
         by_time[time_key] = sorted(files, key=sort_key)
     return by_time
@@ -2529,6 +2637,7 @@ def _combine_time_step(
     fix_headers_on_demand: bool = True,
     lm_reference_ds: Optional[xr.Dataset] = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> Tuple[xr.Dataset, List[float], List[Path]]:
     """Create a single-time dataset by combining frequency slices from subbands.
 
@@ -2558,7 +2667,11 @@ def _combine_time_step(
         newly-created ``*_fixed.fits`` paths for optional cleanup).
     """
     created_fixed_paths: List[Path] = []
-    sort_key = lambda p: _discovery_frequency_sort_tuple(p, group_metadata_source=group_metadata_source)
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
     if fix_headers_on_demand:
         existed_before: Dict[Path, bool] = {}
         for f in sorted(files, key=sort_key):
@@ -2568,7 +2681,11 @@ def _combine_time_step(
             existed_before[candidate] = candidate.exists()
         # Fix headers if needed (skips existing fixed files)
         fixed_paths = fix_fits_headers(
-            files, fixed_dir, skip_existing=True, group_metadata_source=group_metadata_source
+            files,
+            fixed_dir,
+            skip_existing=True,
+            group_metadata_source=group_metadata_source,
+            filename_convention=filename_convention,
         )
         for f in sorted(files, key=sort_key):
             if f.name.endswith("_fixed.fits"):
@@ -2578,14 +2695,22 @@ def _combine_time_step(
                 created_fixed_paths.append(candidate)
     else:
         # Just get the paths to already-fixed files
-        fixed_paths = _get_fixed_paths(files, fixed_dir, group_metadata_source=group_metadata_source)
+        fixed_paths = _get_fixed_paths(
+            files,
+            fixed_dir,
+            group_metadata_source=group_metadata_source,
+            filename_convention=filename_convention,
+        )
 
     xds_list: List[xr.Dataset] = []
     freqs_seen: List[float] = []
     for fp in fixed_paths:
         xds = _load_for_combine(fp, chunk_lm=chunk_lm)
         xds = _assign_canonical_frequency_for_stack(
-            xds, fp, group_metadata_source=group_metadata_source
+            xds,
+            fp,
+            group_metadata_source=group_metadata_source,
+            filename_convention=filename_convention,
         )
         fvals = np.atleast_1d(xds.frequency.values)
         freqs_seen.extend([float(f) for f in fvals])
@@ -3051,6 +3176,7 @@ def convert_fits_dir_to_zarr(
     lm_reference_target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: Literal["header", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
     consolidate_metadata_at_end: bool = True,
 ) -> Path:
     """Convert all matching FITS in a directory into a single LM-only Zarr store.
@@ -3176,6 +3302,7 @@ def convert_fits_dir_to_zarr(
         freq_bin_hz=discovery_freq_bin_hz,
         time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
     )
     if time_keys_only is not None:
         allowed = {str(k) for k in time_keys_only}
@@ -3191,10 +3318,15 @@ def convert_fits_dir_to_zarr(
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
     for k, v in by_time.items():
-        if group_metadata_source == "filename":
-            freqs_hz = [_extract_group_metadata_filename_only(p)[1] for p in v]
-        else:
-            freqs_hz = [_extract_group_metadata(p)[1] for p in v]
+        freqs_hz = [
+            _extract_group_metadata_for_discovery(
+                p,
+                filename_convention=filename_convention,
+                group_metadata_source=group_metadata_source,
+                time_key_source=time_key_source,
+            )[1]
+            for p in v
+        ]
         logger.info(f"  time {k}: {len(v)} file(s), frequencies (Hz): {freqs_hz}")
 
     if not by_time:
@@ -3229,6 +3361,7 @@ def convert_fits_dir_to_zarr(
         freq_coord_hz = _global_frequency_coord_hz(
             by_time_for_global_freq,
             group_metadata_source=group_metadata_source,
+            filename_convention=filename_convention,
         )
         logger.info(
             "Built global frequency axis: %d channel(s), %.3f–%.3f MHz",
@@ -3250,6 +3383,7 @@ def convert_fits_dir_to_zarr(
             fix_headers_on_demand=fix_headers_on_demand,
             target_size=lm_reference_target_size,
             group_metadata_source=group_metadata_source,
+            filename_convention=filename_convention,
         )
     lm_reference = (lm_ref_ds["l"].values.copy(), lm_ref_ds["m"].values.copy())
 
@@ -3268,6 +3402,7 @@ def convert_fits_dir_to_zarr(
             fix_headers_on_demand=fix_headers_on_demand,
             lm_reference_ds=lm_ref_ds,
             group_metadata_source=group_metadata_source,
+            filename_convention=filename_convention,
         )
         xds_t = _align_time_step_to_frequency_grid(xds_t, freq_coord_hz)
         logger.info(f"  combined dims: {dict(xds_t.sizes)}")
