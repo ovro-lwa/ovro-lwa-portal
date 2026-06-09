@@ -1,0 +1,7 @@
+{
+  "ServerApp": {
+    "jpserver_extensions": {
+      "ovro_lwa_portal.viz.hips_server": true
+    }
+  }
+}

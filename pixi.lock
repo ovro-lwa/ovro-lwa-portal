@@ -6578,8 +6578,8 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev64
-  sha256: 0f1f7672c4f99eb1dd4cd6c73fe824e7d6f5d60e03248f23acb09511d1a52324
+  version: 0.1.1.dev66
+  sha256: d21e7ac570bd7fcf58b2a80dc771bb780ed6d9d95bec02bc37f3cae413ad5f1a
   requires_dist:
   - astropy>=7.1.0,<8
   - dask>=2025.9.1,<2026

@@ -99,6 +99,9 @@ local_scheme = "no-local-version"
 [tool.hatch.build.targets.sdist]
 exclude = ["/tests"]
 
+[tool.hatch.build.targets.wheel.shared-data]
+"jupyter-config/jupyter_server_config.d" = "etc/jupyter/jupyter_server_config.d"
+
 [tool.pytest.ini_options]
 # Prefer the in-repo package under src/ so tests do not pick up a stale
 # site-packages install when running from a git checkout (requires pytest>=7).
