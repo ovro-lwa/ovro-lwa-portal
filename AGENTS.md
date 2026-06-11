@@ -286,7 +286,8 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 │       │   └── prefect_workflow.py  # Optional Prefect workflow orchestration
 │       └── viz/               # Panel QA apps, SkyWidget integration
 │           ├── pipeline_qa.py      # FITS→Zarr QA pipeline, load_qa_datasets
-│           └── pipeline_qa_app.py  # Jupyter UI; bind_sky_widget_dataset, WCS patch
+│           ├── pipeline_qa_app.py  # Jupyter UI; bind_sky_widget_dataset, WCS patch
+│           └── source_review.py    # Pure Center-button controller (plan_center_action)
 └── tests/                      # Test suite
     ├── __init__.py            # Test package initialization
     ├── test_import.py         # Basic import tests
@@ -295,6 +296,7 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
     ├── ingest/                # Ingest module tests
     │   └── test_cli.py        # CLI integration tests
     └── viz/                   # Viz / pipeline QA tests
+        └── test_source_review.py  # Center-button controller (plan_center_action) tests
 ```
 
 ## Ingest Module Overview
@@ -345,87 +347,90 @@ capabilities:
 
 OVRO-LWA snapshot ingest stores **one FITS WCS header per time step**. The
 zenith-tracking geometry means **`CRVAL1` and `CRVAL2` change with time**—that
-is expected science, not a ingest bug. Any code that maps pixels, tracks sources,
-or draws a sky view **must use the WCS for the active `time_idx`**, not a single
-header from time 0 or from static dataset attrs.
+is expected science, not a ingest bug. Any code that maps pixels, tracks
+sources, or draws a sky view **must use the WCS for the active `time_idx`**, not
+a single header from time 0 or from static dataset attrs.
 
 ### How WCS is written (ingest)
 
 - **Header fix** (`fits_to_zarr_xradio.py`, `_fix_headers`): per input FITS,
   **preserves native `CRVAL1`/`CRVAL2`** (and `LATPOLE` when present). Also
-  applies BSCALE/BZERO, Stokes-axis promotion, and spectral/frame keywords.
-  **Do not** overwrite the phase center from filename timestamps.
+  applies BSCALE/BZERO, Stokes-axis promotion, and spectral/frame keywords. **Do
+  not** overwrite the phase center from filename timestamps.
 - **Combine** (`_load_for_combine`, `_combine_time_step`): each time step gets
-  its own header string from the fixed FITS WCS; `_collapse_wcs_header_str_variable`
-  reduces auxiliary frequency dimensions so the persisted variable is
-  **`wcs_header_str(time)`** (or `(time, frequency)` with one channel—see accessor
-  handling). Regrid uses the reference LM pixel grid but keeps each source's
-  native `CRVAL1`/`CRVAL2` (`_wcs_header_from_ref_grid_and_source_crval`).
+  its own header string from the fixed FITS WCS;
+  `_collapse_wcs_header_str_variable` reduces auxiliary frequency dimensions so
+  the persisted variable is **`wcs_header_str(time)`** (or `(time, frequency)`
+  with one channel—see accessor handling). Regrid uses the reference LM pixel
+  grid but keeps each source's native `CRVAL1`/`CRVAL2`
+  (`_wcs_header_from_ref_grid_and_source_crval`).
 - **Zarr append** (`_align_time_dimension_for_zarr_write`): scalar metadata is
   promoted to `(time,)` so incremental appends stay consistent.
 - **Do not** assume all slices share one phase center.
 
 #### Filename timestamps vs WCS (do not confuse)
 
-| Use of basename `-image-YYYYMMDD_HHMMSS` | Allowed? |
-| --- | --- |
-| Discovery, grouping, time ordering (`_time_key_from_filename`, `_discover_groups`) | **Yes** |
-| Overwriting `CRVAL1`/`CRVAL2` with FK5 zenith at that instant | **No** |
+| Use of basename `-image-YYYYMMDD_HHMMSS`                                           | Allowed? |
+| ---------------------------------------------------------------------------------- | -------- |
+| Discovery, grouping, time ordering (`_time_key_from_filename`, `_discover_groups`) | **Yes**  |
+| Overwriting `CRVAL1`/`CRVAL2` with FK5 zenith at that instant                      | **No**   |
 
 The FITS header `CRVAL1`/`CRVAL2` are **authoritative** for each integration's
-phase center. Filename time tokens are for **sorting files into time bins only**—not
-for recomputing celestial reference values.
+phase center. Filename time tokens are for **sorting files into time bins
+only**—not for recomputing celestial reference values.
 
 Per-time `wcs_header_str` drift in a Zarr store should match the native FITS
-headers written through `_fix_headers`, not a recomputed zenith from the basename.
-`_zenith_fk5_crvals_deg()` remains in the codebase for **audit diagnostics only**
-(`scripts/audit_zarr_wcs_timeline.py --sample-fits`); it is **not** called during
-convert.
+headers written through `_fix_headers`, not a recomputed zenith from the
+basename. `_zenith_fk5_crvals_deg()` remains in the codebase for **audit
+diagnostics only** (`scripts/audit_zarr_wcs_timeline.py --sample-fits`); it is
+**not** called during convert.
 
 **If you change `_fix_headers`:** extend
 `tests/test_fits_to_zarr.py::test_fix_headers_preserves_crval_from_input_not_filename`
-and keep filename parsing tests in `tests/ingest/test_metadata_audit.py` separate
-from WCS stamping.
+and keep filename parsing tests in `tests/ingest/test_metadata_audit.py`
+separate from WCS stamping.
 
 #### Canonical Zarr metadata (do not regress)
 
 When **`wcs_header_str`** is a data variable, it is the **only** persisted
 celestial WCS for multi-time stores:
 
-| Storage | Allowed? | Notes |
-| --- | --- | --- |
-| `wcs_header_str(time)` (or `(time, frequency)` collapsed to time) | **Yes** | One FITS header string per time step; updates on every append. |
+| Storage                                                                  | Allowed?                  | Notes                                                                                                                                                                               |
+| ------------------------------------------------------------------------ | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wcs_header_str(time)` (or `(time, frequency)` collapsed to time)        | **Yes**                   | One FITS header string per time step; updates on every append.                                                                                                                      |
 | `fits_wcs_header` on `ds.attrs`, `SKY.attrs`, other data vars, or coords | **No** on Zarr write/open | Zarr array attrs are **not** per-slice; a single `SKY.attrs["fits_wcs_header"]` freezes **time-0** CRVAL and breaks SkyWidget or any code that reads attrs before `wcs_header_str`. |
 
 **Enforcement (already in the library — keep these calls when touching I/O):**
 
-- **Before every Zarr write/append:** `fits_to_zarr_xradio._write_or_append_zarr`
-  calls `strip_redundant_fits_wcs_header_attrs()` so incremental ingest (e.g.
-  `scripts/ingest-I-Clean-Snapshot-20250120-LST4-5.sh` → `ingest_per_time_convert.py`)
-  does not persist stale attrs.
-- **On load:** `open_dataset()` applies the same strip so legacy stores remain safe
-  in memory without re-ingest.
+- **Before every Zarr write/append:**
+  `fits_to_zarr_xradio._write_or_append_zarr` calls
+  `strip_redundant_fits_wcs_header_attrs()` so incremental ingest (e.g.
+  `scripts/ingest-I-Clean-Snapshot-20250120-LST4-5.sh` →
+  `ingest_per_time_convert.py`) does not persist stale attrs.
+- **On load:** `open_dataset()` applies the same strip so legacy stores remain
+  safe in memory without re-ingest.
 
-`_load_for_combine` may still set `fits_wcs_header` **in memory** for combine/regrid;
-that is internal only. **Never** rely on those attrs after Zarr export—always
-`wcs_header_str` + `_read_wcs_header_str(ds, time_idx=…)`.
+`_load_for_combine` may still set `fits_wcs_header` **in memory** for
+combine/regrid; that is internal only. **Never** rely on those attrs after Zarr
+export—always `wcs_header_str` + `_read_wcs_header_str(ds, time_idx=…)`.
 
 **If you change ingest or I/O:** extend
 `tests/test_fits_to_zarr.py::test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present`
-and `tests/test_io_integration.py::test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str`.
+and
+`tests/test_io_integration.py::test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str`.
 Do **not** re-add `fits_wcs_header` to Zarr `.zattrs` for QA/review paths.
 
 ### How WCS is read (accessor)
 
 Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 
-| Function | Role |
-| --- | --- |
-| `_has_per_time_wcs_header_str(ds)` | True when `wcs_header_str` is indexed by `time` (1-D or `(time, frequency)`) |
-| `_read_wcs_header_str(ds, time_idx=…)` | FITS header string for one time index |
+| Function                                    | Role                                                                                                           |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `_has_per_time_wcs_header_str(ds)`          | True when `wcs_header_str` is indexed by `time` (1-D or `(time, frequency)`)                                   |
+| `_read_wcs_header_str(ds, time_idx=…)`      | FITS header string for one time index                                                                          |
 | `strip_redundant_fits_wcs_header_attrs(ds)` | Drop static `fits_wcs_header` attrs when `wcs_header_str` is canonical (used by `open_dataset` and Zarr write) |
-| `RadportAccessor._get_wcs(time_idx=…)` | Astropy WCS for pixel↔sky mapping |
-| `pixel_to_coords` / `coords_to_pixel` | Must pass `time_idx` when per-time WCS exists |
+| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                              |
+| `pixel_to_coords` / `coords_to_pixel`       | Must pass `time_idx` when per-time WCS exists                                                                  |
 
 **Strict rules (do not break these):**
 
@@ -435,39 +440,46 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 2. If a per-time header entry is **empty**, return `None`—**do not** fall back
    to time-0 or static attrs (that mis-registers late slices and freezes
    `CRVAL1`).
-3. Tests live in `tests/test_accessor.py` (`TestRadportGetWcsTimePromotedHeader`);
-   extend them when changing WCS lookup.
-4. Load multi-time QA/review data with **`ovro_lwa_portal.open_dataset`** (not raw
-   `xr.open_zarr` alone) so stale on-disk `fits_wcs_header` attrs are stripped.
-5. For review notebooks (`jupiter_flux_review.ipynb`, `source_review.ipynb`), prefer
-   `open_dataset(path, chunks="auto").chunk({"l": 512, "m": 512})`. Avoid an extra
-   `ds.chunk({"time": 1, …})` under an active distributed Dask `Client` on large
-   incremental stores (unnecessary rechunk/shuffle); Jupiter-style review works
-   without a `Client` for SkyWidget + tracked extractions.
+3. Tests live in `tests/test_accessor.py`
+   (`TestRadportGetWcsTimePromotedHeader`); extend them when changing WCS
+   lookup.
+4. Load multi-time QA/review data with **`ovro_lwa_portal.open_dataset`** (not
+   raw `xr.open_zarr` alone) so stale on-disk `fits_wcs_header` attrs are
+   stripped.
+5. For review notebooks (`jupiter_flux_review.ipynb`, `source_review.ipynb`),
+   prefer `open_dataset(path, chunks="auto").chunk({"l": 512, "m": 512})`. Avoid
+   an extra `ds.chunk({"time": 1, …})` under an active distributed Dask `Client`
+   on large incremental stores (unnecessary rechunk/shuffle); Jupiter-style
+   review works without a `Client` for SkyWidget + tracked extractions.
 
 ### Fixed-sky source tracking (`dynamic_spectrum`, `patch_*`, `light_curve`)
 
-LPT and transient review pass **catalog (RA, Dec)** to `dataset.radport.dynamic_spectrum(ra=…, dec=…)`.
-That is **not** the same as fixed **(l, m)** on the image grid: as per-time `CRVAL`
-moves each integration, the same celestial source sits on **different pixels** each
-time.
+LPT and transient review pass **catalog (RA, Dec)** to
+`dataset.radport.dynamic_spectrum(ra=…, dec=…)`. That is **not** the same as
+fixed **(l, m)** on the image grid: as per-time `CRVAL` moves each integration,
+the same celestial source sits on **different pixels** each time.
 
 **Required behavior:**
 
-- `_compute_pixel_track` / `coords_to_pixel` must call **`_coords_to_pixel_via_wcs` with the
-  slice `time_idx`** when `_has_per_time_wcs_header_str(ds)` is true.
-- **Do not** use the analytical LST+SIN fallback for multi-time incremental Zarr (it ignores
-  per-slice `CRVAL` and makes heatmaps look like the source drifts in RA).
-- **Do not** use the batched `right_ascension`/`declination` grid path when only per-time
-  `wcs_header_str` is available and RA/Dec coords lack a `time` dimension.
+- `_compute_pixel_track` / `coords_to_pixel` must call
+  **`_coords_to_pixel_via_wcs` with the slice `time_idx`** when
+  `_has_per_time_wcs_header_str(ds)` is true.
+- **Do not** use the analytical LST+SIN fallback for multi-time incremental Zarr
+  (it ignores per-slice `CRVAL` and makes heatmaps look like the source drifts
+  in RA).
+- **Do not** use the batched `right_ascension`/`declination` grid path when only
+  per-time `wcs_header_str` is available and RA/Dec coords lack a `time`
+  dimension.
 - If per-time WCS is missing for a step, raise—do not fall back to time-0 attrs.
 
-Regression test: `TestCelestialTimeSeriesTracking::test_radec_track_uses_per_time_wcs_not_fixed_pixel`.
+Regression test:
+`TestCelestialTimeSeriesTracking::test_radec_track_uses_per_time_wcs_not_fixed_pixel`.
 
-**UI note:** Status text in `source_review.ipynb` shows **catalog** RA/Dec (constant).
-`pixel_to_coords` must use the **same per-time WCS** as `coords_to_pixel` (not time-0 header +
-analytical SIN); otherwise reported RA drifts by ~0.5° while the dynamic spectrum is correct.
-`patch_fit` peak RA/Dec maps pixels through `pixel_to_coords`—fix both together.
+**UI note:** Status text in `source_review.ipynb` shows **catalog** RA/Dec
+(constant). `pixel_to_coords` must use the **same per-time WCS** as
+`coords_to_pixel` (not time-0 header + analytical SIN); otherwise reported RA
+drifts by ~0.5° while the dynamic spectrum is correct. `patch_fit` peak RA/Dec
+maps pixels through `pixel_to_coords`—fix both together.
 
 ### How WCS is shown (SkyWidget / viz)
 
@@ -476,35 +488,192 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
 1. **Patch astrowidget once** at import: `_patch_astrowidget_get_wcs()` routes
    `astrowidget.wcs.get_wcs` through `_read_wcs_header_str` so the widget’s
    `crval`/`cdelt`/`crpix` traits match each slice.
-2. **Load the cube** with `bind_sky_widget_dataset(widget, ds, max_size=…)` (defer
-   first frame) or `set_dataset(..., defer_display=True)` after
-   `_patch_astrowidget_get_wcs()`. `source_review.ipynb` uses `bind_sky_widget_dataset`;
-   call `update_slice` immediately so the first frame is not zenith at t=0.
-3. **Update slices through** `widget.update_slice(time_idx, freq_idx, center=…)`.
-   Astrowidget refreshes slice WCS when `time_idx` changes (`_update_display_wcs`
-   → patched `get_wcs`). When `center=` is set (catalog/LPT), astrowidget must
+2. **Load the cube** with `bind_sky_widget_dataset(widget, ds, max_size=…)`
+   (defer first frame) or `set_dataset(..., defer_display=True)` after
+   `_patch_astrowidget_get_wcs()`. `source_review.ipynb` uses
+   `bind_sky_widget_dataset`; call `update_slice` immediately so the first frame
+   is not zenith at t=0.
+3. **Update slices through**
+   `widget.update_slice(time_idx, freq_idx, center=…)`. Astrowidget refreshes
+   slice WCS when `time_idx` changes (`_update_display_wcs` → patched
+   `get_wcs`). When `center=` is set (catalog/LPT), astrowidget must
    **reproject** onto a shader grid at the view center even if the header passes
-   `wcs_projection_matches_naive_shader`—otherwise per-time `CRVAL` drifts in the
-   traits while `view_ra` stays fixed and the source appears to move in RA.
+   `wcs_projection_matches_naive_shader`—otherwise per-time `CRVAL` drifts in
+   the traits while `view_ra` stays fixed and the source appears to move in RA.
 4. **View center vs phase center**:
-   - **Zenith QA** (`pipeline_qa_app`): recenter with `sky_view_center(dataset, time_idx)`
-     (CRVAL from per-time WCS) on time changes.
+   - **Zenith QA** (`pipeline_qa_app`): recenter with
+     `sky_view_center(dataset, time_idx)` (CRVAL from per-time WCS) on time
+     changes.
    - **Catalog / LPT review** (`notebooks/source_review.ipynb`): fixed catalog
      `center=` (like Jupiter’s fixed t₀ ephemeris), with `update_slice` on every
      heatmap click so image and WCS traits match that `time_idx`.
 5. After slice updates in Jupyter, call `widget.send_state()` when available
    (see `_notify_sky_widget` in pipeline QA).
-6. **Do not transpose** the slice sent to SkyWidget: `astrowidget.PreloadedCube.image()`
-   must stay in ``(l, m)`` order to match the WCS/shader (transposing to ``(m, l)``
-   makes a fixed catalog target appear to drift in RA as ``CRVAL`` changes).
-   The editable package is `../astrowidget` via Pixi feature `astrowidget-local`.
-7. **Image axis order**: ``PreloadedCube.image()`` must return ``(l, m)`` (not transposed).
-   A transposed slice makes catalog ``center=`` look wrong while ``tracked@slice`` in
-   the status line stays correct. Restart the Jupyter kernel after updating the
-   editable ``../astrowidget`` package.
+6. **Do not transpose** the slice sent to SkyWidget:
+   `astrowidget.PreloadedCube.image()` must stay in `(l, m)` order to match the
+   WCS/shader (transposing to `(m, l)` makes a fixed catalog target appear to
+   drift in RA as `CRVAL` changes). The editable package is `../astrowidget` via
+   Pixi feature `astrowidget-local`.
+7. **Image axis order**: `PreloadedCube.image()` must return `(l, m)` (not
+   transposed). A transposed slice makes catalog `center=` look wrong while
+   `tracked@slice` in the status line stays correct. Restart the Jupyter kernel
+   after updating the editable `../astrowidget` package.
 
 Data loading for QA apps follows `viz/pipeline_qa.py` → `load_qa_datasets()` →
 `ovro_lwa_portal.open_dataset(zarr_path, chunks={…})`.
+
+### `source_review.ipynb` coordinate UI and SkyWidget actions
+
+Reference: `SourceReview` in `notebooks/source_review.ipynb`. The **Center**
+button's decision logic is a pure function — `plan_center_action` in
+`src/ovro_lwa_portal/viz/source_review.py`, tested in
+`tests/viz/test_source_review.py`. Keep decisions there, not inline in the
+notebook: the UI cannot be exercised headlessly, and several "Center recenters
+on the wrong position" bugs were only pinned down once the decision became a
+testable function. When changing Center semantics, change `plan_center_action` +
+its tests first, then the notebook call site.
+
+**Coordinate field (`pn.widgets.AutocompleteInput`):**
+
+- Typing / tab completion / dropdown pick **log** RA/Dec only
+  (`_log_coordinate_resolution`); they do **not** load Zarr or build a heatmap.
+- **Center** — resolves the field, computes a `CenterPlan`, then
+  `widget.goto(field_coord, fov=SKY_FOV_DEG)`. **Never clear an existing overlay
+  on Center** — reproject it onto the field coordinate instead
+  (`update_slice(center=field_coord)`). Users click a source in the overlay, hit
+  Center, and expect to see the _same source_ centered; clearing reads as data
+  loss. If the field no longer matches the generated heatmap target, reset the
+  heatmap to a **zeros grid** (`_reset_heatmap_to_zeros`) — do not hide the
+  heatmap pane (`object = None`), it must stay clickable.
+- **Generate heatmap** — resolves the field, then `_load_heatmap()`; sets
+  `_heatmap_coord` (the target the _computed_ spectrum belongs to, distinct from
+  `_coord`, the current overlay center).
+- **Sky click** — observe `SkyWidget.click_tick`; read `clicked_coord`, format
+  with `format_icrs_degree_pair` (`ovro_lwa_portal.name_resolution`), fill the
+  field via `_set_coordinate_field_from_text`. Schedule on the Panel UI thread
+  with `_run_on_main_thread` from `viz.pipeline_qa_app` (not
+  `_schedule_ipython_main` alone).
+
+**Always-on heatmap grid and overlay toggle:**
+
+- A clickable **zeros heatmap** spanning the full Zarr `time × frequency` shape
+  is shown as soon as the store opens (`_ensure_heatmap_grid`); Generate
+  replaces the zeros in place. No notebook action may leave
+  `_heatmap_pane.object = None` — rebuild a zeros grid instead.
+- **Heatmap cell click** loads that Zarr slice as the overlay and **turns the
+  overlay on** (`_set_overlay_toggle_display(True)`), even if the user toggled
+  it off. It must **preserve pan/zoom**: call `update_slice(view_lock=True)`
+  with **no `center` and no `fov`** (`_update_sky(..., preserve_view=True)`).
+  Passing `fov=` on every slice change resets the user's zoom and reads as the
+  view "jumping".
+- **Overlay toggle off** calls `widget.clear_image()`; the JS side must clear
+  the GPU texture (`clearImageTexture()` uploads a 1×1 transparent texture),
+  otherwise the stale overlay keeps rendering even though Python state says it
+  is gone.
+- When syncing a `pn.widgets.Toggle` programmatically, set `.value` under a
+  suppress flag (`_suppress_overlay_toggle`) checked at the top of the watcher —
+  same pattern as the coordinate field below; `discard_events` would break
+  browser sync.
+- Long operations (overlay slice loads, heatmap computation) must log start
+  _and_ finish to the activity log (`_update_sky(..., log_loading=True)`); a
+  silent multi-second load reads as a dead UI.
+
+**Panel widget updates from sky clicks and io-loop callbacks:**
+
+- Do **not** wrap `AutocompleteInput` value updates in
+  `param.parameterized.discard_events` when the browser must show the new text —
+  that suppresses Param events and the field stays blank while the activity log
+  still updates. Use a `_suppress_coord_value_handler` flag to skip duplicate
+  resolution logging on programmatic writes instead.
+- `_log()` already calls `_push_panel_layout`; sky-click field writes do not
+  need a separate push if they go through `_set_coordinate_field_from_text`
+  after `_run_on_main_thread`.
+- **Any Bokeh figure built from an io-loop callback** (e.g.
+  `_ensure_heatmap_grid` from `_finish_open`) must be followed by
+  `_push_panel_layout(...)` — there is no live Bokeh doc context, so without the
+  push the tap handler is never wired and clicks silently go nowhere.
+  Status-pane updates from watchers also need a push to be visible.
+
+**Testing the controller:** compare numpy-derived booleans with
+`bool(...) is True`, not `np.bool_ is True` (`assert np.True_ is True` fails).
+Run `pixi run python -m pytest tests/viz/test_source_review.py` after any
+Center-semantics change.
+
+### astrowidget HiPS + WebGL overlay sync (editable `../astrowidget`)
+
+The default Pixi env uses **`astrowidget-local`** (`../astrowidget`, editable).
+After JS changes: `cd ../astrowidget && pixi run build`, then **restart the
+Jupyter kernel**.
+
+Layout: Aladin HiPS (`z-index: 0`) under a transparent WebGL canvas
+(`z-index: 1`). Pan/zoom on the canvas must keep both layers on the same
+celestial view.
+
+**Python-driven view** (`goto`, `update_slice(..., center=, fov=)`):
+
+1. Traits `view_ra` / `view_dec` / `view_fov` update in Python.
+2. JS `onPythonViewChange` (only when `userInteracting` is false):
+   `applyViewFromModel()` → `syncAladin()` → `scheduleDraw()` (deferred
+   `requestAnimationFrame`, not synchronous `draw()`). `change:image_revision`
+   uses the same deferred draw and calls `applyViewFromModel()` directly (not
+   `syncView`, which skips during `userInteracting`) so
+   `update_slice(..., center=)` cannot paint the new view center before
+   `image_data`/`crval` sync — that mismatch projected zenith data onto the
+   wrong sky (e.g. southern hemisphere).
+3. **Do not** call `syncViewFromAladin()` inside `updateViewPlaneScales()`
+   before `syncAladin()` runs. That reads the **stale** HiPS center and reverts
+   the overlay before Python’s target is applied (breaks **Slew** and makes the
+   field appear not to move).
+
+**User drag / wheel on the canvas:**
+
+- While `userInteracting` is true, ignore trait `change:view_*` echo (would
+  redraw with stale Aladin scales mid-gesture).
+- On pan/zoom end, `finishViewGesture()`: `syncViewFromAladin()` →
+  `syncAladin()` → `draw()`.
+- Pan uses Aladin WASM `goFromTo` when available; refresh
+  `measureViewPlaneScales` each drag frame with current `viewRotation`
+  (`-aladin.getRotation()`).
+
+**Projection / overlay appearance:**
+
+- `measureViewPlaneScales` must pass **rotation-aware** scales (inverse-rotate
+  measured `l,m` into the view plane) so overlay and HiPS stay registered when
+  north is not up.
+- With a HiPS background, use **measured** scales from `pix2world` directly; cap
+  zoom-out with `maxSinViewFov(aspect)` so SIN view-disk corners stay inside
+  `r ≤ 1`.
+- Crosshair after sky click: fixed **screen-space** size via
+  `celestialToScreen`, not angular FOV scaling.
+- `update_slice(..., center=catalog)` reprojects so shader `crval` matches the
+  catalog view; **panning** moves `view_ra/dec` away from that `crval`. A curved
+  clip at the view edge is expected after large pans; do not re-add the shader
+  “horizon circle” overlay (it drew a second great circle and looked like a
+  wedge intersection).
+- **SIN two-to-one ambiguity:** `reproject_for_shader_display` must mask output
+  pixels whose world coordinate is ≥ 90° from the source tangent point
+  (`cos_sep ≤ 0 → NaN`). Without the mask, `all_world2pix` maps far-hemisphere
+  world points back onto valid source pixels and real data appears mirrored near
+  the opposite celestial pole when zooming out from an empty field. Regression
+  tests: `test_reproject_rejects_far_hemisphere_mirror_ghost`,
+  `test_reproject_masks_southern_ghost_for_northern_snapshot` in
+  `../astrowidget/tests/test_wcs_shader_reproject.py`.
+
+**View-locked overlay (HiPS pan/zoom):**
+
+- `overlay_view_lock=True` + `view_gesture_revision` (incremented by JS
+  `finishViewGesture`) drive a **debounced** Python-side reproject of the
+  current slice onto the new view center.
+- `update_slice(view_lock=True)` with no `center` reprojects to the current
+  `view_ra`/`view_dec` — this is the path that preserves user pan/zoom across
+  time/frequency changes. An explicit `center=` always overrides view lock.
+- Python `clear_image()` empties `image_data`/`image_shape` and bumps
+  `image_revision`; JS `syncImage()` must detect the empty payload and call
+  `clearImageTexture()` (1×1 transparent texture). A Python-side clear without
+  the GPU clear leaves a stale overlay on screen.
+- `clicked_coord_debug` carries both the Aladin `pix2world` and WebGL
+  `screenToRaDec` results for the same click — use it to localize
+  click-coordinate bugs to one projection layer.
 
 ### Verification and debugging
 
@@ -684,28 +853,30 @@ Then run `pixi install`.
 
 ### Issue: LPT heatmap / dynamic spectrum looks like RA drifts in time
 
-**Symptoms:** Catalog source should be fixed on the sky, but the time–frequency map changes as
-if the wrong pixel were sampled; `patch_fit` peak RA may wander.
+**Symptoms:** Catalog source should be fixed on the sky, but the time–frequency
+map changes as if the wrong pixel were sampled; `patch_fit` peak RA may wander.
 
-**Cause:** `coords_to_pixel` / `_compute_pixel_track` used the **LST+SIN analytical path** or
-a **static** `fits_wcs_header` while the Zarr has **per-time** `wcs_header_str` with drifting
-`CRVAL1`.
+**Cause:** `coords_to_pixel` / `_compute_pixel_track` used the **LST+SIN
+analytical path** or a **static** `fits_wcs_header` while the Zarr has
+**per-time** `wcs_header_str` with drifting `CRVAL1`.
 
-**Solution:** Ensure `_has_per_time_wcs_header_str` is true for the store and use current
-`accessor.py` (WCS `world2pix` per `time_idx`). Re-run heatmap after upgrading. See
-**Fixed-sky source tracking** under Per-Time WCS and CRVAL.
+**Solution:** Ensure `_has_per_time_wcs_header_str` is true for the store and
+use current `accessor.py` (WCS `world2pix` per `time_idx`). Re-run heatmap after
+upgrading. See **Fixed-sky source tracking** under Per-Time WCS and CRVAL.
 
 ### Issue: Catalog source drifts in RA in SkyWidget when changing time
 
-**Symptoms:** Heatmap and `tracked@slice` are stable, but the sky image or coordinate
-grid makes a fixed catalog target slide in RA as `time_idx` advances.
+**Symptoms:** Heatmap and `tracked@slice` are stable, but the sky image or
+coordinate grid makes a fixed catalog target slide in RA as `time_idx` advances.
 
-**Cause:** `update_slice(..., center=catalog)` fixed `view_ra`/`view_dec` but skipped
-`reproject_for_shader_display` because the OVRO header matched the naive SIN shader;
-widget `crval` traits still followed per-time `CRVAL1` from `wcs_header_str`.
+**Cause:** `update_slice(..., center=catalog)` fixed `view_ra`/`view_dec` but
+skipped `reproject_for_shader_display` because the OVRO header matched the naive
+SIN shader; widget `crval` traits still followed per-time `CRVAL1` from
+`wcs_header_str`.
 
-**Solution:** Use editable `../astrowidget` with `_push_image_frame` reprojecting when
-`center` is not `None`. Restart the Jupyter kernel after upgrading astrowidget.
+**Solution:** Use editable `../astrowidget` with `_push_image_frame`
+reprojecting when `center` is not `None`. Restart the Jupyter kernel after
+upgrading astrowidget.
 
 ### Issue: SkyWidget RA/Dec grid does not update when changing time
 
@@ -717,13 +888,13 @@ does not.
 
 - `set_dataset()` called **without** `defer_display=True` before the first
   `update_slice()`.
-- `astrowidget.wcs.get_wcs` used **without** `_patch_astrowidget_get_wcs()` (falls
-  back to static `fits_wcs_header` from time 0).
-- **Stale Zarr attrs:** `SKY.attrs["fits_wcs_header"]` or `ds.attrs["fits_wcs_header"]`
-  left from incremental ingest (time-0 only) and read by unpatched code. Fix:
-  use `open_dataset()` / `strip_redundant_fits_wcs_header_attrs`, ensure
-  `_write_or_append_zarr` still strips before write; restart kernel after
-  astrowidget edits.
+- `astrowidget.wcs.get_wcs` used **without** `_patch_astrowidget_get_wcs()`
+  (falls back to static `fits_wcs_header` from time 0).
+- **Stale Zarr attrs:** `SKY.attrs["fits_wcs_header"]` or
+  `ds.attrs["fits_wcs_header"]` left from incremental ingest (time-0 only) and
+  read by unpatched code. Fix: use `open_dataset()` /
+  `strip_redundant_fits_wcs_header_attrs`, ensure `_write_or_append_zarr` still
+  strips before write; restart kernel after astrowidget edits.
 - `_read_wcs_header_str` or viz code ignores `time_idx`, or falls back to static
   attrs when a per-time header is empty.
 - `wcs_header_str` stored as `(time, frequency)` but code only handles 1-D
@@ -743,8 +914,113 @@ share the same `CRVAL2`.
 `-image-YYYYMMDD_HHMMSS` in the basename (filename is for grouping only).
 
 **Solution:** Re-ingest with current `fits_to_zarr_xradio` (native CRVAL
-preserved) or repair WCS rows from FITS via `ovro-ingest repair --fits-dir`.
-Do **not** reintroduce filename-based zenith stamping in `_fix_headers`.
+preserved) or repair WCS rows from FITS via `ovro-ingest repair --fits-dir`. Do
+**not** reintroduce filename-based zenith stamping in `_fix_headers`.
+
+### Issue: Sky click logs coordinates but Coordinate field stays empty
+
+**Symptoms:** Activity log shows `Sky click → 'RA, Dec'`; AutocompleteInput does
+not update.
+
+**Cause:** `_set_coordinate_field_from_text` used
+`param.parameterized.discard_events` on `_coord_input`, which suppresses
+Param/Bokeh sync to the browser.
+
+**Solution:** Update `value` / `value_input` without `discard_events`; use
+`_suppress_coord_value_handler` to avoid duplicate resolution logs. Schedule the
+update with `_run_on_main_thread`, not `_schedule_ipython_main` alone.
+
+### Issue: Heatmap clicks do nothing / toggle shows no feedback
+
+**Symptoms:** The zeros heatmap renders but clicking cells produces no log entry
+or overlay; the Overlay toggle flips visually but nothing else changes.
+
+**Cause:** The Bokeh figure (or status pane) was set from an io-loop callback
+(e.g. `_ensure_heatmap_grid` from `_finish_open`) without `_push_panel_layout`.
+With no live Bokeh doc context, the tap handler never gets wired to the comm, so
+clicks never reach Python.
+
+**Solution:** Always call `_push_panel_layout(...)` after assigning
+`_heatmap_pane.object` or updating panes from callbacks/watchers (see
+`_ensure_heatmap_grid`, `_on_overlay_toggle`).
+
+### Issue: Center clears the overlay or makes the heatmap disappear
+
+**Symptoms:** Click a source in the overlay, press **Center** — the overlay
+vanishes; or pressing Center wipes the (zeros) heatmap so there is nothing left
+to click.
+
+**Cause:** Old Center logic cleared the overlay when the field coordinate was
+far from the heatmap target, and set `_heatmap_pane.object = None`. Both read as
+data loss; the zeros grid is the entry point for loading slices, so hiding it
+dead-ends the workflow.
+
+**Solution:** Center **always keeps and reprojects** the overlay onto the field
+coordinate (`plan_center_action` returns `overlay_center=field_coord` whenever
+`has_overlay`), and resets the heatmap to a zeros grid
+(`_reset_heatmap_to_zeros`) instead of hiding it. Note the Python
+`clear_image()` → JS `clearImageTexture()` pairing: without the GPU texture
+clear, a "cleared" overlay keeps rendering at its old position, which presented
+as "overlay shows the wrong position" after Center.
+
+### Issue: Zoom/FOV resets when changing time/frequency via heatmap click
+
+**Symptoms:** User zooms in, clicks another heatmap cell, and the view jumps
+back to the default FOV or recenters.
+
+**Cause:** `_update_sky` passed `center=` and/or `fov=` on every slice change.
+
+**Solution:** Heatmap taps use `_update_sky(..., preserve_view=True)` →
+`update_slice(view_lock=True)` with no `center`/`fov`: only the slice changes,
+the view stays put. Reserve `center=`/`fov=` for explicit Center/Generate
+actions.
+
+### Issue: Overlay shows mirrored data near the opposite celestial pole
+
+**Symptoms:** Click an empty field (e.g. far southern sky for a northern
+snapshot), zoom out — radio data appears near the south celestial pole where no
+data exists.
+
+**Cause:** SIN projection is two-to-one; without masking, `all_world2pix` in
+`reproject_for_shader_display` maps far-hemisphere world points onto valid
+source pixels.
+
+**Solution:** Use current `../astrowidget`: pixels ≥ 90° from the source tangent
+point are set to NaN (`cos_sep ≤ 0` mask). Covered by
+`test_wcs_shader_reproject.py` regressions.
+
+### Issue: Slew button does not move the sky view
+
+**Symptoms:** Log says “Slewed HiPS background…”, but the widget view does not
+change.
+
+**Cause:** `updateViewPlaneScales()` called `syncViewFromAladin()` before
+`syncAladin()` applied Python `goto()`, reverting `view_ra/dec` to the old HiPS
+center.
+
+**Solution:** Use current `../astrowidget` (`onPythonViewChange`: apply model →
+`syncAladin` → `draw`; no `syncViewFromAladin` inside `updateViewPlaneScales`).
+Rebuild astrowidget JS and restart the kernel.
+
+### Issue: Zarr overlay misaligned or “two great circles” after panning
+
+**Symptoms:** After dragging the background, the field recenters unexpectedly;
+radio overlay covers only a wedge; edges look like two great circles
+intersecting.
+
+**Causes:**
+
+- Trait `change:view_*` fired `draw()` mid-drag with stale Aladin scales while
+  `userInteracting` was true.
+- View center (`view_ra/dec`) moved away from shader `crval` after pan (catalog
+  slice keeps reprojected `crval` fixed on the sky).
+- (Historical) shader drew the image SIN horizon as a visible arc crossing the
+  view disk.
+
+**Solution:** Use current `../astrowidget` (`finishViewGesture` on pan end; skip
+trait echo while `userInteracting`; rotation-aware `measureViewPlaneScales`).
+Rebuild and restart kernel. After large pans off the catalog center, some curved
+clipping at the view edge is expected.
 
 ### Issue: SkyWidget correct but `SKY.attrs["fits_wcs_header"]` still on disk
 
@@ -755,8 +1031,9 @@ Do **not** reintroduce filename-based zenith stamping in `_fix_headers`.
 update per appended time (not a notebook bug).
 
 **Solution:** Read with `open_dataset()` (strips in memory). New appends from
-current `fits_to_zarr_xradio` omit those attrs. Optional: re-ingest or a metadata
-repair pass only if you need clean on-disk `.zattrs`; not required for analysis.
+current `fits_to_zarr_xradio` omit those attrs. Optional: re-ingest or a
+metadata repair pass only if you need clean on-disk `.zattrs`; not required for
+analysis.
 
 ## Key Configuration Details
 

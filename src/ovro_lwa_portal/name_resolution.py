@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -141,6 +142,21 @@ def resolve_via_ned(
         return None, [f"WARNING: NED could not interpret {name!r} as an object name."], None
 
     return None, [f"WARNING: NED lookup failed for {name!r} (ResultCode={result_code})."], None
+
+
+def format_icrs_degree_pair(ra_deg: float, dec_deg: float, *, precision: int = 4) -> str:
+    """Format ICRS RA/Dec as a decimal-degree pair for coordinate entry.
+
+    The returned string round-trips through :func:`resolve_coordinate_string`
+    when parsed as a degree pair (no letters in the string).
+    """
+    if not (math.isfinite(ra_deg) and math.isfinite(dec_deg)):
+        msg = f"RA/Dec must be finite, got RA={ra_deg}, Dec={dec_deg}"
+        raise ValueError(msg)
+    if not (-90.0 <= dec_deg <= 90.0):
+        msg = f"Dec must be in [-90, 90]°, got {dec_deg}"
+        raise ValueError(msg)
+    return f"{ra_deg:.{precision}f}, {dec_deg:.{precision}f}"
 
 
 def _try_degree_pair(text: str) -> SkyCoord | None:
