@@ -287,7 +287,9 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 │       └── viz/               # Panel QA apps, SkyWidget integration
 │           ├── pipeline_qa.py      # FITS→Zarr QA pipeline, load_qa_datasets
 │           ├── pipeline_qa_app.py  # Jupyter UI; bind_sky_widget_dataset, WCS patch
-│           └── source_review.py    # Pure Center-button controller (plan_center_action)
+│           ├── source_review.py      # Pure Center/load orchestration (testable)
+│           ├── source_review_data.py # Heatmap helpers, known-sources I/O
+│           └── source_review_app.py  # SourceReview Panel app class
 └── tests/                      # Test suite
     ├── __init__.py            # Test package initialization
     ├── test_import.py         # Basic import tests
@@ -296,7 +298,9 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
     ├── ingest/                # Ingest module tests
     │   └── test_cli.py        # CLI integration tests
     └── viz/                   # Viz / pipeline QA tests
-        └── test_source_review.py  # Center-button controller (plan_center_action) tests
+        ├── test_source_review.py      # Center/load orchestration tests
+        ├── test_source_review_app.py  # SourceReview Panel app smoke tests
+        └── test_source_review_data.py # Heatmap data helper tests
 ```
 
 ## Ingest Module Overview
@@ -527,9 +531,105 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
 Data loading for QA apps follows `viz/pipeline_qa.py` → `load_qa_datasets()` →
 `ovro_lwa_portal.open_dataset(zarr_path, chunks={…})`.
 
+### Panel notebook comm management (Jupyter)
+
+OVRO-LWA review apps combine **three comm channels** (validated on calim10):
+
+| UI piece | Technology | Comm | Update path |
+| -------- | ---------- | ---- | ----------- |
+| SkyWidget | ipywidgets | Widget comm | Trait updates; works from observers/workers |
+| Activity log | ipywidgets `HTML` in `pn.pane.IPyWidget` | Widget comm | `_refresh_log_widget()` on every `_log()` |
+| Status, heatmap, spinner, controls | Panel/Bokeh | One notebook comm | `_dispatch` → `dispatch_notebook_ui` → `hold_and_push` |
+
+**Bottom line:** Panel/Bokeh mutations outside an active Bokeh callback must use
+explicit `doc.hold('combine')`, sync nested panes, then `push(doc, comm)`. Use
+`dispatch_notebook_ui` as the single entry point for that path. **Do not** route
+the activity log through Panel — use ipywidgets instead.
+
+#### What did **not** work (do not reintroduce)
+
+These were tried repeatedly; Python state updated but the browser UI stayed frozen
+(last log line often **`HiPS background`**, the final `__init__` message baked into
+the first render):
+
+- **`_push_panel_layout` / plain `push()`** without an active document hold — diffs
+  empty `_held_events` in Jupyter → silent no-op.
+- **`notebook_views_registered(review._layout) is True`** as the only gate — the
+  layout root can be registered while nested pane refs (`_log_pane`, `_status_pane`)
+  are absent from `state._views`; Panel's `_update_pane` then skips them.
+- **`panel.io.document.hold(doc, comm=comm)`** (Panel's wrapper) on the main thread
+  in Jupyter — under `state._jupyter_kernel_context`, the `unlocked` path is a
+  no-op; held events may not accumulate and push sends nothing useful.
+- **Activity log as `pn.pane.HTML`** with `@param.depends('log_text')` +
+  `sync_pane_to_notebook` — same nested-ref problem; manual `_dispatch` log tests
+  did not appear in the browser even when the layout comm was registered.
+- **Starting Zarr open synchronously** on first `review.panel` access — races the
+  notebook comm; worker callbacks can exhaust retry before registration completes.
+- **`_run_on_main_thread` / inline `pn.state.execute`** from worker threads —
+  runs on the worker without a live Bokeh session; comm updates never reach the
+  browser (SkyWidget still worked because it uses a separate comm).
+
+#### What **did** work (current `source_review_app.py`)
+
+1. **ipywidgets activity log** — `_log_widget = widgets.HTML(...)` wrapped in
+   `pn.pane.IPyWidget`; `_sync_log()` sets `log_text` and calls
+   `_refresh_log_widget()`. Logging does not depend on Panel push.
+2. **`hold_and_push`** — explicit `doc.hold('combine')` + `set_curdoc`, body,
+   then `_sync_all_notebook_views()` and `push(doc, comm)` per document (not
+   Panel's `hold()` context manager).
+3. **`dispatch_notebook_ui(callback, *views)`** — schedules on the kernel
+   `io_loop`, waits for a registered comm, runs the callback inside
+   `hold_and_push`. Re-entrant calls run inline. SourceReview wraps this as
+   `_dispatch()`.
+4. **`sync_pane_to_notebook(pane, *root_views)`** — force nested Panel panes
+   (status, heatmap) through the layout root ref when their own ref is missing
+   from `state._views`.
+5. **`schedule_when_panel_loaded(_open_dataset)`** — defer the Zarr worker until
+   `pn.state.loaded` so open/progress/finalize callbacks run against a live comm.
+6. **Status pane** — `@param.depends('status')` → `_sync_status_pane` +
+   `sync_pane_to_notebook` (inside an active `hold_and_push` from `_dispatch`).
+7. **Module extraction** — `source_review_app.py` / `source_review_data.py` so
+   threading and comm helpers are headless-testable (see tests below).
+
+#### Reference helpers (`viz/pipeline_qa_app.py`)
+
+| Function | Role |
+| -------- | ---- |
+| `dispatch_notebook_ui(callback, *views)` | Schedule + hold/push wrapper for Panel panes |
+| `hold_and_push(*views)` | `doc.hold('combine')` → sync all nested viewables → `push` |
+| `sync_pane_to_notebook(pane, *root_views)` | Force nested pane sync via layout root ref |
+| `schedule_when_panel_loaded(callback)` | Run after Panel notebook comm is ready |
+| `notebook_views_registered(*views)` | Diagnostic only — **not** sufficient alone |
+
+Tests: `tests/viz/test_pipeline_qa.py` (hold, sync, dispatch, real-document
+integration), `tests/viz/test_source_review_app.py`.
+
+### `source_review` Panel app and notebook
+
+The **SourceReview** UI lives in `src/ovro_lwa_portal/viz/source_review_app.py` (extracted
+from the notebook for testability). `notebooks/source_review.ipynb` keeps path/config
+constants, calls `configure_source_review_notebook()`, and constructs
+`SourceReview` with a `SourceReviewConfig`.
+
+Notebook launch pattern:
+
+```python
+configure_source_review_notebook()
+review = SourceReview(ZARR_PATH, ..., config=SourceReviewConfig(...), validate_zarr=False)
+review.panel  # triggers schedule_when_panel_loaded → Zarr open
+```
+
+Pure decision logic remains in `viz/source_review.py` (`plan_center_action`,
+`run_dataset_load`, `finalize_dataset_load`). Data helpers (heatmap computation,
+known-sources YAML) are in `viz/source_review_data.py`.
+
+Headless tests: `tests/viz/test_source_review.py`, `test_source_review_app.py`,
+`test_source_review_data.py`, and `test_pipeline_qa.py::test_hold_and_push_real_document_pushes_nested_html_pane`.
+
 ### `source_review.ipynb` coordinate UI and SkyWidget actions
 
-Reference: `SourceReview` in `notebooks/source_review.ipynb`. The **Center**
+Reference: `SourceReview` in `viz/source_review_app.py` (launched from
+`notebooks/source_review.ipynb`). The **Center**
 button's decision logic is a pure function — `plan_center_action` in
 `src/ovro_lwa_portal/viz/source_review.py`, tested in
 `tests/viz/test_source_review.py`. Keep decisions there, not inline in the
@@ -555,8 +655,8 @@ its tests first, then the notebook call site.
   `_coord`, the current overlay center).
 - **Sky click** — observe `SkyWidget.click_tick`; read `clicked_coord`, format
   with `format_icrs_degree_pair` (`ovro_lwa_portal.name_resolution`), fill the
-  field via `_set_coordinate_field_from_text`. Schedule on the Panel UI thread
-  with `_run_on_main_thread` from `viz.pipeline_qa_app` (not
+  field via `_set_coordinate_field_from_text`. Schedule with
+  `_dispatch(...)` → `dispatch_notebook_ui` from `viz.pipeline_qa_app` (not
   `_schedule_ipython_main` alone).
 
 **Always-on heatmap grid and overlay toggle:**
@@ -590,14 +690,13 @@ its tests first, then the notebook call site.
   that suppresses Param events and the field stays blank while the activity log
   still updates. Use a `_suppress_coord_value_handler` flag to skip duplicate
   resolution logging on programmatic writes instead.
-- `_log()` already calls `_push_panel_layout`; sky-click field writes do not
-  need a separate push if they go through `_set_coordinate_field_from_text`
-  after `_run_on_main_thread`.
+- `_log()` updates `log_text` and the ipywidgets log via `_sync_log()` /
+  `_refresh_log_widget()` — **not** through Panel push. Sky-click and coord-input
+  writes still go through `_dispatch` for Panel panes that need `hold_and_push`.
 - **Any Bokeh figure built from an io-loop callback** (e.g.
-  `_ensure_heatmap_grid` from `_finish_open`) must be followed by
-  `_push_panel_layout(...)` — there is no live Bokeh doc context, so without the
-  push the tap handler is never wired and clicks silently go nowhere.
-  Status-pane updates from watchers also need a push to be visible.
+  `_ensure_heatmap_grid` from `_finish_open`) runs inside `_dispatch` so
+  `hold_and_push` syncs `_heatmap_pane` and wires the tap handler to the comm.
+  Status uses `@param.depends('status')` → `_sync_status_pane`.
 
 **Testing the controller:** compare numpy-derived booleans with
 `bool(...) is True`, not `np.bool_ is True` (`assert np.True_ is True` fails).
@@ -948,7 +1047,36 @@ Param/Bokeh sync to the browser.
 
 **Solution:** Update `value` / `value_input` without `discard_events`; use
 `_suppress_coord_value_handler` to avoid duplicate resolution logs. Schedule the
-update with `_run_on_main_thread`, not `_schedule_ipython_main` alone.
+update with `_dispatch` → `dispatch_notebook_ui`, not `_schedule_ipython_main`
+alone.
+
+### Issue: Activity log frozen after `HiPS background`; no heatmap after Zarr open
+
+**Symptoms:** Activity log stops at the last `__init__` line (often `HiPS background`);
+`review.log_text` in Python is correct but the browser log pane is stale. No
+`Opening…`, Zarr progress, `Opened — …`, or zeros heatmap. SkyWidget overlay and
+Center may still work. `notebook_views_registered(review._layout)` may be `True`;
+`review._dispatch(lambda: review._log("test"))` may not appear when the log was
+still a Panel HTML pane.
+
+**Cause:** Dual (really triple) comm architecture. Pre-display `__init__` logs are
+baked into the first Panel render snapshot. Post-display updates need either an
+ipywidgets comm (log) or explicit `doc.hold` + nested-pane sync + `push` (heatmap,
+status, spinner). Panel HTML nested in a `Column` often has refs not in
+`state._views`; plain `push()` and Panel's `hold()` main-thread path do not fix
+that in Jupyter.
+
+**Solution (validated):**
+
+1. Activity log → ipywidgets `HTML` + `_refresh_log_widget()` (see
+   `source_review_app.py`).
+2. Panel panes → `_dispatch` → `dispatch_notebook_ui` → `hold_and_push` (explicit
+   `doc.hold`, not Panel's `hold()` wrapper).
+3. Defer open → `schedule_when_panel_loaded(_open_dataset)`.
+4. After kernel restart, re-run all cells; confirm log continues past HiPS and
+   heatmap grid appears after open.
+
+Do **not** revert to `pn.pane.HTML` for the activity log or `_push_panel_layout`.
 
 ### Issue: Heatmap clicks do nothing / toggle shows no feedback
 
@@ -956,13 +1084,15 @@ update with `_run_on_main_thread`, not `_schedule_ipython_main` alone.
 or overlay; the Overlay toggle flips visually but nothing else changes.
 
 **Cause:** The Bokeh figure (or status pane) was set from an io-loop callback
-(e.g. `_ensure_heatmap_grid` from `_finish_open`) without `_push_panel_layout`.
-With no live Bokeh doc context, the tap handler never gets wired to the comm, so
-clicks never reach Python.
+(e.g. `_ensure_heatmap_grid` from `_finish_open`) without
+`dispatch_notebook_ui` / `sync_pane_to_notebook`. With no live Bokeh doc
+context, the tap handler never gets wired to the comm, so clicks never reach
+Python.
 
-**Solution:** Always call `_push_panel_layout(...)` after assigning
-`_heatmap_pane.object` or updating panes from callbacks/watchers (see
-`_ensure_heatmap_grid`, `_on_overlay_toggle`).
+**Solution:** Wrap io-loop and worker-thread UI in `_dispatch(...)` so
+`hold_and_push` runs (see `_ensure_heatmap_grid`, `_on_overlay_toggle`). Activity
+log lines from those paths use ipywidgets; heatmap/status use Panel sync inside
+`hold_and_push`.
 
 ### Issue: Radio overlay flipped or rotated relative to HiPS
 

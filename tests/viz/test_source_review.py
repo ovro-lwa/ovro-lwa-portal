@@ -8,11 +8,20 @@ in :mod:`ovro_lwa_portal.viz.source_review`.
 
 from __future__ import annotations
 
+import threading
+from collections.abc import Callable
+
 import astropy.units as u
 import pytest
 from astropy.coordinates import SkyCoord
 
-from ovro_lwa_portal.viz.source_review import plan_center_action
+from ovro_lwa_portal.viz.source_review import (
+    DatasetLoad,
+    finalize_dataset_load,
+    plan_center_action,
+    run_dataset_load,
+    should_build_heatmap_grid,
+)
 
 # Cas A and a clearly different target (Cyg A) for "different source" cases.
 CAS_A = SkyCoord(ra=350.8500 * u.deg, dec=58.8150 * u.deg, frame="icrs")
@@ -113,3 +122,215 @@ def test_goto_always_field_coord(has_overlay):
             CAS_A, heatmap_coord=heatmap_coord, has_overlay=has_overlay
         )
         assert plan.goto_center is CAS_A
+
+
+class _DeferredDispatcher:
+    """Collects callbacks instead of running them (like a busy main loop).
+
+    Records the thread each callback is *scheduled* from and *executed* on, so
+    tests can prove UI work never runs on the worker thread.
+    """
+
+    def __init__(self) -> None:
+        self.pending: list[Callable[[], None]] = []
+        self.scheduled_from: list[threading.Thread] = []
+        self.executed_on: list[threading.Thread] = []
+
+    def __call__(self, callback: Callable[[], None]) -> None:
+        self.scheduled_from.append(threading.current_thread())
+        self.pending.append(callback)
+
+    def drain(self) -> None:
+        while self.pending:
+            callback = self.pending.pop(0)
+            self.executed_on.append(threading.current_thread())
+            callback()
+
+
+def _fake_load(n_times: int = 3, n_freqs: int = 4) -> DatasetLoad:
+    return DatasetLoad(
+        dataset=object(),
+        default_time_idx=0,
+        default_freq_idx=n_freqs // 2,
+        lst_hours=list(range(n_times)),
+        freq_mhz=list(range(n_freqs)),
+    )
+
+
+class TestRunDatasetLoadThreading:
+    """Pin the recurring 'heatmap never loads / log frozen' threading bug."""
+
+    def test_no_ui_callback_runs_on_worker_thread(self):
+        dispatcher = _DeferredDispatcher()
+        loaded: list[DatasetLoad] = []
+        logs: list[str] = []
+        open_threads: list[threading.Thread] = []
+
+        def _open(report: Callable[[str], None]) -> DatasetLoad:
+            open_threads.append(threading.current_thread())
+            report("Zarr opened")
+            report("Coordinates ready")
+            return _fake_load()
+
+        worker = threading.Thread(
+            target=lambda: run_dataset_load(
+                open_dataset=_open,
+                dispatch=dispatcher,
+                on_loaded=loaded.append,
+                on_error=lambda exc: pytest.fail(f"unexpected error {exc!r}"),
+                log=logs.append,
+            )
+        )
+        worker.start()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+
+        # The slow open ran off the test's main thread...
+        assert open_threads and open_threads[0] is not threading.main_thread()
+        # ...and NOTHING touched UI state during the worker run.
+        assert loaded == []
+        assert logs == []
+        assert dispatcher.executed_on == []
+        # Everything was scheduled from the worker, deferred for the main thread.
+        assert all(t is worker for t in dispatcher.scheduled_from)
+        assert len(dispatcher.pending) == 3  # 2 progress reports + on_loaded
+
+        # Draining on the main thread delivers logs (in order) then the load.
+        dispatcher.drain()
+        assert logs == ["Zarr opened", "Coordinates ready"]
+        assert len(loaded) == 1
+        assert all(t is threading.main_thread() for t in dispatcher.executed_on)
+
+    def test_success_calls_on_loaded_not_on_error(self):
+        dispatcher = _DeferredDispatcher()
+        loaded: list[DatasetLoad] = []
+        errors: list[BaseException] = []
+
+        run_dataset_load(
+            open_dataset=lambda report: _fake_load(),
+            dispatch=dispatcher,
+            on_loaded=loaded.append,
+            on_error=errors.append,
+        )
+        dispatcher.drain()
+
+        assert len(loaded) == 1
+        assert errors == []
+
+    def test_error_path_dispatches_on_error_only(self):
+        dispatcher = _DeferredDispatcher()
+        loaded: list[DatasetLoad] = []
+        errors: list[BaseException] = []
+        boom = RuntimeError("zarr open failed")
+
+        def _open(report: Callable[[str], None]) -> DatasetLoad:
+            report("Opening…")
+            raise boom
+
+        run_dataset_load(
+            open_dataset=_open,
+            dispatch=dispatcher,
+            on_loaded=loaded.append,
+            on_error=errors.append,
+            log=lambda _msg: None,
+        )
+        dispatcher.drain()
+
+        assert loaded == []
+        assert errors == [boom]
+
+    def test_progress_reported_before_load_completes(self):
+        dispatcher = _DeferredDispatcher()
+        order: list[str] = []
+
+        def _open(report: Callable[[str], None]) -> DatasetLoad:
+            report("step-1")
+            report("step-2")
+            return _fake_load()
+
+        run_dataset_load(
+            open_dataset=_open,
+            dispatch=dispatcher,
+            on_loaded=lambda _load: order.append("loaded"),
+            on_error=lambda exc: pytest.fail(f"unexpected error {exc!r}"),
+            log=order.append,
+        )
+        dispatcher.drain()
+
+        assert order == ["step-1", "step-2", "loaded"]
+
+
+class TestShouldBuildHeatmapGrid:
+    def test_builds_when_no_existing_grid(self):
+        assert should_build_heatmap_grid(False, force=False) is True
+
+    def test_skips_when_grid_present_and_not_forced(self):
+        assert should_build_heatmap_grid(True, force=False) is False
+
+    def test_force_rebuilds_even_with_existing_grid(self):
+        assert should_build_heatmap_grid(True, force=True) is True
+        assert should_build_heatmap_grid(False, force=True) is True
+
+
+class TestFinalizeDatasetLoad:
+    """Guard the post-open tail: heatmap grid + loading state must always settle."""
+
+    def test_happy_path_runs_steps_in_order(self):
+        order: list[str] = []
+        finalize_dataset_load(
+            mount_sky=lambda: order.append("mount"),
+            build_heatmap_grid=lambda: order.append("heatmap"),
+            clear_loading=lambda: order.append("clear"),
+            on_step_error=lambda name, exc: order.append(("error", name)),
+        )
+        assert order == ["mount", "heatmap", "clear"]
+
+    def test_heatmap_grid_built_and_loading_cleared_when_mount_raises(self):
+        # The exact reported symptom: SkyWidget mount fails, but the clickable
+        # heatmap grid must still appear and the spinner must still clear.
+        order: list[str] = []
+        errors: list[tuple[str, BaseException]] = []
+        boom = RuntimeError("SkyWidget/HiPS failed")
+
+        def _mount() -> None:
+            order.append("mount")
+            raise boom
+
+        finalize_dataset_load(
+            mount_sky=_mount,
+            build_heatmap_grid=lambda: order.append("heatmap"),
+            clear_loading=lambda: order.append("clear"),
+            on_step_error=lambda name, exc: errors.append((name, exc)),
+        )
+
+        assert order == ["mount", "heatmap", "clear"]
+        assert errors == [("mount_sky", boom)]
+
+    def test_loading_cleared_when_heatmap_build_raises(self):
+        order: list[str] = []
+        errors: list[tuple[str, BaseException]] = []
+        boom = RuntimeError("bokeh figure failed")
+
+        def _build() -> None:
+            order.append("heatmap")
+            raise boom
+
+        finalize_dataset_load(
+            mount_sky=lambda: order.append("mount"),
+            build_heatmap_grid=_build,
+            clear_loading=lambda: order.append("clear"),
+            on_step_error=lambda name, exc: errors.append((name, exc)),
+        )
+
+        assert order == ["mount", "heatmap", "clear"]
+        assert errors == [("build_heatmap_grid", boom)]
+
+    def test_clear_loading_runs_even_without_error_sink(self):
+        cleared: list[bool] = []
+        finalize_dataset_load(
+            mount_sky=lambda: (_ for _ in ()).throw(RuntimeError("x")),
+            build_heatmap_grid=lambda: (_ for _ in ()).throw(RuntimeError("y")),
+            clear_loading=lambda: cleared.append(True),
+            on_step_error=None,
+        )
+        assert cleared == [True]

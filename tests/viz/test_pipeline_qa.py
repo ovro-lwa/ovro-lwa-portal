@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -2235,6 +2237,70 @@ def test_load_dewarp_summary_dataframe_phase2(tmp_path: Path) -> None:
     assert dewarp_df["lst_hour"].iloc[0] == "05h"
 
 
+def test_run_on_main_thread_from_worker_schedules_ipython_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as app
+
+    scheduled: list[Callable[[], None]] = []
+    executed_inline: list[int] = []
+
+    monkeypatch.setattr(
+        app,
+        "_schedule_ipython_main",
+        lambda callback: scheduled.append(callback),
+    )
+
+    def _fail_execute(callback: Callable[[], None]) -> None:
+        executed_inline.append(1)
+        callback()
+
+    monkeypatch.setattr(app.pn.state, "execute", _fail_execute)
+
+    import threading
+
+    worker_done = threading.Event()
+
+    def _worker() -> None:
+        app._run_on_main_thread(lambda: executed_inline.append(2))
+        worker_done.set()
+
+    threading.Thread(target=_worker).start()
+    worker_done.wait(timeout=2.0)
+
+    assert executed_inline == []
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert executed_inline == [2]
+
+
+def test_schedule_ipython_main_from_worker_never_runs_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as app
+
+    monkeypatch.setattr(app, "_IPYTHON_IO_LOOP", None)
+    monkeypatch.setattr(app, "_resolve_ipython_event_loop", lambda: None)
+    executed: list[int] = []
+
+    import threading
+
+    worker_done = threading.Event()
+
+    def _worker() -> None:
+        app._schedule_ipython_main(lambda: executed.append(1))
+        worker_done.set()
+
+    threading.Thread(target=_worker).start()
+    worker_done.wait(timeout=2.0)
+
+    assert executed == []
+    assert len(app._PENDING_MAIN_CALLBACKS) >= 1
+    app._flush_pending_main_callbacks()
+    assert executed == [1]
+    assert app._PENDING_MAIN_CALLBACKS == []
+
+
 def test_dewarp_shift_grid_and_figure(tmp_path: Path) -> None:
     from bokeh.models import ColorBar, HoverTool
 
@@ -2261,3 +2327,218 @@ def test_dewarp_shift_grid_and_figure(tmp_path: Path) -> None:
     panel = build_dewarp_shift_panel(dewarp_df)
     assert isinstance(panel, pn.Column)
     assert len(panel.objects) == 1
+
+
+class _FakeCallbacks:
+    def __init__(self) -> None:
+        self._hold: str | None = None
+
+    @property
+    def hold_value(self) -> str | None:
+        return self._hold
+
+    def hold(self, policy: str = "combine") -> None:
+        self._hold = policy
+
+    def unhold(self) -> None:
+        self._hold = None
+
+
+class _FakeDoc:
+    def __init__(self) -> None:
+        self.callbacks = _FakeCallbacks()
+
+    def hold(self, policy: str = "combine") -> None:
+        self.callbacks.hold(policy)
+
+    def unhold(self) -> None:
+        self.callbacks.unhold()
+
+
+class _FakeRoot:
+    tags: list[str] = []
+
+
+class _FakeView:
+    def __init__(self, ref: str, *, children: tuple["_FakeView", ...] = ()) -> None:
+        self._models = {ref: object()}
+        self.objects = children
+
+
+def _install_fake_view(
+    monkeypatch: pytest.MonkeyPatch, *, ref: str = "root-1"
+) -> tuple[_FakeView, _FakeDoc, list[Any]]:
+    """Register one fake Panel view/document in panel state and capture pushes."""
+    from panel.io.state import state
+
+    doc = _FakeDoc()
+    comm = object()
+    monkeypatch.setattr(state, "_views", {ref: (object(), _FakeRoot(), doc, comm)})
+
+    pushed: list[Any] = []
+    monkeypatch.setattr(
+        "panel.io.notebook.push", lambda d, c, *a, **k: pushed.append((d, c))
+    )
+    return _FakeView(ref), doc, pushed
+
+
+def test_notebook_doc_comms_walks_nested_viewables(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _notebook_doc_comms
+    from panel.io.state import state
+
+    doc = _FakeDoc()
+    comm = object()
+    child = pn.pane.HTML("child")
+    parent = pn.Column(child)
+    child_ref = "child-ref"
+    child._models = {child_ref: object()}  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        state,
+        "_views",
+        {
+            child_ref: (child, _FakeRoot(), doc, comm),
+        },
+    )
+
+    docs = _notebook_doc_comms(parent)
+    assert len(docs) == 1
+    assert docs[id(doc)][1] is comm
+
+
+def test_hold_and_push_enters_panel_hold_with_comm(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push
+
+    view, doc, pushed = _install_fake_view(monkeypatch)
+
+    with hold_and_push(view):
+        pass
+
+    assert doc.callbacks.hold_value is None
+    assert pushed == [(doc, pushed[0][1])]
+
+
+def test_hold_and_push_noops_when_views_not_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push
+    from panel.io.state import state
+
+    monkeypatch.setattr(state, "_views", {})
+    pushed: list[Any] = []
+    monkeypatch.setattr(
+        "panel.io.notebook.push",
+        lambda *args, **kwargs: pushed.append(args),
+    )
+
+    with hold_and_push(_FakeView("missing")):
+        pass
+
+    assert pushed == []
+
+
+def test_sync_pane_to_notebook_uses_layout_root_when_pane_ref_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import sync_pane_to_notebook
+    from panel.io.state import state
+
+    doc = _FakeDoc()
+    comm = object()
+    layout_ref = "layout-ref"
+    pane_ref = "pane-ref"
+    layout = _FakeView(layout_ref)
+    pane = _FakeView(pane_ref)
+    parent = object()
+    root = _FakeRoot()
+    pane._models = {pane_ref: (object(), parent)}  # type: ignore[attr-defined]
+    updates: list[tuple[str, Any, Any, Any, Any, Any]] = []
+
+    def _update_object(ref: str, doc_arg: Any, root: Any, parent: Any, comm_arg: Any) -> None:
+        updates.append((ref, doc_arg, root, parent, comm_arg))
+
+    pane._update_object = _update_object  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        state,
+        "_views",
+        {layout_ref: (layout, root, doc, comm)},
+    )
+
+    sync_pane_to_notebook(pane, layout)
+
+    assert updates == [(pane_ref, doc, root, parent, comm)]
+
+
+def test_dispatch_notebook_ui_runs_inside_hold_when_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    view, doc, _pushed = _install_fake_view(monkeypatch)
+    ran: list[str] = []
+
+    monkeypatch.setattr(pqa, "_schedule_ipython_main", lambda fn: fn())
+
+    pqa.dispatch_notebook_ui(lambda: ran.append("done"), view)
+
+    assert ran == ["done"]
+    assert doc.callbacks.hold_value is None
+
+
+def test_dispatch_notebook_ui_reentrant_runs_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    view, _doc, _pushed = _install_fake_view(monkeypatch)
+    scheduled: list[Callable[[], None]] = []
+    ran: list[str] = []
+
+    monkeypatch.setattr(pqa, "_schedule_ipython_main", lambda fn: scheduled.append(fn))
+    depth: ContextVar[int] = pqa._NOTEBOOK_UI_DEPTH
+    token = depth.set(1)
+    try:
+        pqa.dispatch_notebook_ui(lambda: ran.append("inline"), view)
+    finally:
+        depth.reset(token)
+
+    assert ran == ["inline"]
+    assert scheduled == []
+
+
+def test_hold_and_push_real_document_pushes_nested_html_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration: real Bokeh doc + sync_pane_to_notebook inside hold."""
+    import param
+    from bokeh.document import Document
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, sync_pane_to_notebook
+    from panel.io.state import state
+
+    class _FakeComm:
+        _comm = object()
+
+    doc = Document()
+    comm = _FakeComm()
+    log_pane = pn.pane.HTML("<p>before</p>")
+    layout = pn.Column(log_pane)
+    root = layout.get_root(doc)
+    doc.add_root(root)
+
+    layout_ref = next(iter(layout._models))
+    # Nested log pane ref is intentionally absent — mirrors the notebook comm bug.
+    state._views = {layout_ref: (layout, root, doc, comm)}
+
+    pushed: list[tuple[Any, Any]] = []
+
+    def _capture_push(d: Any, c: Any, *args: Any, **kwargs: Any) -> None:
+        pushed.append((d, c))
+
+    monkeypatch.setattr("panel.io.notebook.push", _capture_push)
+    monkeypatch.setattr("panel.pane.base.push", _capture_push)
+
+    with hold_and_push(layout, log_pane):
+        with param.parameterized.discard_events(log_pane):
+            log_pane.object = "<p>after</p>"
+        sync_pane_to_notebook(log_pane, layout)
+
+    assert pushed == [(doc, comm)]
+    assert log_pane.object == "<p>after</p>"
