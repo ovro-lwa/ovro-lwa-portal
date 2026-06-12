@@ -2508,37 +2508,196 @@ def test_hold_and_push_real_document_pushes_nested_html_pane(
 ) -> None:
     """Integration: real Bokeh doc + sync_pane_to_notebook inside hold."""
     import param
-    from bokeh.document import Document
 
     from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, sync_pane_to_notebook
-    from panel.io.state import state
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
 
-    class _FakeComm:
-        _comm = object()
-
-    doc = Document()
-    comm = _FakeComm()
+    harness = PanelUITestHarness()
     log_pane = pn.pane.HTML("<p>before</p>")
     layout = pn.Column(log_pane)
-    root = layout.get_root(doc)
-    doc.add_root(root)
+    harness.mount_layout_only(layout)
 
-    layout_ref = next(iter(layout._models))
-    # Nested log pane ref is intentionally absent — mirrors the notebook comm bug.
-    state._views = {layout_ref: (layout, root, doc, comm)}
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, log_pane):
+            with param.parameterized.discard_events(log_pane):
+                log_pane.object = "<p>after</p>"
+            sync_pane_to_notebook(log_pane, layout)
 
-    pushed: list[tuple[Any, Any]] = []
-
-    def _capture_push(d: Any, c: Any, *args: Any, **kwargs: Any) -> None:
-        pushed.append((d, c))
-
-    monkeypatch.setattr("panel.io.notebook.push", _capture_push)
-    monkeypatch.setattr("panel.pane.base.push", _capture_push)
-
-    with hold_and_push(layout, log_pane):
-        with param.parameterized.discard_events(log_pane):
-            log_pane.object = "<p>after</p>"
-        sync_pane_to_notebook(log_pane, layout)
-
-    assert pushed == [(doc, comm)]
+    assert pushed == [(harness.doc, harness.comm)]
     assert log_pane.object == "<p>after</p>"
+
+
+def test_set_notebook_pane_object_replaces_bokeh_figure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bokeh pane figure swap inside hold uses discard_events + sync."""
+    from bokeh.plotting import figure
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, set_notebook_pane_object
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    def _make_fig(values: np.ndarray):
+        n_t, n_f = values.shape
+        plot = figure(width=400, height=200, x_range=(0, n_t), y_range=(0, n_f))
+        plot.image(image=[values.T], x=0, y=0, dw=n_t, dh=n_f)
+        return plot
+
+    harness = PanelUITestHarness()
+    zeros = np.zeros((4, 6))
+    pane = pn.pane.Bokeh(_make_fig(zeros), height=200, sizing_mode="stretch_width")
+    layout = pn.Column(pane)
+    harness.mount(layout)
+    layout_ref = harness.layout_ref(layout)
+    root = harness.doc.roots[0]
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, pane):
+            set_notebook_pane_object(
+                pane, _make_fig(np.arange(24.0).reshape(4, 6)), layout
+            )
+
+    assert pushed == [(harness.doc, harness.comm)]
+    new_model = pane._models[layout_ref][0]
+    assert root.children[0] is new_model
+
+
+def test_sync_widget_to_notebook_updates_autocomplete_inside_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widgets need sync_widget_to_notebook; sync_pane alone is a no-op."""
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, set_notebook_widget_params
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    coord = pn.widgets.AutocompleteInput(
+        name="Coordinate", value="", value_input="", restrict=False
+    )
+    layout = pn.Column(coord)
+    harness.mount(layout)
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, coord):
+            set_notebook_widget_params(
+                coord,
+                layout,
+                value="123.4, 56.7",
+                value_input="123.4, 56.7",
+                options=[],
+            )
+
+    model = harness.bokeh_model(coord, layout)
+    assert pushed == [(harness.doc, harness.comm)]
+    assert model.value == "123.4, 56.7"
+    assert model.value_input == "123.4, 56.7"
+
+
+def test_set_notebook_widget_params_spinner_spins_inside_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LoadingSpinner needs synthetic events — empty events skip CSS ``spin`` class."""
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, set_notebook_widget_params
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    spinner = pn.indicators.LoadingSpinner(value=False, size=24)
+    layout = pn.Column(spinner)
+    harness.mount(layout)
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, spinner):
+            set_notebook_widget_params(
+                spinner,
+                layout,
+                value=True,
+                visible=True,
+            )
+
+    model = harness.bokeh_model(spinner, layout)
+    assert pushed == [(harness.doc, harness.comm)]
+    assert spinner.value is True
+    assert "spin" in model.css_classes
+
+
+def test_defer_after_notebook_hold_runs_bokeh_publish_after_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bokeh figure assign must not run inside hold_and_push (Jupiter path)."""
+    from bokeh.plotting import figure
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, publish_bokeh_pane_to_notebook
+    from ovro_lwa_portal.viz.source_review_app import _placeholder_heatmap_figure
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    pane = pn.pane.Bokeh(_placeholder_heatmap_figure(), height=420, sizing_mode="stretch_width")
+    layout = pn.Column(pane)
+    harness.mount(layout)
+
+    new_fig = figure(width=100, height=100, title="AFTER HOLD")
+
+    with hold_and_push(layout, pane):
+        publish_bokeh_pane_to_notebook(pane, new_fig, layout)
+
+    model = harness.bokeh_model(pane, layout)
+    assert model.title.text == "AFTER HOLD"
+
+
+def test_discard_events_blocks_bokeh_pane_push(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: discard_events + push leaves the browser on the placeholder."""
+    import param
+    from bokeh.plotting import figure
+
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+    from ovro_lwa_portal.viz.source_review_app import _placeholder_heatmap_figure
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    pane = pn.pane.Bokeh(_placeholder_heatmap_figure(), height=420, sizing_mode="stretch_width")
+    layout = pn.Column(pane)
+    harness.mount(layout)
+
+    pushed: list[Any] = []
+
+    def _capture_push(*args: Any, **kwargs: Any) -> None:
+        pushed.append(args)
+
+    monkeypatch.setattr(pqa, "_push_panel_layout", _capture_push)
+
+    new_fig = figure(width=100, height=100, title="SHOULD NOT STICK")
+    with param.parameterized.discard_events(pane):
+        pane.object = new_fig
+    pqa._push_panel_layout(layout, pane)
+
+    model = harness.bokeh_model(pane, layout)
+    assert pane.object.title.text == "SHOULD NOT STICK"
+    assert model.title.text != "SHOULD NOT STICK"
+
+
+def test_publish_panel_widget_to_notebook_updates_autocomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+    from ovro_lwa_portal.viz.pipeline_qa_app import publish_panel_widget_to_notebook
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    coord = pn.widgets.AutocompleteInput(value="", value_input="", restrict=False)
+    layout = pn.Column(coord)
+    harness.mount(layout)
+
+    pushed: list[Any] = []
+
+    def _capture_push(*args: Any, **kwargs: Any) -> None:
+        pushed.append(args)
+
+    monkeypatch.setattr(pqa, "_push_panel_layout", _capture_push)
+
+    publish_panel_widget_to_notebook(
+        coord, layout, value="12.3, 45.6", value_input="12.3, 45.6", options=[]
+    )
+
+    model = harness.bokeh_model(coord, layout)
+    assert len(pushed) == 1
+    assert coord.value == "12.3, 45.6"
+    assert model.value == "12.3, 45.6"
+    assert model.value_input == "12.3, 45.6"

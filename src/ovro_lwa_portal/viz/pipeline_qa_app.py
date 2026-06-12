@@ -7,7 +7,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -120,7 +120,47 @@ _NOTEBOOK_UI_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
     "_NOTEBOOK_UI_DEPTH",
     default=0,
 )
+_AFTER_HOLD_CALLBACKS: contextvars.ContextVar[list[Callable[[], None]] | None] = (
+    contextvars.ContextVar("_AFTER_HOLD_CALLBACKS", default=None)
+)
 DEFAULT_NOTEBOOK_UI_MAX_ATTEMPTS = 50
+
+
+def notebook_ui_hold_active() -> bool:
+    """True while inside :func:`dispatch_notebook_ui` / :func:`hold_and_push`."""
+    return _NOTEBOOK_UI_DEPTH.get() > 0
+
+
+def defer_after_notebook_hold(callback: Callable[[], None]) -> None:
+    """Run ``callback`` after the active :func:`hold_and_push` cycle completes.
+
+    Bokeh heatmap figure swaps and coordinate-field Jupiter pushes must not run
+    inside ``doc.hold('combine')`` — assign + push is lost or never reaches the
+    browser. Queue those updates here when a hold queue is active; otherwise
+    run on the kernel io_loop in Jupyter or inline in headless tests.
+    """
+    queue = _AFTER_HOLD_CALLBACKS.get()
+    if queue is not None:
+        queue.append(callback)
+    else:
+        _run_after_hold(callback)
+
+
+def _is_jupyter_kernel_context() -> bool:
+    try:
+        from panel.io.state import state
+
+        return bool(getattr(state, "_jupyter_kernel_context", False))
+    except Exception:
+        return False
+
+
+def _run_after_hold(callback: Callable[[], None]) -> None:
+    """Flush after-hold work on the kernel io_loop (Jupyter) or inline (tests)."""
+    if _IPYTHON_IO_LOOP is not None or _is_jupyter_kernel_context():
+        _schedule_ipython_main(callback)
+    else:
+        callback()
 
 
 def _resolve_ipython_event_loop() -> Any:
@@ -367,13 +407,85 @@ def _primary_notebook_ref(*views: pn.viewable.Viewable) -> str | None:
     return None
 
 
+def _is_panel_layout_container(view: pn.viewable.Viewable) -> bool:
+    """True for Column/Row-like containers that must not be widget-synced wholesale."""
+    if isinstance(view, pn.pane.IPyWidget):
+        return False
+    if callable(getattr(view, "_update_object", None)):
+        return False
+    return hasattr(view, "objects")
+
+
 def _sync_all_notebook_views(*views: pn.viewable.Viewable) -> None:
     """Force-sync every nested Panel viewable (except ipywidgets) to the notebook."""
     for view in views:
         for panel_view in _iter_panel_viewables(view):
             if isinstance(panel_view, pn.pane.IPyWidget):
                 continue
+            if _is_panel_layout_container(panel_view):
+                continue
             sync_pane_to_notebook(panel_view, *views)
+
+
+def sync_widget_to_notebook(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    changes: Mapping[str, Any] | None = None,
+) -> None:
+    """Force-sync a Panel widget model without calling ``push``.
+
+    Widgets (``AutocompleteInput``, ``LoadingSpinner``, …) use ``_update_model``,
+    not ``_update_object``. :func:`sync_pane_to_notebook` cannot sync them; call
+    this helper inside :func:`hold_and_push` instead.
+    """
+    if not getattr(widget, "_models", None):
+        return
+    layout_ref = _primary_notebook_ref(*root_views)
+    if layout_ref is None:
+        return
+    process_change = getattr(widget, "_process_param_change", None)
+    update_model = getattr(widget, "_update_model", None)
+    if not callable(process_change) or not callable(update_model):
+        return
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return
+    if changes is None:
+        changes = {
+            name: getattr(widget, name)
+            for name in getattr(widget, "_synced_params", ())
+            if name in widget.param
+        }
+    if not changes:
+        return
+    try:
+        msg = process_change(dict(changes))
+    except Exception:  # noqa: BLE001
+        logger.debug("Notebook widget param sync failed for %r", widget, exc_info=True)
+        return
+    if not msg:
+        return
+    # BooleanIndicator._update_model returns immediately when ``events`` is empty,
+    # so LoadingSpinner never gets the ``spin`` CSS class in the browser.
+    synthetic_events = {
+        name: param.parameterized.Event(
+            "changed",
+            name,
+            widget,
+            type(widget),
+            None,
+            changes[name],
+            "changed",
+        )
+        for name in changes
+    }
+    _viewable, root, doc, comm = state._views[layout_ref]
+    for ref, (model, _parent) in widget._models.copy().items():
+        try:
+            update_model(synthetic_events, msg, root, model, doc, comm)
+        except Exception:  # noqa: BLE001
+            logger.debug("Notebook widget model sync failed for %r", widget, exc_info=True)
 
 
 def sync_pane_to_notebook(
@@ -387,11 +499,16 @@ def sync_pane_to_notebook(
     is. Panel's ``_update_pane`` then skips the update and ``push`` diffs an
     empty event list — Python state changes but the browser UI freezes.
 
+    Panel **widgets** (``AutocompleteInput``, ``LoadingSpinner``) have no
+    ``_update_object``; use :func:`sync_widget_to_notebook` for those.
+
     Call while :func:`hold_and_push` is active (inside
     :func:`dispatch_notebook_ui`). Uses the registered layout root from
     :func:`_primary_notebook_ref` to invoke ``pane._update_object(...)`` directly.
     """
     if not getattr(pane, "_models", None):
+        return
+    if _is_panel_layout_container(pane):
         return
     layout_ref = _primary_notebook_ref(*root_views)
     if layout_ref is None:
@@ -402,6 +519,7 @@ def sync_pane_to_notebook(
         return
     update_object = getattr(pane, "_update_object", None)
     if not callable(update_object):
+        sync_widget_to_notebook(pane, *root_views)
         return
     _viewable, root, doc, comm = state._views[layout_ref]
     for ref, (_model, parent) in pane._models.copy().items():
@@ -409,6 +527,94 @@ def sync_pane_to_notebook(
             update_object(ref, doc, root, parent, comm)
         except Exception:  # noqa: BLE001
             logger.debug("Notebook pane sync failed for %r", pane, exc_info=True)
+
+
+def set_notebook_widget_params(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    **param_values: Any,
+) -> None:
+    """Assign widget params and sync without Panel's mid-hold ``push``.
+
+    Use for ``AutocompleteInput``, ``LoadingSpinner``, and other widgets when
+    :func:`notebook_ui_hold_active` is true.
+    """
+    if not param_values:
+        return
+    with param.parameterized.discard_events(widget):
+        for name, value in param_values.items():
+            setattr(widget, name, value)
+    applied = {name: getattr(widget, name) for name in param_values}
+    sync_widget_to_notebook(widget, *root_views, changes=applied)
+
+
+def set_notebook_pane_object(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Assign ``pane.object`` and sync without Panel's premature notebook push.
+
+    Replacing ``pn.pane.Bokeh.object`` (or any pane with ``object`` in
+    ``_rerender_params``) fires Panel's ``_update_pane`` watcher, which calls
+    ``push()`` immediately. Inside an active ``doc.hold('combine')`` that
+    mid-hold push is lost in Jupyter — the browser keeps the old figure even
+    though Python state is correct. Suppress the watcher and sync explicitly
+    instead; call only from inside :func:`hold_and_push` /
+    :func:`dispatch_notebook_ui`.
+    """
+    replacing_bokeh = (
+        isinstance(pane, pn.pane.Bokeh)
+        and pane.object is not None
+        and value is not None
+        and pane.object is not value
+    )
+    with param.parameterized.discard_events(pane):
+        if replacing_bokeh:
+            pane.object = None
+        pane.object = value
+    sync_pane_to_notebook(pane, *root_views)
+
+
+def publish_panel_widget_to_notebook(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    **param_values: Any,
+) -> None:
+    """Push Panel widget changes with assign + :func:`_push_panel_layout`.
+
+    Schedule on the io_loop **after** an active ``hold_and_push`` cycle when
+    updating widgets from a callback that also syncs other panes (e.g. sky click
+    → coordinate field while status updates in the same hold).
+    """
+    if not param_values:
+        return
+    for name, value in param_values.items():
+        setattr(widget, name, value)
+    _push_panel_layout(*root_views, widget)
+
+
+def publish_bokeh_pane_to_notebook(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
+
+    Match ``jupiter_flux_review.ipynb``: assign ``pane.object`` (Panel's watcher
+    registers the model change) then :func:`_push_panel_layout`. Do **not** wrap
+    the assign in ``discard_events`` — that suppresses the watcher and a bare
+    push then leaves the browser on the placeholder figure.
+    """
+    if (
+        isinstance(pane, pn.pane.Bokeh)
+        and pane.object is not None
+        and value is not None
+        and pane.object is not value
+    ):
+        pane.object = None
+    pane.object = value
+    _push_panel_layout(*root_views, pane)
 
 
 def dispatch_notebook_ui(
@@ -458,6 +664,22 @@ def dispatch_notebook_ui(
     _schedule_ipython_main(_wrapped)
 
 
+def defer_notebook_ui(
+    callback: Callable[[], None],
+    *views: pn.viewable.Viewable,
+) -> None:
+    """Schedule a **new** hold/push cycle after the current one finishes.
+
+    Re-entrant :func:`dispatch_notebook_ui` runs inline inside an active hold.
+    Bokeh figure replacement bundled with widget/status syncs in the same hold
+    can fail to reach the browser; defer the figure publish to its own cycle.
+    """
+    def _wrapped() -> None:
+        dispatch_notebook_ui(callback, *views)
+
+    _schedule_ipython_main(_wrapped)
+
+
 @contextmanager
 def hold_and_push(*views: pn.viewable.Viewable) -> Iterator[None]:
     """Hold notebook document(s) for ``views`` during the body, sync, then push.
@@ -484,6 +706,8 @@ def hold_and_push(*views: pn.viewable.Viewable) -> Iterator[None]:
         return
 
     held: list[tuple[Any, Any]] = []
+    after_hold: list[Callable[[], None]] = []
+    after_hold_token = _AFTER_HOLD_CALLBACKS.set(after_hold)
     with ExitStack() as stack:
         for doc, comm in docs.values():
             stack.enter_context(set_curdoc(doc))
@@ -503,6 +727,9 @@ def hold_and_push(*views: pn.viewable.Viewable) -> Iterator[None]:
                         doc.unhold()
                 except Exception:  # noqa: BLE001
                     logger.debug("Document unhold failed", exc_info=True)
+            _AFTER_HOLD_CALLBACKS.reset(after_hold_token)
+            for deferred in after_hold:
+                _run_after_hold(deferred)
 
 
 ACTIVITY_LOG_HEIGHT_PX = 150

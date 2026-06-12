@@ -289,7 +289,8 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 │           ├── pipeline_qa_app.py  # Jupyter UI; bind_sky_widget_dataset, WCS patch
 │           ├── source_review.py      # Pure Center/load orchestration (testable)
 │           ├── source_review_data.py # Heatmap helpers, known-sources I/O
-│           └── source_review_app.py  # SourceReview Panel app class
+│           ├── source_review_app.py  # SourceReview Panel app class
+│           └── panel_ui_session.py   # PanelUISession backends (Jupyter vs headless)
 └── tests/                      # Test suite
     ├── __init__.py            # Test package initialization
     ├── test_import.py         # Basic import tests
@@ -298,6 +299,9 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
     ├── ingest/                # Ingest module tests
     │   └── test_cli.py        # CLI integration tests
     └── viz/                   # Viz / pipeline QA tests
+        ├── panel_ui_testkit.py        # PanelUITestHarness, QueuedIOLoop
+        ├── test_panel_ui_session.py   # PanelUISession + harness
+        ├── test_source_review_ui_integration.py  # Comm integration (inline + queued io_loop)
         ├── test_source_review.py      # Center/load orchestration tests
         ├── test_source_review_app.py  # SourceReview Panel app smoke tests
         └── test_source_review_data.py # Heatmap data helper tests
@@ -533,76 +537,178 @@ Data loading for QA apps follows `viz/pipeline_qa.py` → `load_qa_datasets()` �
 
 ### Panel notebook comm management (Jupyter)
 
-OVRO-LWA review apps combine **three comm channels** (validated on calim10):
+**Canonical reference:** When guidance differs, follow **`source_review.ipynb`** /
+``viz/source_review_app.py`` + ``viz/panel_ui_session.py``. That app is extracted,
+headless-tested (``test_source_review_ui_integration.py``, ``test_panel_ui_session.py``),
+and validated in live Jupyter. **`jupiter_flux_review.ipynb`** is a legacy inline
+notebook with minimal automated comm coverage — use it for science/workflow examples
+(Zarr chunking, Jupiter ephemeris, flux methods), not as the comm architecture template.
+
+Two notebook UIs share low-level helpers from ``viz/pipeline_qa_app`` but differ in structure:
+
+| | ``source_review.ipynb`` **(canonical)** | ``jupiter_flux_review.ipynb`` (legacy) |
+| --- | --- | --- |
+| Test coverage | App module + UI integration tests | Manual notebook only |
+| App code | ``viz/source_review_app.py`` + ``JupyterPanelUISession`` | Inline ``JupiterFluxReview`` class in the notebook |
+| Activity log | ipywidgets ``HTML`` in ``pn.pane.IPyWidget`` | ``pn.pane.HTML`` + ``_push_panel_layout`` per ``_log()`` |
+| Panel/Bokeh updates | ``_dispatch`` → ``JupyterPanelUISession`` (batch assign + push) | Direct assign + ``_push_panel_layout`` (explicit pane list) |
+| Zarr open timing | ``schedule_when_panel_loaded`` + ``configure_source_review_notebook()`` | Loads on init when a default store is selected |
+| ``hold_and_push`` | **Not** used in production | **Not** used |
+
+**On conflict:** port **from** ``source_review`` **to** Jupiter (or new notebooks), not the
+reverse. Shared primitive only: ``assign model`` + ``_push_panel_layout(*views)`` — both
+avoid ``hold_and_push`` in the notebook UI.
+
+**``source_review`` comm channels** (validated on calim10):
 
 | UI piece | Technology | Comm | Update path |
 | -------- | ---------- | ---- | ----------- |
 | SkyWidget | ipywidgets | Widget comm | Trait updates; works from observers/workers |
-| Activity log | ipywidgets `HTML` in `pn.pane.IPyWidget` | Widget comm | `_refresh_log_widget()` on every `_log()` |
-| Status, heatmap, spinner, controls | Panel/Bokeh | One notebook comm | `_dispatch` → `dispatch_notebook_ui` → `hold_and_push` |
+| Activity log | ipywidgets ``HTML`` in ``pn.pane.IPyWidget`` | Widget comm | ``_refresh_log_widget()`` on every ``_log()`` |
+| Status, spinner, controls | Panel/Bokeh | One notebook comm | ``_dispatch`` → ``JupyterPanelUISession.dispatch`` → assign + ``_push_panel_layout`` |
+| Heatmap (Bokeh figure) | Panel/Bokeh | Same comm | ``publish_bokeh_pane_to_notebook`` **after** batch push |
 
-**Bottom line:** Panel/Bokeh mutations outside an active Bokeh callback must use
-explicit `doc.hold('combine')`, sync nested panes, then `push(doc, comm)`. Use
-`dispatch_notebook_ui` as the single entry point for that path. **Do not** route
-the activity log through Panel — use ipywidgets instead.
+**Bottom line (``source_review``):** Production UI goes through
+:class:`~ovro_lwa_portal.viz.panel_ui_session.JupyterPanelUISession` (``SourceReview._ui``).
+Schedule worker/io-loop callbacks via ``_dispatch`` / ``_schedule_ipython_main``, mutate
+Python models, then ``_push_panel_layout`` over ``SourceReview._notebook_ui_views()``
+(layout + status + spinner + heatmap + coord field). **Do not** use ``hold_and_push`` in
+production ``SourceReview``. **Do not** copy ``jupiter_flux_review``'s Panel HTML log or
+inline-class structure when they differ — follow ``source_review_app.py`` instead.
+
+**Activity log:** ``source_review`` uses ipywidgets (validated). ``jupiter_flux_review``
+still uses Panel HTML log; treat that as legacy unless you re-validate with
+``source_review``-level tests.
+
+#### Three sync tiers (do not collapse)
+
+Implemented in ``viz/panel_ui_session.py``; app code calls ``self._ui.*`` only:
+
+1. **Dispatch batch** — spinner, status markdown inside
+   :meth:`~ovro_lwa_portal.viz.panel_ui_session.JupyterPanelUISession.dispatch`:
+   assign on Python models, one ``_push_panel_layout`` sweep over
+   ``SourceReview._notebook_ui_views()`` (layout + status + spinner + heatmap +
+   coord field).
+2. **Direct Bokeh publish** — heatmap figures: assign ``pane.object``, then
+   ``_push_panel_layout`` via ``publish_bokeh_pane_to_notebook`` — **never** inside
+   ``doc.hold('combine')``, **never** ``discard_events``.
+3. **Deferred widget publish** — coordinate field when a dispatch batch is active:
+   queue ``publish_panel_widget_to_notebook`` with ``defer_after_notebook_hold`` and
+   flush it **after** the batch push in the same io-loop turn.
+
+Worker threads must never mutate Panel panes directly — always ``self._dispatch(...)``
+(which schedules on the io_loop) or ``self._ui.schedule(...)``.
 
 #### What did **not** work (do not reintroduce)
 
 These were tried repeatedly; Python state updated but the browser UI stayed frozen
-(last log line often **`HiPS background`**, the final `__init__` message baked into
-the first render):
+(activity log often still worked via ipywidgets):
 
-- **`_push_panel_layout` / plain `push()`** without an active document hold — diffs
-  empty `_held_events` in Jupyter → silent no-op.
-- **`notebook_views_registered(review._layout) is True`** as the only gate — the
-  layout root can be registered while nested pane refs (`_log_pane`, `_status_pane`)
-  are absent from `state._views`; Panel's `_update_pane` then skips them.
-- **`panel.io.document.hold(doc, comm=comm)`** (Panel's wrapper) on the main thread
-  in Jupyter — under `state._jupyter_kernel_context`, the `unlocked` path is a
-  no-op; held events may not accumulate and push sends nothing useful.
-- **Activity log as `pn.pane.HTML`** with `@param.depends('log_text')` +
-  `sync_pane_to_notebook` — same nested-ref problem; manual `_dispatch` log tests
-  did not appear in the browser even when the layout comm was registered.
-- **Starting Zarr open synchronously** on first `review.panel` access — races the
-  notebook comm; worker callbacks can exhaust retry before registration completes.
-- **`_run_on_main_thread` / inline `pn.state.execute`** from worker threads —
-  runs on the worker without a live Bokeh session; comm updates never reach the
-  browser (SkyWidget still worked because it uses a separate comm).
+- **`hold_and_push` / `dispatch_notebook_ui` in production `SourceReview`** — explicit
+  ``doc.hold('combine')`` + nested sync froze spinner, status, heatmap, and coordinate
+  field in live Jupyter even when pytest passed (see **Test coverage vs Jupyter**
+  below). **Validated fix:** ``JupyterPanelUISession`` (assign + push on ``io_loop``).
+- **`discard_events` + `_push_panel_layout` for Bokeh heatmap** — suppresses Panel's
+  watcher; browser stays on the placeholder figure.
+- **Assigning `pn.pane.Bokeh.object` inside any hold cycle** — mid-hold watcher push is
+  lost; zeros grid persists after Generate heatmap.
+- **Activity log as `pn.pane.HTML`** with Panel push in **`source_review`** — nested-ref /
+  comm issues; log pane stale while ipywidgets log works. (``jupiter_flux_review`` still
+  uses Panel HTML log + ``_push_panel_layout`` successfully — layout-specific, not a
+  universal ban on Panel logging.)
+- **Starting Zarr open synchronously** on first ``review.panel`` access — races the
+  notebook comm; use ``schedule_when_panel_loaded(_open_dataset)``.
+- **`_run_on_main_thread` / inline `pn.state.execute` from worker threads** — no live
+  Bokeh session on the worker; Panel updates never reach the browser.
+- **`notebook_views_registered(review._layout) is True` as the only gate** — layout root
+  can be registered while nested pane refs are absent from ``state._views``; pass
+  mutated panes explicitly in ``_notebook_ui_views()``.
+- **Assuming green pytest implies a working notebook** — ``InlinePanelUISession`` uses
+  ``hold_and_push`` synchronously with a fully registered view tree; that is **not** the
+  production Jupyter comm path.
 
-#### What **did** work (current `source_review_app.py`)
+#### What **did** work (current `source_review_app.py` + `panel_ui_session.py`)
 
-1. **ipywidgets activity log** — `_log_widget = widgets.HTML(...)` wrapped in
-   `pn.pane.IPyWidget`; `_sync_log()` sets `log_text` and calls
-   `_refresh_log_widget()`. Logging does not depend on Panel push.
-2. **`hold_and_push`** — explicit `doc.hold('combine')` + `set_curdoc`, body,
-   then `_sync_all_notebook_views()` and `push(doc, comm)` per document (not
-   Panel's `hold()` context manager).
-3. **`dispatch_notebook_ui(callback, *views)`** — schedules on the kernel
-   `io_loop`, waits for a registered comm, runs the callback inside
-   `hold_and_push`. Re-entrant calls run inline. SourceReview wraps this as
-   `_dispatch()`.
-4. **`sync_pane_to_notebook(pane, *root_views)`** — force nested Panel panes
-   (status, heatmap) through the layout root ref when their own ref is missing
-   from `state._views`.
-5. **`schedule_when_panel_loaded(_open_dataset)`** — defer the Zarr worker until
-   `pn.state.loaded` so open/progress/finalize callbacks run against a live comm.
-6. **Status pane** — `@param.depends('status')` → `_sync_status_pane` +
-   `sync_pane_to_notebook` (inside an active `hold_and_push` from `_dispatch`).
-7. **Module extraction** — `source_review_app.py` / `source_review_data.py` so
-   threading and comm helpers are headless-testable (see tests below).
+1. **ipywidgets activity log** — ``_log_widget = widgets.HTML(...)`` in
+   ``pn.pane.IPyWidget``; ``_refresh_log_widget()`` on every ``_log()``. Independent
+   of Panel push (symptom: log updates while spinner/heatmap stay frozen → Panel path
+   bug, not logging).
+2. **`JupyterPanelUISession`** — production backend for ``source_review`` (default in
+   ``SourceReview``): ``dispatch`` on ``io_loop`` → mutate models → ``_push_panel_layout``
+   → flush deferred Bokeh/widget publishes in the same turn. This is the validated
+   comm architecture; do not replace it with ``jupiter_flux_review``'s inline direct-push
+   class when the two differ.
+3. **`configure_source_review_notebook()`** — call once before launch; captures kernel
+   ``io_loop`` via ``_capture_ipython_io_loop()``.
+4. **`schedule_when_panel_loaded(_open_dataset)`** — defer Zarr worker until
+   ``pn.state.loaded`` so open callbacks run against a live comm.
+5. **`publish_bokeh_pane_to_notebook`** — heatmap via ``_publish_heatmap_figure`` →
+   ``self._ui.publish_bokeh_figure`` (deferred after batch push, not inside hold).
+6. **`publish_panel_widget_to_notebook`** — coordinate field after sky click (deferred
+   when ``notebook_ui_hold_active()`` during a dispatch batch).
+7. **Module extraction** — ``source_review_app.py`` / ``source_review_data.py`` /
+   ``panel_ui_session.py`` so threading and comm intent are headless-testable.
 
-#### Reference helpers (`viz/pipeline_qa_app.py`)
+#### Low-level helpers (`viz/pipeline_qa_app.py`)
+
+Used by ``JupyterPanelUISession``, ``InlinePanelUISession``, and legacy QA code:
 
 | Function | Role |
 | -------- | ---- |
-| `dispatch_notebook_ui(callback, *views)` | Schedule + hold/push wrapper for Panel panes |
-| `hold_and_push(*views)` | `doc.hold('combine')` → sync all nested viewables → `push` |
-| `sync_pane_to_notebook(pane, *root_views)` | Force nested pane sync via layout root ref |
+| `_schedule_ipython_main(callback)` | Schedule on kernel ``io_loop`` (never inline from workers) |
+| `_push_panel_layout(*views)` | Push layout comm after model assign (shared primitive) |
+| `publish_bokeh_pane_to_notebook(pane, value, *root_views)` | Bokeh figure: assign + push, no hold (`source_review` heatmap path) |
+| `publish_panel_widget_to_notebook(widget, *root_views, **params)` | Widget assign + push |
+| `defer_after_notebook_hold(callback)` | Queue publish after active dispatch batch |
+| `notebook_ui_hold_active()` | True inside ``JupyterPanelUISession.dispatch`` batch |
+| `hold_and_push(*views)` | **Headless / ``InlinePanelUISession`` only** — not production Jupyter |
+| `dispatch_notebook_ui(callback, *views)` | Legacy hold/push entry; prefer ``JupyterPanelUISession`` |
+| `set_notebook_widget_params` / `sync_pane_to_notebook` | Used inside ``InlinePanelUISession`` + unit tests |
 | `schedule_when_panel_loaded(callback)` | Run after Panel notebook comm is ready |
-| `notebook_views_registered(*views)` | Diagnostic only — **not** sufficient alone |
+| `notebook_views_registered(*views)` | Comm retry gate; not sufficient alone |
 
-Tests: `tests/viz/test_pipeline_qa.py` (hold, sync, dispatch, real-document
-integration), `tests/viz/test_source_review_app.py`.
+Tests: ``tests/viz/test_pipeline_qa.py`` (low-level hold/sync/publish helpers),
+``tests/viz/test_panel_ui_session.py``, ``tests/viz/test_source_review_ui_integration.py``,
+``tests/viz/test_source_review_app.py``.
+
+#### Headless testing architecture
+
+App code must not branch on ``notebook_ui_hold_active()`` in production — inject a
+:class:`~ovro_lwa_portal.viz.panel_ui_session.PanelUISession`:
+
+| Backend | Comm strategy | Use |
+| ------- | ------------- | --- |
+| ``JupyterPanelUISession`` | Assign + ``_push_panel_layout`` on ``io_loop`` + deferred publish | Production ``source_review`` (default) |
+| ``InlinePanelUISession`` | Synchronous ``hold_and_push`` on mounted document | Headless harness tests |
+| ``RecordingPanelUISession`` | Operation log; optional ``InlinePanelUISession`` delegate | Behavioral / ordering tests |
+| ``CallbackPanelUISession`` | Inline ``dispatch_override`` | Python state only (no comm) |
+
+**Harness:** ``PanelUITestHarness.mount(layout)`` registers a real
+``bokeh.document.Document`` and full nested view tree in ``state._views``.
+``mount_layout_only`` keeps only the layout root registered (notebook-like gap).
+``capture_notebook_pushes(monkeypatch)`` records ``push`` calls. Assert on **Bokeh
+models** via ``harness.bokeh_model(viewable, layout)``, not only Python Param values.
+
+**What pytest covers:**
+
+| Test module | What it proves |
+| ----------- | -------------- |
+| ``test_panel_ui_session.py`` | ``PanelUISession`` API + harness publish/spinner/coord |
+| ``test_source_review_ui_integration.py`` | End-to-end heatmap/spinner/coord via inline **and** ``QueuedIOLoop`` + ``JupyterPanelUISession`` |
+| ``test_pipeline_qa.py`` | ``hold_and_push``, ``sync_*``, ``publish_*`` helpers on real documents |
+| ``test_source_review.py`` | Pure logic (Center, load threading) — no browser comm |
+
+**Test coverage vs Jupyter (critical):**
+
+- ``InlinePanelUISession`` runs **synchronously** with ``hold_and_push`` and a **fully
+  registered** view tree. Passing these tests does **not** prove live Jupyter works.
+- ``test_jupyter_session_open_generate_and_sky_click`` uses ``QueuedIOLoop`` with
+  monkeypatched ``_schedule_ipython_main`` and **synchronous flush** — closer to the
+  notebook, but still not async browser comm timing.
+- After any change to ``JupyterPanelUISession``, ``_push_panel_layout``, or io-loop
+  scheduling: run pytest **and** manual ``source_review.ipynb`` smoke (kernel restart,
+  confirm spinner, heatmap grid after open, coordinate field on sky click).
+- SkyWidget, HiPS, and WebGL overlay still require manual notebook validation.
 
 ### `source_review` Panel app and notebook
 
@@ -611,20 +717,28 @@ from the notebook for testability). `notebooks/source_review.ipynb` keeps path/c
 constants, calls `configure_source_review_notebook()`, and constructs
 `SourceReview` with a `SourceReviewConfig`.
 
-Notebook launch pattern:
+Notebook launch pattern (``notebooks/source_review.ipynb``):
 
 ```python
-configure_source_review_notebook()
+configure_source_review_notebook()  # astrowidget patch, pn.extension, _capture_ipython_io_loop
 review = SourceReview(ZARR_PATH, ..., config=SourceReviewConfig(...), validate_zarr=False)
-review.panel  # triggers schedule_when_panel_loaded → Zarr open
+review.panel  # schedule_when_panel_loaded → Zarr open
 ```
+
+``jupiter_flux_review.ipynb`` defines ``JupiterFluxReview`` in-notebook with a simpler
+comm stack (direct ``_push_panel_layout``, Panel HTML log). **Do not treat that notebook
+as the template for new Panel comm work** — align Jupiter with ``source_review`` when
+updating comm behavior, and add tests under ``tests/viz/`` before relying on changes.
 
 Pure decision logic remains in `viz/source_review.py` (`plan_center_action`,
 `run_dataset_load`, `finalize_dataset_load`). Data helpers (heatmap computation,
 known-sources YAML) are in `viz/source_review_data.py`.
 
 Headless tests: `tests/viz/test_source_review.py`, `test_source_review_app.py`,
-`test_source_review_data.py`, and `test_pipeline_qa.py::test_hold_and_push_real_document_pushes_nested_html_pane`.
+`test_source_review_data.py`, `test_source_review_ui_integration.py`,
+`test_panel_ui_session.py`, and `test_pipeline_qa.py` (low-level comm helpers).
+Run `pixi run python -m pytest tests/viz/test_source_review_ui_integration.py`
+after Panel comm or `JupyterPanelUISession` changes; still smoke-test the notebook.
 
 ### `source_review.ipynb` coordinate UI and SkyWidget actions
 
@@ -656,8 +770,8 @@ its tests first, then the notebook call site.
 - **Sky click** — observe `SkyWidget.click_tick`; read `clicked_coord`, format
   with `format_icrs_degree_pair` (`ovro_lwa_portal.name_resolution`), fill the
   field via `_set_coordinate_field_from_text`. Schedule with
-  `_dispatch(...)` → `dispatch_notebook_ui` from `viz.pipeline_qa_app` (not
-  `_schedule_ipython_main` alone).
+  `_dispatch(...)` → `JupyterPanelUISession.dispatch` (io_loop + batch push),
+  not `_schedule_ipython_main` alone from a worker.
 
 **Always-on heatmap grid and overlay toggle:**
 
@@ -690,13 +804,15 @@ its tests first, then the notebook call site.
   that suppresses Param events and the field stays blank while the activity log
   still updates. Use a `_suppress_coord_value_handler` flag to skip duplicate
   resolution logging on programmatic writes instead.
-- `_log()` updates `log_text` and the ipywidgets log via `_sync_log()` /
-  `_refresh_log_widget()` — **not** through Panel push. Sky-click and coord-input
-  writes still go through `_dispatch` for Panel panes that need `hold_and_push`.
-- **Any Bokeh figure built from an io-loop callback** (e.g.
-  `_ensure_heatmap_grid` from `_finish_open`) runs inside `_dispatch` so
-  `hold_and_push` syncs `_heatmap_pane` and wires the tap handler to the comm.
-  Status uses `@param.depends('status')` → `_sync_status_pane`.
+- Sky-click coordinate writes: status and spinner mutate inside
+  `JupyterPanelUISession.dispatch`; the coordinate field uses
+  **`publish_panel_widget_to_notebook`** via `defer_after_notebook_hold` (flush
+  after the batch push, same io-loop turn).
+- **Bokeh heatmap figures** from io-loop callbacks (e.g. `_ensure_heatmap_grid`,
+  Generate) use **`publish_bokeh_pane_to_notebook`** via `_publish_heatmap_figure`
+  → `self._ui.publish_bokeh_figure` — deferred after batch push, **not** inside
+  `hold_and_push`. Use `publish_bokeh_pane_to_notebook` (assign `pane.object` then
+  `_push_panel_layout`) as in `source_review_app.py`.
 
 **Testing the controller:** compare numpy-derived booleans with
 `bool(...) is True`, not `np.bool_ is True` (`assert np.True_ is True` fails).
@@ -1041,58 +1157,86 @@ preserved) or repair WCS rows from FITS via `ovro-ingest repair --fits-dir`. Do
 **Symptoms:** Activity log shows `Sky click → 'RA, Dec'`; AutocompleteInput does
 not update.
 
-**Cause:** `_set_coordinate_field_from_text` used
-`param.parameterized.discard_events` on `_coord_input`, which suppresses
-Param/Bokeh sync to the browser.
+**Cause:** Coordinate field publish ran inside a failed Panel comm path (e.g.
+legacy `hold_and_push`, or `discard_events` suppressing browser sync). Activity
+log still updates because it uses ipywidgets.
 
-**Solution:** Update `value` / `value_input` without `discard_events`; use
-`_suppress_coord_value_handler` to avoid duplicate resolution logs. Schedule the
-update with `_dispatch` → `dispatch_notebook_ui`, not `_schedule_ipython_main`
-alone.
+**Solution:** Use `self._ui.sync_coordinate_field` → `publish_panel_widget_to_notebook`
+(deferred after dispatch batch push). Schedule sky-click handling through
+`_dispatch`, not `_schedule_ipython_main` alone from a worker.
 
 ### Issue: Activity log frozen after `HiPS background`; no heatmap after Zarr open
 
 **Symptoms:** Activity log stops at the last `__init__` line (often `HiPS background`);
 `review.log_text` in Python is correct but the browser log pane is stale. No
 `Opening…`, Zarr progress, `Opened — …`, or zeros heatmap. SkyWidget overlay and
-Center may still work. `notebook_views_registered(review._layout)` may be `True`;
-`review._dispatch(lambda: review._log("test"))` may not appear when the log was
-still a Panel HTML pane.
+Center may still work.
 
-**Cause:** Dual (really triple) comm architecture. Pre-display `__init__` logs are
-baked into the first Panel render snapshot. Post-display updates need either an
-ipywidgets comm (log) or explicit `doc.hold` + nested-pane sync + `push` (heatmap,
-status, spinner). Panel HTML nested in a `Column` often has refs not in
-`state._views`; plain `push()` and Panel's `hold()` main-thread path do not fix
-that in Jupyter.
+**Cause:** Dual (triple) comm architecture. Pre-display `__init__` logs are baked
+into the first Panel render snapshot unless ipywidgets log is used. Post-display
+Panel updates need assign + `_push_panel_layout` on the kernel `io_loop` via
+`JupyterPanelUISession`. Legacy `hold_and_push` froze Panel widgets in live Jupyter
+while pytest still passed.
 
 **Solution (validated):**
 
 1. Activity log → ipywidgets `HTML` + `_refresh_log_widget()` (see
    `source_review_app.py`).
-2. Panel panes → `_dispatch` → `dispatch_notebook_ui` → `hold_and_push` (explicit
-   `doc.hold`, not Panel's `hold()` wrapper).
-3. Defer open → `schedule_when_panel_loaded(_open_dataset)`.
+2. Panel panes → `_dispatch` → `JupyterPanelUISession` (assign + push, not
+   production `hold_and_push`).
+3. Defer open → `schedule_when_panel_loaded(_open_dataset)`; call
+   `configure_source_review_notebook()` before launch.
 4. After kernel restart, re-run all cells; confirm log continues past HiPS and
    heatmap grid appears after open.
 
-Do **not** revert to `pn.pane.HTML` for the activity log or `_push_panel_layout`.
+Do **not** revert to `pn.pane.HTML` for the activity log. Do **not** assume green
+pytest replaces a notebook smoke test after comm changes.
+
+### Issue: Generate heatmap runs but the plot stays zeros
+
+**Symptoms:** Activity log shows computation progress, finite-cell stats, and
+`Finished … in N s`, but the time–frequency pane still shows the initial zeros
+grid.
+
+**Cause:** Bokeh figure update went through `hold_and_push`, `discard_events`, or
+`set_notebook_pane_object` instead of the validated `source_review` publish path. Python
+`pane.object` updates but the browser does not.
+
+**Solution:** Route heatmap figure updates through `_publish_heatmap_figure` →
+`self._ui.publish_bokeh_figure` → `publish_bokeh_pane_to_notebook` (assign
+`pane.object`, then `_push_panel_layout`, deferred after dispatch batch push).
+Spinner/status sync in the same dispatch batch via direct assign + batch push.
+
+### Issue: pytest passes but `source_review.ipynb` Panel UI is frozen
+
+**Symptoms:** Activity log updates (ipywidgets) on sky click and after Zarr open,
+but spinner, status markdown, heatmap, and coordinate field stay on their initial
+render. `test_source_review_ui_integration.py` is green.
+
+**Cause:** Headless tests use ``InlinePanelUISession`` (synchronous ``hold_and_push``
++ fully registered view tree) or ``QueuedIOLoop`` with synchronous flush — neither
+matches async live Jupyter comm timing. Production previously used ``hold_and_push``,
+which froze the browser while tests still passed.
+
+**Solution:** Production must use ``JupyterPanelUISession`` (assign +
+``_push_panel_layout`` on the kernel ``io_loop``). After comm changes, restart the
+kernel and smoke-test ``source_review.ipynb`` even when pytest passes. Symptom triage: log works,
+Panel frozen → Panel comm path, not logging.
 
 ### Issue: Heatmap clicks do nothing / toggle shows no feedback
 
 **Symptoms:** The zeros heatmap renders but clicking cells produces no log entry
 or overlay; the Overlay toggle flips visually but nothing else changes.
 
-**Cause:** The Bokeh figure (or status pane) was set from an io-loop callback
-(e.g. `_ensure_heatmap_grid` from `_finish_open`) without
-`dispatch_notebook_ui` / `sync_pane_to_notebook`. With no live Bokeh doc
-context, the tap handler never gets wired to the comm, so clicks never reach
-Python.
+**Cause:** The Bokeh figure was never published to the browser (placeholder still
+shown), or tap handler was wired before the live figure reached the comm. Often
+the same root cause as “Generate heatmap runs but plot stays zeros” — Panel path
+broken while activity log still works.
 
-**Solution:** Wrap io-loop and worker-thread UI in `_dispatch(...)` so
-`hold_and_push` runs (see `_ensure_heatmap_grid`, `_on_overlay_toggle`). Activity
-log lines from those paths use ipywidgets; heatmap/status use Panel sync inside
-`hold_and_push`.
+**Solution:** Ensure `_ensure_heatmap_grid` / Generate use `_publish_heatmap_figure`
+(`source_review` path). Log/status/spinner from io-loop paths use `_dispatch` →
+`JupyterPanelUISession`. After comm fixes, restart the kernel and confirm the
+heatmap title changes from “Heatmap loads…” before testing clicks.
 
 ### Issue: Radio overlay flipped or rotated relative to HiPS
 

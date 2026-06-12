@@ -38,16 +38,18 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     _format_activity_log_html,
     _patch_astrowidget_get_wcs,
     bind_sky_widget_dataset,
-    dispatch_notebook_ui,
     schedule_when_panel_loaded,
-    sync_pane_to_notebook,
+)
+from ovro_lwa_portal.viz.panel_ui_session import (
+    CallbackPanelUISession,
+    JupyterPanelUISession,
+    PanelUISession,
 )
 from ovro_lwa_portal.viz.source_review import (
     DatasetLoad,
     finalize_dataset_load,
     plan_center_action,
     run_dataset_load,
-    should_build_heatmap_grid,
 )
 from ovro_lwa_portal.viz.source_review_data import (
     HEATMAP_METHOD_OPTIONS,
@@ -93,6 +95,29 @@ class SourceReviewConfig:
     hips_background_percentile_high: float = 98.0
 
 
+def _placeholder_heatmap_figure() -> figure:
+    """Minimal Bokeh plot shown before the Zarr store opens.
+
+    Ensures the heatmap ``pn.pane.Bokeh`` is a real figure in the layout comm
+    from the first render (not an empty Spacer placeholder that is hard to
+    replace from io-loop callbacks).
+    """
+    plot = figure(
+        width=1000,
+        height=400,
+        x_range=(0, 1),
+        y_range=(0, 1),
+        tools="",
+        active_drag=None,
+        active_tap=None,
+        title="Heatmap loads after the Zarr store opens…",
+    )
+    plot.xaxis.visible = False
+    plot.yaxis.visible = False
+    plot.outline_line_alpha = 0
+    return plot
+
+
 def configure_source_review_notebook() -> None:
     """One-time notebook setup: astrowidget patch, Panel extension, io_loop capture."""
     _patch_astrowidget_get_wcs()
@@ -128,6 +153,7 @@ class SourceReview(param.Parameterized):
         config: SourceReviewConfig | None = None,
         validate_zarr: bool = True,
         dispatch_override: Callable[[Callable[[], None]], None] | None = None,
+        ui_session: PanelUISession | None = None,
         **params,
     ) -> None:
         self._zarr_path = Path(zarr_path)
@@ -141,6 +167,8 @@ class SourceReview(param.Parameterized):
         self._patch_fit_max_chi2 = float(patch_fit_max_reduced_chi_squared)
         self._config = config or SourceReviewConfig()
         self._dispatch_override = dispatch_override
+        self._ui_session_override = ui_session
+        self._ui_session: PanelUISession | None = None
         self._scroll_log = ScrollLog()
         self._dataset: xr.Dataset | None = None
         self._cache: dict[tuple[str, str], HeatmapLoad] = {}
@@ -168,10 +196,15 @@ class SourceReview(param.Parameterized):
         self._default_time_idx = 0
         self._default_freq_idx = 0
         self._heatmap_job_id = 0
+        self._heatmap_grid_ready = False
 
         super().__init__(coordinate_string=coordinate_string.strip(), **params)
 
-        self._heatmap_pane = pn.pane.Bokeh(height=420, sizing_mode="stretch_width")
+        self._heatmap_pane = pn.pane.Bokeh(
+            _placeholder_heatmap_figure(),
+            height=420,
+            sizing_mode="stretch_width",
+        )
         self._sky_container = widgets.VBox(
             children=[widgets.HTML("<i>Sky view loads after the Zarr store opens.</i>")],
             layout=widgets.Layout(width="100%", min_height="620px"),
@@ -304,12 +337,32 @@ class SourceReview(param.Parameterized):
         return self._layout
 
     def _notebook_ui_views(self) -> tuple[pn.viewable.Viewable, ...]:
+        # Include panes we mutate often so _push_panel_layout matches jupiter_flux_review.
         return (
             self._layout,
             self._status_pane,
-            self._heatmap_pane,
             self._spinner,
+            self._heatmap_pane,
+            self._coord_input,
         )
+
+    @property
+    def _ui(self) -> PanelUISession:
+        if self._ui_session is None:
+            if self._ui_session_override is not None:
+                self._ui_session = self._ui_session_override
+            elif self._dispatch_override is not None:
+                self._ui_session = CallbackPanelUISession(
+                    self._dispatch_override,
+                    root_views=self._notebook_ui_views,
+                )
+            else:
+                self._ui_session = JupyterPanelUISession(self._notebook_ui_views)
+        return self._ui_session
+
+    def _publish_heatmap_figure(self, figure: object) -> None:
+        """Push a Bokeh heatmap figure on the next io-loop turn (Jupiter push path)."""
+        self._ui.publish_bokeh_figure(self._heatmap_pane, figure)
 
     def _ensure_dataset_open(self) -> None:
         if self._open_scheduled or self._dataset is not None:
@@ -319,10 +372,7 @@ class SourceReview(param.Parameterized):
         schedule_when_panel_loaded(self._open_dataset)
 
     def _dispatch(self, callback: Callable[[], None]) -> None:
-        if self._dispatch_override is not None:
-            self._dispatch_override(callback)
-            return
-        dispatch_notebook_ui(callback, *self._notebook_ui_views())
+        self._ui.dispatch(callback)
 
 
     def _active_coordinate_text(self) -> str:
@@ -398,14 +448,18 @@ class SourceReview(param.Parameterized):
         self.coordinate_string = text
         self._suppress_coord_value_handler = True
         try:
-            self._coord_input.value = text
-            self._coord_input.value_input = text
-            self._coord_input.options = []
+            self._ui.sync_coordinate_field(
+                self._coord_input,
+                value=text,
+                value_input=text,
+            )
         finally:
             self._suppress_coord_value_handler = False
         if log_prefix:
             self._log(f"{log_prefix} {text!r}")
-        sync_pane_to_notebook(self._coord_input, *self._notebook_ui_views())
+
+    def _sync_spinner(self, value: bool) -> None:
+        self._ui.sync_spinner(self._spinner, value=value, visible=value)
 
     def _sync_coordinate_field(self) -> str:
         resolved = self._active_coordinate_text()
@@ -490,6 +544,12 @@ class SourceReview(param.Parameterized):
         return bool(self._coord.separation(coord) < 1 * u.arcsec)
 
     def _on_slew(self, _event: object | None = None) -> None:
+        def _run() -> None:
+            self._on_slew_impl()
+
+        self._dispatch(_run)
+
+    def _on_slew_impl(self) -> None:
         self._sync_coordinate_field()
         resolved = self._resolve_active_coordinate()
         if resolved is None:
@@ -657,8 +717,7 @@ class SourceReview(param.Parameterized):
 
     @param.depends("status", watch=True)
     def _sync_status_pane(self) -> None:
-        self._status_pane.object = self.status
-        sync_pane_to_notebook(self._status_pane, *self._notebook_ui_views())
+        self._ui.sync_status_pane(self._status_pane, self.status)
 
     def _refresh_log_widget(self) -> None:
         """Update the ipywidgets activity log (separate comm from Panel layout)."""
@@ -708,8 +767,7 @@ class SourceReview(param.Parameterized):
     def _open_dataset(self) -> None:
         def _start() -> None:
             self.loading = True
-            self._spinner.value = True
-            sync_pane_to_notebook(self._spinner, *self._notebook_ui_views())
+            self._sync_spinner(True)
             self._log(
                 f"Opening {self._zarr_path} (chunks='auto', l/m={self._config.zarr_lm_chunk})…"
             )
@@ -786,8 +844,7 @@ class SourceReview(param.Parameterized):
     ) -> None:
         if error is not None:
             self.loading = False
-            self._spinner.value = False
-            sync_pane_to_notebook(self._spinner, *self._notebook_ui_views())
+            self._sync_spinner(False)
             err_text = str(error).strip()
             self._log(f"ERROR: {err_text}")
             first_line = err_text.splitlines()[0] if err_text else repr(error)
@@ -809,25 +866,25 @@ class SourceReview(param.Parameterized):
             f"Opened — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs, "
             f"{int(ds.sizes['l'])}×{int(ds.sizes['m'])} px, WCS={ds.radport.has_wcs}."
         )
-        self._set_status(
-            f"**Zarr ready** — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs. "
-            "Enter a coordinate, then **click a heatmap cell** to load a slice or "
-            "**Generate heatmap** for the dynamic spectrum."
-        )
 
         def _clear_loading() -> None:
             self.loading = False
-            self._spinner.value = False
-            sync_pane_to_notebook(self._spinner, *self._notebook_ui_views())
+            self._sync_spinner(False)
 
         def _report_step_error(step: str, exc: BaseException) -> None:
             self._log(f"ERROR: post-open step {step!r} failed: {exc}")
 
         finalize_dataset_load(
             mount_sky=lambda: self._mount_sky_widget(ds),
-            build_heatmap_grid=self._ensure_heatmap_grid,
+            build_heatmap_grid=lambda: None,
             clear_loading=_clear_loading,
             on_step_error=_report_step_error,
+        )
+        self._ui.defer_dispatch(self._ensure_heatmap_grid)
+        self._set_status(
+            f"**Zarr ready** — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs. "
+            "Enter a coordinate, then **click a heatmap cell** to load a slice or "
+            "**Generate heatmap** for the dynamic spectrum."
         )
 
     def _on_heatmap_method_change(self, *_events) -> None:
@@ -842,7 +899,7 @@ class SourceReview(param.Parameterized):
         method = str(self.heatmap_method)
         cache_key = (self.coordinate_string.strip(), method)
         if cache_key in self._cache:
-            self._apply_heatmap(src, self._cache[cache_key])
+            self._dispatch(lambda: self._apply_heatmap(src, self._cache[cache_key]))
             return
 
         self._heatmap_job_id += 1
@@ -850,8 +907,7 @@ class SourceReview(param.Parameterized):
 
         def _begin() -> None:
             self.loading = True
-            self._spinner.value = True
-            sync_pane_to_notebook(self._spinner, *self._notebook_ui_views())
+            self._sync_spinner(True)
             n_times = int(self._dataset.sizes["time"])
             n_freqs = int(self._dataset.sizes["frequency"])
             label = src["name"]
@@ -902,8 +958,7 @@ class SourceReview(param.Parameterized):
             return
         elapsed_s = time.perf_counter() - started_at
         self.loading = False
-        self._spinner.value = False
-        sync_pane_to_notebook(self._spinner, *self._notebook_ui_views())
+        self._sync_spinner(False)
         if error is not None:
             self._log(f"ERROR ({src['name']}): {error}")
             self._set_status(f"**Heatmap failed for {src['name']}:** {error}")
@@ -946,6 +1001,9 @@ class SourceReview(param.Parameterized):
         self._heatmap_coord = self._coord
         self._time_idx, self._freq_idx = self._default_slice(payload.values)
 
+        figure = self._build_heatmap_figure(payload.values)
+        self._publish_heatmap_figure(figure)
+
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
         dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
         overlay_hint = (
@@ -959,8 +1017,6 @@ class SourceReview(param.Parameterized):
             f"Heatmap: **{self._heatmap_method_label()}** (scale={self._patch_scale:g}) · "
             f"{overlay_hint}"
         )
-        self._heatmap_pane.object = self._build_heatmap_figure(payload.values)
-        sync_pane_to_notebook(self._heatmap_pane, *self._notebook_ui_views())
         if self._overlay_enabled:
             self._update_sky(
                 self._time_idx,
@@ -1172,7 +1228,12 @@ class SourceReview(param.Parameterized):
             finally:
                 self._suppress_overlay_toggle = False
 
-    def _ensure_heatmap_grid(self, *, force: bool = False, announce: bool = True) -> None:
+    def _ensure_heatmap_grid(
+        self,
+        *,
+        force: bool = False,
+        announce: bool = True,
+    ) -> None:
         """Display a clickable zeros heatmap so any time/frequency slice can be
         loaded as an overlay before a dynamic spectrum is computed.
 
@@ -1185,25 +1246,21 @@ class SourceReview(param.Parameterized):
         """
         if self._dataset is None:
             return
-        if not should_build_heatmap_grid(
-            self._heatmap_pane.object is not None, force=force
-        ):
+        if not force and self._heatmap_grid_ready:
             return
         if self._lst_hours is None or self._freq_mhz is None:
             return
         n_times = int(self._dataset.sizes["time"])
         n_freqs = int(self._dataset.sizes["frequency"])
         self._heatmap_values = np.zeros((n_times, n_freqs), dtype=np.float64)
-        self._heatmap_pane.object = self._build_heatmap_figure(self._heatmap_values)
-        sync_pane_to_notebook(self._heatmap_pane, *self._notebook_ui_views())
+        figure = self._build_heatmap_figure(self._heatmap_values)
+        self._heatmap_grid_ready = True
+        self._publish_heatmap_figure(figure)
         if announce:
             self._log(
                 f"Heatmap grid ready ({n_times} times × {n_freqs} freqs) — enter a "
                 "coordinate and click a cell to load that slice as an overlay."
             )
-        # Built from an io-loop callback (no live Bokeh doc context), so push the
-        # heatmap pane to the frontend; this also wires the Bokeh tap handler to
-        # the comm so clicks reach Python (matches _apply_heatmap).
 
     def _on_overlay_toggle(self, event: object) -> None:
         """Show/hide the radio overlay without touching the heatmap."""
