@@ -510,14 +510,19 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
 5. After slice updates in Jupyter, call `widget.send_state()` when available
    (see `_notify_sky_widget` in pipeline QA).
 6. **Do not transpose** the slice sent to SkyWidget:
-   `astrowidget.PreloadedCube.image()` must stay in `(l, m)` order to match the
-   WCS/shader (transposing to `(m, l)` makes a fixed catalog target appear to
-   drift in RA as `CRVAL` changes). The editable package is `../astrowidget` via
-   Pixi feature `astrowidget-local`.
-7. **Image axis order**: `PreloadedCube.image()` must return `(l, m)` (not
-   transposed). A transposed slice makes catalog `center=` look wrong while
-   `tracked@slice` in the status line stays correct. Restart the Jupyter kernel
-   after updating the editable `../astrowidget` package.
+   `astrowidget.PreloadedCube.image()` must return **`(l, m)`** (numpy row = WCS
+   axis 1, column = axis 2). Transposing to `(m, l)` mis-registers the overlay
+   (fixed catalog targets drift in RA as `CRVAL` changes). The editable package
+   is `../astrowidget` via Pixi feature `astrowidget-local`.
+7. **WebGL texture UV vs numpy `(l, m)`** — the JS shader uploads
+   `image_shape = (n_l, n_m)` as texture **height × width** (`n_l` rows, `n_m`
+   columns). WCS `world2pix` yields `px` on axis 1 and `py` on axis 2; texture
+   sampling must be **`uv = (py/n_m, px/n_l)`** (axis 2 → `u`, axis 1 → `v`).
+   Swapping `px`/`py` in the UV assignment transposes the texture on square OVRO
+   images and reads as a **flip + ~90° rotation** relative to HiPS. Regression:
+   `../astrowidget/tests/test_wcs_shader_reproject.py::test_shader_texture_axes_match_numpy_lm_order`.
+   After shader edits: `cd ../astrowidget && pixi run build`, then **restart the
+   Jupyter kernel** (browser caches the bundled `widget.js`).
 
 Data loading for QA apps follows `viz/pipeline_qa.py` → `load_qa_datasets()` →
 `ovro_lwa_portal.open_dataset(zarr_path, chunks={…})`.
@@ -637,6 +642,13 @@ celestial view.
 
 **Projection / overlay appearance:**
 
+- **Two coordinate layers** — do not conflate them:
+  - **View / HiPS** (Aladin): screen ↔ sky via measured `pix2world` scales,
+    `view_ra`/`view_dec`/`view_fov`, and `viewRotation` (`-aladin.getRotation()`).
+  - **Radio texture** (WebGL): sky ↔ numpy `(l, m)` via shader `crval`/`cdelt`/
+    `crpix` after optional `reproject_for_shader_display`. Small FOV only shrinks
+    the visible patch; it does **not** bound reprojection error or HiPS↔WCS
+    disagreement (arcsecond offsets span more pixels when zoomed in).
 - `measureViewPlaneScales` must pass **rotation-aware** scales (inverse-rotate
   measured `l,m` into the view plane) so overlay and HiPS stay registered when
   north is not up.
@@ -644,12 +656,20 @@ celestial view.
   zoom-out with `maxSinViewFov(aspect)` so SIN view-disk corners stay inside
   `r ≤ 1`.
 - Crosshair after sky click: fixed **screen-space** size via
-  `celestialToScreen`, not angular FOV scaling.
+  `celestialToScreen`, not angular FOV scaling. Sky clicks use **Aladin**
+  `pix2world` when HiPS is active (`clicked_coord_debug` logs HiPS vs WebGL for
+  the same pixel).
 - `update_slice(..., center=catalog)` reprojects so shader `crval` matches the
   catalog view; **panning** moves `view_ra/dec` away from that `crval`. A curved
   clip at the view edge is expected after large pans; do not re-add the shader
   “horizon circle” overlay (it drew a second great circle and looked like a
   wedge intersection).
+- **View-lock vs catalog-center reproject** — `update_slice(view_lock=True)`
+  warps the slice to the **current pan/zoom** center (can look aligned with HiPS
+  while browsing). **Center** / explicit `center=` re-samples onto the
+  **field/catalog** tangent plane; a source that sat under the crosshair in
+  view-lock mode can shift when Center exposes the true FITS WCS position vs the
+  HiPS-reported click coordinate.
 - **SIN two-to-one ambiguity:** `reproject_for_shader_display` must mask output
   pixels whose world coordinate is ≥ 90° from the source tangent point
   (`cos_sep ≤ 0 → NaN`). Without the mask, `all_world2pix` maps far-hemisphere
@@ -943,6 +963,44 @@ clicks never reach Python.
 **Solution:** Always call `_push_panel_layout(...)` after assigning
 `_heatmap_pane.object` or updating panes from callbacks/watchers (see
 `_ensure_heatmap_grid`, `_on_overlay_toggle`).
+
+### Issue: Radio overlay flipped or rotated relative to HiPS
+
+**Symptoms:** DSS/WISE background looks correct, but the Zarr radio overlay
+appears mirrored, rotated ~90°, or sheared — worst when zoomed on an off-center
+source. May have looked “almost right” at the phase center on square 512×512
+fields.
+
+**Cause:** WebGL texture UV mapped WCS axis 1/2 onto the wrong texture
+dimensions (correct: `uv = (py/n_m, px/n_l)`; the bug used `uv = (px/n_m,
+py/n_l)`, which transposes numpy `(l, m)` on upload). This is independent of
+`reproject_for_shader_display` and per-time `CRVAL`; it is a **shader sampling**
+bug in `../astrowidget/js/inline_widget.js` (and `renderer.js`).
+
+**Solution:** Use current `../astrowidget` with the corrected UV line; run
+`cd ../astrowidget && pixi run build`; restart the Jupyter kernel. Extend
+`test_shader_texture_axes_match_numpy_lm_order` if you touch the fragment shader.
+
+### Issue: Source moves away from crosshair after Center (small FOV)
+
+**Symptoms:** User clicks a radio feature, crosshair marks the spot, **Center**
+recenters — the bright source no longer sits under the crosshair. Worse at small
+FOV, so it feels like a “zoom math” bug.
+
+**Cause:** Not FOV-scaled. **Center** runs `goto` + `update_slice(center=field)`
+(full spherical reproject onto the click/catalog tangent plane). The crosshair
+stays at the **HiPS click** coordinate; the overlay peak follows **FITS/Zarr
+WCS** after reproject. View-lock display before Center can hide a HiPS↔WCS
+offset. Check activity-log diagnostics:
+`[diag] Click … hips↔webgl Δ=…″` and
+`[diag] Center[…]: intended … | view=… Δ=…″ | crval=… Δ=…″`.
+
+**Solution:** Compare click coords to
+`dataset.radport.pixel_to_coords(l, m, time_idx=…)` at the feature pixel. Large
+`hips↔webgl Δ` → projection-layer mismatch; small Δ but post-Center offset →
+view-lock vs catalog reproject or stale `astrowidget`. Heatmap taps should keep
+`preserve_view=True` (no `center=`/`fov=`); reserve `center=` for explicit
+Center/Generate.
 
 ### Issue: Center clears the overlay or makes the heatmap disappear
 
