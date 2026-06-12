@@ -188,6 +188,41 @@ def test_scan_coverage_finds_wideband_runs(tmp_path: Path) -> None:
     assert coverage.iloc[0]["latest_run"] == "Run_20241228_120000"
 
 
+def test_scan_coverage_defers_subband_listing(tmp_path: Path) -> None:
+    _write_qa_tree(tmp_path)
+    coverage = pq.scan_coverage(tmp_path)
+    assert pd.isna(coverage.iloc[0]["n_subbands"])
+    assert pd.isna(coverage.iloc[0]["subbands"])
+
+    pq.populate_subbands_for_day(coverage, "2024-12-28")
+    assert int(coverage.iloc[0]["n_subbands"]) == 1
+    assert coverage.iloc[0]["subbands"] == "82MHz"
+
+    table = pq.day_summary_table("2024-12-28", coverage)
+    assert int(table.iloc[0]["n_subbands"]) == 1
+
+
+def test_populate_subbands_for_day_only_touches_selected_day(tmp_path: Path) -> None:
+    for obs_date in ("2024-12-27", "2024-12-28"):
+        run_dir = tmp_path / "08h" / obs_date / f"Run_{obs_date.replace('-', '')}_120000"
+        wideband = run_dir / "Wideband"
+        wideband.mkdir(parents=True)
+        (wideband / "thermal_noise_vs_subband.png").write_bytes(b"png")
+        subband = run_dir / "82MHz" / "I" / "deep"
+        subband.mkdir(parents=True)
+        if obs_date == "2024-12-28":
+            (run_dir / "23MHz").mkdir(parents=True)
+
+    coverage = pq.scan_coverage(tmp_path)
+    pq.populate_subbands_for_day(coverage, "2024-12-28")
+
+    row27 = coverage.loc[coverage["obs_date"].dt.strftime("%Y-%m-%d") == "2024-12-27"].iloc[0]
+    row28 = coverage.loc[coverage["obs_date"].dt.strftime("%Y-%m-%d") == "2024-12-28"].iloc[0]
+    assert pd.isna(row27["n_subbands"])
+    assert int(row28["n_subbands"]) == 2
+    assert row28["subbands"] == "23MHz, 82MHz"
+
+
 def test_default_select_day_prefers_earliest_with_i_zarr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -605,12 +640,26 @@ def test_reselect_same_day_skips_when_already_loaded(
     assert calls == []
 
 
-def test_finish_zenith_load_clears_flag_when_superseded() -> None:
+def test_finish_zenith_load_skips_stale_load_seq() -> None:
+    """Stale zenith finish must not clear ``loading_zenith`` owned by a newer load."""
     app = PipelineQAApp()
     app._load_seq = 2
     app.loading_zenith = True
 
     app._finish_zenith_load(load_seq=1)
+
+    assert app.loading_zenith is True
+
+
+def test_finish_zenith_load_clears_flag_for_current_seq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    app._load_seq = 2
+    app.loading_zenith = True
+    monkeypatch.setattr(app, "_dispatch_ui", lambda callback: callback())
+
+    app._finish_zenith_load(load_seq=2)
 
     assert app.loading_zenith is False
 
@@ -2701,3 +2750,138 @@ def test_publish_panel_widget_to_notebook_updates_autocomplete(
     assert coord.value == "12.3, 45.6"
     assert model.value == "12.3, 45.6"
     assert model.value_input == "12.3, 45.6"
+
+
+def test_stokes_review_controls_row_property(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    holder = _StokesReviewHolder()
+    assert holder.controls_row is holder._controls_row
+
+
+def test_notebook_ui_views_includes_zenith_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self, **kwargs: None,
+    )
+    app = PipelineQAApp()
+    app.panel()
+    views = app._notebook_ui_views()
+    assert app._layout in views
+    assert app._zenith_slot in views
+    assert app._stokes_review.controls_row in views
+
+
+def test_mount_zenith_sections_skips_stale_load_seq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self, **kwargs: None,
+    )
+    app = PipelineQAApp()
+    app.panel()
+    app._load_seq = 2
+    banner_before = app._zenith_banner.object
+    content_before = list(app._zenith_section_content["I"].objects)
+    stale = pn.pane.Markdown("STALE MOUNT")
+    publish_calls: list[str] = []
+
+    monkeypatch.setattr(app, "_publish_zenith_heatmaps", lambda: publish_calls.append("publish"))
+
+    app._mount_zenith_sections(
+        {"I": stale, "V": stale},
+        banner="STALE BANNER",
+        load_seq=1,
+    )
+
+    assert app._zenith_banner.object == banner_before
+    assert list(app._zenith_section_content["I"].objects) == content_before
+    assert publish_calls == []
+
+
+def test_publish_zenith_heatmaps_uses_ui_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel
+
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self, **kwargs: None,
+    )
+    app = PipelineQAApp()
+    app.panel()
+    dataset = _mock_zenith_dataset()
+    stat_map = np.ones((dataset.sizes["time"], dataset.sizes["frequency"]))
+    panel = ZenithReviewPanel(
+        dataset,
+        stat_map,
+        slice_selection=app._stokes_review.slice_selection,
+        stokes_label="I",
+        metric_label="STD",
+    )
+    app._stokes_review._panels["I"] = panel
+    published: list[tuple[Any, Any]] = []
+
+    class _RecordingUI:
+        def publish_bokeh_figure(self, pane: Any, figure: Any) -> None:
+            published.append((pane, figure))
+
+    app._ui_session = _RecordingUI()
+    app._publish_zenith_heatmaps()
+
+    assert len(published) == 1
+    assert published[0][0] is panel._heatmap.pane
+    assert published[0][1] is panel._heatmap._plot
+
+
+def test_zenith_heatmap_set_data_publishes_with_root_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    stat_map = np.ones((3, 5))
+    lst_hours = np.array([12.0, 13.0, 14.0])
+    freq_mhz = np.linspace(70.0, 90.0, 5)
+    published: list[tuple[Any, Any, tuple[Any, ...]]] = []
+
+    monkeypatch.setattr(
+        pqa,
+        "publish_bokeh_pane_to_notebook",
+        lambda pane, figure, *roots: published.append((pane, figure, roots)),
+    )
+
+    selector = pqa._ZenithHeatmapSelector(
+        stat_map,
+        metric_label="STD",
+        lst_hours=lst_hours,
+        freq_mhz=freq_mhz,
+        on_select=lambda _t, _f: None,
+    )
+    layout = pn.Column(selector.pane)
+    new_map = np.full((3, 5), 2.0)
+    selector.set_data(new_map, lst_hours=lst_hours, freq_mhz=freq_mhz, root_views=(layout,))
+
+    assert len(published) == 1
+    assert published[0][0] is selector.pane
+    assert published[0][2] == (layout,)
+
+
+def test_configure_pipeline_qa_notebook_patches_wcs_and_io_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    calls: list[str] = []
+    monkeypatch.setattr(pqa, "_patch_astrowidget_get_wcs", lambda: calls.append("wcs"))
+    monkeypatch.setattr(pqa, "_capture_ipython_io_loop", lambda: calls.append("io_loop"))
+    monkeypatch.setattr(pqa.pn, "extension", lambda *args, **kwargs: calls.append("ext"))
+
+    pqa.configure_pipeline_qa_notebook()
+
+    assert calls[0] == "wcs"
+    assert "ext" in calls
+    assert calls[-1] == "io_loop"

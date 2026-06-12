@@ -284,6 +284,23 @@ def schedule_when_panel_loaded(callback: Callable[[], None]) -> None:
         pn.state.onload(_run)
 
 
+def configure_pipeline_qa_notebook() -> None:
+    """One-time notebook setup for ``display_pipeline_qa_app`` (phase1/phase2 QA).
+
+    Captures the kernel ``io_loop``, patches astrowidget WCS lookup, and loads
+    Panel extensions. Safe to call once per kernel before displaying the dashboard.
+    """
+    _patch_astrowidget_get_wcs()
+    try:
+        pn.extension("tabulator", "ipywidgets")
+    except Exception:
+        try:
+            pn.extension("tabulator")
+        except Exception as exc:
+            logger.debug("Panel tabulator extension unavailable: %s", exc)
+    _capture_ipython_io_loop()
+
+
 def _run_on_main_thread(callback: Callable[[], None]) -> None:
     """Run a callback on the IPython/Panel notebook UI thread.
 
@@ -1202,12 +1219,20 @@ class _ZenithHeatmapSelector:
         *,
         lst_hours: np.ndarray,
         freq_mhz: np.ndarray,
+        root_views: tuple[pn.viewable.Viewable, ...] = (),
     ) -> None:
         self._stat_map = stat_map
         self._lst_hours = np.asarray(lst_hours, dtype=np.float64)
         self._freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
         self._plot = self._build_plot()
-        self.pane.object = self._plot
+        if root_views:
+            publish_bokeh_pane_to_notebook(self.pane, self._plot, *root_views)
+        else:
+            self.pane.object = self._plot
+
+    def publish_to_notebook(self, *root_views: pn.viewable.Viewable) -> None:
+        """Assign the heatmap figure and push via the validated Bokeh publish path."""
+        publish_bokeh_pane_to_notebook(self.pane, self._plot, *root_views)
 
     def dispose(self) -> None:
         return
@@ -1363,6 +1388,10 @@ class ZenithReviewPanel(param.Parameterized):
     def heatmap_column(self) -> pn.Column:
         """Header and heatmap for side-by-side zenith review layout."""
         return self._layout
+
+    def publish_heatmap(self, *root_views: pn.viewable.Viewable) -> None:
+        """Push the zenith heatmap Bokeh model to the notebook frontend."""
+        self._heatmap.publish_to_notebook(*root_views)
 
     def dispose(self) -> None:
         self._heatmap.dispose()
@@ -1555,6 +1584,11 @@ class _StokesReviewHolder(param.Parameterized):
     def zenith_footer(self) -> pn.Column:
         """Shared slice controls and sky view below the heatmap row."""
         return self._zenith_footer
+
+    @property
+    def controls_row(self) -> pn.Row:
+        """Shared time/frequency sliders and Stokes toggle (hoisted for notebook push)."""
+        return self._controls_row
 
     @property
     def heatmap_status_row(self) -> pn.Row:
@@ -2086,6 +2120,12 @@ class _StokesReviewHolder(param.Parameterized):
         self._configure_slice_selection()
         self._sync_zenith_status_lines()
 
+    def publish_heatmap_panes(self, *root_views: pn.viewable.Viewable) -> None:
+        """Publish each mounted Stokes zenith heatmap through ``publish_bokeh_pane_to_notebook``."""
+        for panel in self._panels.values():
+            if panel is not None:
+                panel.publish_heatmap(*root_views)
+
     def build_no_zarr_contents(self) -> dict[str, pn.viewable.Viewable]:
         """Placeholder content when the selected day has no QA Zarr stores."""
         self._dispose_panels()
@@ -2279,6 +2319,7 @@ class PipelineQAApp(param.Parameterized):
         self._scan_started = False
         self._load_seq = 0
         self._active_datasets: dict[str, xr.Dataset] = {}
+        self._ui_session: Any = None
 
     @property
     def busy(self) -> bool:
@@ -2329,8 +2370,41 @@ class PipelineQAApp(param.Parameterized):
 
     def _push_panel_roots(self) -> None:
         """Push the dashboard layout to the notebook frontend."""
-        if self._layout is not None:
-            _push_panel_layout(self._layout)
+        views = self._notebook_ui_views()
+        if views:
+            _push_panel_layout(*views)
+
+    def _notebook_ui_views(self) -> tuple[pn.viewable.Viewable, ...]:
+        """Panel viewables that must receive comm pushes after zenith QA updates."""
+        if self._layout is None:
+            return ()
+        return (
+            self._layout,
+            self._zenith_slot,
+            self._zenith_review_row,
+            self._stokes_review.heatmap_status_row,
+            self._stokes_review.zenith_footer,
+            self._stokes_review.controls_row,
+        )
+
+    @property
+    def _ui(self) -> Any:
+        """Lazy ``JupyterPanelUISession`` for zenith QA comm (avoids import cycle)."""
+        if self._ui_session is None:
+            from ovro_lwa_portal.viz.panel_ui_session import JupyterPanelUISession
+
+            self._ui_session = JupyterPanelUISession(self._notebook_ui_views)
+        return self._ui_session
+
+    def _dispatch_ui(self, callback: Callable[[], None]) -> None:
+        """Run a UI mutation on the kernel io_loop with batch assign + push."""
+        self._ui.dispatch(callback)
+
+    def _publish_zenith_heatmaps(self) -> None:
+        """Deferred Bokeh publish for each Stokes zenith heatmap (after dispatch batch)."""
+        for panel in self._stokes_review._panels.values():
+            if panel is not None:
+                self._ui.publish_bokeh_figure(panel._heatmap.pane, panel._heatmap._plot)
 
     def _reset_thermal_qa_section(self) -> None:
         """Restore thermal-noise PNG grid and dewarp summary placeholders."""
@@ -2413,11 +2487,15 @@ class PipelineQAApp(param.Parameterized):
         section_contents: dict[str, pn.viewable.Viewable],
         *,
         banner: str,
+        load_seq: int,
     ) -> None:
         """Populate stable zenith section slots and mount sky widgets below."""
+        if not self._is_current_load(load_seq):
+            return
         self._zenith_banner.object = banner
-        # Push zenith row + full layout (nested status panes may not have their own comms).
-        self._stokes_review.set_push_root(self._push_zenith_root)
+        self._stokes_review.set_push_root(
+            lambda: self._dispatch_ui(lambda: None),
+        )
         self._stokes_review.set_extra_push_views(
             lambda: [
                 self._stokes_review.heatmap_status_row,
@@ -2430,7 +2508,7 @@ class PipelineQAApp(param.Parameterized):
                 section_contents[spec.stokes],
             ]
         self._stokes_review.mount_sky()
-        self._execute(self._push_zenith_root)
+        self._publish_zenith_heatmaps()
 
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
         """Update day options and selection from scan results."""
@@ -2675,12 +2753,15 @@ class PipelineQAApp(param.Parameterized):
             return
 
         select_day = self.select_day
-        self.loading_zenith = True
-        self._log(f"Loading zenith review panels for {select_day}…")
-        self._flush_log()
-        self._release_active_datasets()
-        self._reset_zenith_sections(banner="*Loading zenith panels…*")
-        self._execute(self._push_zenith_root)
+
+        def _start_ui() -> None:
+            self.loading_zenith = True
+            self._log(f"Loading zenith review panels for {select_day}…")
+            self._flush_log()
+            self._release_active_datasets()
+            self._reset_zenith_sections(banner="*Loading zenith panels…*")
+
+        self._dispatch_ui(_start_ui)
 
         def _run() -> None:
             try:
@@ -2716,18 +2797,22 @@ class PipelineQAApp(param.Parameterized):
                     if not self._is_current_load(load_seq):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
-                    self._mount_zenith_sections(section_contents, banner=banner)
+                    self._mount_zenith_sections(
+                        section_contents,
+                        banner=banner,
+                        load_seq=load_seq,
+                    )
                     self._clear_error()
                     self._log(f"Zenith review panels ready for {select_day}.")
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_mount)
+                self._dispatch_ui(_mount)
             except _LoadSuperseded:
 
                 def _abort() -> None:
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_abort)
+                self._dispatch_ui(_abort)
             except Exception as exc:
                 import traceback
 
@@ -2743,21 +2828,24 @@ class PipelineQAApp(param.Parameterized):
                     self._reset_zenith_sections()
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_fail)
+                self._dispatch_ui(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _finish_zenith_load(self, *, load_seq: int | None = None) -> None:
         """Clear zenith loading state and refresh controls."""
-        self.loading_zenith = False
         if load_seq is not None and not self._is_current_load(load_seq):
             return
-        self._flush_log()
-        self._execute(self._push_zenith_root)
+
+        def _clear() -> None:
+            self.loading_zenith = False
+            self._flush_log()
+
+        self._dispatch_ui(_clear)
 
     def _push_zenith_root(self) -> None:
         """Push zenith heatmaps after nested panel updates."""
-        self._push_panel_roots()
+        self._dispatch_ui(lambda: None)
 
     def _run_day_load(self, select_day: str, load_seq: int) -> None:
         """Fetch Zarr data and rebuild widgets on the main thread."""
@@ -3027,10 +3115,7 @@ def display_pipeline_qa_app(
     """
     from IPython.display import display
 
-    try:
-        pn.extension("ipywidgets")
-    except Exception as exc:
-        logger.debug("Panel ipywidgets extension unavailable: %s", exc)
+    configure_pipeline_qa_notebook()
 
     resolved_config = resolve_pipeline_qa_config(
         config=qa_config,
