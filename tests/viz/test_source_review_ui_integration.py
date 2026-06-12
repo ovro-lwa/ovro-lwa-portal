@@ -212,6 +212,39 @@ def _flush_jupyter_io(loop: QueuedIOLoop) -> None:
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_session_generate_before_deferred_grid_does_not_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: deferred open-time grid must not overwrite a finished heatmap."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch)
+    _seed_dataset(review)
+
+    review._heatmap_job_id = 1
+    src = review._current_source
+    assert src is not None
+    payload = HeatmapLoad(
+        values=np.full((6, 4), 77.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+
+    review._ui.dispatch(
+        lambda: review._finish_heatmap(
+            src, payload, None, job_id=1, started_at=time.perf_counter()
+        )
+    )
+    _flush_jupyter_io(loop)
+    assert _heatmap_values_max(review) == pytest.approx(77.0)
+
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    assert _heatmap_values_max(review) == pytest.approx(77.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_jupyter_session_open_generate_and_sky_click(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -242,6 +242,34 @@ def _format_lst_hour_label(lst_hour: float) -> str:
     return f"{hour:02d}h"
 
 
+def calendar_mmdd_labels_for_time_coord(time_values: np.ndarray) -> np.ndarray:
+    """UTC calendar ``MM-DD`` label for each sample in a dataset ``time`` coordinate."""
+    from astropy.time import Time
+
+    tv = np.asarray(time_values)
+    if np.issubdtype(tv.dtype, np.datetime64):
+        times = Time(tv, format="datetime64")
+    else:
+        times = Time(np.asarray(tv, dtype=np.float64), format="mjd", scale="utc")
+    return np.array([t.isot[5:10] for t in times])
+
+
+def format_heatmap_time_axis_label(
+    time_values: np.ndarray,
+    time_idx: int,
+    lst_hours: np.ndarray,
+    *,
+    day_labels: np.ndarray | None = None,
+) -> str:
+    """Compact heatmap tick: calendar day + LST hour (disambiguates multi-day stores)."""
+    lst = _format_lst_hour_label(float(lst_hours[int(time_idx)]))
+    if day_labels is not None:
+        day = str(day_labels[int(time_idx)])
+    else:
+        day = calendar_mmdd_labels_for_time_coord(time_values)[int(time_idx)]
+    return f"{day} {lst}"
+
+
 def _format_scalar_hover(value: float, *, fmt: str = ".3g") -> str:
     if np.isfinite(value):
         return format(float(value), fmt)

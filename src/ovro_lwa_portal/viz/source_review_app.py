@@ -56,16 +56,17 @@ from ovro_lwa_portal.viz.source_review_data import (
     HeatmapLoad,
     _PROGRESS_STAGE_LABELS,
     _color_mapper,
-    _format_lst_hour_label,
     _format_patch_fit_diagnostics,
     _heatmap_index_from_coord,
     _patch_fit_hover_columns,
     _row_hover,
     build_source_from_coordinate,
+    calendar_mmdd_labels_for_time_coord,
     compute_source_heatmap,
     diagnose_heatmap_coverage,
     filter_known_source_names,
     first_valid_sky_slice,
+    format_heatmap_time_axis_label,
     load_known_sources,
     lst_hours_for_dataset,
     resolve_known_sources_path,
@@ -184,6 +185,7 @@ class SourceReview(param.Parameterized):
         self._overlay_enabled = True
         self._suppress_overlay_toggle = False
         self._lst_hours: np.ndarray | None = None
+        self._time_day_labels: np.ndarray | None = None
         self._freq_mhz: np.ndarray | None = None
         self._sky_widget: SkyWidget | None = None
         self._hips_background_url = hips_background_survey_url(
@@ -856,6 +858,7 @@ class SourceReview(param.Parameterized):
 
         self._dataset = ds
         self._lst_hours = lst_hours
+        self._time_day_labels = calendar_mmdd_labels_for_time_coord(ds.coords["time"].values)
         self._freq_mhz = freq_mhz
         self._default_time_idx = int(default_time_idx)
         self._default_freq_idx = int(default_freq_idx)
@@ -876,11 +879,10 @@ class SourceReview(param.Parameterized):
 
         finalize_dataset_load(
             mount_sky=lambda: self._mount_sky_widget(ds),
-            build_heatmap_grid=lambda: None,
+            build_heatmap_grid=lambda: self._ensure_heatmap_grid(),
             clear_loading=_clear_loading,
             on_step_error=_report_step_error,
         )
-        self._ui.defer_dispatch(self._ensure_heatmap_grid)
         self._set_status(
             f"**Zarr ready** — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs. "
             "Enter a coordinate, then **click a heatmap cell** to load a slice or "
@@ -1000,6 +1002,8 @@ class SourceReview(param.Parameterized):
         self._coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg, frame="icrs")
         self._heatmap_coord = self._coord
         self._time_idx, self._freq_idx = self._default_slice(payload.values)
+        # Grid placeholder and deferred open-time grid must not clobber this figure.
+        self._heatmap_grid_ready = True
 
         figure = self._build_heatmap_figure(payload.values)
         self._publish_heatmap_figure(figure)
@@ -1138,7 +1142,12 @@ class SourceReview(param.Parameterized):
         if self._lst_hours is None or self._freq_mhz is None:
             return
 
-        lst = _format_lst_hour_label(float(self._lst_hours[time_idx]))
+        lst = format_heatmap_time_axis_label(
+            np.asarray(self._dataset.coords["time"].values),
+            time_idx,
+            self._lst_hours,
+            day_labels=self._time_day_labels,
+        )
         freq = float(self._freq_mhz[freq_idx])
 
         # Clicking any cell loads that Zarr slice centered on the current
@@ -1197,13 +1206,22 @@ class SourceReview(param.Parameterized):
             f"Heatmap cell — {name}, t={time_idx}, f={freq_idx} ({freq:.1f} MHz); "
             "loading overlay at current view."
         )
-        # Preserve pan/zoom: reproject the new slice to the current view center only.
-        self._update_sky(
-            time_idx,
-            freq_idx,
-            preserve_view=True,
-            log_loading=True,
-        )
+        self.loading = True
+        self._sync_spinner(True)
+
+        def _load_overlay() -> None:
+            try:
+                self._update_sky(
+                    time_idx,
+                    freq_idx,
+                    preserve_view=True,
+                    log_loading=True,
+                )
+            finally:
+                self.loading = False
+                self._sync_spinner(False)
+
+        self._ui.schedule(_load_overlay)
 
     def _reset_heatmap_to_zeros(self) -> None:
         """Replace the heatmap with a zeros grid when centering on a new position."""
@@ -1247,6 +1265,14 @@ class SourceReview(param.Parameterized):
         if self._dataset is None:
             return
         if not force and self._heatmap_grid_ready:
+            return
+        if (
+            not force
+            and self._current_source is not None
+            and self._heatmap_values is not None
+            and np.any(np.isfinite(self._heatmap_values) & (self._heatmap_values != 0))
+        ):
+            self._heatmap_grid_ready = True
             return
         if self._lst_hours is None or self._freq_mhz is None:
             return
@@ -1331,20 +1357,26 @@ class SourceReview(param.Parameterized):
         )
         flat_time = time_idx.ravel()
         flat_freq = freq_idx.ravel()
+        time_values = np.asarray(self._dataset.coords["time"].values)
         hover_data: dict[str, object] = {
             "x": flat_time + 0.5,
             "y": flat_freq + 0.5,
             "time_idx": flat_time,
             "freq_idx": flat_freq,
             "lst_hour": [
-                _format_lst_hour_label(float(h))
-                for h in self._lst_hours[flat_time]  # type: ignore[index]
+                format_heatmap_time_axis_label(
+                    time_values,
+                    int(t),
+                    self._lst_hours,  # type: ignore[arg-type]
+                    day_labels=self._time_day_labels,
+                )
+                for t in flat_time
             ],
             "freq_mhz": self._freq_mhz[flat_freq],  # type: ignore[index]
             "value_display": _row_hover(values),
         }
         tooltips: list[tuple[str, str]] = [
-            ("LST hour", "@lst_hour"),
+            ("Day · LST", "@lst_hour"),
             ("Freq (MHz)", "@freq_mhz{0.1}"),
             ("Time idx", "@time_idx"),
             ("Freq idx", "@freq_idx"),
@@ -1385,7 +1417,14 @@ class SourceReview(param.Parameterized):
             return ticks, labels
 
         x_ticks, x_labels = _axis_ticks(
-            n_times, self._lst_hours, _format_lst_hour_label  # type: ignore[arg-type]
+            n_times,
+            np.arange(n_times, dtype=float),
+            lambda i: format_heatmap_time_axis_label(
+                time_values,
+                int(i),
+                self._lst_hours,  # type: ignore[arg-type]
+                day_labels=self._time_day_labels,
+            ),
         )
         y_ticks, y_labels = _axis_ticks(
             n_freqs, self._freq_mhz, lambda v: f"{float(v):.1f}"  # type: ignore[arg-type]
@@ -1394,7 +1433,7 @@ class SourceReview(param.Parameterized):
         plot.yaxis.ticker = FixedTicker(ticks=y_ticks)
         plot.xaxis.major_label_overrides = x_labels
         plot.yaxis.major_label_overrides = y_labels
-        plot.xaxis.axis_label = "LST hour"
+        plot.xaxis.axis_label = "Day · LST hour"
         plot.yaxis.axis_label = "Frequency (MHz)"
         plot.xaxis.major_label_orientation = math.pi / 4
 

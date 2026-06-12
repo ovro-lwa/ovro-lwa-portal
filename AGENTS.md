@@ -612,6 +612,10 @@ These were tried repeatedly; Python state updated but the browser UI stayed froz
   watcher; browser stays on the placeholder figure.
 - **Assigning `pn.pane.Bokeh.object` inside any hold cycle** — mid-hold watcher push is
   lost; zeros grid persists after Generate heatmap.
+- **`defer_dispatch(_ensure_heatmap_grid)` after Zarr open** — a second io-loop dispatch
+  can run **after** Generate finishes; the zeros grid republish overwrites the computed
+  spectrum (activity log shows finite range; browser stays zeros). Build the grid inside
+  ``finalize_dataset_load`` instead (see **Deferred UI ordering** below).
 - **Activity log as `pn.pane.HTML`** with Panel push in **`source_review`** — nested-ref /
   comm issues; log pane stale while ipywidgets log works. (``jupiter_flux_review`` still
   uses Panel HTML log + ``_push_panel_layout`` successfully — layout-specific, not a
@@ -644,9 +648,13 @@ These were tried repeatedly; Python state updated but the browser UI stayed froz
    ``pn.state.loaded`` so open callbacks run against a live comm.
 5. **`publish_bokeh_pane_to_notebook`** — heatmap via ``_publish_heatmap_figure`` →
    ``self._ui.publish_bokeh_figure`` (deferred after batch push, not inside hold).
-6. **`publish_panel_widget_to_notebook`** — coordinate field after sky click (deferred
+6. **`finalize_dataset_load` builds the zeros grid synchronously** — call
+   ``_ensure_heatmap_grid()`` from the ``build_heatmap_grid`` step in ``_finish_open``,
+   not ``defer_dispatch`` afterward. ``_apply_heatmap`` sets ``_heatmap_grid_ready`` so
+   late grid passes cannot clobber a computed spectrum.
+7. **`publish_panel_widget_to_notebook`** — coordinate field after sky click (deferred
    when ``notebook_ui_hold_active()`` during a dispatch batch).
-7. **Module extraction** — ``source_review_app.py`` / ``source_review_data.py`` /
+8. **Module extraction** — ``source_review_app.py`` / ``source_review_data.py`` /
    ``panel_ui_session.py`` so threading and comm intent are headless-testable.
 
 #### Low-level helpers (`viz/pipeline_qa_app.py`)
@@ -694,7 +702,7 @@ models** via ``harness.bokeh_model(viewable, layout)``, not only Python Param va
 | Test module | What it proves |
 | ----------- | -------------- |
 | ``test_panel_ui_session.py`` | ``PanelUISession`` API + harness publish/spinner/coord |
-| ``test_source_review_ui_integration.py`` | End-to-end heatmap/spinner/coord via inline **and** ``QueuedIOLoop`` + ``JupyterPanelUISession`` |
+| ``test_source_review_ui_integration.py`` | End-to-end heatmap/spinner/coord via inline **and** ``QueuedIOLoop`` + ``JupyterPanelUISession``; includes inverted-order grid race regression |
 | ``test_pipeline_qa.py`` | ``hold_and_push``, ``sync_*``, ``publish_*`` helpers on real documents |
 | ``test_source_review.py`` | Pure logic (Center, load threading) — no browser comm |
 
@@ -709,6 +717,42 @@ models** via ``harness.bokeh_model(viewable, layout)``, not only Python Param va
   scheduling: run pytest **and** manual ``source_review.ipynb`` smoke (kernel restart,
   confirm spinner, heatmap grid after open, coordinate field on sky click).
 - SkyWidget, HiPS, and WebGL overlay still require manual notebook validation.
+
+#### Deferred UI ordering (heatmap grid race)
+
+Once Panel comm delivery works, the next class of bugs is **ordering and overwrite** —
+not “nothing reaches the browser.”
+
+**Symptom:** Activity log shows ``Finished … in N s`` and a finite value range, but the
+Bokeh heatmap still looks like the initial zeros grid (correct ``time × frequency``
+shape, no colormap).
+
+**Cause:** ``_ensure_heatmap_grid()`` republishes the same ``_heatmap_pane`` with a zeros
+array. If that ran **after** ``_apply_heatmap`` (e.g. ``defer_dispatch(_ensure_heatmap_grid)``
+queued at end of ``_finish_open`` while Generate finished on an earlier/later io-loop
+turn), the browser received the computed figure and then the zeros figure. Python
+``_heatmap_values`` could already hold real data.
+
+**Enforcement (do not regress):**
+
+| Rule | Allowed? |
+| ---- | -------- |
+| Build zeros grid in ``finalize_dataset_load`` ``build_heatmap_grid`` step (same open dispatch batch as mount/clear-loading) | **Yes** |
+| ``defer_dispatch(_ensure_heatmap_grid)`` after open | **No** |
+| ``_apply_heatmap`` sets ``_heatmap_grid_ready = True`` before publish | **Yes** |
+| ``_ensure_heatmap_grid`` skips when a non-zero computed spectrum is already loaded (unless ``force=True``) | **Yes** |
+
+**Defer only** Bokeh **publish** (``publish_bokeh_figure`` → after batch push), not whole
+workflow steps that republish the same pane.
+
+**Testing:** Sequential open → grid → generate tests are insufficient. Keep
+``test_jupyter_session_generate_before_deferred_grid_does_not_reset`` in
+``test_source_review_ui_integration.py`` — it runs Generate **before** a deferred grid
+pass and asserts values are not reset.
+
+**Triage:** Log shows finite range but heatmap is zeros → check overwrite race before
+debugging ``publish_bokeh_pane_to_notebook``. Log frozen → Panel comm path. Log works,
+Panel frozen → comm path, not logging.
 
 ### `source_review` Panel app and notebook
 
@@ -776,8 +820,9 @@ its tests first, then the notebook call site.
 **Always-on heatmap grid and overlay toggle:**
 
 - A clickable **zeros heatmap** spanning the full Zarr `time × frequency` shape
-  is shown as soon as the store opens (`_ensure_heatmap_grid`); Generate
-  replaces the zeros in place. No notebook action may leave
+  is shown as soon as the store opens (`_ensure_heatmap_grid` via
+  ``finalize_dataset_load`` in ``_finish_open`` — **not** ``defer_dispatch``);
+  Generate replaces the zeros in place. No notebook action may leave
   `_heatmap_pane.object = None` — rebuild a zeros grid instead.
 - **Heatmap cell click** loads that Zarr slice as the overlay and **turns the
   overlay on** (`_set_overlay_toggle_display(True)`), even if the user toggled
@@ -1196,16 +1241,30 @@ pytest replaces a notebook smoke test after comm changes.
 
 **Symptoms:** Activity log shows computation progress, finite-cell stats, and
 `Finished … in N s`, but the time–frequency pane still shows the initial zeros
-grid.
+grid (correct shape, no colormap).
 
-**Cause:** Bokeh figure update went through `hold_and_push`, `discard_events`, or
-`set_notebook_pane_object` instead of the validated `source_review` publish path. Python
-`pane.object` updates but the browser does not.
+**Two distinct causes:**
 
-**Solution:** Route heatmap figure updates through `_publish_heatmap_figure` →
-`self._ui.publish_bokeh_figure` → `publish_bokeh_pane_to_notebook` (assign
-`pane.object`, then `_push_panel_layout`, deferred after dispatch batch push).
-Spinner/status sync in the same dispatch batch via direct assign + batch push.
+1. **Panel comm path broken** — Bokeh figure update went through `hold_and_push`,
+   `discard_events`, or `set_notebook_pane_object` instead of the validated
+   `source_review` publish path. Python `pane.object` may update but the browser
+   does not.
+2. **Deferred grid overwrote computed heatmap** — `_apply_heatmap` published real
+   data, then a later `_ensure_heatmap_grid` (often from `defer_dispatch` after
+   open) republished zeros to the same pane. Activity log and `_heatmap_values`
+   can show finite stats while the browser shows zeros. See **Deferred UI
+   ordering (heatmap grid race)** above.
+
+**Solution:**
+
+- Route all heatmap figure updates through `_publish_heatmap_figure` →
+  `self._ui.publish_bokeh_figure` → `publish_bokeh_pane_to_notebook` (assign
+  `pane.object`, then `_push_panel_layout`, deferred after dispatch batch push).
+- Build the open-time zeros grid inside `finalize_dataset_load`, not
+  `defer_dispatch(_ensure_heatmap_grid)`.
+- Ensure `_apply_heatmap` sets `_heatmap_grid_ready` and `_ensure_heatmap_grid`
+  does not replace a loaded computed spectrum unless `force=True`.
+- Spinner/status sync in the same dispatch batch via direct assign + batch push.
 
 ### Issue: pytest passes but `source_review.ipynb` Panel UI is frozen
 
