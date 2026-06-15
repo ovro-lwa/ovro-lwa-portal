@@ -1704,7 +1704,7 @@ packages:
 - pypi: ../astrowidget
   name: astrowidget
   version: 0.2.0
-  sha256: 6b308ad66cd5b67ec9b4e4c404cc3d6382a68c2b802a643c63eae219bbef4560
+  sha256: 915fb688ebc55713c5ecb03696536f55dfed13611fb270b03fca492f9d26ed4c
   requires_dist:
   - anywidget>=0.9
   - traitlets>=5.0
@@ -6578,7 +6578,7 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev44
+  version: 0.1.1.dev65
   sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
   requires_dist:
   - astropy>=7.1.0,<8
@@ -6637,7 +6637,7 @@ packages:
   requires_python: '>=3.12,<3.14'
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev65
+  version: 0.1.1.dev71
   sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
   requires_dist:
   - astropy>=7.1.0,<8

@@ -1206,7 +1206,7 @@ def test_filter_invalid_beam_files_drops_empty_time_keys(tmp_path: Path, caplog)
 
 
 def test_filter_invalid_beam_files_logs_unreadable_files(tmp_path: Path, caplog):
-    """Header read failures should drop the file rather than abort the run."""
+    """Missing or unreadable files should drop the file rather than abort the run."""
     import logging
 
     mod = _import_module()
@@ -1220,7 +1220,7 @@ def test_filter_invalid_beam_files_logs_unreadable_files(tmp_path: Path, caplog)
 
     assert filtered == {"t": [real]}
     assert "does_not_exist.fits" in caplog.text
-    assert "could not read primary header" in caplog.text
+    assert "cannot stat file" in caplog.text
 
 
 def test_truncated_fits_reason_detects_short_file(tmp_path: Path) -> None:
