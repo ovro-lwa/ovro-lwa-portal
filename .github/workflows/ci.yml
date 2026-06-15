@@ -31,6 +31,7 @@ jobs:
           pixi-version: v0.63.2
           cache: true
           frozen: true
+          environments: default
 
       - name: Run pre-commit checks
         run: pixi run pre-commit-all
@@ -56,6 +57,7 @@ jobs:
           pixi-version: v0.63.2
           cache: true
           frozen: true
+          environments: default
 
       - name: Install dependencies
         run: pixi install --frozen
