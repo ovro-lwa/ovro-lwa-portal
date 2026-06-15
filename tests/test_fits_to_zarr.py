@@ -951,6 +951,18 @@ def test_discover_groups_lst_color_header_frequency_jitter_single_plane(tmp_path
     assert groups["20250508_LST22h_t0001"] == [f1]
 
 
+def test_discover_groups_lst_color_rejects_filename_metadata_source(tmp_path: Path) -> None:
+    """LST color grouping requires FITS headers for subband frequency."""
+    mod = _import_module()
+
+    with pytest.raises(ValueError, match='use group_metadata_source="fits"'):
+        mod._discover_groups(
+            tmp_path,
+            filename_convention="lst-color",
+            group_metadata_source="filename",
+        )
+
+
 def test_rechunk_lm_for_zarr_uniform_spatial_chunks():
     """Irregular dask chunks along l/m must become uniform for Zarr compatibility."""
     import dask.array as da

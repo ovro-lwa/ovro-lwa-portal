@@ -2577,6 +2577,12 @@ def _discover_groups(
     if freq_bin_hz <= 0.0:
         msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
         raise ValueError(msg)
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        msg = (
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            'use group_metadata_source="fits".'
+        )
+        raise ValueError(msg)
 
     by_time: Dict[str, List[Path]] = {}
     by_time_freq: Dict[str, Dict[int, List[Path]]] = {}
