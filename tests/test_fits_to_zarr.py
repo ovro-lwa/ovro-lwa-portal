@@ -1509,6 +1509,7 @@ def test_fix_headers_adds_stokes_axis_when_missing(tmp_path: Path):
     assert hdr["CTYPE4"] == "STOKES"
     assert hdr["CRVAL4"] == pytest.approx(1.0)
     assert hdr["CRPIX4"] == pytest.approx(1.0)
+    assert out_data.shape == (1, 1, 4, 4)
 
 
 def test_fix_headers_2d_promotion_uses_restfrq_for_synthetic_freq_axis(tmp_path: Path) -> None:
