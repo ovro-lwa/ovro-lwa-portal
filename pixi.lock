@@ -506,6 +506,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/32/53/bac4724684064bfee95ece0bb6caf3887e509006845e25388a12cac26d0c/astroid-4.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/c3/1c/f06ad85180e7dd9855aa5ede901bfc2be858d7bee17d4e978a14c0ecec14/astropy-7.2.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/0f/c6/cdfe89a694f41d435687dea90b14b567b2e8daf18afc2b3168c7f1260124/astropy_iers_data-0.2026.2.23.0.48.33-py3-none-any.whl
+      - pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
       - pypi: https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/13/5c/af990f019b8dd11c5492a6371fe74a5b0276357370030b67254a87329944/async_lru-2.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3a/2a/7cc015f5b9f5db42b7d48157e23356022889fc354a2813c15934b7cb5c0e/attrs-25.4.0-py3-none-any.whl
@@ -666,7 +667,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/c9/cd8538dc2e7727095e0c1d867bad1e40c98f37763e6d995c1939f5fdc7b1/yarl-1.22.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5e/d8/9ffd8c237b3559945bb52103cf0eed64ea098f7b7f573f8d2962ef27b4b2/zarr-2.18.7-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/80/ab/11a76c1e2126084fde2639514f24e6111b789b0bfa4fc6264a8975c7e1f1/zict-3.0.0-py2.py3-none-any.whl
-      - pypi: ../astrowidget
       - pypi: ./
   dewarp:
     channels:
@@ -838,7 +838,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/c3/1c/f06ad85180e7dd9855aa5ede901bfc2be858d7bee17d4e978a14c0ecec14/astropy-7.2.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/9c/da/baa3dc875e05ef28e7c3c4aa2154a9a965a9814c56ff4ffe201ce52adb85/astropy_healpix-1.1.3-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/a8/77/22a4fd8774e04aa2599fe02637b3cea107ac5234745ae91dbd3e7a8349dd/astropy_iers_data-0.2026.5.11.1.8.52-py3-none-any.whl
-      - pypi: https://files.pythonhosted.org/packages/63/71/30a9cd5807ada9d91c2ff64de3285735f20418b95c25f4deedaec19cb22d/astrowidget-0.2.0-py3-none-any.whl
+      - pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
       - pypi: https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/e5/e2/c2e3abf398f80732e58b03be77bde9022550d221dd8781bf586bd4d97cc1/async_lru-2.3.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl
@@ -1227,6 +1227,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/32/53/bac4724684064bfee95ece0bb6caf3887e509006845e25388a12cac26d0c/astroid-4.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/c3/1c/f06ad85180e7dd9855aa5ede901bfc2be858d7bee17d4e978a14c0ecec14/astropy-7.2.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/0f/c6/cdfe89a694f41d435687dea90b14b567b2e8daf18afc2b3168c7f1260124/astropy_iers_data-0.2026.2.23.0.48.33-py3-none-any.whl
+      - pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
       - pypi: https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/13/5c/af990f019b8dd11c5492a6371fe74a5b0276357370030b67254a87329944/async_lru-2.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3a/2a/7cc015f5b9f5db42b7d48157e23356022889fc354a2813c15934b7cb5c0e/attrs-25.4.0-py3-none-any.whl
@@ -1388,7 +1389,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/c9/cd8538dc2e7727095e0c1d867bad1e40c98f37763e6d995c1939f5fdc7b1/yarl-1.22.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5e/d8/9ffd8c237b3559945bb52103cf0eed64ea098f7b7f573f8d2962ef27b4b2/zarr-2.18.7-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/80/ab/11a76c1e2126084fde2639514f24e6111b789b0bfa4fc6264a8975c7e1f1/zict-3.0.0-py2.py3-none-any.whl
-      - pypi: ../astrowidget
       - pypi: ./
 packages:
 - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -1701,16 +1701,14 @@ packages:
   - pytest ; extra == 'test'
   - pytest-remotedata ; extra == 'test'
   requires_python: '>=3.10'
-- pypi: ../astrowidget
+- pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
   name: astrowidget
   version: 0.2.0
-  sha256: 915fb688ebc55713c5ecb03696536f55dfed13611fb270b03fca492f9d26ed4c
   requires_dist:
   - anywidget>=0.9
   - traitlets>=5.0
   - astropy>=6.0
   - numpy>=1.24
-  - scipy>=1.10
   - xarray>=2024.1
   - zarr>=2.16,<3
   - dask[array]>=2024.1
@@ -1726,31 +1724,6 @@ packages:
   - pytest>=8.0 ; extra == 'dev'
   - pytest-cov ; extra == 'dev'
   - ruff ; extra == 'dev'
-  requires_python: '>=3.11'
-- pypi: https://files.pythonhosted.org/packages/63/71/30a9cd5807ada9d91c2ff64de3285735f20418b95c25f4deedaec19cb22d/astrowidget-0.2.0-py3-none-any.whl
-  name: astrowidget
-  version: 0.2.0
-  sha256: 183bd003c5022d002bdd1f96b41b147cb085e59c60c5806c2e15416a5702284e
-  requires_dist:
-  - anywidget>=0.9
-  - astropy>=6.0
-  - dask[array]>=2024.1
-  - numcodecs>=0.12
-  - numpy>=1.24
-  - traitlets>=5.0
-  - xarray>=2024.1
-  - zarr>=2.16,<3
-  - bokeh>=3.3,<4 ; extra == 'dashboard'
-  - holoviews>=1.18,<2 ; extra == 'dashboard'
-  - panel>=1.3,<2 ; extra == 'dashboard'
-  - param>=2.0 ; extra == 'dashboard'
-  - pytest-cov ; extra == 'dev'
-  - pytest>=8.0 ; extra == 'dev'
-  - ruff ; extra == 'dev'
-  - xradio[all]>=0.0.59,<0.1 ; extra == 'ingest'
-  - fsspec ; extra == 'remote'
-  - s3fs ; extra == 'remote'
-  - universal-pathlib>=0.2 ; extra == 'remote'
   requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl
   name: asttokens
@@ -6578,67 +6551,8 @@ packages:
   requires_python: '>=3.8'
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev65
-  sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
-  requires_dist:
-  - astropy>=7.1.0,<8
-  - dask>=2025.9.1,<2026
-  - matplotlib>=3.8,<4
-  - numcodecs>=0.15,<0.16
-  - portalocker>=2.8.0
-  - rich>=13.7.0
-  - typer>=0.9.0
-  - universal-pathlib>=0.2
-  - xarray>=2025.9.1,<2026
-  - xradio[all]>=0.0.59,<0.1
-  - zarr>=2.16,<3
-  - astrowidget>=0.1.1 ; extra == 'all'
-  - bokeh>=3.3,<4 ; extra == 'all'
-  - holoviews>=1.18,<2 ; extra == 'all'
-  - ipyaladin>=0.5.0 ; extra == 'all'
-  - ipympl>=0.9 ; extra == 'all'
-  - ipywidgets-bokeh>=1.5 ; extra == 'all'
-  - ipywidgets>=8.0,<9 ; extra == 'all'
-  - jupyter-bokeh>=4.0 ; extra == 'all'
-  - panel>=1.3,<2 ; extra == 'all'
-  - param>=2.0,<3 ; extra == 'all'
-  - pre-commit ; extra == 'all'
-  - pytest-cov ; extra == 'all'
-  - pytest-mock ; extra == 'all'
-  - pytest-xdist ; extra == 'all'
-  - pytest>=7 ; extra == 'all'
-  - python-dotenv>=1.2.1,<2 ; extra == 'ci'
-  - s3fs>=2024.6.0 ; extra == 'ci'
-  - tqdm>=4.67.1,<5 ; extra == 'ci'
-  - pre-commit ; extra == 'dev'
-  - pytest-cov ; extra == 'dev'
-  - pytest-mock ; extra == 'dev'
-  - pytest-xdist ; extra == 'dev'
-  - pytest>=7 ; extra == 'dev'
-  - mkdocs-material>=9.5.0 ; extra == 'docs'
-  - mkdocs>=1.6.0 ; extra == 'docs'
-  - mkdocstrings[python]>=0.25.0 ; extra == 'docs'
-  - prefect>=3.0.0 ; extra == 'prefect'
-  - caltechdata-api>=1.0.0 ; extra == 'remote'
-  - fsspec>=2024.6.0 ; extra == 'remote'
-  - gcsfs>=2024.6.0 ; extra == 'remote'
-  - requests>=2.31.0 ; extra == 'remote'
-  - s3fs>=2024.6.0 ; extra == 'remote'
-  - astrowidget>=0.1.1 ; extra == 'visualization'
-  - bokeh>=3.3,<4 ; extra == 'visualization'
-  - holoviews>=1.18,<2 ; extra == 'visualization'
-  - ipyaladin>=0.5.0 ; extra == 'visualization'
-  - ipympl>=0.9 ; extra == 'visualization'
-  - ipywidgets-bokeh>=1.5 ; extra == 'visualization'
-  - ipywidgets>=8.0,<9 ; extra == 'visualization'
-  - jupyter-bokeh>=4.0 ; extra == 'visualization'
-  - panel>=1.3,<2 ; extra == 'visualization'
-  - param>=2.0,<3 ; extra == 'visualization'
-  requires_python: '>=3.12,<3.14'
-- pypi: ./
-  name: ovro-lwa-portal
-  version: 0.1.1.dev71
-  sha256: 1da80ced4721a5fab4b39a2a2eb7aeac9c62129e70d940f8e1c27468e482c532
+  version: 0.1.1.dev73
+  sha256: e2facf043778f9a97d38354d32a64c608af144045d5f02b11c779d6a56dc2631
   requires_dist:
   - astropy>=7.1.0,<8
   - dask>=2025.9.1,<2026
