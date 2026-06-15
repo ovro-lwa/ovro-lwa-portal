@@ -393,6 +393,12 @@ def convert(
     time_key_source = _cli_time_key_source(discovery_time_key_source)
     filename_convention = _cli_filename_convention(discovery_filename_convention)
 
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        raise typer.BadParameter(
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            'use --discovery-metadata-source fits.',
+            param_hint="--discovery-filename-convention",
+        )
     # Build configuration
     config = ConversionConfig(
         input_dir=input_dir,
