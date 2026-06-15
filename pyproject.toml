@@ -193,7 +193,7 @@ docs-serve = { cmd = "mkdocs serve", description = "Serve the documentation site
 rtd-publish = { cmd = "python -m mkdocs build --clean --site-dir $READTHEDOCS_OUTPUT/html --config-file mkdocs.yml", description = "Build docs for Read the Docs" }
 
 [tool.pixi.environments]
-default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget-local"], solve-group = "default" }
+default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget"], solve-group = "default" }
 onboard = { features = ["pre-commit", "gh-cli", "onboard", "visualization", "astrowidget"], solve-group = "default" }
 ci = ["ci"]
 # Dewarp: includes `image-plane-correction` from `../image-plane-correction`. Run
