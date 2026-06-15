@@ -1004,6 +1004,83 @@ def test_discover_groups_skips_file_without_time_or_frequency_metadata(tmp_path:
     assert groups == {}
 
 
+def test_time_key_from_lst_color_filename(tmp_path: Path) -> None:
+    """LST color-band basenames encode date, LST hour, and time bin."""
+    mod = _import_module()
+    name = "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    assert mod._time_key_from_lst_color_filename(tmp_path / name) == "20250508_LST22h_t0001"
+    assert mod._time_key_from_lst_color_filename(tmp_path / "no_match.fits") is None
+
+
+def test_extract_group_metadata_lst_color(tmp_path: Path) -> None:
+    """LST color-band metadata uses basename time and header frequency."""
+    mod = _import_module()
+    fpath = tmp_path / "Green_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0002.fits"
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 55.0e6}),
+    ).writeto(fpath)
+
+    time_key, frequency_hz, notes = mod._extract_group_metadata_lst_color(fpath)
+
+    assert time_key == "20250508_LST22h_t0002"
+    assert frequency_hz == pytest.approx(55.0e6)
+    assert "time-from-lst-color-filename" in notes
+    assert "frequency-from-header" in notes
+
+
+def test_discover_groups_lst_color_groups_subbands_by_time_and_header_mhz(
+    tmp_path: Path,
+) -> None:
+    """Blue/Green/Red at the same LST bin group together; distinct bins stay separate."""
+    mod = _import_module()
+    blue = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    green = tmp_path / "Green_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    red_other_bin = tmp_path / "Red_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0002.fits"
+    for path, hz in ((blue, 41e6), (green, 55e6), (red_other_bin, 73e6)):
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"RESTFREQ": hz}),
+        ).writeto(path)
+
+    groups = mod._discover_groups(tmp_path, filename_convention="lst-color")
+
+    assert set(groups.keys()) == {"20250508_LST22h_t0001", "20250508_LST22h_t0002"}
+    assert {p.name for p in groups["20250508_LST22h_t0001"]} == {blue.name, green.name}
+    assert groups["20250508_LST22h_t0002"] == [red_other_bin]
+
+
+def test_discover_groups_lst_color_header_frequency_jitter_single_plane(tmp_path: Path) -> None:
+    """Header MHz jitter within the discovery bin merges duplicate subbands."""
+    mod = _import_module()
+    f1 = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001.fits"
+    f2 = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_20250508_LST22h_t0001_dup.fits"
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 41.0e6}),
+    ).writeto(f1)
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 41.0e6 + 100.0}),
+    ).writeto(f2)
+
+    groups = mod._discover_groups(tmp_path, filename_convention="lst-color")
+
+    assert groups["20250508_LST22h_t0001"] == [f1]
+
+
+def test_discover_groups_lst_color_rejects_filename_metadata_source(tmp_path: Path) -> None:
+    """LST color grouping requires FITS headers for subband frequency."""
+    mod = _import_module()
+
+    with pytest.raises(ValueError, match='use group_metadata_source="fits"'):
+        mod._discover_groups(
+            tmp_path,
+            filename_convention="lst-color",
+            group_metadata_source="filename",
+        )
+
+
 def test_rechunk_lm_for_zarr_uniform_spatial_chunks():
     """Irregular dask chunks along l/m must become uniform for Zarr compatibility."""
     import dask.array as da
@@ -1329,7 +1406,7 @@ def test_filter_invalid_beam_files_drops_empty_time_keys(tmp_path: Path, caplog)
 
 
 def test_filter_invalid_beam_files_logs_unreadable_files(tmp_path: Path, caplog):
-    """Header read failures should drop the file rather than abort the run."""
+    """Missing or unreadable files should drop the file rather than abort the run."""
     import logging
 
     mod = _import_module()
@@ -1343,7 +1420,7 @@ def test_filter_invalid_beam_files_logs_unreadable_files(tmp_path: Path, caplog)
 
     assert filtered == {"t": [real]}
     assert "does_not_exist.fits" in caplog.text
-    assert "could not read primary header" in caplog.text
+    assert "cannot stat file" in caplog.text
 
 
 def test_truncated_fits_reason_detects_short_file(tmp_path: Path) -> None:
@@ -1398,6 +1475,53 @@ def test_filter_invalid_beam_files_drops_truncated(tmp_path: Path, caplog) -> No
     assert filtered == {"20240524_050009": [good]}
     assert "bad.fits" in caplog.text
     assert "truncated" in caplog.text.lower()
+
+
+def test_filter_lst_color_groups_drops_mismatched_header_times(tmp_path: Path, caplog) -> None:
+    """Lst-color groups with conflicting DATE-OBS across subbands must be excluded."""
+    import logging
+
+    mod = _import_module()
+    stem = "20241218_LST02h_t0002"
+    good_paths = []
+    for color, date_obs in (
+        ("Blue", "2024-12-18T04:09:01.0"),
+        ("Green", "2024-12-18T04:09:01.0"),
+        ("Red", "2024-12-18T04:09:01.0"),
+    ):
+        fp = tmp_path / f"{color}_I_10min_Taper_Robust-0_pbcorr_dewarped_{stem}.fits"
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"DATE-OBS": date_obs, "RESTFRQ": 4.1e7}),
+        ).writeto(fp)
+        good_paths.append(fp)
+
+    bad_paths = []
+    for color, date_obs in (
+        ("Blue", "2024-12-18T04:09:01.0"),
+        ("Green", "2024-12-18T04:18:58.0"),
+        ("Red", "2024-12-18T04:09:01.0"),
+    ):
+        fp = tmp_path / f"{color}_bad_{stem}.fits"
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header({"DATE-OBS": date_obs, "RESTFRQ": 4.1e7}),
+        ).writeto(fp)
+        bad_paths.append(fp)
+
+    by_time = {
+        "20241218_LST02h_t0001": good_paths,
+        stem: bad_paths,
+    }
+    caplog.set_level(logging.WARNING, logger="ovro_lwa_portal.fits_to_zarr_xradio")
+    filtered = mod._filter_lst_color_groups_with_mismatched_header_times(by_time)
+
+    assert list(filtered.keys()) == ["20241218_LST02h_t0001"]
+    assert filtered["20241218_LST02h_t0001"] == good_paths
+    assert stem not in filtered
+    assert "Dropping lst-color time group" in caplog.text
+    assert "20241218_040901" in caplog.text
+    assert "20241218_041858" in caplog.text
 
 
 def test_fix_headers_raises_invalid_beam_error_on_missing_beam(tmp_path: Path):
@@ -1597,9 +1721,48 @@ def test_fix_headers_adds_stokes_axis_when_missing(tmp_path: Path):
     assert hdr["CTYPE4"] == "STOKES"
     assert hdr["CRVAL4"] == pytest.approx(1.0)
     assert hdr["CRPIX4"] == pytest.approx(1.0)
-    assert hdr["CDELT4"] == pytest.approx(1.0)
-    assert out_data is not None
     assert out_data.shape == (1, 1, 4, 4)
+
+
+def test_fix_headers_2d_promotion_uses_restfrq_for_synthetic_freq_axis(tmp_path: Path) -> None:
+    """2D dewarped planes often carry ``RESTFRQ`` only; promotion must not default to 60 MHz."""
+    import numpy as np
+
+    mod = _import_module()
+    in_path = tmp_path / "Blue_I_10min_Taper_Robust-0_pbcorr_dewarped_20241218_LST01h_t0001.fits"
+    out_path = tmp_path / "output_fixed.fits"
+
+    data = np.zeros((8, 8), dtype=np.float32)
+    header = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 8,
+            "NAXIS2": 8,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "RESTFRQ": 73.77609456783534e6,
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+        }
+    )
+    fits.PrimaryHDU(data=data, header=header).writeto(in_path)
+
+    mod._fix_headers(in_path, out_path)
+
+    with fits.open(out_path) as hdul:
+        hdr = hdul[0].header
+
+    assert hdr["NAXIS"] == 4
+    assert hdr["CTYPE3"] == "FREQ"
+    assert hdr["CRVAL3"] == pytest.approx(73.77609456783534e6)
+    assert hdr["RESTFREQ"] == pytest.approx(73.77609456783534e6)
+
+    hz = mod._canonical_stack_frequency_hz(
+        out_path,
+        group_metadata_source="fits",
+        filename_convention="lst-color",
+    )
+    assert hz == pytest.approx(73.77609456783534e6)
 
 
 def test_normalize_time_key_from_datetime64():

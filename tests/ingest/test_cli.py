@@ -56,6 +56,7 @@ class TestCLI:
         assert "largest grid" in plain_output
         assert "--no-resume" in plain_output
         assert "discovery-time-key" in plain_output
+        assert "discovery-filename-convention" in plain_output
         assert "--target-size" in plain_output
 
     def test_validate_help(self) -> None:

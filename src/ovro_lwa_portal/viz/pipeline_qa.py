@@ -7,7 +7,7 @@ import re
 import shutil
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -132,7 +132,8 @@ def resolve_pipeline_qa_config(
         and v_fits_glob is None
     ):
         return base
-    return PipelineQAConfig(
+    return replace(
+        base,
         pipeline_root=Path(pipeline_root) if pipeline_root is not None else base.pipeline_root,
         symlink_root=Path(symlink_root) if symlink_root is not None else base.symlink_root,
         zarr_root=Path(zarr_root) if zarr_root is not None else base.zarr_root,
@@ -374,9 +375,12 @@ def load_flux_check_hybrid_dataframe(
             chunk["obs_date"] = select_day
             chunk["run_path"] = str(run_dir)
             if cfg.flux_check_csv_per_run:
-                chunk["subband"] = chunk["freq"].map(
-                    lambda f: f"{float(f):.0f}MHz" if pd.notna(f) else ""
-                )
+                if "freq" in chunk.columns:
+                    chunk["subband"] = chunk["freq"].map(
+                        lambda f: f"{float(f):.0f}MHz" if pd.notna(f) else ""
+                    )
+                else:
+                    chunk["subband"] = ""
             else:
                 subband = csv_path.parent.parent.name
                 chunk["subband"] = subband
