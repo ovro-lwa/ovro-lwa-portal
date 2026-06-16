@@ -193,16 +193,16 @@ docs-serve = { cmd = "mkdocs serve", description = "Serve the documentation site
 rtd-publish = { cmd = "python -m mkdocs build --clean --site-dir $READTHEDOCS_OUTPUT/html --config-file mkdocs.yml", description = "Build docs for Read the Docs" }
 
 [tool.pixi.environments]
-default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget-local"], solve-group = "default" }
+default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget"], solve-group = "default" }
 onboard = { features = ["pre-commit", "gh-cli", "onboard", "visualization", "astrowidget"], solve-group = "default" }
 ci = ["ci"]
-# Dewarp: includes `image-plane-correction` from `../image-plane-correction`. Run
-# `pixi lock` only with that sibling checkout present; CI uses other envs only.
-dewarp = { features = ["dewarp", "astrowidget"], solve-group = "dewarp" }
+# Optional dewarp env (requires ../image-plane-correction sibling). Do not commit;
+# see CONTRIBUTING.md. Example:
+# dewarp = { features = ["dewarp", "astrowidget"], solve-group = "dewarp" }
 
 # Optional: editable sibling checkout — add manually (see CONTRIBUTING.md), e.g.:
-[tool.pixi.feature.astrowidget-local.pypi-dependencies]
-astrowidget = { path = "../astrowidget", editable = true }
+# [tool.pixi.feature.astrowidget-local.pypi-dependencies]
+# astrowidget = { path = "../astrowidget", editable = true }
 # then extend an environment's features with "astrowidget-local".
 
 # GitHub CLI feature for interacting with GitHub from the command line
@@ -235,20 +235,20 @@ python-dotenv = ">=1.2.1,<2"
 jupyterlab = ">=4.0"
 s3fs = ">=2024.6.0"
 
-# PyPI astrowidget (SkyWidget). On `default`, `onboard`, and `dewarp`; for editable
+# GitHub astrowidget (SkyWidget). On `default`, `onboard`, and `dewarp`; for editable
 # sibling checkout use the snippet under [tool.pixi.environments].
 [tool.pixi.feature.astrowidget.pypi-dependencies]
-astrowidget = ">=0.1.1"
+astrowidget = { git = "https://github.com/ovro-lwa/astrowidget.git", branch = "main" }
 
 # Dewarp / cascade (`image_plane_correction.flow`). Optional: requires a local editable
-# checkout at `../image-plane-correction` (sibling of this repo). Not used by default
-# or CI—enable via the `dewarp` Pixi environment (see CONTRIBUTING.md).
-[tool.pixi.feature.dewarp.pypi-dependencies]
-image-plane-correction = { path = "../image-plane-correction", editable = true }
-
+# checkout at `../image-plane-correction` (sibling of this repo) or a git source.
+# Not used by default or CI—enable via the `dewarp` Pixi environment (see CONTRIBUTING.md).
+# [tool.pixi.feature.dewarp.pypi-dependencies]
+# image-plane-correction = { path = "../image-plane-correction", editable = true }
+#
 # Linux: install JAX with the CUDA 12 extra (jax-cuda12-plugin + matching jaxlib wheels from PyPI).
-[tool.pixi.feature.dewarp.target.linux-64.pypi-dependencies]
-jax = { version = ">=0.4.30,<0.7", extras = ["cuda12"] }
+# [tool.pixi.feature.dewarp.target.linux-64.pypi-dependencies]
+# jax = { version = ">=0.4.30,<0.7", extras = ["cuda12"] }
 
 # Onboarding feature for setting up the development environment
 [tool.pixi.feature.onboard.pypi-dependencies]

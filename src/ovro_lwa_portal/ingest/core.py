@@ -92,6 +92,10 @@ class ConversionConfig:
         ``"fits"`` (default) reads FITS headers (with filename fallbacks).
         ``"filename"`` uses only basename ``-image-`` and ``_NNNMHz_`` tokens (no header
         reads during discovery). Match the value used when building ``lm_reference_ds``.
+    discovery_filename_convention : {"image", "lst-color"}, optional
+        Basename pattern for observation-time grouping. ``"image"`` (default) uses
+        ``-image-YYYYMMDD_HHMMSS``. ``"lst-color"`` uses
+        ``Blue_..._YYYYMMDD_LSTNNh_tXXXX.fits`` with subband frequency from FITS headers.
     consolidate_metadata_at_end : bool, optional
         When True (default), write consolidated ``.zmetadata`` after conversion.
         Set False for intermediate per-time Zarr appends (dewarp workflow).
@@ -115,6 +119,7 @@ class ConversionConfig:
         lm_reference_ds: Any | None = None,
         group_metadata_source: Literal["fits", "filename"] = "fits",
         discovery_time_key_source: Literal["header", "filename"] = "filename",
+        discovery_filename_convention: Literal["image", "lst-color"] = "image",
         lm_reference_target_size: int | None = None,
         consolidate_metadata_at_end: bool = True,
     ) -> None:
@@ -134,6 +139,7 @@ class ConversionConfig:
         self.lm_reference_ds = lm_reference_ds
         self.group_metadata_source = group_metadata_source
         self.discovery_time_key_source = discovery_time_key_source
+        self.discovery_filename_convention = discovery_filename_convention
         self.lm_reference_target_size = lm_reference_target_size
         self.consolidate_metadata_at_end = consolidate_metadata_at_end
 
@@ -289,6 +295,7 @@ class FITSToZarrConverter:
                     lm_reference_ds=self.config.lm_reference_ds,
                     group_metadata_source=self.config.group_metadata_source,
                     time_key_source=self.config.discovery_time_key_source,
+                    filename_convention=self.config.discovery_filename_convention,
                     lm_reference_target_size=self.config.lm_reference_target_size,
                     consolidate_metadata_at_end=self.config.consolidate_metadata_at_end,
                 )

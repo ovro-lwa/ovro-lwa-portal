@@ -64,6 +64,15 @@ def _cli_time_key_source(value: str) -> Literal["header", "filename"]:
     return value  # type: ignore[return-value]
 
 
+def _cli_filename_convention(value: str) -> Literal["image", "lst-color"]:
+    if value not in ("image", "lst-color"):
+        raise typer.BadParameter(
+            f'expected "image" or "lst-color", got {value!r}',
+            param_hint="--discovery-filename-convention",
+        )
+    return value  # type: ignore[return-value]
+
+
 @contextmanager
 def suppress_stderr() -> Iterator[None]:
     """Context manager to temporarily suppress stderr output.
@@ -326,6 +335,16 @@ def convert(
             "DATE-OBS only."
         ),
     ),
+    discovery_filename_convention: str = typer.Option(
+        "image",
+        "--discovery-filename-convention",
+        help=(
+            'Basename convention for grouping: "image" (default) uses '
+            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tokens. "
+            '"lst-color" uses ``Blue_..._YYYYMMDD_LSTNNh_tXXXX.fits`` (Blue/Green/Red '
+            "subbands; frequency from FITS headers)."
+        ),
+    ),
     log_level: LogLevel = typer.Option(
         LogLevel.INFO,
         "--log-level",
@@ -361,6 +380,10 @@ def convert(
         ovro-ingest fix-headers /data/fits /data/fixed_fits
         ovro-ingest convert /data/fits /data/output \\
             --fixed-dir /data/fixed_fits --skip-header-fixing
+
+        # LST color-band filenames (Blue/Green/Red subbands)
+        ovro-ingest convert /data/fits /data/output \\
+            --discovery-filename-convention lst-color
     """
     _configure_logging(log_level)
 
@@ -368,7 +391,14 @@ def convert(
 
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
     time_key_source = _cli_time_key_source(discovery_time_key_source)
+    filename_convention = _cli_filename_convention(discovery_filename_convention)
 
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        raise typer.BadParameter(
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            'use --discovery-metadata-source fits.',
+            param_hint="--discovery-filename-convention",
+        )
     # Build configuration
     config = ConversionConfig(
         input_dir=input_dir,
@@ -385,6 +415,7 @@ def convert(
         verbose=verbose,
         group_metadata_source=group_metadata_source,
         discovery_time_key_source=time_key_source,
+        discovery_filename_convention=filename_convention,
         lm_reference_target_size=target_size,
     )
 
@@ -403,6 +434,7 @@ def convert(
     console.print(f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits else 'NO'}")
     console.print(f"  Discovery meta:   {group_metadata_source}")
     console.print(f"  Time key source:  {time_key_source}")
+    console.print(f"  Filename conv.:   {filename_convention}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
