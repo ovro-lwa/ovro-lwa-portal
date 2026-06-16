@@ -252,6 +252,11 @@ _LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
 
 DiscoveryFilenameConvention = Literal["image", "lst-color"]
 
+# LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
+_LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
+
+DiscoveryFilenameConvention = Literal["image", "lst-color"]
+
 
 def _mhz_from_name(p: Path) -> int:
     """Extract the subband MHz from a filename; return a large sentinel if absent.
