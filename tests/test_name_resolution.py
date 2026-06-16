@@ -10,6 +10,7 @@ from astropy.coordinates import SkyCoord
 
 from ovro_lwa_portal.name_resolution import (
     CoordinateResolution,
+    format_icrs_degree_pair,
     resolve_coordinate_string,
     resolve_via_ned,
 )
@@ -22,6 +23,27 @@ def test_resolve_degree_pair() -> None:
     assert result.resolver == "degrees"
     assert result.coord.ra.deg == pytest.approx(61.14)
     assert result.coord.dec.deg == pytest.approx(37.16)
+
+
+def test_format_icrs_degree_pair_roundtrip() -> None:
+    text = format_icrs_degree_pair(61.14, 37.16)
+    assert text == "61.1400, 37.1600"
+    result, messages = resolve_coordinate_string(text, use_ned_fallback=False)
+    assert messages == []
+    assert result is not None
+    assert result.resolver == "degrees"
+    assert result.coord.ra.deg == pytest.approx(61.14)
+    assert result.coord.dec.deg == pytest.approx(37.16)
+
+
+def test_format_icrs_degree_pair_non_finite_raises() -> None:
+    with pytest.raises(ValueError, match="finite"):
+        format_icrs_degree_pair(float("nan"), 0.0)
+
+
+def test_format_icrs_degree_pair_dec_out_of_range_raises() -> None:
+    with pytest.raises(ValueError, match="Dec must be"):
+        format_icrs_degree_pair(0.0, 95.0)
 
 
 @patch("ovro_lwa_portal.name_resolution.SkyCoord.from_name")

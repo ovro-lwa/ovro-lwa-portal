@@ -3,12 +3,118 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 DEFAULT_HIPS_ROOT = Path("/lustre/pipeline/calibration/hips")
 DEFAULT_HIPS_HTTP_PREFIX = "/calibration/hips"
+DEFAULT_HIPS_HTTP_HOST = "localhost"
+DEFAULT_HIPS_HTTP_SCHEME = "http"
+
+
+@dataclass(frozen=True)
+class HipsBackgroundConfig:
+    """Resolved on-disk HiPS survey and browser URL for ``SkyWidget``."""
+
+    survey: str
+    disk_path: Path
+    url: str
+
+
+def normalize_hips_survey_name(survey: str | Path) -> str:
+    """Return a ``*.hips`` directory basename."""
+    name = Path(survey).name if isinstance(survey, Path) else str(survey)
+    name = name.strip().strip("/")
+    if name.endswith(".hips"):
+        return name
+    return f"{name}.hips"
+
+
+def resolve_hips_survey_path(survey: str | Path, *, hips_root: Path | str | None = None) -> Path:
+    """On-disk path to a HiPS survey directory (for tile reads and existence checks)."""
+    hips_path = Path(survey).expanduser()
+    if hips_path.is_absolute():
+        return hips_path.resolve()
+    root = Path(hips_root).resolve() if hips_root is not None else resolve_hips_root().resolve()
+    return (root / normalize_hips_survey_name(str(survey))).resolve()
+
+
+def hips_http_server_survey_url(
+    survey: str,
+    *,
+    port: int,
+    host: str | None = None,
+    path_prefix: str = "",
+    scheme: str = DEFAULT_HIPS_HTTP_SCHEME,
+) -> str:
+    """HTTP URL for a HiPS survey served by a standalone static file server.
+
+    Expects the server document root to contain the ``*.hips`` folder, e.g.::
+
+        cd /lustre/pipeline/calibration/hips
+        python3 -m http.server 3005
+
+    Parameters
+    ----------
+    survey
+        HiPS survey name (``*.hips`` suffix optional).
+    port
+        TCP port of the HTTP server (e.g. ``3005``).
+    host
+        Hostname or IP the **browser** uses to reach that port. Defaults to
+        ``OVRO_HIPS_HTTP_HOST`` or ``localhost``. Use the machine hostname when
+        Jupyter runs on the server but the browser is elsewhere and port 3005 is
+        not SSH-tunnelled.
+    path_prefix
+        Optional URL path between host/port and the survey (if the server root is
+        above the HiPS directories).
+    scheme
+        ``http`` or ``https``.
+    """
+    name = normalize_hips_survey_name(survey)
+    if host is None:
+        host = os.environ.get("OVRO_HIPS_HTTP_HOST", DEFAULT_HIPS_HTTP_HOST)
+    host = host.strip() or DEFAULT_HIPS_HTTP_HOST
+    prefix = path_prefix.strip().strip("/")
+    rel = f"{prefix}/{name}" if prefix else name
+    return f"{scheme}://{host}:{port}/{rel}/"
+
+
+def configure_hips_background(
+    survey: str,
+    *,
+    hips_root: Path | str | None = None,
+    http_port: int | None = None,
+    http_host: str | None = None,
+    http_path_prefix: str = "",
+    http_scheme: str = DEFAULT_HIPS_HTTP_SCHEME,
+    jupyter_http_prefix: str | None = None,
+) -> HipsBackgroundConfig:
+    """Resolve disk path and browser URL for a calibration HiPS background.
+
+    When ``http_port`` is set, build an absolute URL for a standalone HTTP server
+    (``python3 -m http.server <port>`` with cwd = ``hips_root``). Otherwise use
+    the ovro-lwa-portal Jupyter server extension at ``jupyter_http_prefix``.
+    """
+    name = normalize_hips_survey_name(survey)
+    disk = resolve_hips_survey_path(name, hips_root=hips_root)
+    if http_port is not None:
+        url = hips_http_server_survey_url(
+            name,
+            port=int(http_port),
+            host=http_host,
+            path_prefix=http_path_prefix,
+            scheme=http_scheme,
+        )
+    else:
+        url = hips_background_survey_url(
+            disk,
+            hips_root=hips_root,
+            http_prefix=jupyter_http_prefix,
+        )
+    return HipsBackgroundConfig(survey=name, disk_path=disk, url=url)
 
 
 def resolve_hips_root() -> Path:

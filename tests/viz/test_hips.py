@@ -8,7 +8,14 @@ import numpy as np
 import pytest
 from astropy.io import fits
 
-from ovro_lwa_portal.viz.hips import compute_hips_percentile_cuts, hips_background_survey_url
+from ovro_lwa_portal.viz.hips import (
+    compute_hips_percentile_cuts,
+    configure_hips_background,
+    hips_background_survey_url,
+    hips_http_server_survey_url,
+    normalize_hips_survey_name,
+    resolve_hips_survey_path,
+)
 
 
 def _write_tile(path: Path, values: np.ndarray) -> None:
@@ -26,6 +33,59 @@ def test_hips_background_survey_url_relative_prefix(tmp_path: Path, monkeypatch)
 
     url = hips_background_survey_url(survey, hips_root=hips_root, http_prefix="/calibration/hips")
     assert url == "/calibration/hips/Blue_I_deep.hips/"
+
+
+def test_normalize_hips_survey_name() -> None:
+    assert normalize_hips_survey_name("Blue_I_deep") == "Blue_I_deep.hips"
+    assert normalize_hips_survey_name("Blue_I_deep.hips/") == "Blue_I_deep.hips"
+
+
+def test_resolve_hips_survey_path_relative(tmp_path: Path) -> None:
+    hips_root = tmp_path / "hips"
+    survey = hips_root / "Blue_I_deep.hips"
+    survey.mkdir(parents=True)
+
+    assert resolve_hips_survey_path("Blue_I_deep", hips_root=hips_root) == survey.resolve()
+
+
+def test_hips_http_server_survey_url() -> None:
+    url = hips_http_server_survey_url(
+        "Blue_I_deep_Taper_Robust-0.75_Jan25",
+        port=3005,
+        host="calim10.example.edu",
+    )
+    assert url == "http://calim10.example.edu:3005/Blue_I_deep_Taper_Robust-0.75_Jan25.hips/"
+
+
+def test_configure_hips_background_external_server(tmp_path: Path) -> None:
+    hips_root = tmp_path / "hips"
+    survey = hips_root / "Blue_I_deep.hips"
+    survey.mkdir(parents=True)
+
+    cfg = configure_hips_background(
+        "Blue_I_deep",
+        hips_root=hips_root,
+        http_port=3005,
+        http_host="localhost",
+    )
+
+    assert cfg.disk_path == survey.resolve()
+    assert cfg.url == "http://localhost:3005/Blue_I_deep.hips/"
+
+
+def test_configure_hips_background_jupyter_extension(tmp_path: Path) -> None:
+    hips_root = tmp_path / "hips"
+    survey = hips_root / "Blue_I_deep.hips"
+    survey.mkdir(parents=True)
+
+    cfg = configure_hips_background(
+        survey,
+        hips_root=hips_root,
+        http_port=None,
+        jupyter_http_prefix="/calibration/hips",
+    )
+
+    assert cfg.url == "/calibration/hips/Blue_I_deep.hips/"
 
 
 def test_hips_background_survey_url_absolute_http_base(tmp_path: Path) -> None:

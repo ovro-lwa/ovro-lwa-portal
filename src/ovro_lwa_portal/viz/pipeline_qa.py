@@ -203,6 +203,29 @@ def list_subbands(run_dir: Path) -> list[str]:
     )
 
 
+def populate_subbands_for_day(coverage: pd.DataFrame, select_day: str) -> None:
+    """Fill ``n_subbands`` and ``subbands`` for one observation day (lazy scan).
+
+    :func:`scan_coverage` leaves these columns unset (``NA``) until a day is
+    loaded so the initial pipeline-tree walk avoids thousands of Lustre ``stat``
+    calls. Updates ``coverage`` in place.
+    """
+    if coverage.empty or "n_subbands" not in coverage.columns:
+        return
+    day_mask = coverage["obs_date"].dt.strftime("%Y-%m-%d") == select_day
+    day_mask &= coverage["latest_run"].notna()
+    missing = day_mask & coverage["n_subbands"].isna()
+    for idx in coverage.index[missing]:
+        run_path = coverage.at[idx, "run_path"]
+        if pd.isna(run_path):
+            coverage.at[idx, "n_subbands"] = 0
+            coverage.at[idx, "subbands"] = ""
+            continue
+        subbands = list_subbands(Path(str(run_path)))
+        coverage.at[idx, "n_subbands"] = len(subbands)
+        coverage.at[idx, "subbands"] = ", ".join(subbands)
+
+
 def discover_hour_bins(root: Path) -> list[str]:
     return sorted(
         (path.name for path in root.iterdir() if path.is_dir() and HOUR_PATTERN.match(path.name)),
@@ -230,7 +253,6 @@ def scan_coverage(
                 p for p in day_dir.iterdir() if p.is_dir() and p.name.startswith(cfg.run_dir_prefix)
             ]
             selected = select_run_dir(day_dir, config=cfg)
-            subbands = list_subbands(selected) if selected is not None else []
             thermal_png = (
                 thermal_noise_png_for_run(selected, config=cfg) if selected is not None else None
             )
@@ -244,8 +266,9 @@ def scan_coverage(
                         1 for p in all_runs if run_has_thermal_noise_qa(p, config=cfg)
                     ),
                     "latest_run": selected.name if selected is not None else pd.NA,
-                    "n_subbands": len(subbands),
-                    "subbands": ", ".join(subbands),
+                    # Deferred: populated by populate_subbands_for_day when a day loads.
+                    "n_subbands": pd.NA if selected is not None else 0,
+                    "subbands": pd.NA if selected is not None else "",
                     "run_path": str(selected) if selected is not None else pd.NA,
                     "thermal_noise_png": str(thermal_png) if thermal_png is not None else pd.NA,
                 }
@@ -327,6 +350,7 @@ def day_rows(select_day: str, coverage: pd.DataFrame) -> pd.DataFrame:
 
 def day_summary_table(select_day: str, coverage: pd.DataFrame) -> pd.DataFrame:
     """Minimal per-hour summary for the QA plot grid."""
+    populate_subbands_for_day(coverage, select_day)
     rows = day_rows(select_day, coverage)
     if rows.empty:
         return pd.DataFrame(columns=["lst_hour", "n_subbands", "thermal_noise_png"])

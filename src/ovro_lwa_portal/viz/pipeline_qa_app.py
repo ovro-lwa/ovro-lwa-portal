@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -111,64 +113,225 @@ THERMAL_NOISE_GRID_COLS = 4
 
 
 _IPYTHON_IO_LOOP: Any = None
+_PENDING_MAIN_CALLBACKS: list[Callable[[], None]] = []
+_PENDING_MAIN_LOCK = threading.Lock()
+_ONLOAD_FLUSH_REGISTERED = False
+_NOTEBOOK_UI_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_NOTEBOOK_UI_DEPTH",
+    default=0,
+)
+_AFTER_HOLD_CALLBACKS: contextvars.ContextVar[list[Callable[[], None]] | None] = (
+    contextvars.ContextVar("_AFTER_HOLD_CALLBACKS", default=None)
+)
+DEFAULT_NOTEBOOK_UI_MAX_ATTEMPTS = 50
 
 
-def _capture_ipython_io_loop() -> None:
-    """Cache the IPython kernel ``io_loop`` from the main thread.
+def notebook_ui_hold_active() -> bool:
+    """True while inside :func:`dispatch_notebook_ui` / :func:`hold_and_push`."""
+    return _NOTEBOOK_UI_DEPTH.get() > 0
 
-    Background worker threads cannot call ``get_ipython()`` reliably in
-    Jupyter. Call this once from a notebook setup cell (after imports).
+
+def defer_after_notebook_hold(callback: Callable[[], None]) -> None:
+    """Run ``callback`` after the active :func:`hold_and_push` cycle completes.
+
+    Bokeh heatmap figure swaps and coordinate-field Jupiter pushes must not run
+    inside ``doc.hold('combine')`` — assign + push is lost or never reaches the
+    browser. Queue those updates here when a hold queue is active; otherwise
+    run on the kernel io_loop in Jupyter or inline in headless tests.
     """
+    queue = _AFTER_HOLD_CALLBACKS.get()
+    if queue is not None:
+        queue.append(callback)
+    else:
+        _run_after_hold(callback)
+
+
+def _is_jupyter_kernel_context() -> bool:
+    try:
+        from panel.io.state import state
+
+        return bool(getattr(state, "_jupyter_kernel_context", False))
+    except Exception:
+        return False
+
+
+def _run_after_hold(callback: Callable[[], None]) -> None:
+    """Flush after-hold work on the kernel io_loop (Jupyter) or inline (tests)."""
+    if _IPYTHON_IO_LOOP is not None or _is_jupyter_kernel_context():
+        _schedule_ipython_main(callback)
+    else:
+        callback()
+
+
+def _resolve_ipython_event_loop() -> Any:
+    """Return the IPython kernel event loop when running inside Jupyter."""
     global _IPYTHON_IO_LOOP
-    _IPYTHON_IO_LOOP = None
+    if _IPYTHON_IO_LOOP is not None:
+        return _IPYTHON_IO_LOOP
     try:
         from IPython import get_ipython
 
         ip = get_ipython()
         kernel = getattr(ip, "kernel", None) if ip is not None else None
         if kernel is not None:
-            _IPYTHON_IO_LOOP = getattr(kernel, "io_loop", None)
+            loop = getattr(kernel, "io_loop", None)
+            if loop is not None:
+                _IPYTHON_IO_LOOP = loop
+                return loop
     except Exception:
         pass
+    try:
+        from tornado.ioloop import IOLoop
+
+        loop = IOLoop.current()
+        if loop is not None:
+            return loop
+    except Exception:
+        pass
+    return None
+
+
+def _capture_ipython_io_loop() -> None:
+    """Cache the IPython kernel event loop from the main thread.
+
+    Background worker threads cannot call ``get_ipython()`` reliably in
+    Jupyter. Call this once from a notebook setup cell (after imports), and
+    again when a Panel layout is first shown.
+    """
+    _resolve_ipython_event_loop()
+    _ensure_panel_onload_flush()
+
+
+def _ensure_panel_onload_flush() -> None:
+    """Drain queued UI callbacks once the embedded Panel comm is ready."""
+    global _ONLOAD_FLUSH_REGISTERED
+    if _ONLOAD_FLUSH_REGISTERED:
+        return
+    _ONLOAD_FLUSH_REGISTERED = True
+    try:
+        if pn.state.loaded:
+            _schedule_ipython_main(_flush_pending_main_callbacks)
+        else:
+            pn.state.onload(lambda: _schedule_ipython_main(_flush_pending_main_callbacks))
+    except Exception:
+        logger.debug("Could not register Panel onload flush", exc_info=True)
+
+
+def _enqueue_pending_main(callback: Callable[[], None]) -> None:
+    with _PENDING_MAIN_LOCK:
+        _PENDING_MAIN_CALLBACKS.append(callback)
+    _ensure_panel_onload_flush()
+
+
+def _flush_pending_main_callbacks() -> None:
+    """Run UI callbacks that could not be scheduled from worker threads."""
+    with _PENDING_MAIN_LOCK:
+        pending = list(_PENDING_MAIN_CALLBACKS)
+        _PENDING_MAIN_CALLBACKS.clear()
+    for callback in pending:
+        try:
+            callback()
+        except Exception as exc:
+            logger.debug("Pending notebook UI callback failed: %s", exc, exc_info=True)
+
+
+def _schedule_on_event_loop(loop: Any, callback: Callable[[], None]) -> bool:
+    """Schedule ``callback`` on a Tornado or asyncio event loop."""
+    add_callback = getattr(loop, "add_callback", None)
+    if add_callback is not None:
+        try:
+            add_callback(callback)
+            return True
+        except Exception:
+            pass
+    call_soon_threadsafe = getattr(loop, "call_soon_threadsafe", None)
+    if call_soon_threadsafe is not None:
+        try:
+            call_soon_threadsafe(callback)
+            return True
+        except Exception:
+            pass
+    return False
 
 
 def _schedule_ipython_main(callback: Callable[[], None]) -> None:
-    """Run callback on the IPython kernel event loop."""
-    io_loop = _IPYTHON_IO_LOOP
-    if io_loop is not None:
-        try:
-            io_loop.add_callback(callback)
-            return
-        except Exception:
-            pass
-    try:
-        from IPython import get_ipython
+    """Run callback on the IPython kernel event loop.
 
-        ip = get_ipython()
-        kernel = getattr(ip, "kernel", None) if ip is not None else None
-        io_loop = getattr(kernel, "io_loop", None) if kernel is not None else None
-        if io_loop is not None:
-            io_loop.add_callback(callback)
-            return
+    Never executes inline on a background worker thread: Panel/Bokeh comm
+    updates from workers are silently dropped by the browser.
+    """
+    loop = _resolve_ipython_event_loop()
+    if loop is not None and _schedule_on_event_loop(loop, callback):
+        return
+    if threading.current_thread() is threading.main_thread():
+        callback()
+        _flush_pending_main_callbacks()
+        return
+    _enqueue_pending_main(callback)
+
+
+def schedule_when_panel_loaded(callback: Callable[[], None]) -> None:
+    """Run ``callback`` after the embedded Panel layout comm is ready."""
+    _capture_ipython_io_loop()
+
+    def _run() -> None:
+        callback()
+        _flush_pending_main_callbacks()
+
+    if pn.state.loaded:
+        _schedule_ipython_main(_run)
+    else:
+        pn.state.onload(_run)
+
+
+def configure_pipeline_qa_notebook() -> None:
+    """One-time notebook setup for ``display_pipeline_qa_app`` (phase1/phase2 QA).
+
+    Captures the kernel ``io_loop``, patches astrowidget WCS lookup, and loads
+    Panel extensions. Safe to call once per kernel before displaying the dashboard.
+    """
+    _patch_astrowidget_get_wcs()
+    try:
+        pn.extension("tabulator", "ipywidgets")
     except Exception:
-        pass
-    callback()
+        try:
+            pn.extension("tabulator")
+        except Exception as exc:
+            logger.debug("Panel tabulator extension unavailable: %s", exc)
+    _capture_ipython_io_loop()
 
 
 def _run_on_main_thread(callback: Callable[[], None]) -> None:
     """Run a callback on the IPython/Panel notebook UI thread.
 
-    Do not run synchronously when ``state.curdoc`` is set: Bokeh heatmap tap handlers
-    execute with the heatmap pane's document active, and an in-place callback there
-    updates Param objects without refreshing the embedded Panel sliders.
+    Background worker threads must not call :func:`pn.state.execute` directly:
+    without an active Bokeh ``curdoc`` Panel runs the callback inline on the
+    worker, so Param/HTML/Bokeh updates never reach the notebook comm. Schedule
+    those callbacks on the IPython ``io_loop`` instead.
+
+    When a Bokeh heatmap tap handler runs with ``state.curdoc`` set, use
+    :func:`pn.state.execute` so the document lock is acquired before Param
+    widgets elsewhere in the layout are updated.
     """
-    try:
-        pn.state.execute(callback)
-    except Exception:
+    if threading.current_thread() is not threading.main_thread():
         _schedule_ipython_main(callback)
+        return
+    try:
+        from panel.io.state import state
+
+        doc = state.curdoc
+        if doc is not None and doc.session_context is not None:
+            state.execute(callback)
+            return
+    except Exception:
+        pass
+    _schedule_ipython_main(callback)
 
 
-def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
+def _push_panel_layout(
+    *views: pn.viewable.Viewable,
+    _retry: bool = True,
+) -> None:
     """Push Panel layout changes to the notebook frontend."""
     try:
         from panel.io.notebook import push, push_on_root
@@ -200,6 +363,390 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
                     pushed_roots.add(ref)
                 except Exception as exc:
                     logger.debug("Panel push_on_root failed: %s", exc, exc_info=True)
+
+    if _retry and views and not pushed_docs and not pushed_roots:
+        # Models may not be registered yet (e.g. first Bokeh heatmap assign from a
+        # worker-thread callback that ran before the notebook comm was ready).
+        pending = views
+
+        def _retry_push() -> None:
+            _push_panel_layout(*pending, _retry=False)
+
+        _schedule_ipython_main(_retry_push)
+
+
+def _iter_panel_viewables(view: pn.viewable.Viewable) -> Iterator[pn.viewable.Viewable]:
+    """Yield ``view`` and every nested Panel viewable child."""
+    yield view
+    objects = getattr(view, "objects", None)
+    if not objects:
+        return
+    for child in objects:
+        if isinstance(child, pn.viewable.Viewable):
+            yield from _iter_panel_viewables(child)
+
+
+def _notebook_doc_comms(*views: pn.viewable.Viewable) -> dict[int, tuple[Any, Any]]:
+    """Return unique ``(doc, comm)`` pairs registered for notebook ``views``."""
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return {}
+
+    docs: dict[int, tuple[Any, Any]] = {}
+    for view in views:
+        for panel_view in _iter_panel_viewables(view):
+            for ref in getattr(panel_view, "_models", {}) or {}:
+                if ref not in state._views:
+                    continue
+                _viewable, root, doc, comm = state._views[ref]
+                if comm and "embedded" not in root.tags:
+                    docs[id(doc)] = (doc, comm)
+    return docs
+
+
+def notebook_views_registered(*views: pn.viewable.Viewable) -> bool:
+    """True when at least one view has a live notebook comm in ``state._views``."""
+    return bool(_notebook_doc_comms(*views))
+
+
+def _primary_notebook_ref(*views: pn.viewable.Viewable) -> str | None:
+    """Return the first ``state._views`` ref found walking nested ``views``."""
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return None
+    for view in views:
+        for panel_view in _iter_panel_viewables(view):
+            for ref in getattr(panel_view, "_models", {}) or {}:
+                if ref in state._views:
+                    return ref
+    return None
+
+
+def _is_panel_layout_container(view: pn.viewable.Viewable) -> bool:
+    """True for Column/Row-like containers that must not be widget-synced wholesale."""
+    if isinstance(view, pn.pane.IPyWidget):
+        return False
+    if callable(getattr(view, "_update_object", None)):
+        return False
+    return hasattr(view, "objects")
+
+
+def _sync_all_notebook_views(*views: pn.viewable.Viewable) -> None:
+    """Force-sync every nested Panel viewable (except ipywidgets) to the notebook."""
+    for view in views:
+        for panel_view in _iter_panel_viewables(view):
+            if isinstance(panel_view, pn.pane.IPyWidget):
+                continue
+            if _is_panel_layout_container(panel_view):
+                continue
+            sync_pane_to_notebook(panel_view, *views)
+
+
+def sync_widget_to_notebook(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    changes: Mapping[str, Any] | None = None,
+) -> None:
+    """Force-sync a Panel widget model without calling ``push``.
+
+    Widgets (``AutocompleteInput``, ``LoadingSpinner``, …) use ``_update_model``,
+    not ``_update_object``. :func:`sync_pane_to_notebook` cannot sync them; call
+    this helper inside :func:`hold_and_push` instead.
+    """
+    if not getattr(widget, "_models", None):
+        return
+    layout_ref = _primary_notebook_ref(*root_views)
+    if layout_ref is None:
+        return
+    process_change = getattr(widget, "_process_param_change", None)
+    update_model = getattr(widget, "_update_model", None)
+    if not callable(process_change) or not callable(update_model):
+        return
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return
+    if changes is None:
+        changes = {
+            name: getattr(widget, name)
+            for name in getattr(widget, "_synced_params", ())
+            if name in widget.param
+        }
+    if not changes:
+        return
+    try:
+        msg = process_change(dict(changes))
+    except Exception:  # noqa: BLE001
+        logger.debug("Notebook widget param sync failed for %r", widget, exc_info=True)
+        return
+    if not msg:
+        return
+    # BooleanIndicator._update_model returns immediately when ``events`` is empty,
+    # so LoadingSpinner never gets the ``spin`` CSS class in the browser.
+    synthetic_events = {
+        name: param.parameterized.Event(
+            "changed",
+            name,
+            widget,
+            type(widget),
+            None,
+            changes[name],
+            "changed",
+        )
+        for name in changes
+    }
+    _viewable, root, doc, comm = state._views[layout_ref]
+    for ref, (model, _parent) in widget._models.copy().items():
+        try:
+            update_model(synthetic_events, msg, root, model, doc, comm)
+        except Exception:  # noqa: BLE001
+            logger.debug("Notebook widget model sync failed for %r", widget, exc_info=True)
+
+
+def sync_pane_to_notebook(
+    pane: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Force-sync a nested pane's Bokeh model through the layout document comm.
+
+    Nested panes (``pn.pane.HTML`` inside a ``Column``) often have model refs
+    that are **not** registered in ``state._views`` even though the layout root
+    is. Panel's ``_update_pane`` then skips the update and ``push`` diffs an
+    empty event list — Python state changes but the browser UI freezes.
+
+    Panel **widgets** (``AutocompleteInput``, ``LoadingSpinner``) have no
+    ``_update_object``; use :func:`sync_widget_to_notebook` for those.
+
+    Call while :func:`hold_and_push` is active (inside
+    :func:`dispatch_notebook_ui`). Uses the registered layout root from
+    :func:`_primary_notebook_ref` to invoke ``pane._update_object(...)`` directly.
+    """
+    if not getattr(pane, "_models", None):
+        return
+    if _is_panel_layout_container(pane):
+        return
+    layout_ref = _primary_notebook_ref(*root_views)
+    if layout_ref is None:
+        return
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return
+    update_object = getattr(pane, "_update_object", None)
+    if not callable(update_object):
+        sync_widget_to_notebook(pane, *root_views)
+        return
+    _viewable, root, doc, comm = state._views[layout_ref]
+    for ref, (_model, parent) in pane._models.copy().items():
+        try:
+            update_object(ref, doc, root, parent, comm)
+        except Exception:  # noqa: BLE001
+            logger.debug("Notebook pane sync failed for %r", pane, exc_info=True)
+
+
+def set_notebook_widget_params(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    **param_values: Any,
+) -> None:
+    """Assign widget params and sync without Panel's mid-hold ``push``.
+
+    Use for ``AutocompleteInput``, ``LoadingSpinner``, and other widgets when
+    :func:`notebook_ui_hold_active` is true.
+    """
+    if not param_values:
+        return
+    with param.parameterized.discard_events(widget):
+        for name, value in param_values.items():
+            setattr(widget, name, value)
+    applied = {name: getattr(widget, name) for name in param_values}
+    sync_widget_to_notebook(widget, *root_views, changes=applied)
+
+
+def set_notebook_pane_object(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Assign ``pane.object`` and sync without Panel's premature notebook push.
+
+    Replacing ``pn.pane.Bokeh.object`` (or any pane with ``object`` in
+    ``_rerender_params``) fires Panel's ``_update_pane`` watcher, which calls
+    ``push()`` immediately. Inside an active ``doc.hold('combine')`` that
+    mid-hold push is lost in Jupyter — the browser keeps the old figure even
+    though Python state is correct. Suppress the watcher and sync explicitly
+    instead; call only from inside :func:`hold_and_push` /
+    :func:`dispatch_notebook_ui`.
+    """
+    replacing_bokeh = (
+        isinstance(pane, pn.pane.Bokeh)
+        and pane.object is not None
+        and value is not None
+        and pane.object is not value
+    )
+    with param.parameterized.discard_events(pane):
+        if replacing_bokeh:
+            pane.object = None
+        pane.object = value
+    sync_pane_to_notebook(pane, *root_views)
+
+
+def publish_panel_widget_to_notebook(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    **param_values: Any,
+) -> None:
+    """Push Panel widget changes with assign + :func:`_push_panel_layout`.
+
+    Schedule on the io_loop **after** an active ``hold_and_push`` cycle when
+    updating widgets from a callback that also syncs other panes (e.g. sky click
+    → coordinate field while status updates in the same hold).
+    """
+    if not param_values:
+        return
+    for name, value in param_values.items():
+        setattr(widget, name, value)
+    _push_panel_layout(*root_views, widget)
+
+
+def publish_bokeh_pane_to_notebook(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
+
+    Match ``jupiter_flux_review.ipynb``: assign ``pane.object`` (Panel's watcher
+    registers the model change) then :func:`_push_panel_layout`. Do **not** wrap
+    the assign in ``discard_events`` — that suppresses the watcher and a bare
+    push then leaves the browser on the placeholder figure.
+    """
+    if (
+        isinstance(pane, pn.pane.Bokeh)
+        and pane.object is not None
+        and value is not None
+        and pane.object is not value
+    ):
+        pane.object = None
+    pane.object = value
+    _push_panel_layout(*root_views, pane)
+
+
+def dispatch_notebook_ui(
+    callback: Callable[[], None],
+    *views: pn.viewable.Viewable,
+    _attempt: int = 0,
+    max_attempts: int = DEFAULT_NOTEBOOK_UI_MAX_ATTEMPTS,
+) -> None:
+    """Single entry point for notebook UI mutations outside Bokeh callbacks.
+
+    Background threads, ipywidgets observers, and io-loop handlers must not
+    mutate Panel panes directly. Schedule on the kernel ``io_loop``, wait until
+    the layout comm is registered, then run ``callback`` inside
+    ``hold(doc, comm=comm)`` so model changes reach the browser.
+
+    Re-entrant calls (e.g. ``_log`` invoked from a callback already inside this
+    wrapper) run inline without re-scheduling.
+    """
+    if _NOTEBOOK_UI_DEPTH.get() > 0:
+        callback()
+        return
+
+    def _wrapped() -> None:
+        if not notebook_views_registered(*views):
+            if _attempt < max_attempts:
+                dispatch_notebook_ui(
+                    callback,
+                    *views,
+                    _attempt=_attempt + 1,
+                    max_attempts=max_attempts,
+                )
+            else:
+                logger.error(
+                    "Notebook Panel comm not registered after %d attempts; "
+                    "skipped UI update callback %r",
+                    max_attempts,
+                    callback,
+                )
+            return
+        token = _NOTEBOOK_UI_DEPTH.set(_NOTEBOOK_UI_DEPTH.get() + 1)
+        try:
+            with hold_and_push(*views):
+                callback()
+        finally:
+            _NOTEBOOK_UI_DEPTH.reset(token)
+
+    _schedule_ipython_main(_wrapped)
+
+
+def defer_notebook_ui(
+    callback: Callable[[], None],
+    *views: pn.viewable.Viewable,
+) -> None:
+    """Schedule a **new** hold/push cycle after the current one finishes.
+
+    Re-entrant :func:`dispatch_notebook_ui` runs inline inside an active hold.
+    Bokeh figure replacement bundled with widget/status syncs in the same hold
+    can fail to reach the browser; defer the figure publish to its own cycle.
+    """
+    def _wrapped() -> None:
+        dispatch_notebook_ui(callback, *views)
+
+    _schedule_ipython_main(_wrapped)
+
+
+@contextmanager
+def hold_and_push(*views: pn.viewable.Viewable) -> Iterator[None]:
+    """Hold notebook document(s) for ``views`` during the body, sync, then push.
+
+    Background-thread and io-loop callbacks mutate Panel/Bokeh models *outside*
+    any Bokeh event callback. In Jupyter, :func:`panel.io.document.unlocked` is a
+    no-op and plain :func:`panel.io.notebook.push` diffs an empty held-event list,
+    so the browser freezes even though Python state is correct.
+
+    Uses explicit ``doc.hold('combine')`` plus a final ``sync_pane_to_notebook``
+    sweep and ``push(doc, comm)`` — do not rely on Panel's ``hold()`` main-thread
+    path, which is a no-op under ``state._jupyter_kernel_context``.
+    """
+    try:
+        from panel.io.notebook import push
+        from panel.io.state import set_curdoc
+    except ImportError:
+        yield
+        return
+
+    docs = _notebook_doc_comms(*views)
+    if not docs:
+        yield
+        return
+
+    held: list[tuple[Any, Any]] = []
+    after_hold: list[Callable[[], None]] = []
+    after_hold_token = _AFTER_HOLD_CALLBACKS.set(after_hold)
+    with ExitStack() as stack:
+        for doc, comm in docs.values():
+            stack.enter_context(set_curdoc(doc))
+            doc.hold("combine")
+            held.append((doc, comm))
+        try:
+            yield
+        finally:
+            _sync_all_notebook_views(*views)
+            for doc, comm in held:
+                try:
+                    push(doc, comm)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Notebook push failed: %s", exc, exc_info=True)
+                try:
+                    if doc.callbacks.hold_value:
+                        doc.unhold()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Document unhold failed", exc_info=True)
+            _AFTER_HOLD_CALLBACKS.reset(after_hold_token)
+            for deferred in after_hold:
+                _run_after_hold(deferred)
 
 
 ACTIVITY_LOG_HEIGHT_PX = 150
@@ -672,12 +1219,20 @@ class _ZenithHeatmapSelector:
         *,
         lst_hours: np.ndarray,
         freq_mhz: np.ndarray,
+        root_views: tuple[pn.viewable.Viewable, ...] = (),
     ) -> None:
         self._stat_map = stat_map
         self._lst_hours = np.asarray(lst_hours, dtype=np.float64)
         self._freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
         self._plot = self._build_plot()
-        self.pane.object = self._plot
+        if root_views:
+            publish_bokeh_pane_to_notebook(self.pane, self._plot, *root_views)
+        else:
+            self.pane.object = self._plot
+
+    def publish_to_notebook(self, *root_views: pn.viewable.Viewable) -> None:
+        """Assign the heatmap figure and push via the validated Bokeh publish path."""
+        publish_bokeh_pane_to_notebook(self.pane, self._plot, *root_views)
 
     def dispose(self) -> None:
         return
@@ -833,6 +1388,10 @@ class ZenithReviewPanel(param.Parameterized):
     def heatmap_column(self) -> pn.Column:
         """Header and heatmap for side-by-side zenith review layout."""
         return self._layout
+
+    def publish_heatmap(self, *root_views: pn.viewable.Viewable) -> None:
+        """Push the zenith heatmap Bokeh model to the notebook frontend."""
+        self._heatmap.publish_to_notebook(*root_views)
 
     def dispose(self) -> None:
         self._heatmap.dispose()
@@ -1025,6 +1584,11 @@ class _StokesReviewHolder(param.Parameterized):
     def zenith_footer(self) -> pn.Column:
         """Shared slice controls and sky view below the heatmap row."""
         return self._zenith_footer
+
+    @property
+    def controls_row(self) -> pn.Row:
+        """Shared time/frequency sliders and Stokes toggle (hoisted for notebook push)."""
+        return self._controls_row
 
     @property
     def heatmap_status_row(self) -> pn.Row:
@@ -1556,6 +2120,12 @@ class _StokesReviewHolder(param.Parameterized):
         self._configure_slice_selection()
         self._sync_zenith_status_lines()
 
+    def publish_heatmap_panes(self, *root_views: pn.viewable.Viewable) -> None:
+        """Publish each mounted Stokes zenith heatmap through ``publish_bokeh_pane_to_notebook``."""
+        for panel in self._panels.values():
+            if panel is not None:
+                panel.publish_heatmap(*root_views)
+
     def build_no_zarr_contents(self) -> dict[str, pn.viewable.Viewable]:
         """Placeholder content when the selected day has no QA Zarr stores."""
         self._dispose_panels()
@@ -1749,6 +2319,7 @@ class PipelineQAApp(param.Parameterized):
         self._scan_started = False
         self._load_seq = 0
         self._active_datasets: dict[str, xr.Dataset] = {}
+        self._ui_session: Any = None
 
     @property
     def busy(self) -> bool:
@@ -1799,8 +2370,41 @@ class PipelineQAApp(param.Parameterized):
 
     def _push_panel_roots(self) -> None:
         """Push the dashboard layout to the notebook frontend."""
-        if self._layout is not None:
-            _push_panel_layout(self._layout)
+        views = self._notebook_ui_views()
+        if views:
+            _push_panel_layout(*views)
+
+    def _notebook_ui_views(self) -> tuple[pn.viewable.Viewable, ...]:
+        """Panel viewables that must receive comm pushes after zenith QA updates."""
+        if self._layout is None:
+            return ()
+        return (
+            self._layout,
+            self._zenith_slot,
+            self._zenith_review_row,
+            self._stokes_review.heatmap_status_row,
+            self._stokes_review.zenith_footer,
+            self._stokes_review.controls_row,
+        )
+
+    @property
+    def _ui(self) -> Any:
+        """Lazy ``JupyterPanelUISession`` for zenith QA comm (avoids import cycle)."""
+        if self._ui_session is None:
+            from ovro_lwa_portal.viz.panel_ui_session import JupyterPanelUISession
+
+            self._ui_session = JupyterPanelUISession(self._notebook_ui_views)
+        return self._ui_session
+
+    def _dispatch_ui(self, callback: Callable[[], None]) -> None:
+        """Run a UI mutation on the kernel io_loop with batch assign + push."""
+        self._ui.dispatch(callback)
+
+    def _publish_zenith_heatmaps(self) -> None:
+        """Deferred Bokeh publish for each Stokes zenith heatmap (after dispatch batch)."""
+        for panel in self._stokes_review._panels.values():
+            if panel is not None:
+                self._ui.publish_bokeh_figure(panel._heatmap.pane, panel._heatmap._plot)
 
     def _reset_thermal_qa_section(self) -> None:
         """Restore thermal-noise PNG grid and dewarp summary placeholders."""
@@ -1883,11 +2487,15 @@ class PipelineQAApp(param.Parameterized):
         section_contents: dict[str, pn.viewable.Viewable],
         *,
         banner: str,
+        load_seq: int,
     ) -> None:
         """Populate stable zenith section slots and mount sky widgets below."""
+        if not self._is_current_load(load_seq):
+            return
         self._zenith_banner.object = banner
-        # Push zenith row + full layout (nested status panes may not have their own comms).
-        self._stokes_review.set_push_root(self._push_zenith_root)
+        self._stokes_review.set_push_root(
+            lambda: self._dispatch_ui(lambda: None),
+        )
         self._stokes_review.set_extra_push_views(
             lambda: [
                 self._stokes_review.heatmap_status_row,
@@ -1900,7 +2508,7 @@ class PipelineQAApp(param.Parameterized):
                 section_contents[spec.stokes],
             ]
         self._stokes_review.mount_sky()
-        self._execute(self._push_zenith_root)
+        self._publish_zenith_heatmaps()
 
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
         """Update day options and selection from scan results."""
@@ -2145,12 +2753,15 @@ class PipelineQAApp(param.Parameterized):
             return
 
         select_day = self.select_day
-        self.loading_zenith = True
-        self._log(f"Loading zenith review panels for {select_day}…")
-        self._flush_log()
-        self._release_active_datasets()
-        self._reset_zenith_sections(banner="*Loading zenith panels…*")
-        self._execute(self._push_zenith_root)
+
+        def _start_ui() -> None:
+            self.loading_zenith = True
+            self._log(f"Loading zenith review panels for {select_day}…")
+            self._flush_log()
+            self._release_active_datasets()
+            self._reset_zenith_sections(banner="*Loading zenith panels…*")
+
+        self._dispatch_ui(_start_ui)
 
         def _run() -> None:
             try:
@@ -2186,18 +2797,22 @@ class PipelineQAApp(param.Parameterized):
                     if not self._is_current_load(load_seq):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
-                    self._mount_zenith_sections(section_contents, banner=banner)
+                    self._mount_zenith_sections(
+                        section_contents,
+                        banner=banner,
+                        load_seq=load_seq,
+                    )
                     self._clear_error()
                     self._log(f"Zenith review panels ready for {select_day}.")
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_mount)
+                self._dispatch_ui(_mount)
             except _LoadSuperseded:
 
                 def _abort() -> None:
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_abort)
+                self._dispatch_ui(_abort)
             except Exception as exc:
                 import traceback
 
@@ -2213,21 +2828,24 @@ class PipelineQAApp(param.Parameterized):
                     self._reset_zenith_sections()
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_fail)
+                self._dispatch_ui(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _finish_zenith_load(self, *, load_seq: int | None = None) -> None:
         """Clear zenith loading state and refresh controls."""
-        self.loading_zenith = False
         if load_seq is not None and not self._is_current_load(load_seq):
             return
-        self._flush_log()
-        self._execute(self._push_zenith_root)
+
+        def _clear() -> None:
+            self.loading_zenith = False
+            self._flush_log()
+
+        self._dispatch_ui(_clear)
 
     def _push_zenith_root(self) -> None:
         """Push zenith heatmaps after nested panel updates."""
-        self._push_panel_roots()
+        self._dispatch_ui(lambda: None)
 
     def _run_day_load(self, select_day: str, load_seq: int) -> None:
         """Fetch Zarr data and rebuild widgets on the main thread."""
@@ -2497,10 +3115,7 @@ def display_pipeline_qa_app(
     """
     from IPython.display import display
 
-    try:
-        pn.extension("ipywidgets")
-    except Exception as exc:
-        logger.debug("Panel ipywidgets extension unavailable: %s", exc)
+    configure_pipeline_qa_notebook()
 
     resolved_config = resolve_pipeline_qa_config(
         config=qa_config,
