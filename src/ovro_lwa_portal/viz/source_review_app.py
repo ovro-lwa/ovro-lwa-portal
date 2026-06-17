@@ -362,9 +362,11 @@ class SourceReview(param.Parameterized):
                 self._ui_session = JupyterPanelUISession(self._notebook_ui_views)
         return self._ui_session
 
-    def _publish_heatmap_figure(self, figure: object) -> None:
+    def _publish_heatmap_figure(
+        self, figure: object, *, after_publish: Callable[[], None] | None = None
+    ) -> None:
         """Push a Bokeh heatmap figure on the next io-loop turn (Jupiter push path)."""
-        self._ui.publish_bokeh_figure(self._heatmap_pane, figure)
+        self._ui.publish_bokeh_figure(self._heatmap_pane, figure, after_publish=after_publish)
 
     def _ensure_dataset_open(self) -> None:
         if self._open_scheduled or self._dataset is not None:
@@ -376,6 +378,9 @@ class SourceReview(param.Parameterized):
     def _dispatch(self, callback: Callable[[], None]) -> None:
         self._ui.dispatch(callback)
 
+    def _schedule_ui_action(self, callback: Callable[[], None]) -> None:
+        """Run a Panel button/param handler on the kernel io_loop (``JupyterPanelUISession``)."""
+        self._dispatch(callback)
 
     def _active_coordinate_text(self) -> str:
         typing = (self._coord_input.value_input or "").strip()
@@ -491,7 +496,7 @@ class SourceReview(param.Parameterized):
                 "**Center** reprojects the overlay here; **Generate heatmap** tracks this position."
             )
 
-        self._dispatch(_apply)
+        self._schedule_ui_action(_apply)
 
     def _resolve_active_coordinate(self) -> tuple[SkyCoord, str] | None:
         coord_text = self._active_coordinate_text().strip()
@@ -546,10 +551,7 @@ class SourceReview(param.Parameterized):
         return bool(self._coord.separation(coord) < 1 * u.arcsec)
 
     def _on_slew(self, _event: object | None = None) -> None:
-        def _run() -> None:
-            self._on_slew_impl()
-
-        self._dispatch(_run)
+        self._schedule_ui_action(self._on_slew_impl)
 
     def _on_slew_impl(self) -> None:
         self._sync_coordinate_field()
@@ -695,10 +697,21 @@ class SourceReview(param.Parameterized):
         self._log(f"[diag] Click reported=({ra_deg:.4f}, {dec_deg:.4f}) | " + " | ".join(parts))
 
     def _on_generate_heatmap(self, _event: object | None = None) -> None:
+        self._schedule_ui_action(self._on_generate_heatmap_impl)
+
+    def _on_generate_heatmap_impl(self) -> None:
         self._sync_coordinate_field()
         if not self._apply_coordinate_from_field():
             return
         if self._dataset is None:
+            self._log(
+                "WARNING: Zarr store not open yet — wait for "
+                "'Opened —' in the activity log before generating a heatmap."
+            )
+            self._set_status(
+                "**Zarr still opening** — wait for **Opened —** in the activity log, "
+                "then **Generate heatmap**."
+            )
             return
         self._load_heatmap()
 
@@ -890,6 +903,9 @@ class SourceReview(param.Parameterized):
         )
 
     def _on_heatmap_method_change(self, *_events) -> None:
+        self._schedule_ui_action(self._on_heatmap_method_change_impl)
+
+    def _on_heatmap_method_change_impl(self) -> None:
         if self._current_source is None or self._dataset is None or self.loading:
             return
         self._load_heatmap()
@@ -901,11 +917,46 @@ class SourceReview(param.Parameterized):
         method = str(self.heatmap_method)
         cache_key = (self.coordinate_string.strip(), method)
         if cache_key in self._cache:
-            self._dispatch(lambda: self._apply_heatmap(src, self._cache[cache_key]))
+            cached = self._cache[cache_key]
+            self._dispatch(lambda: self._apply_heatmap(src, cached))
             return
 
         self._heatmap_job_id += 1
         job_id = self._heatmap_job_id
+        self._begin_heatmap_load(src)
+
+        def _work() -> None:
+            t0 = time.perf_counter()
+            try:
+                payload = compute_source_heatmap(
+                    self._dataset,
+                    src,
+                    method=method,
+                    scale=self._patch_scale,
+                    patch_fit_max_reduced_chi_squared=self._patch_fit_max_chi2,
+                    progress_callback=self._heatmap_progress_callback(),
+                )
+            except Exception as exc:
+                captured_error = exc
+                self._dispatch(
+                    lambda err=captured_error: self._finish_heatmap(
+                        src, None, err, job_id, t0
+                    )
+                )
+                return
+            captured_payload = payload
+            self._dispatch(
+                lambda result=captured_payload: self._finish_heatmap(
+                    src, result, None, job_id, t0
+                )
+            )
+
+        import threading
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _begin_heatmap_load(self, src: dict) -> None:
+        """Show spinner/status for a new heatmap job."""
 
         def _begin() -> None:
             self.loading = True
@@ -924,30 +975,6 @@ class SourceReview(param.Parameterized):
 
         self._dispatch(_begin)
 
-        def _work() -> None:
-            t0 = time.perf_counter()
-            try:
-                payload = compute_source_heatmap(
-                    self._dataset,
-                    src,
-                    method=method,
-                    scale=self._patch_scale,
-                    patch_fit_max_reduced_chi_squared=self._patch_fit_max_chi2,
-                    progress_callback=self._heatmap_progress_callback(),
-                )
-            except Exception as exc:
-                self._dispatch(
-                    lambda: self._finish_heatmap(src, None, exc, job_id, t0)
-                )
-                return
-            self._dispatch(
-                lambda: self._finish_heatmap(src, payload, None, job_id, t0)
-            )
-
-        import threading
-
-        threading.Thread(target=_work, daemon=True).start()
-
     def _finish_heatmap(
         self,
         src: dict,
@@ -959,9 +986,9 @@ class SourceReview(param.Parameterized):
         if job_id != self._heatmap_job_id:
             return
         elapsed_s = time.perf_counter() - started_at
-        self.loading = False
-        self._sync_spinner(False)
         if error is not None:
+            self.loading = False
+            self._sync_spinner(False)
             self._log(f"ERROR ({src['name']}): {error}")
             self._set_status(f"**Heatmap failed for {src['name']}:** {error}")
             return
@@ -1006,7 +1033,16 @@ class SourceReview(param.Parameterized):
         self._heatmap_grid_ready = True
 
         figure = self._build_heatmap_figure(payload.values)
-        self._publish_heatmap_figure(figure)
+        # Keep the spinner active until the figure swap is actually pushed to the
+        # notebook frontend. Otherwise, the UI reads as "done" while the browser
+        # is still on the zeros placeholder during comm latency.
+        self._publish_heatmap_figure(
+            figure,
+            after_publish=lambda: (
+                setattr(self, "loading", False),
+                self._sync_spinner(False),
+            ),
+        )
 
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
         dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
@@ -1072,7 +1108,7 @@ class SourceReview(param.Parameterized):
         if change.get("type") != "change" or change.get("name") != "view_gesture_revision":
             return
         rev = change.get("new")
-        self._dispatch(lambda: self._log(f"Overlay view lock: gesture revision {rev}"))
+        self._schedule_ui_action(lambda: self._log(f"Overlay view lock: gesture revision {rev}"))
 
     def _update_sky(
         self,
@@ -1221,7 +1257,7 @@ class SourceReview(param.Parameterized):
                 self.loading = False
                 self._sync_spinner(False)
 
-        self._ui.schedule(_load_overlay)
+        self._ui.defer_dispatch(_load_overlay)
 
     def _reset_heatmap_to_zeros(self) -> None:
         """Replace the heatmap with a zeros grid when centering on a new position."""
@@ -1292,7 +1328,15 @@ class SourceReview(param.Parameterized):
         """Show/hide the radio overlay without touching the heatmap."""
         if self._suppress_overlay_toggle:
             return
-        self._overlay_enabled = bool(getattr(event, "new", self._overlay_toggle.value))
+        enabled = bool(getattr(event, "new", self._overlay_toggle.value))
+
+        def _run() -> None:
+            self._on_overlay_toggle_impl(enabled)
+
+        self._schedule_ui_action(_run)
+
+    def _on_overlay_toggle_impl(self, enabled: bool) -> None:
+        self._overlay_enabled = enabled
         self._set_overlay_toggle_display(self._overlay_enabled)
         widget = self._sky_widget
         if widget is None:
@@ -1442,7 +1486,7 @@ class SourceReview(param.Parameterized):
                 return
             t_idx = _heatmap_index_from_coord(event.x, n_times)
             f_idx = _heatmap_index_from_coord(event.y, n_freqs)
-            self._dispatch(lambda: self._on_heatmap_tap(t_idx, f_idx))
+            self._schedule_ui_action(lambda: self._on_heatmap_tap(t_idx, f_idx))
 
         plot.on_event(Tap, _on_tap)
         return plot

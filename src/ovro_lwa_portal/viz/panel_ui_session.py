@@ -10,8 +10,9 @@ Three sync tiers (do not collapse into one code path):
    assign on Python models, then one :func:`_push_panel_layout` sweep.
 2. **Direct publish** — Bokeh heatmap figures: assign ``pane.object`` + push
    (Jupiter path; never inside ``doc.hold``, never ``discard_events``).
-3. **Deferred widget publish** — coordinate field when a dispatch batch is active:
-   queue ``publish_panel_widget_to_notebook`` after the batch push completes.
+3. **Deferred publish** — Bokeh heatmap + coordinate field when a dispatch batch is
+   active: ``publish_bokeh_pane_to_notebook`` (assign + sync + ``force_push``)
+   runs before the batch layout push so the browser receives the new figure.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     _NOTEBOOK_UI_DEPTH,
     _push_panel_layout,
     _schedule_ipython_main,
+    _sync_all_notebook_views,
     defer_after_notebook_hold,
     hold_and_push,
     notebook_ui_hold_active,
@@ -86,7 +88,13 @@ class PanelUISession(Protocol):
     def sync_status_pane(self, pane: pn.viewable.Viewable, text: str) -> None:
         ...
 
-    def publish_bokeh_figure(self, pane: pn.viewable.Viewable, figure: object) -> None:
+    def publish_bokeh_figure(
+        self,
+        pane: pn.viewable.Viewable,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
         ...
 
 
@@ -131,9 +139,16 @@ class JupyterPanelUISession:
         finally:
             _AFTER_HOLD_CALLBACKS.reset(after_token)
             _NOTEBOOK_UI_DEPTH.reset(depth_token)
-        self._push_views()
+        # Assign deferred Bokeh/widget models before the batch push. Pushing first
+        # leaves the browser on a stale zeros heatmap when publish runs second
+        # (_push_panel_layout deduplicates by document id).
         for deferred in after_batch:
             deferred()
+        # Nested ``pn.pane.Bokeh`` refs are often absent from ``state._views`` in
+        # live Jupyter (layout root only). Sync before push or the browser keeps
+        # the zeros placeholder even though ``pane.object`` updated in Python.
+        _sync_all_notebook_views(*self._views())
+        self._push_views()
 
     def dispatch(
         self,
@@ -189,11 +204,24 @@ class JupyterPanelUISession:
         value: bool,
         visible: bool,
     ) -> None:
-        widget.value = value
-        widget.visible = visible
-        if self.hold_active():
-            return
-        _schedule_ipython_main(lambda: self._push_views(widget))
+        def _assign() -> None:
+            widget.value = value
+            widget.visible = visible
+
+        def _push() -> None:
+            # LoadingSpinner needs ``sync_widget_to_notebook`` for the ``spin`` CSS
+            # class; a bare layout push often leaves the browser on a static icon.
+            set_notebook_widget_params(
+                widget,
+                *self._views(),
+                value=value,
+                visible=visible,
+            )
+            _push_panel_layout(*self._views(), widget, _force=True)
+
+        if notebook_ui_hold_active():
+            defer_after_notebook_hold(_assign)
+        defer_after_notebook_hold(_push)
 
     def sync_coordinate_field(
         self,
@@ -202,6 +230,11 @@ class JupyterPanelUISession:
         value: str,
         value_input: str,
     ) -> None:
+        def _assign() -> None:
+            widget.value = value
+            widget.value_input = value_input
+            widget.options = []
+
         def _push() -> None:
             publish_panel_widget_to_notebook(
                 widget,
@@ -211,7 +244,10 @@ class JupyterPanelUISession:
                 options=[],
             )
 
-        defer_after_notebook_hold(_push)
+        if notebook_ui_hold_active():
+            defer_after_notebook_hold(_assign)
+        else:
+            defer_after_notebook_hold(_push)
 
     def sync_status_pane(self, pane: pn.viewable.Viewable, text: str) -> None:
         pane.object = text
@@ -219,11 +255,32 @@ class JupyterPanelUISession:
             return
         _schedule_ipython_main(lambda: self._push_views(pane))
 
-    def publish_bokeh_figure(self, pane: pn.viewable.Viewable, figure: object) -> None:
+    def publish_bokeh_figure(
+        self,
+        pane: pn.viewable.Viewable,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
         def _publish() -> None:
-            publish_bokeh_pane_to_notebook(pane, figure, *self._views())
+            publish_bokeh_pane_to_notebook(
+                pane,
+                figure,
+                *self._views(),
+                force_push=True,
+            )
+            if after_publish is not None:
+                after_publish()
 
-        defer_after_notebook_hold(_publish)
+        def _schedule_publish() -> None:
+            _schedule_ipython_main(_publish)
+
+        # Never publish inside the dispatch batch push: schedule a fresh io_loop
+        # turn so assign + sync + force_push are not lost or overwritten.
+        if notebook_ui_hold_active():
+            defer_after_notebook_hold(_schedule_publish)
+        else:
+            _schedule_ipython_main(_publish)
 
 
 class InlinePanelUISession:
@@ -301,9 +358,17 @@ class InlinePanelUISession:
             with hold_and_push(*self._views()):
                 _apply()
 
-    def publish_bokeh_figure(self, pane: pn.viewable.Viewable, figure: object) -> None:
+    def publish_bokeh_figure(
+        self,
+        pane: pn.viewable.Viewable,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
         def _publish() -> None:
             publish_bokeh_pane_to_notebook(pane, figure, *self._views())
+            if after_publish is not None:
+                after_publish()
 
         defer_after_notebook_hold(_publish)
 
@@ -359,8 +424,16 @@ class CallbackPanelUISession:
     def sync_status_pane(self, pane: pn.viewable.Viewable, text: str) -> None:
         pane.object = text
 
-    def publish_bokeh_figure(self, pane: pn.viewable.Viewable, figure: object) -> None:
+    def publish_bokeh_figure(
+        self,
+        pane: pn.viewable.Viewable,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
         pane.object = figure
+        if after_publish is not None:
+            after_publish()
 
 
 @dataclass(frozen=True)
@@ -461,10 +534,18 @@ class RecordingPanelUISession:
         if self._delegate is not None:
             self._delegate.sync_status_pane(pane, text)
 
-    def publish_bokeh_figure(self, pane: pn.viewable.Viewable, figure: object) -> None:
+    def publish_bokeh_figure(
+        self,
+        pane: pn.viewable.Viewable,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
         title = getattr(getattr(figure, "title", None), "text", None)
         self._record("publish_bokeh_figure", title=title)
         if self._delegate is not None:
-            self._delegate.publish_bokeh_figure(pane, figure)
+            self._delegate.publish_bokeh_figure(pane, figure, after_publish=after_publish)
         else:
             pane.object = figure
+            if after_publish is not None:
+                after_publish()

@@ -331,6 +331,7 @@ def _run_on_main_thread(callback: Callable[[], None]) -> None:
 def _push_panel_layout(
     *views: pn.viewable.Viewable,
     _retry: bool = True,
+    _force: bool = False,
 ) -> None:
     """Push Panel layout changes to the notebook frontend."""
     try:
@@ -350,7 +351,7 @@ def _push_panel_layout(
             _viewable, root, doc, comm = state._views[ref]
             if comm and "embedded" not in root.tags:
                 doc_id = id(doc)
-                if doc_id in pushed_docs:
+                if doc_id in pushed_docs and not _force:
                     continue
                 try:
                     push(doc, comm)
@@ -611,18 +612,11 @@ def publish_panel_widget_to_notebook(
     _push_panel_layout(*root_views, widget)
 
 
-def publish_bokeh_pane_to_notebook(
+def _assign_bokeh_pane_for_notebook(
     pane: pn.viewable.Viewable,
     value: Any,
-    *root_views: pn.viewable.Viewable,
 ) -> None:
-    """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
-
-    Match ``jupiter_flux_review.ipynb``: assign ``pane.object`` (Panel's watcher
-    registers the model change) then :func:`_push_panel_layout`. Do **not** wrap
-    the assign in ``discard_events`` — that suppresses the watcher and a bare
-    push then leaves the browser on the placeholder figure.
-    """
+    """Assign a Bokeh figure to a ``pn.pane.Bokeh`` without pushing the layout comm."""
     if (
         isinstance(pane, pn.pane.Bokeh)
         and pane.object is not None
@@ -631,7 +625,21 @@ def publish_bokeh_pane_to_notebook(
     ):
         pane.object = None
     pane.object = value
-    _push_panel_layout(*root_views, pane)
+
+
+def publish_bokeh_pane_to_notebook(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+    force_push: bool = False,
+) -> None:
+    """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
+
+    Assign via :func:`set_notebook_pane_object` (suppress mid-hold watcher loss,
+    then explicit ``sync_pane_to_notebook``) and force-push the layout comm.
+    """
+    set_notebook_pane_object(pane, value, *root_views)
+    _push_panel_layout(*root_views, pane, _force=force_push)
 
 
 def dispatch_notebook_ui(

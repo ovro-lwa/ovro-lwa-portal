@@ -182,3 +182,35 @@ def test_source_review_sky_click_records_ui_intent(tmp_path: Path) -> None:
     assert "dispatch" in ops
     assert "sync_coordinate_field" in ops
     assert ops.count("sync_status_pane") >= 1
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_dispatch_batch_publishes_heatmap_on_next_io_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: heatmap publish must run on a fresh io_loop turn after dispatch."""
+    from ovro_lwa_portal.viz import panel_ui_session as pus
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+    from ovro_lwa_portal.viz.panel_ui_session import JupyterPanelUISession
+    from ovro_lwa_portal.viz.source_review_app import _placeholder_heatmap_figure
+    from tests.viz.panel_ui_testkit import PanelUITestHarness, QueuedIOLoop
+
+    harness = PanelUITestHarness()
+    pane = pn.pane.Bokeh(_placeholder_heatmap_figure(), height=420)
+    layout = pn.Column(pane)
+    harness.mount(layout)
+    loop = QueuedIOLoop()
+    monkeypatch.setattr(pqa, "_IPYTHON_IO_LOOP", loop)
+    monkeypatch.setattr(pqa, "_resolve_ipython_event_loop", lambda: loop)
+    monkeypatch.setattr(pqa, "_is_jupyter_kernel_context", lambda: True)
+    monkeypatch.setattr(pqa, "_schedule_ipython_main", loop.add_callback)
+    monkeypatch.setattr(pqa, "notebook_views_registered", lambda *views: True)
+
+    session = JupyterPanelUISession(lambda: (layout, pane))
+    generated = figure(width=100, height=100, title="FL Cnc — tracked centre pixel")
+
+    session.dispatch(lambda: session.publish_bokeh_figure(pane, generated))
+    while loop.callbacks:
+        loop.flush()
+
+    assert harness.bokeh_model(pane, layout).title.text == "FL Cnc — tracked centre pixel"

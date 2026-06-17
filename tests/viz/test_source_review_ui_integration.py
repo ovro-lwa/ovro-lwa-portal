@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -15,6 +16,9 @@ from astropy.coordinates import SkyCoord
 pn = pytest.importorskip("panel")
 pytest.importorskip("astrowidget")
 
+from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+from ovro_lwa_portal.viz import source_review_app as sra
+from ovro_lwa_portal.viz.source_review import DatasetLoad, run_dataset_load
 from ovro_lwa_portal.viz.source_review_app import SourceReview, SourceReviewConfig
 from ovro_lwa_portal.viz.source_review_data import HeatmapLoad, build_source_from_coordinate
 from tests.viz.panel_ui_testkit import PanelUITestHarness, QueuedIOLoop
@@ -176,9 +180,10 @@ def test_generate_flow_spinner_and_heatmap_and_coord_on_sky_click(tmp_path: Path
 def _mount_review_jupyter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    layout_only: bool = False,
 ) -> tuple[PanelUITestHarness, SourceReview, QueuedIOLoop]:
     """SourceReview with production ``JupyterPanelUISession`` + queued io_loop."""
-    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
     from ovro_lwa_portal.viz.panel_ui_session import JupyterPanelUISession
 
     zarr = tmp_path / "store.zarr"
@@ -195,7 +200,10 @@ def _mount_review_jupyter(
         validate_zarr=False,
     )
     harness = PanelUITestHarness()
-    harness.mount(review._layout)
+    if layout_only:
+        harness.mount_layout_only(review._layout)
+    else:
+        harness.mount(review._layout)
     loop = QueuedIOLoop()
     monkeypatch.setattr(pqa, "_IPYTHON_IO_LOOP", loop)
     monkeypatch.setattr(pqa, "_resolve_ipython_event_loop", lambda: loop)
@@ -203,6 +211,42 @@ def _mount_review_jupyter(
     monkeypatch.setattr(pqa, "_schedule_ipython_main", loop.add_callback)
     review._ui_session = JupyterPanelUISession(review._notebook_ui_views)
     return harness, review, loop
+
+
+def _make_dataset(*, n_times: int = 6, n_freqs: int = 4) -> xr.Dataset:
+    from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+    times = np.arange(
+        np.datetime64("2025-01-01T00:00:00"),
+        np.datetime64("2025-01-01T00:00:00") + np.timedelta64(n_times, "s"),
+        np.timedelta64(1, "s"),
+    )
+    freqs = np.linspace(50e6, 55e6, n_freqs)
+    hdr = _make_sin_wcs_header_str(nx=8, ny=8, crval1=350.85, crval2=58.815)
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "l", "m"),
+                np.zeros((n_times, n_freqs, 1, 8, 8)),
+            ),
+            "wcs_header_str": (["time"], [hdr] * n_times),
+        },
+        coords={
+            "time": times,
+            "frequency": freqs,
+            "polarization": [0],
+            "l": np.arange(8),
+            "m": np.arange(8),
+        },
+    )
+    return ds
+
+
+def _drain_io_loop(loop: QueuedIOLoop, *, timeout_s: float = 2.0) -> None:
+    deadline = time.perf_counter() + timeout_s
+    while loop.callbacks and time.perf_counter() < deadline:
+        loop.flush()
+        time.sleep(0.001)
 
 
 def _flush_jupyter_io(loop: QueuedIOLoop) -> None:
@@ -294,3 +338,203 @@ def test_jupyter_session_open_generate_and_sky_click(
     coord_model = harness.bokeh_model(review._coord_input, review._layout)
     assert "6.5916" in coord_model.value
     assert "64.0770" in coord_model.value
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_session_generate_button_updates_heatmap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generate heatmap button must publish through the production dispatch path."""
+    from ovro_lwa_portal.viz import source_review_app as sra
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch)
+    _seed_dataset(review)
+    review.coordinate_string = "Cas A"
+    review._coord_input.value = "Cas A"
+    review._coord_input.value_input = "Cas A"
+
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    values = np.full((6, 4), 55.0)
+
+    def _fast_compute(*_args, **_kwargs) -> HeatmapLoad:
+        return HeatmapLoad(values=values, patch_fit_result=None, patch_stat_result=None)
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fast_compute)
+
+    review._on_generate_heatmap()
+    _flush_jupyter_io(loop)
+    while loop.callbacks:
+        loop.flush()
+
+    assert _heatmap_values_max(review) == pytest.approx(55.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_layout_only_generate_syncs_nested_heatmap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Notebook-like comm: layout root registered, nested heatmap pane is not."""
+    sync_targets: list[pn.viewable.Viewable] = []
+    real_sync = pqa.sync_pane_to_notebook
+
+    def _track_sync(pane: pn.viewable.Viewable, *root_views: pn.viewable.Viewable) -> None:
+        sync_targets.append(pane)
+        real_sync(pane, *root_views)
+
+    monkeypatch.setattr(pqa, "sync_pane_to_notebook", _track_sync)
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.coordinate_string = "Cas A"
+    review._coord_input.value = "Cas A"
+    review._coord_input.value_input = "Cas A"
+
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    values = np.full((6, 4), 61.0)
+
+    def _fast_compute(*_args, **_kwargs) -> HeatmapLoad:
+        return HeatmapLoad(values=values, patch_fit_result=None, patch_stat_result=None)
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fast_compute)
+
+    review._on_generate_heatmap()
+    _drain_io_loop(loop)
+
+    assert review._heatmap_pane in sync_targets
+    assert _heatmap_values_max(review) == pytest.approx(61.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_session_slow_zarr_open_then_generate_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interleave slow Zarr open progress with Generate; heatmap must still publish."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    monkeypatch.setattr(review, "_mount_sky_widget", lambda _ds: None)
+    open_done = threading.Event()
+
+    def _slow_open(report) -> DatasetLoad:
+        report("Opening zarr metadata (slow)…")
+        time.sleep(0.05)
+        ds = _make_dataset()
+        report("Zarr opened (0.1 s)")
+        report("Computing LST labels for time axis…")
+        lst_hours = np.linspace(4.0, 5.0, int(ds.sizes["time"]))
+        freq_mhz = np.asarray(ds.coords["frequency"].values, dtype=np.float64) / 1e6
+        report("Coordinates ready")
+        open_done.set()
+        return DatasetLoad(
+            dataset=ds,
+            default_time_idx=0,
+            default_freq_idx=0,
+            lst_hours=lst_hours,
+            freq_mhz=freq_mhz,
+        )
+
+    def _work() -> None:
+        run_dataset_load(
+            open_dataset=_slow_open,
+            dispatch=review._dispatch,
+            on_loaded=lambda load: review._finish_open(
+                load.dataset,
+                load.default_time_idx,
+                load.default_freq_idx,
+                load.lst_hours,
+                load.freq_mhz,
+                None,
+            ),
+            on_error=lambda exc: review._finish_open(None, None, None, None, None, exc),
+            log=review._log,
+        )
+
+    review._dispatch(
+        lambda: (
+            setattr(review, "loading", True),
+            review._sync_spinner(True),
+            review._log("Opening store…"),
+        )
+    )
+    _flush_jupyter_io(loop)
+    threading.Thread(target=_work, daemon=True).start()
+
+    deadline = time.perf_counter() + 2.0
+    while not open_done.is_set() and time.perf_counter() < deadline:
+        _drain_io_loop(loop, timeout_s=0.05)
+        time.sleep(0.01)
+    _drain_io_loop(loop)
+
+    assert review._dataset is not None
+    assert "click a cell" in _heatmap_title(harness, review).lower()
+
+    review.coordinate_string = "Cas A"
+    review._coord_input.value = "Cas A"
+    review._coord_input.value_input = "Cas A"
+
+    def _fast_compute(*_args, **_kwargs) -> HeatmapLoad:
+        return HeatmapLoad(
+            values=np.full((6, 4), 88.0),
+            patch_fit_result=None,
+            patch_stat_result=None,
+        )
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fast_compute)
+    review._on_generate_heatmap()
+    _drain_io_loop(loop)
+
+    assert _heatmap_values_max(review) == pytest.approx(88.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_spinner_stays_until_heatmap_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spinner stays on during compute and until the deferred heatmap publish."""
+    compute_started = threading.Event()
+    release_compute = threading.Event()
+
+    def _slow_compute(*_args, **_kwargs) -> HeatmapLoad:
+        compute_started.set()
+        assert release_compute.wait(timeout=2.0)
+        return HeatmapLoad(
+            values=np.full((6, 4), 71.0),
+            patch_fit_result=None,
+            patch_stat_result=None,
+        )
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.coordinate_string = "Cas A"
+    review._coord_input.value = "Cas A"
+    review._coord_input.value_input = "Cas A"
+    monkeypatch.setattr(sra, "compute_source_heatmap", _slow_compute)
+
+    review._on_generate_heatmap()
+    _drain_io_loop(loop, timeout_s=2.0)
+
+    assert compute_started.is_set()
+    assert review.loading is True
+    assert _spinner_spinning(harness, review)
+
+    release_compute.set()
+    deadline = time.perf_counter() + 5.0
+    while time.perf_counter() < deadline:
+        _drain_io_loop(loop, timeout_s=0.1)
+        if not review.loading:
+            break
+        time.sleep(0.01)
+
+    assert review.loading is False
+    assert not _spinner_spinning(harness, review)
+    assert _heatmap_values_max(review) == pytest.approx(71.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
