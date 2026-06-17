@@ -96,6 +96,14 @@ class SourceReviewConfig:
     hips_background_percentile_high: float = 98.0
 
 
+LOADING_SPINNER_HTML = (
+    '<div style="display:inline-block;width:22px;height:22px;vertical-align:middle;'
+    'border:3px solid #ddd;border-top-color:#0d6efd;border-radius:50%;'
+    'animation:ovro-lwa-spin 0.8s linear infinite"></div>'
+    "<style>@keyframes ovro-lwa-spin{to{transform:rotate(360deg)}}</style>"
+)
+
+
 def _placeholder_heatmap_figure() -> figure:
     """Minimal Bokeh plot shown before the Zarr store opens.
 
@@ -231,7 +239,15 @@ class SourceReview(param.Parameterized):
             name="Heatmap method",
             width=220,
         )
-        self._spinner = pn.indicators.LoadingSpinner(value=False, size=24, name="")
+        # ipywidgets spinner: same comm path as the activity log (Panel LoadingSpinner
+        # often never spins or clears at the wrong time in live Jupyter).
+        self._loading_widget = widgets.HTML(value="", layout=widgets.Layout(width="28px"))
+        self._loading_pane = pn.pane.IPyWidget(
+            self._loading_widget,
+            width=32,
+            height=32,
+            sizing_mode="fixed",
+        )
         initial_coord = coordinate_string.strip()
         self._coord_input = pn.widgets.AutocompleteInput(
             name="Coordinate",
@@ -274,7 +290,7 @@ class SourceReview(param.Parameterized):
                 self._coord_generate,
                 self._overlay_toggle,
                 self._method_selector,
-                self._spinner,
+                self._loading_pane,
                 sizing_mode="stretch_width",
                 margin=(0, 0, 8, 0),
             ),
@@ -322,7 +338,7 @@ class SourceReview(param.Parameterized):
                     self._zarr_path = resolved
             except (FileNotFoundError, DataSourceError) as exc:
                 self.loading = False
-                self._spinner.value = False
+                self._refresh_loading_widget(False)
                 self._log(f"ERROR: {exc}")
                 self._set_status(
                     "**Invalid Zarr path** — correct `ZARR_PATH` in the config cell "
@@ -343,7 +359,6 @@ class SourceReview(param.Parameterized):
         return (
             self._layout,
             self._status_pane,
-            self._spinner,
             self._heatmap_pane,
             self._coord_input,
         )
@@ -465,8 +480,11 @@ class SourceReview(param.Parameterized):
         if log_prefix:
             self._log(f"{log_prefix} {text!r}")
 
+    def _refresh_loading_widget(self, active: bool) -> None:
+        self._loading_widget.value = LOADING_SPINNER_HTML if active else ""
+
     def _sync_spinner(self, value: bool) -> None:
-        self._ui.sync_spinner(self._spinner, value=value, visible=value)
+        self._refresh_loading_widget(value)
 
     def _sync_coordinate_field(self) -> str:
         resolved = self._active_coordinate_text()
@@ -1021,6 +1039,10 @@ class SourceReview(param.Parameterized):
         )
         self._apply_heatmap(src, payload)
 
+    def _clear_loading_indicator(self) -> None:
+        self.loading = False
+        self._sync_spinner(False)
+
     def _apply_heatmap(self, src: dict, payload: HeatmapLoad) -> None:
         self._current_source = src
         self._heatmap_values = payload.values
@@ -1033,16 +1055,26 @@ class SourceReview(param.Parameterized):
         self._heatmap_grid_ready = True
 
         figure = self._build_heatmap_figure(payload.values)
-        # Keep the spinner active until the figure swap is actually pushed to the
-        # notebook frontend. Otherwise, the UI reads as "done" while the browser
-        # is still on the zeros placeholder during comm latency.
-        self._publish_heatmap_figure(
-            figure,
-            after_publish=lambda: (
-                setattr(self, "loading", False),
-                self._sync_spinner(False),
-            ),
-        )
+
+        def _load_overlay_after_heatmap() -> None:
+            try:
+                if self._overlay_enabled and self._sky_widget is not None:
+                    self._update_sky(
+                        self._time_idx,
+                        self._freq_idx,
+                        center_on_target=True,
+                        center=self._coord,
+                        log_loading=True,
+                    )
+            finally:
+                self._clear_loading_indicator()
+
+        def _after_heatmap_publish() -> None:
+            # Overlay after heatmap publish on the next io-loop turn (do not block
+            # the Bokeh comm push or run heavy Zarr work in the same callback).
+            self._ui.schedule(_load_overlay_after_heatmap)
+
+        self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
 
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
         dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
@@ -1057,14 +1089,6 @@ class SourceReview(param.Parameterized):
             f"Heatmap: **{self._heatmap_method_label()}** (scale={self._patch_scale:g}) · "
             f"{overlay_hint}"
         )
-        if self._overlay_enabled:
-            self._update_sky(
-                self._time_idx,
-                self._freq_idx,
-                center_on_target=True,
-                center=self._coord,
-                log_loading=True,
-            )
 
     def _default_slice(self, values: np.ndarray) -> tuple[int, int]:
         finite = np.argwhere(np.isfinite(values))

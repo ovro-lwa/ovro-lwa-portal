@@ -101,8 +101,8 @@ def test_source_review_accepts_inline_session(tmp_path: Path) -> None:
 
     harness.run_ui(session, _run)
 
-    assert harness.bokeh_model(review._coord_input, review._layout).value == "10.0, 20.0"
-    assert "spin" in harness.bokeh_model(review._spinner, review._layout).css_classes
+    assert review._coord_input.value == "10.0, 20.0"
+    assert "ovro-lwa-spin" in review._loading_widget.value
     assert "ready" in harness.bokeh_model(review._status_pane, review._layout).text
 
 

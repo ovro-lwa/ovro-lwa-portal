@@ -93,9 +93,8 @@ def _assert_heatmap_bokeh_model_live(harness: PanelUITestHarness, review: Source
     assert "Heatmap loads" not in model.title.text
 
 
-def _spinner_spinning(harness: PanelUITestHarness, review: SourceReview) -> bool:
-    model = harness.bokeh_model(review._spinner, review._layout)
-    return "spin" in model.css_classes
+def _spinner_spinning(review: SourceReview) -> bool:
+    return "ovro-lwa-spin" in (review._loading_widget.value or "")
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -155,7 +154,7 @@ def test_generate_flow_spinner_and_heatmap_and_coord_on_sky_click(tmp_path: Path
             setattr(review, "loading", True),
         ),
     )
-    assert _spinner_spinning(harness, review)
+    assert _spinner_spinning(review)
 
     values = np.full((6, 4), 42.0)
     payload = HeatmapLoad(values=values, patch_fit_result=None, patch_stat_result=None)
@@ -164,7 +163,7 @@ def test_generate_flow_spinner_and_heatmap_and_coord_on_sky_click(tmp_path: Path
         lambda: review._finish_heatmap(src, payload, None, job_id=1, started_at=time.perf_counter()),
     )
 
-    assert not _spinner_spinning(harness, review)
+    assert not _spinner_spinning(review)
     assert _heatmap_values_max(review) == pytest.approx(42.0)
     _assert_heatmap_bokeh_model_live(harness, review)
 
@@ -312,7 +311,7 @@ def test_jupyter_session_open_generate_and_sky_click(
         )
     )
     _flush_jupyter_io(loop)
-    assert _spinner_spinning(harness, review)
+    assert _spinner_spinning(review)
 
     payload = HeatmapLoad(
         values=np.full((6, 4), 99.0),
@@ -326,7 +325,7 @@ def test_jupyter_session_open_generate_and_sky_click(
     )
     _flush_jupyter_io(loop)
 
-    assert not _spinner_spinning(harness, review)
+    assert not _spinner_spinning(review)
     assert _heatmap_values_max(review) == pytest.approx(99.0)
     _assert_heatmap_bokeh_model_live(harness, review)
 
@@ -499,7 +498,7 @@ def test_jupyter_spinner_stays_until_heatmap_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Spinner stays on during compute and until the deferred heatmap publish."""
+    """Spinner stays on through compute, heatmap publish, and overlay load."""
     compute_started = threading.Event()
     release_compute = threading.Event()
 
@@ -524,7 +523,7 @@ def test_jupyter_spinner_stays_until_heatmap_publish(
 
     assert compute_started.is_set()
     assert review.loading is True
-    assert _spinner_spinning(harness, review)
+    assert _spinner_spinning(review)
 
     release_compute.set()
     deadline = time.perf_counter() + 5.0
@@ -535,6 +534,6 @@ def test_jupyter_spinner_stays_until_heatmap_publish(
         time.sleep(0.01)
 
     assert review.loading is False
-    assert not _spinner_spinning(harness, review)
+    assert not _spinner_spinning(review)
     assert _heatmap_values_max(review) == pytest.approx(71.0)
     _assert_heatmap_bokeh_model_live(harness, review)

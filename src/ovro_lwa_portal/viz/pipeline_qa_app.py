@@ -635,10 +635,11 @@ def publish_bokeh_pane_to_notebook(
 ) -> None:
     """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
 
-    Assign via :func:`set_notebook_pane_object` (suppress mid-hold watcher loss,
-    then explicit ``sync_pane_to_notebook``) and force-push the layout comm.
+    Match ``jupiter_flux_review``: assign ``pane.object`` (do **not** wrap in
+    ``discard_events``), ``sync_pane_to_notebook``, then force-push the layout comm.
     """
-    set_notebook_pane_object(pane, value, *root_views)
+    _assign_bokeh_pane_for_notebook(pane, value)
+    sync_pane_to_notebook(pane, *root_views)
     _push_panel_layout(*root_views, pane, _force=force_push)
 
 
