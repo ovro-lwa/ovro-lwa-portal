@@ -537,3 +537,52 @@ def test_jupyter_spinner_stays_until_heatmap_publish(
     assert not _spinner_spinning(review)
     assert _heatmap_values_max(review) == pytest.approx(71.0)
     _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlay loads must not wrap Zarr reads in Panel dispatch (double layout push)."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._coord = CAS_A
+    review._heatmap_values = np.zeros((6, 4))
+    widget = MagicMock()
+    widget.overlay_view_lock = True
+    widget.crval = (350.85, 58.815)
+    widget.view_ra = 350.85
+    widget.view_dec = 58.815
+    widget.view_center_skycoord.return_value = CAS_A
+    review._sky_widget = widget
+
+    scheduled: list[str] = []
+    real_schedule = review._ui.schedule
+
+    def _track_schedule(callback) -> None:
+        scheduled.append("schedule")
+        real_schedule(callback)
+
+    monkeypatch.setattr(review._ui, "schedule", _track_schedule)
+    monkeypatch.setattr(review._ui, "defer_dispatch", lambda _cb: scheduled.append("defer_dispatch"))
+
+    review._on_overlay_toggle_impl(True)
+    assert review.loading is True
+    assert _spinner_spinning(review)
+    _flush_jupyter_io(loop)
+
+    assert review.loading is False
+    assert not _spinner_spinning(review)
+    assert "schedule" in scheduled
+    assert "defer_dispatch" not in scheduled
+    widget.update_slice.assert_called_once()
+
+    scheduled.clear()
+    review._on_heatmap_tap(2, 1)
+    assert review.loading is True
+    _flush_jupyter_io(loop)
+
+    assert review.loading is False
+    assert scheduled == ["schedule"]
+    assert widget.update_slice.call_count == 2

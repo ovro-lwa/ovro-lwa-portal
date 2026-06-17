@@ -482,9 +482,53 @@ class SourceReview(param.Parameterized):
 
     def _refresh_loading_widget(self, active: bool) -> None:
         self._loading_widget.value = LOADING_SPINNER_HTML if active else ""
+        send_state = getattr(self._loading_widget, "send_state", None)
+        if callable(send_state):
+            send_state()
 
     def _sync_spinner(self, value: bool) -> None:
         self._refresh_loading_widget(value)
+
+    def _schedule_overlay_slice_load(
+        self,
+        time_idx: int,
+        freq_idx: int,
+        *,
+        center_on_target: bool = False,
+        center: SkyCoord | None = None,
+        preserve_view: bool = False,
+        manage_spinner: bool = True,
+    ) -> None:
+        """Load an overlay slice on the kernel io_loop without a Panel dispatch batch.
+
+        Wrapping ``update_slice`` in ``defer_dispatch`` runs two full layout pushes
+        (before and after the Zarr read) on large notebooks; the spinner then tracks
+        Panel comm latency instead of the actual slice load.
+        """
+        if self._sky_widget is None:
+            if manage_spinner:
+                self._clear_loading_indicator()
+            return
+
+        if manage_spinner:
+            self.loading = True
+            self._sync_spinner(True)
+
+        def _run() -> None:
+            try:
+                self._update_sky(
+                    int(time_idx),
+                    int(freq_idx),
+                    center_on_target=center_on_target,
+                    center=center,
+                    preserve_view=preserve_view,
+                    log_loading=True,
+                )
+            finally:
+                if manage_spinner:
+                    self._clear_loading_indicator()
+
+        self._ui.schedule(_run)
 
     def _sync_coordinate_field(self) -> str:
         resolved = self._active_coordinate_text()
@@ -1058,7 +1102,11 @@ class SourceReview(param.Parameterized):
 
         def _load_overlay_after_heatmap() -> None:
             try:
-                if self._overlay_enabled and self._sky_widget is not None:
+                if (
+                    self._overlay_enabled
+                    and self._sky_widget is not None
+                    and self._coord is not None
+                ):
                     self._update_sky(
                         self._time_idx,
                         self._freq_idx,
@@ -1266,22 +1314,11 @@ class SourceReview(param.Parameterized):
             f"Heatmap cell — {name}, t={time_idx}, f={freq_idx} ({freq:.1f} MHz); "
             "loading overlay at current view."
         )
-        self.loading = True
-        self._sync_spinner(True)
-
-        def _load_overlay() -> None:
-            try:
-                self._update_sky(
-                    time_idx,
-                    freq_idx,
-                    preserve_view=True,
-                    log_loading=True,
-                )
-            finally:
-                self.loading = False
-                self._sync_spinner(False)
-
-        self._ui.defer_dispatch(_load_overlay)
+        self._schedule_overlay_slice_load(
+            time_idx,
+            freq_idx,
+            preserve_view=True,
+        )
 
     def _reset_heatmap_to_zeros(self) -> None:
         """Replace the heatmap with a zeros grid when centering on a new position."""
@@ -1368,12 +1405,11 @@ class SourceReview(param.Parameterized):
             return
         if self._overlay_enabled:
             if self._coord is not None:
-                self._update_sky(
+                self._schedule_overlay_slice_load(
                     self._time_idx,
                     self._freq_idx,
                     center_on_target=True,
                     center=self._coord,
-                    log_loading=True,
                 )
                 msg = f"Overlay **on** — slice t={self._time_idx}, f={self._freq_idx}."
             else:
