@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,6 +20,7 @@ from ovro_lwa_portal.accessor import (
     PatchStatisticResult,
     RadportAccessor,
     _fit_spatial_gaussian,
+    _gaussian_parameters_from_patch_statistics,
     _reduce_spatial_statistic,
 )
 
@@ -97,9 +100,10 @@ class TestRadportValidation:
 class TestRadportHasBeam:
     """Tests for has_beam property."""
 
-    def test_has_beam_false_when_no_beam(self, valid_ovro_dataset: xr.Dataset) -> None:
+    def test_has_beam_false_when_no_beam(self, dataset_missing_sky_variable: xr.Dataset) -> None:
         """has_beam returns False when dataset has no BEAM variable."""
-        assert not valid_ovro_dataset.radport.has_beam
+        ds = dataset_missing_sky_variable.rename({"OTHER": "SKY"})
+        assert not ds.radport.has_beam
 
     def test_has_beam_true_when_beam_present(
         self, valid_ovro_dataset_with_beam: xr.Dataset
@@ -220,7 +224,7 @@ class TestRadportPlot:
     ) -> None:
         """plot() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found in dataset"):
-            valid_ovro_dataset.radport.plot(var="BEAM")
+            valid_ovro_dataset.radport.plot(var="NONEXISTENT")
 
     def test_plot_invalid_variable_lists_available(
         self, valid_ovro_dataset: xr.Dataset
@@ -516,7 +520,7 @@ class TestRadportCutout:
         """cutout() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found"):
             valid_ovro_dataset.radport.cutout(
-                l_center=0.0, m_center=0.0, dl=0.1, dm=0.1, var="BEAM"
+                l_center=0.0, m_center=0.0, dl=0.1, dm=0.1, var="NONEXISTENT"
             )
 
     def test_cutout_out_of_bounds_raises(
@@ -605,12 +609,79 @@ class TestRadportDynamicSpectrum:
         assert "l_idx" in dynspec.attrs
         assert "m_idx" in dynspec.attrs
 
+    def test_dynamic_spectrum_progress_callback(
+        self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
+    ) -> None:
+        """progress_callback reports track and extract stages for RA/Dec tracking."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        valid_ovro_dataset_with_tracking_wcs.radport.dynamic_spectrum(
+            ra=180.0,
+            dec=37.0,
+            progress_callback=_callback,
+        )
+        stages = {stage for stage, *_rest in events}
+        assert "track" in stages
+        assert "extract" in stages
+
+    def test_dynamic_spectrum_extract_progress_updates_regularly(self) -> None:
+        """Extract stage reports start and finish without splitting I/O into batches."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        ds, catalog_ra, catalog_dec = (
+            TestCelestialTimeSeriesTracking._per_time_wcs_dataset(25)
+        )
+        ds.radport.dynamic_spectrum(
+            ra=catalog_ra,
+            dec=catalog_dec,
+            progress_callback=_callback,
+        )
+        extract_events = [
+            (current, total)
+            for stage, current, total, _msg in events
+            if stage == "extract"
+        ]
+        assert len(extract_events) >= 2
+        assert extract_events[0][0] == 0
+        assert extract_events[-1][0] == extract_events[-1][1]
+
+    def test_radport_progress_heartbeat_emits_elapsed_messages(self) -> None:
+        """Elapsed-time heartbeats log without chunking the underlying work."""
+        from ovro_lwa_portal.accessor import _radport_progress_heartbeat
+
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        with _radport_progress_heartbeat(
+            _callback,
+            stage="extract",
+            total=10,
+            message="Extracting 10 tracked pixels",
+            interval_s=0.05,
+        ):
+            time.sleep(0.16)
+
+        assert events
+        assert all(stage == "extract" and current == 0 and total == 10 for stage, current, total, _ in events)
+        assert all("in progress" in message for _stage, _current, _total, message in events)
+        assert len(events) >= 2
+
     def test_dynamic_spectrum_invalid_var_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
         """dynamic_spectrum() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found"):
-            valid_ovro_dataset.radport.dynamic_spectrum(l=0.0, m=0.0, var="BEAM")
+            valid_ovro_dataset.radport.dynamic_spectrum(
+                l=0.0, m=0.0, var="NONEXISTENT"
+            )
 
 
 class TestRadportPatchStatistic:
@@ -641,7 +712,7 @@ class TestRadportPatchStatistic:
         result = ds.radport.patch_statistic(
             l=0.0,
             m=0.0,
-            radius=3,
+            scale=5.0,
             statistic="max",
             threshold=500.0,
             comparison="gt",
@@ -658,7 +729,7 @@ class TestRadportPatchStatistic:
         result_le = ds.radport.patch_statistic(
             l=0.0,
             m=0.0,
-            radius=3,
+            scale=5.0,
             statistic="max",
             threshold=500.0,
             comparison="le",
@@ -706,7 +777,7 @@ class TestRadportPatchStatistic:
         result = ds.radport.patch_statistic(
             l=0.0,
             m=0.0,
-            radius=3,
+            scale=5.0,
             statistic="max",
             threshold=500.0,
             comparison="gt",
@@ -731,12 +802,32 @@ class TestRadportPatchStatistic:
         with pytest.raises(ValueError, match="Unsupported statistic"):
             _reduce_spatial_statistic(np.ones((3, 3)), "invalid")  # type: ignore[arg-type]
 
-    def test_patch_statistic_negative_radius_raises(
+    def test_patch_statistic_nonpositive_scale_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
-        """Negative radius raises ValueError."""
-        with pytest.raises(ValueError, match="radius must be non-negative"):
-            valid_ovro_dataset.radport.patch_statistic(l=0.0, m=0.0, radius=-1)
+        """Non-positive scale raises ValueError."""
+        with pytest.raises(ValueError, match="scale must be positive"):
+            valid_ovro_dataset.radport.patch_statistic(l=0.0, m=0.0, scale=0.0)
+
+    def test_patch_statistic_progress_callback(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """progress_callback reports extract and reduce stages through completion."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        valid_ovro_dataset.radport.patch_statistic(
+            l=0.0,
+            m=0.0,
+            statistic="std",
+            progress_callback=_callback,
+        )
+        stages = {stage for stage, *_rest in events}
+        assert "extract" in stages
+        assert "reduce" in stages
+        assert any(current == total and total > 0 for _s, current, total, _m in events)
 
     def test_patch_statistic_radec_tracking(
         self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
@@ -746,7 +837,7 @@ class TestRadportPatchStatistic:
         result = ds.radport.patch_statistic(
             ra=180.0,
             dec=37.0,
-            radius=2,
+            scale=2.0,
             statistic="mean",
             threshold=0.0,
             comparison="gt",
@@ -759,6 +850,23 @@ class TestRadportPatchStatistic:
 class TestRadportPatchFit:
     """Tests for patch_fit() and Gaussian fit helpers."""
 
+    def test_patch_fit_progress_callback(self, valid_ovro_dataset: xr.Dataset) -> None:
+        """progress_callback reports extract and fit stages through completion."""
+        events: list[tuple[str, int, int, str]] = []
+
+        def _callback(stage: str, current: int, total: int, message: str) -> None:
+            events.append((stage, current, total, message))
+
+        valid_ovro_dataset.radport.patch_fit(
+            l=0.0,
+            m=0.0,
+            progress_callback=_callback,
+        )
+        stages = {stage for stage, *_rest in events}
+        assert "extract" in stages
+        assert "fit" in stages
+        assert any(current == total and total > 0 for _s, current, total, _m in events)
+
     def test_patch_fit_returns_result(self, valid_ovro_dataset: xr.Dataset) -> None:
         """patch_fit() returns PatchFitResult with parameter and chi-squared maps."""
         result = valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0)
@@ -770,9 +878,129 @@ class TestRadportPatchFit:
             result.widthy_map,
             result.background_map,
             result.reduced_chi_squared_map,
+            result.x_offset_map,
+            result.y_offset_map,
+            result.center_flux_map,
+            result.patch_max_map,
+            result.fit_accepted_map,
         ):
             assert set(da.dims) == {"time", "frequency"}
             assert da.shape == (2, 3)
+        diag = result.cell_diagnostics(time_idx=0, frequency_idx=0)
+        assert "fit_accepted" in diag
+        assert "patch_max" in diag
+
+    def test_gaussian_parameters_use_patch_max_for_peak(self) -> None:
+        """Peak estimate uses patch maximum minus median background."""
+        patch = np.array(
+            [
+                [10.0, 10.0, 10.0],
+                [10.0, 20.0, 10.0],
+                [10.0, 10.0, 10.0],
+            ],
+            dtype=np.float64,
+        )
+        ny, nx = patch.shape
+        yy, xx = np.indices((ny, nx))
+        y = yy - (ny - 1) / 2.0
+        x = xx - (nx - 1) / 2.0
+        peak, *_rest = _gaussian_parameters_from_patch_statistics(
+            patch,
+            x,
+            y,
+            beam_widthx=3.0,
+            beam_widthy=3.0,
+            max_width=10.0,
+            max_offset=1.0,
+        )
+        assert peak == pytest.approx(10.0)
+
+    def test_gaussian_parameters_from_patch_statistics_bright_source(self) -> None:
+        """Statistical defaults separate bright peak from high background."""
+        ny, nx = 11, 11
+        true_peak = 500.0
+        true_bg = 4800.0
+        true_fwhm = 3.0
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = true_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = true_bg + true_peak * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        y = yy - cy
+        x = xx - cx
+        peak, x_off, y_off, widthx, widthy, background = (
+            _gaussian_parameters_from_patch_statistics(
+                patch,
+                x,
+                y,
+                beam_widthx=true_fwhm,
+                beam_widthy=true_fwhm,
+                max_width=40.0,
+                max_offset=5.0,
+            )
+        )
+        np.testing.assert_allclose(background, true_bg, rtol=0.05)
+        np.testing.assert_allclose(peak, true_peak, rtol=0.25)
+        assert abs(x_off) < 0.5
+        assert abs(y_off) < 0.5
+        assert 1.0 <= widthx <= 10.0
+        assert 1.0 <= widthy <= 10.0
+
+    def test_fit_spatial_gaussian_returns_statistics_when_optimizer_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failed least_squares still returns finite patch-statistic estimates."""
+
+        def _raise(*_args: object, **_kwargs: object) -> None:
+            msg = "forced optimizer failure"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(
+            "ovro_lwa_portal.accessor.least_squares",
+            _raise,
+        )
+        ny, nx = 11, 11
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = 3.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = 4800.0 + 500.0 * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        peak, _x_off, _y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, beam_widthx=3.0, beam_widthy=3.0
+        )
+        assert np.isfinite(peak)
+        assert np.isfinite(widthx)
+        assert np.isfinite(widthy)
+        assert np.isfinite(background)
+        assert np.isfinite(chi2_red)
+        assert peak > 0
+        assert background > 4000
+
+    def test_fit_spatial_gaussian_recovers_off_center_peak(self) -> None:
+        """Shifted Gaussian fit recovers an off-centre bright peak."""
+        ny, nx = 11, 11
+        true_peak = 40.0
+        true_bg = 5.0
+        true_fwhm = 2.5
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        y_off_true, x_off_true = 4.0, -2.0
+        yy, xx = np.indices((ny, nx))
+        y = yy - cy
+        x = xx - cx
+        sigma = true_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        patch = true_bg + true_peak * np.exp(
+            -0.5 * (((y - y_off_true) / sigma) ** 2 + ((x - x_off_true) / sigma) ** 2)
+        )
+        peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, beam_widthx=true_fwhm, beam_widthy=true_fwhm
+        )
+        assert chi2_red < 3.0
+        np.testing.assert_allclose(peak, true_peak, rtol=0.2)
+        np.testing.assert_allclose(x_off, x_off_true, atol=0.75)
+        np.testing.assert_allclose(y_off, y_off_true, atol=0.75)
+        np.testing.assert_allclose(background, true_bg, atol=2.0)
 
     def test_fit_spatial_gaussian_recovers_synthetic_peak(
         self,
@@ -788,8 +1016,8 @@ class TestRadportPatchFit:
         patch = true_bg + true_peak * np.exp(
             -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
         )
-        peak, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
-            patch, default_fwhm=3.0
+        peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch, beam_widthx=true_fwhm, beam_widthy=true_fwhm
         )
         assert np.isfinite(peak)
         assert chi2_red < 3.0
@@ -797,6 +1025,8 @@ class TestRadportPatchFit:
         np.testing.assert_allclose(widthx, true_fwhm, rtol=0.2)
         np.testing.assert_allclose(widthy, true_fwhm, rtol=0.2)
         np.testing.assert_allclose(background, true_bg, atol=1.0)
+        assert abs(x_off) < 0.5
+        assert abs(y_off) < 0.5
 
     def test_patch_fit_on_injected_gaussian(
         self, valid_ovro_dataset: xr.Dataset
@@ -804,7 +1034,9 @@ class TestRadportPatchFit:
         """patch_fit() returns finite peaks on a centred Gaussian bump with low chi2."""
         ds = valid_ovro_dataset.copy(deep=True)
         l_idx, m_idx = ds.radport._resolve_coordinates(l=0.0, m=0.0)
-        radius = 5
+        scale = 25.0
+        radius = ds.radport.patch_radius_pixels(time_idx=0, scale=scale)
+        assert radius >= 5
         sky = np.zeros(ds["SKY"].shape, dtype=float)
         ny = nx = 2 * radius + 1
         cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
@@ -818,26 +1050,28 @@ class TestRadportPatchFit:
         )
         ds["SKY"].values[:] = sky
 
-        result = ds.radport.patch_fit(l=0.0, m=0.0, radius=radius)
+        result = ds.radport.patch_fit(l=0.0, m=0.0, scale=scale)
+        assert int(result.patch_radius_map.isel(time=0).values) == radius
         peaks = result.peak_map.sel(time=ds.coords["time"][0])
         chi2 = result.reduced_chi_squared_map.sel(time=ds.coords["time"][0])
         assert np.all(np.isfinite(peaks.values))
         assert np.all(peaks.values > 50.0)
         assert np.all(chi2.values <= result.max_reduced_chi_squared)
 
-    def test_patch_fit_negative_radius_raises(
+    def test_patch_fit_nonpositive_scale_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
-        """Negative radius raises ValueError."""
-        with pytest.raises(ValueError, match="radius must be non-negative"):
-            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, radius=-1)
+        """Non-positive scale raises ValueError."""
+        with pytest.raises(ValueError, match="scale must be positive"):
+            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, scale=-1.0)
 
-    def test_patch_fit_invalid_default_fwhm_raises(
+    def test_patch_fit_missing_beam_metadata_raises(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
-        """Non-positive default_fwhm raises ValueError."""
-        with pytest.raises(ValueError, match="default_fwhm must be positive"):
-            valid_ovro_dataset.radport.patch_fit(l=0.0, m=0.0, default_fwhm=0.0)
+        """patch_fit() requires synthesized beam BMAJ/BMIN metadata."""
+        ds = valid_ovro_dataset.drop_vars("BEAM")
+        with pytest.raises(ValueError, match="Synthesized beam metadata unavailable"):
+            ds.radport.patch_fit(l=0.0, m=0.0)
 
     def test_patch_fit_masks_poor_chi2_fits(
         self, valid_ovro_dataset: xr.Dataset
@@ -863,9 +1097,96 @@ class TestRadportPatchFit:
     ) -> None:
         """RA/Dec patch_fit uses tracked pixels and records reduced chi-squared."""
         ds = valid_ovro_dataset_with_tracking_wcs
-        result = ds.radport.patch_fit(ra=180.0, dec=37.0, radius=2)
+        result = ds.radport.patch_fit(ra=180.0, dec=37.0, scale=2.0)
         assert result.peak_map.attrs["tracking"] is True
         assert np.any(np.isfinite(result.reduced_chi_squared_map.values))
+        assert np.any(np.isfinite(result.patch_radius_map.values))
+
+    def test_patch_radius_pixels_scales_with_beam(self) -> None:
+        """patch_radius_pixels grows with scale and beam FWHM."""
+        from ovro_lwa_portal.accessor import patch_half_width_pixels
+
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], np.zeros((1, 2, 1, 50, 50))),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    np.array([[[[0.02, 0.01, 0.0]], [[0.04, 0.02, 0.0]]]]),
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        _wx_lo, _wy_lo = ds.radport.beam_fwhm_pixels(time_idx=0, frequency_idx=0)
+        wx_hi, wy_hi = ds.radport.beam_fwhm_pixels(time_idx=0, frequency_idx=1)
+        r1 = ds.radport.patch_radius_pixels(time_idx=0, scale=2.0)
+        r2 = ds.radport.patch_radius_pixels(time_idx=0, scale=4.0)
+        assert r2 > r1
+        assert r1 == patch_half_width_pixels(2.0, wx_hi, wy_hi)
+
+    def test_beam_fwhm_pixels_from_beam_param(self) -> None:
+        """beam_fwhm_pixels reads major/minor from BEAM beam_param."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], np.zeros((1, 1, 1, 50, 50))),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    np.array([[[[0.02, 0.01, 30.0]]]]),
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [50e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        wx, wy = ds.radport.beam_fwhm_pixels(time_idx=0, frequency_idx=0)
+        assert wx > 1.0
+        assert wy > 1.0
+
+    def test_format_radec_sexagesimal(self) -> None:
+        """Sexagesimal RA/Dec strings use hh:mm:ss.s and signed dd:mm:ss."""
+        from ovro_lwa_portal.accessor import format_radec_sexagesimal
+
+        ra_s, dec_s = format_radec_sexagesimal(299.868, 40.734)
+        assert ra_s.count(":") == 2
+        assert dec_s.count(":") == 2
+        assert dec_s.startswith("+") or dec_s.startswith("-")
+
+    def test_patch_fit_peak_radec_maps(
+        self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
+    ) -> None:
+        """peak_radec_maps() returns finite coordinates when the fit is accepted."""
+        ds = valid_ovro_dataset_with_tracking_wcs
+        result = ds.radport.patch_fit(ra=180.0, dec=37.0, scale=5.0)
+        ra_map, dec_map = result.peak_radec_maps()
+        assert ra_map.shape == result.peak_map.shape
+        accepted = result.fit_accepted_map.values
+        finite_offsets = np.isfinite(result.x_offset_map.values) & np.isfinite(
+            result.y_offset_map.values
+        )
+        if np.any(accepted & finite_offsets):
+            mask = accepted & finite_offsets
+            assert np.any(np.isfinite(ra_map.values[mask]))
+            assert np.any(np.isfinite(dec_map.values[mask]))
+        diag = result.cell_diagnostics(time_idx=0, frequency_idx=0)
+        assert "peak_ra_deg" in diag
+        assert "peak_dec_deg" in diag
+        assert "peak_ra" in diag
+        assert "peak_dec" in diag
 
 
 class TestRadportPlotDynamicSpectrum:
@@ -1163,7 +1484,7 @@ class TestRadportPlotGrid:
     ) -> None:
         """plot_grid() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found"):
-            valid_ovro_dataset.radport.plot_grid(var="BEAM")
+            valid_ovro_dataset.radport.plot_grid(var="NONEXISTENT")
 
     def test_plot_grid_creates_multiple_axes(
         self, valid_ovro_dataset: xr.Dataset
@@ -1716,6 +2037,38 @@ class TestRadportGetWcsTimePromotedHeader:
         assert w1.wcs.crval[0] == pytest.approx(181.0)
         assert _read_wcs_header_str(ds, time_idx=1) == hdr1
 
+    def test_read_wcs_header_str_time_frequency_dim(self) -> None:
+        """Per-time WCS may be stored as (time, frequency) before frequency collapse."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _read_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=190.0, crval2=50.0)
+        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
+        wcs_arr = np.array(
+            [[np.bytes_(enc0)], [np.bytes_(enc1)]],
+            dtype=f"S{max(len(enc0), len(enc1))}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time", "frequency"), wcs_arr),
+            },
+            coords={
+                "time": ("time", np.arange(2, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+        )
+        assert _read_wcs_header_str(ds, time_idx=1) == hdr1
+        assert ds.radport._use_persisted_wcs_for_pixel_mapping() is True
+
     def test_get_wcs_prefers_per_time_header_over_static_attrs(self) -> None:
         """Static ``fits_wcs_header`` must not mask per-time ``wcs_header_str``."""
         from tests.test_fits_to_zarr import _make_sin_wcs_header_str
@@ -1903,6 +2256,41 @@ class TestRadportPixelToCoords:
             lb, mb = ds.radport.coords_to_pixel(ra_t, dec_t, time_idx=ti)
             assert abs(lb - li) <= 1
             assert abs(mb - mi) <= 1
+
+    def test_pixel_to_coords_uses_per_time_wcs_header_str(self) -> None:
+        """pixel_to_coords must not use time-0 WCS when headers vary per step."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=200.0, crval2=45.0)
+        enc = [h.encode("utf-8") for h in (hdr0, hdr1)]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(enc[0]), len(enc[1]))}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", [55e6]),
+                "polarization": ("polarization", [0]),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        for ti, cr1 in enumerate((180.0, 200.0)):
+            li, mi = ds.radport.coords_to_pixel(cr1, 45.0, time_idx=ti)
+            ra_p, dec_p = ds.radport.pixel_to_coords(li, mi, time_idx=ti)
+            lb, mb = ds.radport.coords_to_pixel(ra_p, dec_p, time_idx=ti)
+            assert abs(lb - li) <= 1
+            assert abs(mb - mi) <= 1
+            assert abs(ra_p - cr1) < 0.1
 
     def test_pixel_to_coords_time_mjd_same_as_time_idx(
         self, valid_ovro_dataset_with_wcs: xr.Dataset
@@ -3622,6 +4010,310 @@ class TestCelestialTimeSeriesTracking:
         dynspec = ds.radport.dynamic_spectrum(ra=lst_deg, dec=37.2339)
         # Should have some finite values (source visible at least at t=0)
         assert np.any(np.isfinite(dynspec.values))
+
+    def test_radec_track_uses_per_time_wcs_not_fixed_pixel(self) -> None:
+        """Fixed catalog (RA, Dec) must follow per-time WCS when CRVAL drifts."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        catalog_ra = 180.0
+        catalog_dec = 45.0
+        n_time = 2
+        # Small CRVAL1 steps: source stays in FOV but maps to different pixels.
+        crvals = (180.0, 180.5)
+        headers = [
+            _make_sin_wcs_header_str(nx=16, ny=16, crval1=c1, crval2=catalog_dec)
+            for c1 in crvals
+        ]
+        enc = [h.encode("utf-8") for h in headers]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(e) for e in enc)}",
+        )
+        times = [60000.0 + 0.01 * i for i in range(n_time)]
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.ones((n_time, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", np.asarray(times, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        ds["SKY"].attrs["fits_wcs_header"] = headers[0]
+
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(catalog_ra, catalog_dec)
+        assert np.all(visible)
+        assert (int(l_idx[0]), int(m_idx[0])) != (int(l_idx[1]), int(m_idx[1]))
+
+        for ti in (0, 1):
+            lb, mb = ds.radport.coords_to_pixel(catalog_ra, catalog_dec, time_idx=ti)
+            assert abs(lb - int(l_idx[ti])) <= 1
+            assert abs(mb - int(m_idx[ti])) <= 1
+
+        dynspec = ds.radport.dynamic_spectrum(ra=catalog_ra, dec=catalog_dec)
+        assert dynspec.attrs["tracking"] is True
+        assert np.all(np.isfinite(dynspec.values))
+
+    @staticmethod
+    def _per_time_wcs_dataset(
+        n_time: int,
+        *,
+        crval1_start: float = 180.0,
+        crval1_step: float = 0.1,
+        catalog_dec: float = 45.0,
+    ) -> tuple[xr.Dataset, float, float]:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        catalog_ra = 180.0
+        headers = [
+            _make_sin_wcs_header_str(
+                nx=16,
+                ny=16,
+                crval1=crval1_start + crval1_step * ti,
+                crval2=catalog_dec,
+            )
+            for ti in range(n_time)
+        ]
+        enc = [h.encode("utf-8") for h in headers]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(e) for e in enc)}",
+        )
+        times = [60000.0 + 0.01 * i for i in range(n_time)]
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.ones((n_time, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", np.asarray(times, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        ds["SKY"].attrs["fits_wcs_header"] = headers[0]
+        return ds, catalog_ra, catalog_dec
+
+    def test_world2pix_from_header_str_matches_get_wcs(self) -> None:
+        from astropy.io.fits import Header
+        from astropy.wcs import WCS
+
+        from ovro_lwa_portal.accessor import _world2pix_from_header_str
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=45.0)
+        wcs = WCS(Header.fromstring(hdr, sep="\n")).celestial
+        sky = wcs.pixel_to_world(4, 4)
+        ra_deg = float(sky.ra.deg)
+        dec_deg = float(sky.dec.deg)
+        li, mi, visible = _world2pix_from_header_str(hdr, ra_deg, dec_deg, 16, 16)
+        assert visible
+        assert li == 4
+        assert mi == 4
+
+    def test_per_time_wcs_track_table_uses_template_for_uniform_headers(self) -> None:
+        from ovro_lwa_portal.accessor import (
+            _build_per_time_wcs_track_table,
+            _bulk_per_time_wcs_header_strings,
+        )
+
+        ds, _, _ = self._per_time_wcs_dataset(4)
+        header_strs = _bulk_per_time_wcs_header_strings(ds, 4)
+        table = _build_per_time_wcs_track_table(header_strs)
+        assert table.use_template
+        assert table.template_header is not None
+        assert np.all(table.header_valid)
+
+    def test_per_time_wcs_track_table_falls_back_when_headers_differ(self) -> None:
+        from ovro_lwa_portal.accessor import _build_per_time_wcs_track_table
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        hdr0 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(
+            nx=16, ny=16, crval1=180.0, crval2=45.0, cdelt=0.2
+        )
+        table = _build_per_time_wcs_track_table([hdr0, hdr1])
+        assert not table.use_template
+        assert table.template_header is None
+        assert np.all(table.header_valid)
+
+    def test_per_time_wcs_track_matches_coords_to_pixel(self) -> None:
+        ds, catalog_ra, catalog_dec = self._per_time_wcs_dataset(12)
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(catalog_ra, catalog_dec)
+        assert np.all(visible)
+        assert len({int(v) for v in l_idx}) > 1
+        for ti in range(int(ds.sizes["time"])):
+            lb, mb = ds.radport.coords_to_pixel(
+                catalog_ra, catalog_dec, time_idx=ti
+            )
+            assert abs(lb - int(l_idx[ti])) <= 1
+            assert abs(mb - int(m_idx[ti])) <= 1
+
+    def test_per_time_wcs_track_marks_empty_header_invisible(self) -> None:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _bulk_per_time_wcs_header_strings
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        enc0 = hdr0.encode("utf-8")
+        wcs_per_time = np.array(
+            [np.bytes_(enc0), np.bytes_(b"")],
+            dtype=f"S{len(enc0)}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+        )
+        headers = _bulk_per_time_wcs_header_strings(ds, 2)
+        assert headers[0].strip()
+        assert not headers[1].strip()
+
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(180.0, 45.0)
+        assert visible[0]
+        assert not visible[1]
+        assert l_idx[1] == ds.sizes["l"]
+        assert m_idx[1] == ds.sizes["m"]
+
+    def test_vectorized_tracked_pixel_values_matches_isel_loop(self) -> None:
+        from ovro_lwa_portal.accessor import _vectorized_tracked_pixel_values
+
+        rng = np.random.default_rng(0)
+        n_time, n_freq, n_l, n_m = 5, 3, 8, 8
+        data = rng.random((n_time, n_freq, 1, n_l, n_m), dtype=np.float32)
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "l", "m"),
+                    data,
+                )
+            },
+            coords={
+                "time": np.arange(n_time, dtype=float),
+                "frequency": np.arange(n_freq, dtype=float),
+                "polarization": [0],
+                "l": np.arange(n_l, dtype=float),
+                "m": np.arange(n_m, dtype=float),
+            },
+        )
+        data_var = ds["SKY"].isel(polarization=0)
+        vis_times = np.array([0, 1, 2, 4], dtype=int)
+        vis_l = np.array([1, 2, 3, 4], dtype=int)
+        vis_m = np.array([4, 3, 2, 1], dtype=int)
+        plane = _vectorized_tracked_pixel_values(data_var, vis_times, vis_l, vis_m)
+        loop_rows = [
+            np.asarray(
+                data_var.isel(time=int(t), l=int(li), m=int(mi)).values,
+                dtype=np.float64,
+            )
+            for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True)
+        ]
+        loop_plane = np.stack(loop_rows, axis=0)
+        np.testing.assert_allclose(plane, loop_plane)
+
+    def test_vectorized_tracked_pixel_values_dask_backed(self) -> None:
+        import dask.array as da
+
+        from ovro_lwa_portal.accessor import _vectorized_tracked_pixel_values
+
+        n_time, n_freq, n_l, n_m = 4, 2, 6, 6
+        backing = da.from_array(
+            np.arange(n_time * n_freq * n_l * n_m, dtype=np.float32).reshape(
+                n_time, n_freq, 1, n_l, n_m
+            ),
+            chunks=(1, 1, 1, 3, 3),
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "l", "m"),
+                    backing,
+                )
+            },
+            coords={
+                "time": np.arange(n_time, dtype=float),
+                "frequency": np.arange(n_freq, dtype=float),
+                "polarization": [0],
+                "l": np.arange(n_l, dtype=float),
+                "m": np.arange(n_m, dtype=float),
+            },
+        )
+        data_var = ds["SKY"].isel(polarization=0)
+        vis_times = np.array([0, 2, 3], dtype=int)
+        vis_l = np.array([1, 2, 3], dtype=int)
+        vis_m = np.array([2, 3, 4], dtype=int)
+        plane = _vectorized_tracked_pixel_values(data_var, vis_times, vis_l, vis_m)
+        expected = np.stack(
+            [
+                np.asarray(
+                    data_var.isel(time=int(t), l=int(li), m=int(mi)).compute().values,
+                    dtype=np.float64,
+                )
+                for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True)
+            ],
+            axis=0,
+        )
+        np.testing.assert_allclose(plane, expected)
+
+    def test_per_time_wcs_track_fallback_matches_coords_to_pixel(self) -> None:
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        catalog_ra = 180.0
+        catalog_dec = 45.0
+        hdr0 = _make_sin_wcs_header_str(nx=16, ny=16, crval1=180.0, crval2=catalog_dec)
+        hdr1 = _make_sin_wcs_header_str(
+            nx=16, ny=16, crval1=180.5, crval2=catalog_dec, cdelt=0.2
+        )
+        enc = [h.encode("utf-8") for h in (hdr0, hdr1)]
+        wcs_per_time = np.array(
+            [np.bytes_(e) for e in enc],
+            dtype=f"S{max(len(e) for e in enc)}",
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "m", "l"),
+                    np.ones((2, 1, 1, 16, 16), dtype=np.float32),
+                ),
+                "wcs_header_str": (("time",), wcs_per_time),
+            },
+            coords={
+                "time": ("time", [60000.0, 60000.01]),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+                "l": ("l", np.linspace(-0.2, 0.2, 16)),
+                "m": ("m", np.linspace(-0.2, 0.2, 16)),
+            },
+        )
+        l_idx, m_idx, visible = ds.radport._compute_pixel_track(catalog_ra, catalog_dec)
+        assert np.all(visible)
+        for ti in (0, 1):
+            lb, mb = ds.radport.coords_to_pixel(catalog_ra, catalog_dec, time_idx=ti)
+            assert abs(lb - int(l_idx[ti])) <= 1
+            assert abs(mb - int(m_idx[ti])) <= 1
 
     def test_below_horizon_nan_in_light_curve(
         self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset

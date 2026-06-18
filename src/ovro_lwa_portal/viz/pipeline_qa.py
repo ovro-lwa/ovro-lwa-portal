@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -18,6 +18,7 @@ from astropy.io import fits
 import ovro_lwa_portal
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _lm_reference_from_existing_zarr,
+    _zarr_store_exists,
     convert_fits_dir_to_zarr,
 )
 
@@ -42,6 +43,8 @@ I_QA_ZARR_STEM = "pipelineQA-I-Deep-Taper-Robust-0.75"
 V_QA_ZARR_STEM = "pipelineQA-V-Taper-Deep"
 I_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-I-NoTaper-Robust-0"
 V_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-V-Taper-Robust-0"
+DEWARP_FREQ_COLUMN = "freq_mhz"
+DEWARP_SHIFT_COLUMN = "median_shift_arcmin"
 
 FITS_KEY_PATTERN = re.compile(r"^(?P<subband>\d+MHz)-.*?(?P<stamp>\d{8}_\d{6})")
 
@@ -62,6 +65,7 @@ class PipelineQAConfig:
     qa_thermal_noise_glob: str = "Wideband/thermal_noise_vs_subband.png"
     flux_check_csv_glob: str = "*MHz/QA/flux_check_hybrid.csv"
     flux_check_csv_per_run: bool = False
+    dewarp_summary_csv_glob: str = "QA/*dewarp_summary.csv"
     ref_subband: str = REF_SUBBAND
     i_qa_zarr_stem: str = I_QA_ZARR_STEM
     v_qa_zarr_stem: str = V_QA_ZARR_STEM
@@ -101,8 +105,9 @@ class PipelineQAConfig:
             flux_check_csv_per_run=True,
             i_qa_zarr_stem=I_QA_ZARR_STEM_PHASE2,
             v_qa_zarr_stem=V_QA_ZARR_STEM_PHASE2,
-            thermal_noise_grid_cols=1,
+            thermal_noise_grid_cols=4,
             thermal_noise_plot_name="thermal_noise_vs_freq",
+            dewarp_summary_csv_glob="QA/*dewarp_summary.csv",
             qa_run_label="Science",
         )
 
@@ -169,23 +174,46 @@ def run_has_thermal_noise_qa(
     return thermal_noise_png_for_run(run_dir, config=config) is not None
 
 
+def _science_runs_in_day(day_dir: Path, *, config: PipelineQAConfig) -> list[Path]:
+    """List ``Run_*`` or ``Science_*`` directories under one observation day."""
+    return [
+        path
+        for path in day_dir.iterdir()
+        if path.is_dir() and path.name.startswith(config.run_dir_prefix)
+    ]
+
+
+def _thermal_noise_status_for_runs(
+    runs: Sequence[Path],
+    *,
+    config: PipelineQAConfig | None = None,
+) -> dict[Path, Path | None]:
+    """Resolve thermal-noise QA PNG paths with one glob per run directory."""
+    cfg = config or PipelineQAConfig.default()
+    return {run_dir: thermal_noise_png_for_run(run_dir, config=cfg) for run_dir in runs}
+
+
 def select_run_dir(
     day_dir: Path,
     *,
     config: PipelineQAConfig | None = None,
+    runs: Sequence[Path] | None = None,
+    thermal_pngs: Mapping[Path, Path | None] | None = None,
 ) -> Path | None:
     """Pick the newest run directory that has thermal-noise QA for this product."""
     cfg = config or PipelineQAConfig.default()
-    runs = [
-        path
-        for path in day_dir.iterdir()
-        if path.is_dir()
-        and path.name.startswith(cfg.run_dir_prefix)
-        and run_has_thermal_noise_qa(path, config=cfg)
-    ]
-    if not runs:
+    run_dirs = list(runs) if runs is not None else _science_runs_in_day(day_dir, config=cfg)
+    if not run_dirs:
         return None
-    return max(runs, key=lambda path: run_sort_key(path, config=cfg))
+    png_by_run = (
+        dict(thermal_pngs)
+        if thermal_pngs is not None
+        else _thermal_noise_status_for_runs(run_dirs, config=cfg)
+    )
+    qualified = [path for path in run_dirs if png_by_run.get(path) is not None]
+    if not qualified:
+        return None
+    return max(qualified, key=lambda path: run_sort_key(path, config=cfg))
 
 
 def list_subbands(run_dir: Path) -> list[str]:
@@ -195,6 +223,29 @@ def list_subbands(run_dir: Path) -> list[str]:
         for path in run_dir.iterdir()
         if path.is_dir() and path.name.endswith("MHz")
     )
+
+
+def populate_subbands_for_day(coverage: pd.DataFrame, select_day: str) -> None:
+    """Fill ``n_subbands`` and ``subbands`` for one observation day (lazy scan).
+
+    :func:`scan_coverage` leaves these columns unset (``NA``) until a day is
+    loaded so the initial pipeline-tree walk avoids thousands of Lustre ``stat``
+    calls. Updates ``coverage`` in place.
+    """
+    if coverage.empty or "n_subbands" not in coverage.columns:
+        return
+    day_mask = coverage["obs_date"].dt.strftime("%Y-%m-%d") == select_day
+    day_mask &= coverage["latest_run"].notna()
+    missing = day_mask & coverage["n_subbands"].isna()
+    for idx in coverage.index[missing]:
+        run_path = coverage.at[idx, "run_path"]
+        if pd.isna(run_path):
+            coverage.at[idx, "n_subbands"] = 0
+            coverage.at[idx, "subbands"] = ""
+            continue
+        subbands = list_subbands(Path(str(run_path)))
+        coverage.at[idx, "n_subbands"] = len(subbands)
+        coverage.at[idx, "subbands"] = ", ".join(subbands)
 
 
 def discover_hour_bins(root: Path) -> list[str]:
@@ -220,26 +271,27 @@ def scan_coverage(
             if not day_dir.is_dir() or not DATE_PATTERN.match(day_dir.name):
                 continue
 
-            all_runs = [
-                p for p in day_dir.iterdir() if p.is_dir() and p.name.startswith(cfg.run_dir_prefix)
-            ]
-            selected = select_run_dir(day_dir, config=cfg)
-            subbands = list_subbands(selected) if selected is not None else []
-            thermal_png = (
-                thermal_noise_png_for_run(selected, config=cfg) if selected is not None else None
+            all_runs = _science_runs_in_day(day_dir, config=cfg)
+            thermal_by_run = _thermal_noise_status_for_runs(all_runs, config=cfg)
+            qualified_runs = [path for path in all_runs if thermal_by_run.get(path) is not None]
+            selected = select_run_dir(
+                day_dir,
+                config=cfg,
+                runs=all_runs,
+                thermal_pngs=thermal_by_run,
             )
+            thermal_png = thermal_by_run.get(selected) if selected is not None else None
 
             rows.append(
                 {
                     "lst_hour": hour,
                     "obs_date": day_dir.name,
                     "n_runs": len(all_runs),
-                    "n_wideband_runs": sum(
-                        1 for p in all_runs if run_has_thermal_noise_qa(p, config=cfg)
-                    ),
+                    "n_wideband_runs": len(qualified_runs),
                     "latest_run": selected.name if selected is not None else pd.NA,
-                    "n_subbands": len(subbands),
-                    "subbands": ", ".join(subbands),
+                    # Deferred: populated by populate_subbands_for_day when a day loads.
+                    "n_subbands": pd.NA if selected is not None else 0,
+                    "subbands": pd.NA if selected is not None else "",
                     "run_path": str(selected) if selected is not None else pd.NA,
                     "thermal_noise_png": str(thermal_png) if thermal_png is not None else pd.NA,
                 }
@@ -264,6 +316,7 @@ def qa_days(coverage: pd.DataFrame) -> list[str]:
         .dt.strftime("%Y-%m-%d")
         .drop_duplicates()
         .sort_values()
+        .map(str)
         .tolist()
     )
 
@@ -288,8 +341,8 @@ def zarr_status(
 ) -> dict[str, bool]:
     """Return whether Stokes I/V QA Zarr stores exist for one day."""
     return {
-        "I": qa_zarr_path("I", select_day, config=config).exists(),
-        "V": qa_zarr_path("V", select_day, config=config).exists(),
+        "I": _zarr_store_exists(qa_zarr_path("I", select_day, config=config)),
+        "V": _zarr_store_exists(qa_zarr_path("V", select_day, config=config)),
     }
 
 
@@ -320,6 +373,7 @@ def day_rows(select_day: str, coverage: pd.DataFrame) -> pd.DataFrame:
 
 def day_summary_table(select_day: str, coverage: pd.DataFrame) -> pd.DataFrame:
     """Minimal per-hour summary for the QA plot grid."""
+    populate_subbands_for_day(coverage, select_day)
     rows = day_rows(select_day, coverage)
     if rows.empty:
         return pd.DataFrame(columns=["lst_hour", "n_subbands", "thermal_noise_png"])
@@ -410,6 +464,80 @@ def load_flux_check_hybrid_dataframe(
     return df.sort_values(["source", "lst_hour_num", "frequency_mhz"]).reset_index(drop=True)
 
 
+def collect_dewarp_summary_paths(
+    run_dir: Path,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> list[Path]:
+    """Return dewarp summary CSV paths for one run (under ``QA/``)."""
+    cfg = config or PipelineQAConfig.default()
+    return sorted(run_dir.glob(cfg.dewarp_summary_csv_glob))
+
+
+def load_dewarp_summary_dataframe(
+    select_day: str,
+    coverage: pd.DataFrame,
+    *,
+    config: PipelineQAConfig | None = None,
+) -> pd.DataFrame:
+    """Load and combine ``*dewarp_summary.csv`` files for one observation day."""
+    cfg = config or PipelineQAConfig.default()
+    chunks: list[pd.DataFrame] = []
+    for _, row in day_rows(select_day, coverage).iterrows():
+        run_dir = Path(str(row["run_path"]))
+        if not run_dir.is_dir():
+            continue
+        for csv_path in collect_dewarp_summary_paths(run_dir, config=cfg):
+            chunk = pd.read_csv(csv_path, usecols=[DEWARP_FREQ_COLUMN, DEWARP_SHIFT_COLUMN])
+            chunks.append(
+                pd.DataFrame(
+                    {
+                        "lst_hour": row["lst_hour"],
+                        "lst_hour_num": int(row["lst_hour_num"]),
+                        "obs_date": select_day,
+                        "run_path": str(run_dir),
+                        "frequency_mhz": pd.to_numeric(
+                            chunk[DEWARP_FREQ_COLUMN], errors="coerce"
+                        ),
+                        "median_shift": pd.to_numeric(
+                            chunk[DEWARP_SHIFT_COLUMN], errors="coerce"
+                        ),
+                    }
+                )
+            )
+
+    if not chunks:
+        return pd.DataFrame(
+            columns=[
+                "lst_hour",
+                "lst_hour_num",
+                "obs_date",
+                "run_path",
+                "frequency_mhz",
+                "median_shift",
+            ]
+        )
+    return pd.concat(chunks, ignore_index=True).sort_values(
+        ["lst_hour_num", "frequency_mhz"]
+    ).reset_index(drop=True)
+
+
+def dewarp_shift_grid(dewarp_df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot median dewarp shift into an LST × frequency grid."""
+    if dewarp_df.empty:
+        return pd.DataFrame()
+    return (
+        dewarp_df.pivot_table(
+            index="lst_hour_num",
+            columns="frequency_mhz",
+            values="median_shift",
+            aggfunc="mean",
+        )
+        .sort_index()
+        .sort_index(axis=1)
+    )
+
+
 def flux_ratio_grids(flux_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """Pivot flux ratios into one LST × frequency grid per calibrator source."""
     if flux_df.empty or "source" not in flux_df.columns:
@@ -450,25 +578,53 @@ def infer_target_size_from_82mhz(
     *,
     config: PipelineQAConfig | None = None,
 ) -> int:
-    """Return the square pixel size of the 82 MHz I deep image for this day."""
+    """Return the square pixel size of a reference Stokes I deep image for this day."""
     cfg = config or PipelineQAConfig.default()
-    ref_glob = f"{cfg.ref_subband}/I/deep/{cfg.i_fits_glob}"
-    for run_path in day_rows(select_day, coverage)["run_path"]:
-        matches = sorted(Path(run_path).glob(ref_glob))
-        if not matches:
-            continue
-        with fits.open(matches[0]) as hdul:
-            shape = hdul[0].data.shape
-            return int(max(shape[-2], shape[-1]))
-    msg = f"No {cfg.ref_subband} I deep image found for {select_day}"
+    ref_globs = (
+        f"{cfg.ref_subband}/I/deep/{cfg.i_fits_glob}",
+        f"*/I/deep/{cfg.i_fits_glob}",
+    )
+    for ref_glob in ref_globs:
+        for run_path in day_rows(select_day, coverage)["run_path"]:
+            matches = sorted(Path(run_path).glob(ref_glob))
+            if not matches:
+                continue
+            with fits.open(matches[0]) as hdul:
+                shape = hdul[0].data.shape
+                return int(max(shape[-2], shape[-1]))
+    msg = f"No Stokes I deep reference image found for {select_day}"
     raise FileNotFoundError(msg)
+
+
+def _convert_progress_callback(log: LogFn) -> Callable[[str, int, int, str], None]:
+    """Build a progress callback that writes conversion status to the QA activity log."""
+
+    def _callback(stage: str, current: int, total: int, message: str) -> None:
+        del stage
+        log(f"{message} ({current}/{total})")
+
+    return _callback
+
+
+def _remove_staging_dir(path: Path, log: LogFn) -> None:
+    """Remove a FITS symlink or fixed-header staging directory after Zarr conversion."""
+    if not path.exists():
+        return
+    shutil.rmtree(path)
+    log(f"Removed staging directory {path}")
 
 
 def stage_symlinks(fits_paths: Sequence[Path], staging_dir: Path) -> Path:
     """Symlink FITS files into a flat staging directory."""
     staging_dir.mkdir(parents=True, exist_ok=True)
+    seen_names: set[str] = set()
     for src in fits_paths:
-        dst = staging_dir / src.name
+        link_name = src.name
+        if link_name in seen_names:
+            run_name = src.parents[3].name if len(src.parents) > 3 else src.parent.name
+            link_name = f"{run_name}__{src.name}"
+        seen_names.add(link_name)
+        dst = staging_dir / link_name
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         os.symlink(src, dst)
@@ -476,7 +632,10 @@ def stage_symlinks(fits_paths: Sequence[Path], staging_dir: Path) -> Path:
 
 
 def fits_group_key(path: Path) -> tuple[str, str]:
-    match = FITS_KEY_PATTERN.match(path.name)
+    name = path.name
+    if "__" in name:
+        name = name.split("__", 1)[1]
+    match = FITS_KEY_PATTERN.match(name)
     if match is None:
         msg = f"Cannot parse subband/stamp from {path.name}"
         raise ValueError(msg)
@@ -561,19 +720,25 @@ def convert_missing_zarr(
             raise FileNotFoundError(msg)
 
         staging_i = cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fits"
+        fixed_i = cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fixed"
         stage_symlinks(i_paths, staging_i)
         log(f"Staged {len(i_paths)} Stokes I files -> {staging_i}")
+        log(f"Converting Stokes I -> {zarr_paths['I'].name} …")
+        progress = _convert_progress_callback(log)
 
         zarr_paths["I"] = convert_fits_dir_to_zarr(
             input_dir=staging_i,
             out_dir=cfg.zarr_root,
             zarr_name=zarr_paths["I"].name,
-            fixed_dir=cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fixed",
+            fixed_dir=fixed_i,
             chunk_lm=1024,
             rebuild=True,
             lm_reference_target_size=target_size,
+            progress_callback=progress,
         )
         log(f"Wrote {zarr_paths['I']}")
+        _remove_staging_dir(staging_i, log)
+        _remove_staging_dir(fixed_i, log)
     else:
         log(f"Using existing Stokes I Zarr: {zarr_paths['I']}")
 
@@ -587,19 +752,25 @@ def convert_missing_zarr(
             raise FileNotFoundError(msg)
 
         staging_v = cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fits"
+        fixed_v = cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fixed"
         stage_v_fits_with_beam_from_i(v_paths, fits_by_pol["I"], staging_v)
         log(f"Staged {len(v_paths)} Stokes V files -> {staging_v}")
+        log(f"Converting Stokes V -> {zarr_paths['V'].name} …")
+        progress = _convert_progress_callback(log)
 
         zarr_paths["V"] = convert_fits_dir_to_zarr(
             input_dir=staging_v,
             out_dir=cfg.zarr_root,
             zarr_name=zarr_paths["V"].name,
-            fixed_dir=cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fixed",
+            fixed_dir=fixed_v,
             chunk_lm=1024,
             rebuild=True,
             lm_reference_ds=lm_ref_ds,
+            progress_callback=progress,
         )
         log(f"Wrote {zarr_paths['V']}")
+        _remove_staging_dir(staging_v, log)
+        _remove_staging_dir(fixed_v, log)
     else:
         log(f"Using existing Stokes V Zarr: {zarr_paths['V']}")
 

@@ -14,7 +14,10 @@ Example
 from __future__ import annotations
 
 import contextlib
+import threading
+import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -28,6 +31,8 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from matplotlib.figure import Figure
+
+RadportProgressCallback = Callable[[str, int, int, str], None]
 
 
 # Results smaller than this are eagerly loaded to avoid dask graph
@@ -60,9 +65,30 @@ def _has_per_time_wcs_header_str(ds: xr.Dataset) -> bool:
     if "wcs_header_str" not in ds:
         return False
     wcs_var = ds["wcs_header_str"]
-    return bool(
-        wcs_var.ndim == 1 and "time" in wcs_var.dims and int(wcs_var.sizes.get("time", 0)) > 0
-    )
+    if "time" not in wcs_var.dims or int(wcs_var.sizes.get("time", 0)) <= 0:
+        return False
+    if wcs_var.ndim == 1:
+        return True
+    return bool(wcs_var.ndim == 2 and "frequency" in wcs_var.dims)
+
+
+def strip_redundant_fits_wcs_header_attrs(ds: xr.Dataset) -> xr.Dataset:
+    """Remove static ``fits_wcs_header`` attrs when ``wcs_header_str`` is canonical.
+
+    Incremental Zarr ingest stores one header per time in ``wcs_header_str`` but
+    array-level ``fits_wcs_header`` on ``SKY`` (and similar) only reflects the first
+    write. Drop those attrs on load and before Zarr export so consumers never
+    prefer a frozen time-0 phase center over per-time headers.
+    """
+    if "wcs_header_str" not in ds.data_vars:
+        return ds
+    out = ds.copy(deep=False)
+    out.attrs.pop("fits_wcs_header", None)
+    for name in out.data_vars:
+        out[name].attrs.pop("fits_wcs_header", None)
+    for name in out.coords:
+        out.coords[name].attrs.pop("fits_wcs_header", None)
+    return out
 
 
 def _read_wcs_header_str(
@@ -81,7 +107,10 @@ def _read_wcs_header_str(
     """
     if _has_per_time_wcs_header_str(ds):
         wcs_var = ds["wcs_header_str"]
-        hdr = _decode_wcs_header_bytes(wcs_var.isel(time=time_idx).values)
+        sel = wcs_var.isel(time=time_idx)
+        if "frequency" in sel.dims:
+            sel = sel.isel(frequency=0)
+        hdr = _decode_wcs_header_bytes(sel.values)
         if hdr.strip():
             return hdr
         return None
@@ -116,19 +145,732 @@ def _maybe_load(da: xr.DataArray) -> xr.DataArray:
 
 
 @contextlib.contextmanager
-def _dask_progress(label: str = "Computing") -> Generator[None, None, None]:
+def _dask_progress(
+    label: str = "Computing",
+    *,
+    quiet: bool = False,
+) -> Generator[None, None, None]:
     """Show a dask progress bar when dask is available.
 
-    Falls back to a simple print when dask.diagnostics is unavailable.
+    When ``quiet`` is true, compute silently (used when a UI progress callback
+    already reports the same work to an activity log).
     """
+    message = f"{label}..."
+    if quiet:
+        yield
+        return
     try:
         from dask.diagnostics import ProgressBar
 
         with ProgressBar(dt=1.0, minimum=2.0):
-            print(f"{label}...")  # noqa: T201
+            print(message)  # noqa: T201
             yield
     except ImportError:
         yield
+
+
+_RADPORT_PROGRESS_BATCH_TARGET = 16
+_TRACKED_POINT_DIM = "_radport_track"
+_EXTRACT_PROGRESS_HEARTBEAT_S = 5.0
+
+
+def _radport_progress_batch_size(n_steps: int) -> int:
+    """Batch size for phased progress reporting on long time axes."""
+    if n_steps <= 1:
+        return 1
+    # About ten progress updates per axis; cap task batch size for Dask overhead.
+    target = max(1, (n_steps + 9) // 10)
+    return max(1, min(_RADPORT_PROGRESS_BATCH_TARGET, target))
+
+
+@contextlib.contextmanager
+def _radport_progress_heartbeat(
+    progress_callback: RadportProgressCallback | None,
+    *,
+    stage: str,
+    total: int,
+    message: str,
+    interval_s: float = _EXTRACT_PROGRESS_HEARTBEAT_S,
+) -> Generator[None, None, None]:
+    """Log elapsed-time pulses while a long I/O stage runs as one Dask compute."""
+    if progress_callback is None or total <= 1 or interval_s <= 0:
+        yield
+        return
+
+    stop = threading.Event()
+
+    def _pulse() -> None:
+        t0 = time.perf_counter()
+        while not stop.wait(interval_s):
+            elapsed = time.perf_counter() - t0
+            _emit_radport_progress(
+                progress_callback,
+                stage,
+                0,
+                total,
+                f"{message} (in progress, {elapsed:.0f}s elapsed)",
+            )
+
+    thread = threading.Thread(target=_pulse, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=interval_s + 0.5)
+
+
+def _emit_radport_progress(
+    progress_callback: RadportProgressCallback | None,
+    stage: str,
+    current: int,
+    total: int,
+    message: str,
+) -> None:
+    """Invoke an optional UI/log callback for radport long-running work."""
+    if progress_callback is not None:
+        progress_callback(stage, int(current), int(total), message)
+
+
+def _data_var_is_dask_backed(data_var: xr.DataArray) -> bool:
+    return hasattr(data_var, "chunks") and data_var.chunks is not None
+
+
+def _active_distributed_client() -> bool:
+    """Return True when a dask.distributed ``Client`` is registered."""
+    try:
+        from dask.distributed import get_client
+
+        get_client()
+    except (ImportError, ValueError):
+        return False
+    return True
+
+
+def _point_extract_scheduler() -> str | None:
+    """Pick a local scheduler for many small Zarr reads under a distributed Client.
+
+    Point extractions issue hundreds of tiny reads. Running them on process
+    workers retains decompressed Zarr chunks until memory limits are hit; the
+    threaded scheduler keeps I/O in the caller and avoids that growth.
+    """
+    if _active_distributed_client():
+        return "threads"
+    return None
+
+
+def _io_batch_scheduler() -> str:
+    """Scheduler for batched xarray point/patch reads from dask-backed Zarr."""
+    return "threads"
+
+
+def _compute_xarray_dataarray(
+    da: xr.DataArray,
+    *,
+    label: str,
+    progress_callback: RadportProgressCallback | None = None,
+) -> xr.DataArray:
+    """Materialize one xarray selection with threaded/local Dask scheduling."""
+    scheduler = _point_extract_scheduler()
+    quiet = progress_callback is not None
+    if _data_var_is_dask_backed(da):
+        if scheduler is not None:
+            with _dask_progress(label, quiet=quiet):
+                return da.compute(scheduler=scheduler)
+        import dask
+
+        with _dask_progress(label, quiet=quiet):
+            return da.compute(scheduler=_io_batch_scheduler())
+    return da.load()
+
+
+def _vectorized_tracked_pixel_values(
+    data_var: xr.DataArray,
+    vis_times: np.ndarray,
+    vis_l: np.ndarray,
+    vis_m: np.ndarray,
+    *,
+    progress_callback: RadportProgressCallback | None = None,
+    progress_message: str = "",
+) -> np.ndarray:
+    """Read values at per-time ``(l, m)`` pixels in one vectorized selection.
+
+    Returns an array of shape ``(n_visible,)`` when ``frequency`` was already
+    sliced away, otherwise ``(n_visible, n_frequency)``.
+    """
+    n_vis = int(np.asarray(vis_times).size)
+    if n_vis == 0:
+        return np.empty(0, dtype=np.float64)
+    time_da = xr.DataArray(np.asarray(vis_times, dtype=np.intp), dims=_TRACKED_POINT_DIM)
+    l_da = xr.DataArray(np.asarray(vis_l, dtype=np.intp), dims=_TRACKED_POINT_DIM)
+    m_da = xr.DataArray(np.asarray(vis_m, dtype=np.intp), dims=_TRACKED_POINT_DIM)
+    sel = data_var.isel(time=time_da, l=l_da, m=m_da)
+    if not progress_message:
+        progress_message = f"Extracting {n_vis} tracked pixels"
+    with _radport_progress_heartbeat(
+        progress_callback,
+        stage="extract",
+        total=n_vis,
+        message=progress_message,
+    ):
+        loaded = _compute_xarray_dataarray(
+            sel,
+            label=f"Extracting {n_vis} tracked pixels",
+            progress_callback=progress_callback,
+        )
+    values = np.asarray(loaded.data, dtype=np.float64)
+    if values.ndim == 0:
+        return values.reshape(1)
+    if _TRACKED_POINT_DIM not in loaded.dims:
+        return values.reshape(n_vis)
+    track_axis = loaded.dims.index(_TRACKED_POINT_DIM)
+    if track_axis != 0:
+        values = np.moveaxis(values, track_axis, 0)
+    if values.ndim == 1:
+        return values.reshape(n_vis)
+    return values
+
+
+def _rows_from_tracked_pixel_plane(plane: np.ndarray) -> list[np.ndarray]:
+    """Split a ``(n_visible[, n_frequency])`` plane into per-time rows."""
+    if plane.ndim == 1:
+        return [np.asarray(plane, dtype=np.float64)]
+    return [np.asarray(plane[i], dtype=np.float64) for i in range(int(plane.shape[0]))]
+
+
+def _cpu_delayed_scheduler() -> str | None:
+    """Scheduler for CPU-bound ``dask.delayed`` batch work (patch fit, statistics).
+
+    Gaussian fitting and patch reductions hold the GIL under the threaded
+    scheduler. Use multiprocessing locally when no distributed ``Client`` is
+    registered; otherwise defer to the active distributed scheduler.
+    """
+    if _active_distributed_client():
+        return None
+    return "processes"
+
+
+_WCS_TRACK_VARYING_KEYWORDS = frozenset({"CRVAL1", "CRVAL2", "LATPOLE"})
+
+
+@dataclass(frozen=True)
+class _PerTimeWcsTrackTable:
+    """Parsed ``wcs_header_str(time)`` series for in-process pixel tracking."""
+
+    crval1: np.ndarray
+    crval2: np.ndarray
+    latpole: np.ndarray | None
+    header_valid: np.ndarray
+    use_template: bool
+    template_header: str | None
+    header_strs: tuple[str, ...]
+
+
+def _header_has_sin_celestial(hdr: object) -> bool:
+    ctype1 = str(hdr.get("CTYPE1", "")).strip().upper()  # type: ignore[union-attr]
+    ctype2 = str(hdr.get("CTYPE2", "")).strip().upper()  # type: ignore[union-attr]
+    return ctype1.endswith("SIN") and ctype2.endswith("SIN")
+
+
+def _parse_sin_celestial_keywords(hdr_str: str) -> dict[str, float | str] | None:
+    """Return normalized celestial WCS keywords from one FITS header string."""
+    if not hdr_str.strip():
+        return None
+    try:
+        from astropy.io.fits import Header
+
+        hdr = Header.fromstring(hdr_str, sep="\n")
+    except (OSError, ValueError):
+        return None
+    if not _header_has_sin_celestial(hdr):
+        return None
+    kw: dict[str, float | str] = {
+        "CTYPE1": str(hdr["CTYPE1"]).strip(),
+        "CTYPE2": str(hdr["CTYPE2"]).strip(),
+    }
+    for key in (
+        "NAXIS1",
+        "NAXIS2",
+        "CRPIX1",
+        "CRPIX2",
+        "CRVAL1",
+        "CRVAL2",
+        "CDELT1",
+        "CDELT2",
+        "CROTA2",
+        "LATPOLE",
+    ):
+        if key in hdr:
+            kw[key] = float(hdr[key])
+    cd_entries: list[tuple[str, float]] = []
+    for i in (1, 2):
+        for j in (1, 2):
+            name = f"CD{i}_{j}"
+            if name in hdr:
+                cd_entries.append((name, float(hdr[name])))
+    if cd_entries:
+        kw["cd_entries"] = tuple(cd_entries)
+    pc_entries: list[tuple[str, float]] = []
+    for i in (1, 2):
+        for j in (1, 2):
+            name = f"PC{i}_{j}"
+            if name in hdr:
+                pc_entries.append((name, float(hdr[name])))
+    if pc_entries:
+        kw["pc_entries"] = tuple(pc_entries)
+    if "CRVAL1" not in kw or "CRVAL2" not in kw:
+        return None
+    return kw
+
+
+def _sin_wcs_static_fingerprint(kw: dict[str, float | str]) -> tuple[tuple[str, float | str], ...]:
+    """Hashable fingerprint of header keywords that must not vary across time."""
+    items: list[tuple[str, float | str]] = []
+    for key, value in sorted(kw.items()):
+        if key in _WCS_TRACK_VARYING_KEYWORDS:
+            continue
+        items.append((key, value))
+    return tuple(items)
+
+
+def _build_per_time_wcs_track_table(header_strs: list[str]) -> _PerTimeWcsTrackTable:
+    """Parse all per-time headers once; detect a shared SIN template when possible."""
+    n_times = len(header_strs)
+    crval1 = np.full(n_times, np.nan, dtype=np.float64)
+    crval2 = np.full(n_times, np.nan, dtype=np.float64)
+    latpole = np.full(n_times, np.nan, dtype=np.float64)
+    header_valid = np.zeros(n_times, dtype=bool)
+    latpole_seen = False
+    fingerprints: list[tuple[int, tuple[tuple[str, float | str], ...]]] = []
+    template_header: str | None = None
+
+    for ti, hdr in enumerate(header_strs):
+        kw = _parse_sin_celestial_keywords(hdr)
+        if kw is None:
+            continue
+        header_valid[ti] = True
+        crval1[ti] = float(kw["CRVAL1"])
+        crval2[ti] = float(kw["CRVAL2"])
+        if "LATPOLE" in kw:
+            latpole_seen = True
+            latpole[ti] = float(kw["LATPOLE"])
+        fingerprints.append((ti, _sin_wcs_static_fingerprint(kw)))
+        if template_header is None:
+            template_header = hdr
+
+    use_template = False
+    if fingerprints and template_header is not None:
+        ref_fp = fingerprints[0][1]
+        use_template = all(fp == ref_fp for _, fp in fingerprints)
+
+    latpole_out: np.ndarray | None
+    if latpole_seen and use_template:
+        latpole_out = latpole
+    else:
+        latpole_out = None
+
+    return _PerTimeWcsTrackTable(
+        crval1=crval1,
+        crval2=crval2,
+        latpole=latpole_out,
+        header_valid=header_valid,
+        use_template=use_template,
+        template_header=template_header if use_template else None,
+        header_strs=tuple(header_strs),
+    )
+
+
+def _world2pix_from_header_str(
+    hdr_str: str,
+    ra: float,
+    dec: float,
+    n_l: int,
+    n_m: int,
+) -> tuple[int, int, bool]:
+    """Map one (RA, Dec) through a FITS header string.
+
+    Returns ``(l_idx, m_idx, visible)``.  On missing/invalid WCS or out-of-bounds
+    pixels, returns out-of-range sentinels ``(n_l, n_m)`` with ``visible=False``,
+    matching :meth:`RadportAccessor._compute_pixel_track` error handling.
+    """
+    if not hdr_str.strip():
+        return int(n_l), int(n_m), False
+    try:
+        from astropy.io.fits import Header
+        from astropy.wcs import WCS
+    except ImportError:
+        raise
+    try:
+        wcs = WCS(Header.fromstring(hdr_str, sep="\n"))
+        if not wcs.has_celestial:
+            raise ValueError("WCS header has no celestial axes (RA/Dec)")
+        celestial = wcs.celestial
+        xp, yp = celestial.all_world2pix(float(ra), float(dec), 0)
+        xp_f = float(np.asarray(xp).ravel()[0])
+        yp_f = float(np.asarray(yp).ravel()[0])
+        if not (np.isfinite(xp_f) and np.isfinite(yp_f)):
+            raise ValueError(
+                f"Source (RA={ra}, Dec={dec}) is outside the image footprint."
+            )
+        l_idx = int(np.round(xp_f))
+        m_idx = int(np.round(yp_f))
+        if not (0 <= l_idx < n_l and 0 <= m_idx < n_m):
+            raise ValueError(
+                f"Source (RA={ra}, Dec={dec}) maps outside the image FOV."
+            )
+    except ValueError:
+        return int(n_l), int(n_m), False
+    return l_idx, m_idx, True
+
+
+def _bulk_per_time_wcs_header_strings(ds: xr.Dataset, n_times: int) -> list[str]:
+    """Load decoded ``wcs_header_str`` for every time index in one pass."""
+    wcs_var = ds["wcs_header_str"]
+    sel = wcs_var
+    if wcs_var.ndim == 2 and "frequency" in wcs_var.dims:
+        sel = wcs_var.isel(frequency=0)
+    if hasattr(sel, "chunks") and sel.chunks is not None:
+        sel = sel.load()
+    raw = np.asarray(sel.values)
+    if raw.shape[0] != n_times:
+        msg = (
+            f"wcs_header_str time length {raw.shape[0]} does not match "
+            f"dataset n_times={n_times}"
+        )
+        raise ValueError(msg)
+    return [_decode_wcs_header_bytes(raw[ti]) for ti in range(n_times)]
+
+
+def _assign_world2pix_result(
+    l_indices: np.ndarray,
+    m_indices: np.ndarray,
+    visible: np.ndarray,
+    time_idx: int,
+    li: int,
+    mi: int,
+    vis: bool,
+) -> None:
+    l_indices[time_idx] = int(li)
+    m_indices[time_idx] = int(mi)
+    visible[time_idx] = bool(vis)
+
+
+def _track_pixels_from_wcs_table(
+    table: _PerTimeWcsTrackTable,
+    ra: float,
+    dec: float,
+    *,
+    n_l: int,
+    n_m: int,
+    progress_callback: RadportProgressCallback | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map fixed (RA, Dec) through a parsed per-time WCS table in-process."""
+    n_times = int(table.crval1.shape[0])
+    l_indices = np.full(n_times, n_l, dtype=int)
+    m_indices = np.full(n_times, n_m, dtype=int)
+    visible = np.zeros(n_times, dtype=bool)
+    progress_batch = _radport_progress_batch_size(n_times)
+
+    _emit_radport_progress(
+        progress_callback,
+        "track",
+        0,
+        n_times,
+        "Mapping RA/Dec to image pixels (per-time WCS)",
+    )
+
+    if table.use_template and table.template_header is not None:
+        from astropy.io.fits import Header
+        from astropy.wcs import WCS
+
+        wcs = WCS(Header.fromstring(table.template_header, sep="\n")).celestial
+        const_latpole: float | None = None
+        if table.latpole is not None:
+            valid_latpole = table.latpole[table.header_valid]
+            if valid_latpole.size and np.all(valid_latpole == valid_latpole[0]):
+                const_latpole = float(valid_latpole[0])
+        for ti in range(n_times):
+            if table.header_valid[ti]:
+                wcs.wcs.crval = [float(table.crval1[ti]), float(table.crval2[ti])]
+                if table.latpole is not None and const_latpole is None:
+                    wcs.wcs.latpole = float(table.latpole[ti])
+                elif const_latpole is not None:
+                    wcs.wcs.latpole = const_latpole
+                try:
+                    xp, yp = wcs.all_world2pix(float(ra), float(dec), 0)
+                    xp_f = float(np.asarray(xp).ravel()[0])
+                    yp_f = float(np.asarray(yp).ravel()[0])
+                    if not (np.isfinite(xp_f) and np.isfinite(yp_f)):
+                        raise ValueError("non-finite world2pix")
+                    li = int(np.round(xp_f))
+                    mi = int(np.round(yp_f))
+                    if not (0 <= li < n_l and 0 <= mi < n_m):
+                        raise ValueError("out of bounds")
+                    vis = True
+                except ValueError:
+                    li, mi, vis = n_l, n_m, False
+                _assign_world2pix_result(l_indices, m_indices, visible, ti, li, mi, vis)
+            if (ti + 1) % progress_batch == 0 or ti + 1 == n_times:
+                _emit_radport_progress(
+                    progress_callback,
+                    "track",
+                    ti + 1,
+                    n_times,
+                    "Mapping RA/Dec to image pixels (per-time WCS)",
+                )
+        return l_indices, m_indices, visible
+
+    for ti, hdr in enumerate(table.header_strs):
+        li, mi, vis = _world2pix_from_header_str(hdr, ra, dec, n_l, n_m)
+        _assign_world2pix_result(l_indices, m_indices, visible, ti, li, mi, vis)
+        if (ti + 1) % progress_batch == 0 or ti + 1 == n_times:
+            _emit_radport_progress(
+                progress_callback,
+                "track",
+                ti + 1,
+                n_times,
+                "Mapping RA/Dec to image pixels (per-time WCS)",
+            )
+    return l_indices, m_indices, visible
+
+
+def _compute_xarray_batch(
+    arrays: list[xr.DataArray],
+    *,
+    label: str,
+    progress_callback: RadportProgressCallback | None = None,
+) -> list[np.ndarray]:
+    """Materialize a batch of xarray selections with bounded task-graph growth."""
+    if not arrays:
+        return []
+
+    scheduler = _point_extract_scheduler()
+    quiet = progress_callback is not None
+    if _data_var_is_dask_backed(arrays[0]):
+        import dask
+
+        if scheduler is not None:
+            with _dask_progress(label, quiet=quiet):
+                computed = dask.compute(*arrays, scheduler=scheduler)
+            return [np.asarray(item) for item in computed]
+
+        with _dask_progress(label, quiet=quiet):
+            computed = dask.compute(*arrays, scheduler=_io_batch_scheduler())
+        return [np.asarray(item) for item in computed]
+
+    return [np.asarray(arr.values) for arr in arrays]
+
+
+def _process_patch_statistic_time(
+    time_idx: int,
+    patch: np.ndarray,
+    statistic: PatchStatisticName,
+) -> tuple[int, np.ndarray]:
+    """Reduce one time step's patch cube to a per-frequency statistic vector."""
+    return int(time_idx), _reduce_patch_cube_statistics(patch, statistic)
+
+
+def _process_patch_fit_time(
+    time_idx: int,
+    patch: np.ndarray,
+    *,
+    allow_position_offset: bool,
+    beam_widths_per_freq: list[tuple[float, float]],
+    max_reduced_chi_squared: float,
+) -> tuple[
+    int,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Fit Gaussians on one time step's patch cube and apply the chi-squared mask."""
+    (
+        peaks,
+        x_offs,
+        y_offs,
+        widthxs,
+        widthys,
+        backgrounds,
+        chi2_red,
+        center_flux,
+        patch_max,
+    ) = _fit_patch_cube_gaussian(
+        patch,
+        allow_position_offset=allow_position_offset,
+        beam_widths_per_freq=beam_widths_per_freq,
+    )
+    peaks, widthxs, widthys, backgrounds, x_offs, y_offs = _mask_patch_fit_by_chi2(
+        peaks,
+        widthxs,
+        widthys,
+        backgrounds,
+        chi2_red,
+        max_reduced_chi_squared=max_reduced_chi_squared,
+        x_offsets=x_offs,
+        y_offsets=y_offs,
+    )
+    return (
+        int(time_idx),
+        peaks,
+        x_offs if x_offs is not None else np.full_like(peaks, np.nan),
+        y_offs if y_offs is not None else np.full_like(peaks, np.nan),
+        widthxs,
+        widthys,
+        backgrounds,
+        chi2_red,
+        center_flux,
+        patch_max,
+    )
+
+
+def _run_batched_time_step_work(
+    vis_times: np.ndarray,
+    patches: list[np.ndarray],
+    process_fn: Callable[..., Any],
+    *,
+    process_args: tuple[Any, ...] = (),
+    progress_callback: RadportProgressCallback | None,
+    stage: str,
+    progress_label: str,
+    parallel: bool,
+) -> list[Any]:
+    """Compute per-time work in batches with optional Dask parallelism.
+
+    ``process_fn`` must be a picklable top-level callable invoked as
+    ``process_fn(time_idx, patch, *process_args)``.
+    """
+    total = len(patches)
+    if total <= 0:
+        return []
+    batch_size = _radport_progress_batch_size(total)
+    _emit_radport_progress(
+        progress_callback,
+        stage,
+        0,
+        total,
+        f"{progress_label} (0/{total} time steps)",
+    )
+    results: list[Any] = []
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_times = vis_times[start:end]
+        batch_patches = patches[start:end]
+        if parallel and len(batch_patches) > 1:
+            import dask
+
+            tasks = [
+                dask.delayed(process_fn)(int(ti), patch, *process_args)
+                for ti, patch in zip(batch_times, batch_patches, strict=True)
+            ]
+            label = f"{progress_label} ({end}/{total})"
+            cpu_scheduler = _cpu_delayed_scheduler()
+            with _dask_progress(label, quiet=progress_callback is not None):
+                if cpu_scheduler is not None:
+                    batch_results = dask.compute(*tasks, scheduler=cpu_scheduler)
+                else:
+                    batch_results = dask.compute(*tasks)
+        else:
+            batch_results = [
+                process_fn(int(ti), patch, *process_args)
+                for ti, patch in zip(batch_times, batch_patches, strict=True)
+            ]
+        results.extend(batch_results)
+        _emit_radport_progress(
+            progress_callback,
+            stage,
+            end,
+            total,
+            f"{progress_label} ({end}/{total} time steps)",
+        )
+    return results
+
+
+def _run_batched_patch_fit_work(
+    vis_times: np.ndarray,
+    patches: list[np.ndarray],
+    *,
+    beam_widths_by_time: dict[int, list[tuple[float, float]]],
+    allow_position_offset: bool,
+    max_reduced_chi_squared: float,
+    progress_callback: RadportProgressCallback | None,
+    parallel: bool,
+) -> list[
+    tuple[
+        int,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]
+]:
+    """Batched Gaussian patch fits with per-time beam metadata."""
+    total = len(patches)
+    if total <= 0:
+        return []
+    batch_size = _radport_progress_batch_size(total)
+    _emit_radport_progress(
+        progress_callback,
+        "fit",
+        0,
+        total,
+        f"Fitting Gaussian patches (0/{total} time steps)",
+    )
+    results: list[Any] = []
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_times = vis_times[start:end]
+        batch_patches = patches[start:end]
+        if parallel and len(batch_patches) > 1:
+            import dask
+
+            tasks = [
+                dask.delayed(_process_patch_fit_time)(
+                    int(ti),
+                    patch,
+                    allow_position_offset=allow_position_offset,
+                    beam_widths_per_freq=beam_widths_by_time[int(ti)],
+                    max_reduced_chi_squared=max_reduced_chi_squared,
+                )
+                for ti, patch in zip(batch_times, batch_patches, strict=True)
+            ]
+            label = f"Fitting Gaussian patches ({end}/{total})"
+            cpu_scheduler = _cpu_delayed_scheduler()
+            with _dask_progress(label, quiet=progress_callback is not None):
+                if cpu_scheduler is not None:
+                    batch_results = dask.compute(*tasks, scheduler=cpu_scheduler)
+                else:
+                    batch_results = dask.compute(*tasks)
+        else:
+            batch_results = [
+                _process_patch_fit_time(
+                    int(ti),
+                    patch,
+                    allow_position_offset=allow_position_offset,
+                    beam_widths_per_freq=beam_widths_by_time[int(ti)],
+                    max_reduced_chi_squared=max_reduced_chi_squared,
+                )
+                for ti, patch in zip(batch_times, batch_patches, strict=True)
+            ]
+        results.extend(batch_results)
+        _emit_radport_progress(
+            progress_callback,
+            "fit",
+            end,
+            total,
+            f"Fitting Gaussian patches ({end}/{total} time steps)",
+        )
+    return results
 
 
 PatchStatisticName = Literal["std", "max", "min", "mean", "mad"]
@@ -180,11 +922,23 @@ def _gaussian_predict(
     x: np.ndarray,
     y: np.ndarray,
 ) -> np.ndarray:
-    """Evaluate a centred 2D Gaussian model on a pixel grid."""
-    peak, widthx, widthy, background = params
+    """Evaluate a 2D Gaussian model on a pixel grid.
+
+    ``params`` is either ``(peak, widthx, widthy, background)`` centred at the
+    origin, or ``(peak, x_offset, y_offset, widthx, widthy, background)`` when
+    the peak is offset from the patch centre.
+    """
+    if params.size == 4:
+        peak, widthx, widthy, background = params
+        x0 = 0.0
+        y0 = 0.0
+    else:
+        peak, x0, y0, widthx, widthy, background = params
     sx = max(float(widthx) / _FWHM_TO_SIGMA, 1e-6)
     sy = max(float(widthy) / _FWHM_TO_SIGMA, 1e-6)
-    return background + peak * np.exp(-0.5 * ((x / sx) ** 2 + (y / sy) ** 2))
+    return background + peak * np.exp(
+        -0.5 * (((x - x0) / sx) ** 2 + ((y - y0) / sy) ** 2)
+    )
 
 
 def _reduced_chi_squared(
@@ -207,21 +961,129 @@ def _reduced_chi_squared(
     return chi2 / dof
 
 
+def _beam_fwhm_lm_pixels(
+    bmaj_deg: float,
+    bmin_deg: float,
+    bpa_deg: float,
+    dl_deg: float,
+    dm_deg: float,
+) -> tuple[float, float]:
+    """Convert synthesized beam FWHM (degrees) to ``(widthx, widthy)`` in l/m pixels.
+
+    ``widthx`` is along the ``m`` axis; ``widthy`` is along the ``l`` axis.
+    ``BPA`` follows the FITS convention (degrees east of north).
+    """
+    pa = np.deg2rad(float(bpa_deg))
+    cos_p = float(np.cos(pa))
+    sin_p = float(np.sin(pa))
+    bmaj = float(bmaj_deg)
+    bmin = float(bmin_deg)
+    width_m_deg = float(np.sqrt((bmaj * sin_p) ** 2 + (bmin * cos_p) ** 2))
+    width_l_deg = float(np.sqrt((bmaj * cos_p) ** 2 + (bmin * sin_p) ** 2))
+    dm = abs(float(dm_deg))
+    dl = abs(float(dl_deg))
+    widthx = width_m_deg / dm if dm > 0 else bmaj
+    widthy = width_l_deg / dl if dl > 0 else bmin
+    return max(widthx, 0.5), max(widthy, 0.5)
+
+
+def patch_half_width_pixels(
+    scale: float,
+    beam_widthx: float,
+    beam_widthy: float,
+) -> int:
+    """Patch half-width in pixels: ``scale`` times the larger beam FWHM."""
+    if scale <= 0:
+        msg = f"scale must be positive, got {scale}"
+        raise ValueError(msg)
+    beam_max = max(float(beam_widthx), float(beam_widthy))
+    return max(1, int(np.ceil(scale * beam_max)))
+
+
+def format_radec_sexagesimal(ra_deg: float, dec_deg: float) -> tuple[str, str]:
+    """Format equatorial coordinates as ``hh:mm:ss.s`` and ``±dd:mm:ss.s``."""
+    if not (np.isfinite(ra_deg) and np.isfinite(dec_deg)):
+        return "—", "—"
+    from astropy import units as u
+    from astropy.coordinates import Angle
+
+    ra = Angle(float(ra_deg) * u.deg)
+    dec = Angle(float(dec_deg) * u.deg)
+    ra_s = ra.to_string(unit=u.hour, sep=":", precision=1, pad=True)
+    dec_s = dec.to_string(unit=u.deg, sep=":", alwayssign=True, precision=1, pad=True)
+    return str(ra_s), str(dec_s)
+
+
+def _gaussian_parameters_from_patch_statistics(
+    arr: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    beam_widthx: float,
+    beam_widthy: float,
+    max_width: float,
+    max_offset: float,
+) -> tuple[float, float, float, float, float, float]:
+    """Estimate Gaussian parameters from patch pixel statistics.
+
+    Returns ``(peak, x_offset, y_offset, widthx, widthy, background)`` where
+    offsets are in patch-centred pixel coordinates.  ``peak`` uses the patch
+    maximum minus the median background.  Beam widths are used when provided.
+    """
+    data = np.asarray(arr, dtype=np.float64)
+    background = float(np.nanmedian(data))
+    patch_max = float(np.nanmax(data))
+
+    peak = patch_max - background
+    if not np.isfinite(peak) or peak <= 0:
+        peak = float(np.nanstd(data))
+    if not np.isfinite(peak) or peak <= 0:
+        peak = 1.0
+
+    weight_map = np.where(np.isfinite(data), np.maximum(data - background, 0.0), 0.0)
+    weight_sum = float(weight_map.sum())
+    x_offset = 0.0
+    y_offset = 0.0
+    widthx = float(beam_widthx)
+    widthy = float(beam_widthy)
+    if weight_sum > 0:
+        x_offset = float((weight_map * x).sum() / weight_sum)
+        y_offset = float((weight_map * y).sum() / weight_sum)
+        var_x = float((weight_map * (x - x_offset) ** 2).sum() / weight_sum)
+        var_y = float((weight_map * (y - y_offset) ** 2).sum() / weight_sum)
+        if var_x > 0:
+            widthx = float(_FWHM_TO_SIGMA * np.sqrt(var_x))
+        if var_y > 0:
+            widthy = float(_FWHM_TO_SIGMA * np.sqrt(var_y))
+
+    width_lo = 0.5
+    width_hi = float(max_width)
+    offset_hi = float(max_offset)
+    widthx = float(np.clip(widthx, width_lo, width_hi))
+    widthy = float(np.clip(widthy, width_lo, width_hi))
+    x_offset = float(np.clip(x_offset, -offset_hi, offset_hi))
+    y_offset = float(np.clip(y_offset, -offset_hi, offset_hi))
+    return float(peak), x_offset, y_offset, widthx, widthy, background
+
+
 def _fit_spatial_gaussian(
     values: np.ndarray,
     *,
-    default_fwhm: float = 3.0,
-) -> tuple[float, float, float, float, float]:
-    """Fit a centred 2D Gaussian to a spatial patch.
+    beam_widthx: float,
+    beam_widthy: float,
+    allow_position_offset: bool = True,
+) -> tuple[float, float, float, float, float, float, float]:
+    """Fit a 2D Gaussian to a spatial patch.
 
-    The model is ``background + peak * exp(-0.5 * ((x/sx)**2 + (y/sy)**2))`` with
-    the peak centred on the patch centre.  ``widthx`` and ``widthy`` are returned
-    as full width at half maximum (FWHM) in pixels.
+    Returns ``(peak, x_offset, y_offset, widthx, widthy, background, chi2_red)``
+    where offsets are in patch-centred pixel coordinates.  When
+    ``allow_position_offset`` is False the peak is fixed at the patch centre.
 
-    Initial guesses use ``peak = max(patch)``, ``widthx = widthy = default_fwhm``,
-    and ``background = min(patch)``.
+    Initial guesses and optimizer failures use
+    :func:`_gaussian_parameters_from_patch_statistics`.  The patch is scaled by
+    its maximum absolute value before optimization for numerical stability.
     """
-    nan5 = (float("nan"), float("nan"), float("nan"), float("nan"), float("nan"))
+    nan7 = (float("nan"),) * 7
     arr = np.asarray(values, dtype=np.float64)
     if arr.ndim != 2:
         msg = f"Expected 2D patch, got shape {arr.shape}"
@@ -229,10 +1091,10 @@ def _fit_spatial_gaussian(
 
     ny, nx = arr.shape
     if ny < 2 or nx < 2:
-        return nan5
+        return nan7
 
     if not np.any(np.isfinite(arr)):
-        return nan5
+        return nan7
 
     cy = (ny - 1) / 2.0
     cx = (nx - 1) / 2.0
@@ -240,63 +1102,196 @@ def _fit_spatial_gaussian(
     y = yy - cy
     x = xx - cx
 
-    peak0 = float(np.nanmax(arr))
-    bg0 = float(np.nanmin(arr))
-    width0 = float(default_fwhm)
-    if not np.isfinite(peak0):
-        return nan5
+    max_width = max(nx, ny) * 4.0
+    max_offset = float(min(nx, ny) // 2)
+    widthx_fixed = float(beam_widthx)
+    widthy_fixed = float(beam_widthy)
 
-    def residual(params: np.ndarray) -> np.ndarray:
-        return (_gaussian_predict(params, x, y) - arr).ravel()
+    def _return_statistical() -> tuple[float, float, float, float, float, float, float]:
+        peak, x_off, y_off, widthx, widthy, background = (
+            _gaussian_parameters_from_patch_statistics(
+                arr,
+                x,
+                y,
+                beam_widthx=widthx_fixed,
+                beam_widthy=widthy_fixed,
+                max_width=max_width,
+                max_offset=max_offset,
+            )
+        )
+        if not allow_position_offset:
+            x_off = 0.0
+            y_off = 0.0
+        params = np.array(
+            [peak, x_off, y_off, widthx, widthy, background],
+            dtype=np.float64,
+        )
+        predicted = _gaussian_predict(params, x, y)
+        n_params = 6 if allow_position_offset else 4
+        chi2_red = _reduced_chi_squared(arr, predicted, n_params=n_params)
+        return (
+            float(peak),
+            float(x_off),
+            float(y_off),
+            float(widthx),
+            float(widthy),
+            float(background),
+            chi2_red,
+        )
 
-    x0 = np.array([peak0, width0, width0, bg0], dtype=np.float64)
-    lower = np.array([0.0, 0.5, 0.5, -np.inf], dtype=np.float64)
-    upper = np.array([np.inf, max(nx, ny) * 4.0, max(nx, ny) * 4.0, np.inf], dtype=np.float64)
+    peak0, x0_off, y0_off, widthx0, widthy0, bg0 = _gaussian_parameters_from_patch_statistics(
+        arr,
+        x,
+        y,
+        beam_widthx=widthx_fixed,
+        beam_widthy=widthy_fixed,
+        max_width=max_width,
+        max_offset=max_offset,
+    )
+    widthx0 = widthx_fixed
+    widthy0 = widthy_fixed
+    if not allow_position_offset:
+        x0_off = 0.0
+        y0_off = 0.0
+
+    scale = float(np.nanmax(np.abs(arr)))
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    arr_scaled = arr / scale
+
+    if allow_position_offset:
+
+        def residual(params: np.ndarray) -> np.ndarray:
+            peak_p, x_off, y_off, background_p = params
+            full = np.array(
+                [peak_p, x_off, y_off, widthx0, widthy0, background_p],
+                dtype=np.float64,
+            )
+            return (_gaussian_predict(full, x, y) - arr_scaled).ravel()
+
+        guess = np.array([peak0 / scale, x0_off, y0_off, bg0 / scale], dtype=np.float64)
+        lower = np.array([0.0, -max_offset, -max_offset, -np.inf], dtype=np.float64)
+        upper = np.array([np.inf, max_offset, max_offset, np.inf], dtype=np.float64)
+        n_params = 4
+    else:
+
+        def residual(params: np.ndarray) -> np.ndarray:
+            peak_p, background_p = params
+            full = np.array(
+                [peak_p, 0.0, 0.0, widthx0, widthy0, background_p],
+                dtype=np.float64,
+            )
+            return (_gaussian_predict(full, x, y) - arr_scaled).ravel()
+
+        guess = np.array([peak0 / scale, bg0 / scale], dtype=np.float64)
+        lower = np.array([0.0, -np.inf], dtype=np.float64)
+        upper = np.array([np.inf, np.inf], dtype=np.float64)
+        n_params = 2
 
     try:
         res = least_squares(
             residual,
-            x0=x0,
+            x0=guess,
             bounds=(lower, upper),
             method="trf",
             ftol=1e-8,
             xtol=1e-8,
-            max_nfev=300,
+            max_nfev=500,
         )
     except (ValueError, RuntimeError):
-        return nan5
+        return _return_statistical()
 
     if not res.success:
-        return nan5
+        return _return_statistical()
 
-    peak, widthx, widthy, background = res.x
-    predicted = _gaussian_predict(res.x, x, y)
-    chi2_red = _reduced_chi_squared(arr, predicted)
-    return float(peak), float(widthx), float(widthy), float(background), chi2_red
+    if allow_position_offset:
+        peak, x_off, y_off, background = res.x
+        peak = float(peak) * scale
+        background = float(background) * scale
+        params = np.array(
+            [peak, float(x_off), float(y_off), widthx0, widthy0, background],
+            dtype=np.float64,
+        )
+    else:
+        peak, background = res.x
+        peak = float(peak) * scale
+        background = float(background) * scale
+        params = np.array(
+            [peak, 0.0, 0.0, widthx0, widthy0, background],
+            dtype=np.float64,
+        )
+    predicted = _gaussian_predict(params, x, y)
+    chi2_red = _reduced_chi_squared(arr, predicted, n_params=n_params)
+    return (
+        float(params[0]),
+        float(params[1]),
+        float(params[2]),
+        float(params[3]),
+        float(params[4]),
+        float(params[5]),
+        chi2_red,
+    )
+
+
+def _patch_plane_center_and_max(values: np.ndarray) -> tuple[float, float]:
+    """Return (center_pixel, patch_max) for a 2D spatial patch."""
+    arr = np.asarray(values, dtype=np.float64)
+    center = float(arr[arr.shape[0] // 2, arr.shape[1] // 2])
+    patch_max = float(np.nanmax(arr))
+    return center, patch_max
 
 
 def _fit_patch_cube_gaussian(
     patch: np.ndarray,
     *,
-    default_fwhm: float = 3.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    allow_position_offset: bool = True,
+    beam_widths_per_freq: list[tuple[float, float]],
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Fit a 2D Gaussian on each frequency plane in ``(frequency, l, m)``."""
     patch_arr = np.asarray(patch)
     if patch_arr.ndim != 3:
         msg = f"Expected patch with shape (frequency, l, m), got {patch_arr.shape}"
         raise ValueError(msg)
 
-    peaks = []
-    widthxs = []
-    widthys = []
-    backgrounds = []
-    chi2_reds = []
+    peaks: list[float] = []
+    x_offsets: list[float] = []
+    y_offsets: list[float] = []
+    widthxs: list[float] = []
+    widthys: list[float] = []
+    backgrounds: list[float] = []
+    chi2_reds: list[float] = []
+    center_fluxes: list[float] = []
+    patch_maxes: list[float] = []
     for fi in range(patch_arr.shape[0]):
-        peak, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+        center_flux, patch_max = _patch_plane_center_and_max(patch_arr[fi])
+        center_fluxes.append(center_flux)
+        patch_maxes.append(patch_max)
+        if fi >= len(beam_widths_per_freq):
+            msg = (
+                f"beam_widths_per_freq length {len(beam_widths_per_freq)} "
+                f"is less than number of frequency planes {patch_arr.shape[0]}"
+            )
+            raise ValueError(msg)
+        beam_wx, beam_wy = beam_widths_per_freq[fi]
+        peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
             patch_arr[fi],
-            default_fwhm=default_fwhm,
+            beam_widthx=beam_wx,
+            beam_widthy=beam_wy,
+            allow_position_offset=allow_position_offset,
         )
         peaks.append(peak)
+        x_offsets.append(x_off)
+        y_offsets.append(y_off)
         widthxs.append(widthx)
         widthys.append(widthy)
         backgrounds.append(background)
@@ -304,10 +1299,14 @@ def _fit_patch_cube_gaussian(
 
     return (
         np.array(peaks, dtype=np.float64),
+        np.array(x_offsets, dtype=np.float64),
+        np.array(y_offsets, dtype=np.float64),
         np.array(widthxs, dtype=np.float64),
         np.array(widthys, dtype=np.float64),
         np.array(backgrounds, dtype=np.float64),
         np.array(chi2_reds, dtype=np.float64),
+        np.array(center_fluxes, dtype=np.float64),
+        np.array(patch_maxes, dtype=np.float64),
     )
 
 
@@ -319,7 +1318,9 @@ def _mask_patch_fit_by_chi2(
     chi2_red: np.ndarray,
     *,
     max_reduced_chi_squared: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    x_offsets: np.ndarray | None = None,
+    y_offsets: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
     """Set fit parameters to NaN where reduced chi-squared exceeds the threshold."""
     bad = np.isfinite(chi2_red) & (chi2_red > max_reduced_chi_squared)
     peaks = np.asarray(peaks, dtype=np.float64).copy()
@@ -330,7 +1331,15 @@ def _mask_patch_fit_by_chi2(
     widthxs[bad] = np.nan
     widthys[bad] = np.nan
     backgrounds[bad] = np.nan
-    return peaks, widthxs, widthys, backgrounds
+    x_out: np.ndarray | None = None
+    y_out: np.ndarray | None = None
+    if x_offsets is not None:
+        x_out = np.asarray(x_offsets, dtype=np.float64).copy()
+        x_out[bad] = np.nan
+    if y_offsets is not None:
+        y_out = np.asarray(y_offsets, dtype=np.float64).copy()
+        y_out[bad] = np.nan
+    return peaks, widthxs, widthys, backgrounds, x_out, y_out
 
 
 def _threshold_patch_selection(
@@ -379,7 +1388,7 @@ class PatchStatisticResult:
     threshold: float | None
     comparison: PatchStatisticComparison | None
     statistic: PatchStatisticName
-    radius: int
+    scale: float
     _accessor: Any
     _ra: float | None
     _dec: float | None
@@ -516,9 +1525,14 @@ class PatchFitResult:
 
     Returned by :meth:`RadportAccessor.patch_fit`.  Each parameter map has
     dimensions ``(time, frequency)``.  ``widthx`` and ``widthy`` are full width
-    at half maximum in pixels.  ``reduced_chi_squared_map`` stores the fit
-    quality; parameter maps are NaN where reduced chi-squared exceeds
-    ``max_reduced_chi_squared``.
+    at half maximum in pixels.  ``x_offset_map`` and ``y_offset_map`` give the
+    fitted peak offset from the tracked patch centre in pixels.
+
+    Diagnostic maps ``center_flux_map`` and ``patch_max_map`` compare the
+    tracked-centre pixel and the patch maximum.  ``fit_accepted_map`` is ``True``
+    where reduced chi-squared is at or below ``max_reduced_chi_squared``.
+
+    Fit parameter maps are NaN where the quality cut fails.
     """
 
     peak_map: xr.DataArray
@@ -526,9 +1540,15 @@ class PatchFitResult:
     widthy_map: xr.DataArray
     background_map: xr.DataArray
     reduced_chi_squared_map: xr.DataArray
-    radius: int
-    default_fwhm: float
+    x_offset_map: xr.DataArray
+    y_offset_map: xr.DataArray
+    center_flux_map: xr.DataArray
+    patch_max_map: xr.DataArray
+    fit_accepted_map: xr.DataArray
+    patch_radius_map: xr.DataArray
+    scale: float
     max_reduced_chi_squared: float
+    allow_position_offset: bool
     _accessor: Any
     _ra: float | None
     _dec: float | None
@@ -539,6 +1559,148 @@ class PatchFitResult:
     _track_freq_idx: int | None
     _track_freq_mhz: float | None
     _observatory: Any
+
+    def _tracked_indices(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return ``(l_indices, m_indices, visible)`` used for patch fitting."""
+        resolved = self._accessor._resolve_coordinates(
+            ra=self._ra,
+            dec=self._dec,
+            l=self._l,
+            m=self._m,
+            observatory=self._observatory,
+            freq_idx=self._track_freq_idx,
+            freq_mhz=self._track_freq_mhz,
+            pol=self._pol,
+        )
+        n_times = int(self.peak_map.sizes["time"])
+        if isinstance(resolved, tuple) and len(resolved) == 2:
+            l_idx, m_idx = resolved
+            l_indices = np.full(n_times, int(l_idx), dtype=int)
+            m_indices = np.full(n_times, int(m_idx), dtype=int)
+            visible = np.ones(n_times, dtype=bool)
+        else:
+            l_indices, m_indices, visible = resolved
+        return l_indices, m_indices, visible
+
+    def _peak_radec_at(self, time_idx: int, frequency_idx: int) -> tuple[float, float]:
+        """Peak RA/Dec (degrees) for one fitted cell."""
+        ti = int(time_idx)
+        fi = int(frequency_idx)
+        dx = float(self.x_offset_map.isel(time=ti, frequency=fi).values)
+        dy = float(self.y_offset_map.isel(time=ti, frequency=fi).values)
+        if not (np.isfinite(dx) and np.isfinite(dy)):
+            return float("nan"), float("nan")
+        l_indices, m_indices, visible = self._tracked_indices()
+        if not bool(visible[ti]):
+            return float("nan"), float("nan")
+        li = int(l_indices[ti])
+        mi = int(m_indices[ti])
+        n_l = int(self._accessor._obj.sizes["l"])
+        n_m = int(self._accessor._obj.sizes["m"])
+        l_peak = int(np.clip(int(round(li + dy)), 0, n_l - 1))
+        m_peak = int(np.clip(int(round(mi + dx)), 0, n_m - 1))
+        try:
+            return self._accessor.pixel_to_coords(
+                l_peak,
+                m_peak,
+                time_idx=ti,
+                observatory=self._observatory,
+            )
+        except ValueError:
+            return float("nan"), float("nan")
+
+    def peak_radec_maps(self) -> tuple[xr.DataArray, xr.DataArray]:
+        """Peak position in RA/Dec (degrees) from fitted patch offsets.
+
+        Offsets are added to the tracked patch centre pixel at each time step,
+        then converted with :meth:`RadportAccessor.pixel_to_coords`.  Cells with
+        non-finite offsets or failed coordinate conversion are NaN.
+        """
+        n_times = int(self.peak_map.sizes["time"])
+        n_freqs = int(self.peak_map.sizes["frequency"])
+        ra_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        dec_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        l_indices, m_indices, visible = self._tracked_indices()
+        x_off = np.asarray(self.x_offset_map.values, dtype=np.float64)
+        y_off = np.asarray(self.y_offset_map.values, dtype=np.float64)
+        n_l = int(self._accessor._obj.sizes["l"])
+        n_m = int(self._accessor._obj.sizes["m"])
+
+        for ti in range(n_times):
+            if not bool(visible[ti]):
+                continue
+            li = int(l_indices[ti])
+            mi = int(m_indices[ti])
+            for fi in range(n_freqs):
+                dx = float(x_off[ti, fi])
+                dy = float(y_off[ti, fi])
+                if not (np.isfinite(dx) and np.isfinite(dy)):
+                    continue
+                l_peak = int(np.clip(int(round(li + dy)), 0, n_l - 1))
+                m_peak = int(np.clip(int(round(mi + dx)), 0, n_m - 1))
+                try:
+                    ra_deg, dec_deg = self._accessor.pixel_to_coords(
+                        l_peak,
+                        m_peak,
+                        time_idx=ti,
+                        observatory=self._observatory,
+                    )
+                except ValueError:
+                    continue
+                ra_values[ti, fi] = ra_deg
+                dec_values[ti, fi] = dec_deg
+
+        coords = {
+            "time": self.peak_map.coords["time"].values,
+            "frequency": self.peak_map.coords["frequency"].values,
+        }
+        attrs = dict(self.peak_map.attrs)
+        ra_map = xr.DataArray(
+            ra_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{attrs.get('variable', 'SKY')}_patch_peak_ra",
+        )
+        dec_map = xr.DataArray(
+            dec_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{attrs.get('variable', 'SKY')}_patch_peak_dec",
+        )
+        return ra_map, dec_map
+
+    def cell_diagnostics(self, time_idx: int, frequency_idx: int) -> dict[str, float | bool]:
+        """Summarize patch-fit quality and comparison fluxes for one cell."""
+        ti = int(time_idx)
+        fi = int(frequency_idx)
+        chi2 = float(self.reduced_chi_squared_map.isel(time=ti, frequency=fi).values)
+        accepted = bool(self.fit_accepted_map.isel(time=ti, frequency=fi).values)
+        peak = float(self.peak_map.isel(time=ti, frequency=fi).values)
+        x_off = float(self.x_offset_map.isel(time=ti, frequency=fi).values)
+        y_off = float(self.y_offset_map.isel(time=ti, frequency=fi).values)
+        center = float(self.center_flux_map.isel(time=ti, frequency=fi).values)
+        patch_max = float(self.patch_max_map.isel(time=ti, frequency=fi).values)
+        peak_ra, peak_dec = self._peak_radec_at(ti, fi)
+        peak_ra_str, peak_dec_str = format_radec_sexagesimal(peak_ra, peak_dec)
+        return {
+            "fit_accepted": accepted,
+            "reduced_chi_squared": chi2,
+            "peak": peak,
+            "peak_ra_deg": peak_ra,
+            "peak_dec_deg": peak_dec,
+            "peak_ra": peak_ra_str,
+            "peak_dec": peak_dec_str,
+            "x_offset_pixels": x_off,
+            "y_offset_pixels": y_off,
+            "peak_offset_pixels": float(np.hypot(x_off, y_off)) if np.isfinite(x_off) else float("nan"),
+            "center_flux": center,
+            "patch_max": patch_max,
+            "background": float(self.background_map.isel(time=ti, frequency=fi).values),
+            "widthx": float(self.widthx_map.isel(time=ti, frequency=fi).values),
+            "widthy": float(self.widthy_map.isel(time=ti, frequency=fi).values),
+        }
 
 
 @xr.register_dataset_accessor("radport")
@@ -637,6 +1799,123 @@ class RadportAccessor:
             True if the dataset contains a BEAM variable.
         """
         return "BEAM" in self._obj.data_vars
+
+    def beam_fwhm_pixels(
+        self,
+        *,
+        time_idx: int,
+        frequency_idx: int,
+        pol: int = 0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> tuple[float, float]:
+        """Return synthesized beam FWHM in ``(widthx, widthy)`` patch pixels.
+
+        Reads ``BMAJ``/``BMIN``/``BPA`` from the per-channel ``BEAM`` variable
+        (``beam_param`` of ``major``, ``minor``, ``pa``) when present, otherwise
+        from the FITS WCS header at the requested time.
+
+        ``widthx`` is along the ``m`` axis; ``widthy`` is along the ``l`` axis.
+
+        Raises
+        ------
+        ValueError
+            When beam metadata or pixel scales are unavailable.
+        """
+        bmaj: float | None = None
+        bmin: float | None = None
+        bpa = 0.0
+
+        if self.has_beam:
+            beam = self._obj["BEAM"]
+            if "beam_param" in beam.dims:
+                beam_sel = beam.isel(
+                    time=int(time_idx),
+                    frequency=int(frequency_idx),
+                    polarization=int(pol),
+                )
+                params = {
+                    str(name).lower(): float(beam_sel.sel(beam_param=name).values)
+                    for name in np.asarray(beam.coords["beam_param"].values)
+                }
+                if "major" in params and "minor" in params:
+                    bmaj = params["major"]
+                    bmin = params["minor"]
+                    bpa = params.get("pa", 0.0)
+
+        if bmaj is None or bmin is None:
+            hdr_str = _read_wcs_header_str(self._obj, var=var, time_idx=int(time_idx))
+            if hdr_str:
+                try:
+                    from astropy.io.fits import Header
+
+                    header = Header.fromstring(hdr_str, sep="\n")
+                    if "BMAJ" in header and "BMIN" in header:
+                        bmaj = float(header["BMAJ"])
+                        bmin = float(header["BMIN"])
+                        bpa = float(header.get("BPA", 0.0))
+                except (TypeError, ValueError):
+                    bmaj = None
+
+        if (
+            bmaj is None
+            or bmin is None
+            or not np.isfinite(bmaj)
+            or not np.isfinite(bmin)
+            or bmaj <= 0
+            or bmin <= 0
+        ):
+            msg = (
+                "Synthesized beam metadata unavailable: need BEAM major/minor "
+                f"(time_idx={time_idx}, frequency_idx={frequency_idx}) or "
+                "FITS BMAJ/BMIN in the WCS header."
+            )
+            raise ValueError(msg)
+
+        l_vals = np.asarray(self._obj.coords["l"].values, dtype=np.float64)
+        m_vals = np.asarray(self._obj.coords["m"].values, dtype=np.float64)
+        if l_vals.size < 2 or m_vals.size < 2:
+            msg = "l and m coordinates must have at least two points to convert beam FWHM to pixels."
+            raise ValueError(msg)
+        dl = float(abs(l_vals[1] - l_vals[0]))
+        dm = float(abs(m_vals[1] - m_vals[0]))
+        return _beam_fwhm_lm_pixels(bmaj, bmin, bpa, dl, dm)
+
+    def beam_fwhm_pixels_all_frequencies(
+        self,
+        *,
+        time_idx: int,
+        pol: int = 0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> list[tuple[float, float]]:
+        """Synthesized beam FWHM in pixels for every frequency at one time step."""
+        n_freqs = int(self._obj.sizes["frequency"])
+        return [
+            self.beam_fwhm_pixels(
+                time_idx=int(time_idx),
+                frequency_idx=fi,
+                pol=pol,
+                var=var,
+            )
+            for fi in range(n_freqs)
+        ]
+
+    def patch_radius_pixels(
+        self,
+        *,
+        time_idx: int,
+        scale: float,
+        pol: int = 0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> int:
+        """Patch half-width at one time step from ``scale`` and max beam FWHM over frequency."""
+        beam_widths = self.beam_fwhm_pixels_all_frequencies(
+            time_idx=time_idx,
+            pol=pol,
+            var=var,
+        )
+        max_wx = max(wx for wx, _wy in beam_widths)
+        max_wy = max(wy for _wx, wy in beam_widths)
+        return patch_half_width_pixels(scale, max_wx, max_wy)
 
     # =========================================================================
     # Selection Helper Methods
@@ -952,6 +2231,28 @@ class RadportAccessor:
 
         return l_indices, m_indices, visible
 
+    def _compute_pixel_track_via_per_time_wcs(
+        self,
+        ra: float,
+        dec: float,
+        *,
+        n_l: int,
+        n_m: int,
+        n_times: int,
+        progress_callback: RadportProgressCallback | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Map fixed (RA, Dec) through ``wcs_header_str(time)`` in-process."""
+        header_strs = _bulk_per_time_wcs_header_strings(self._obj, n_times)
+        table = _build_per_time_wcs_track_table(header_strs)
+        return _track_pixels_from_wcs_table(
+            table,
+            ra,
+            dec,
+            n_l=n_l,
+            n_m=n_m,
+            progress_callback=progress_callback,
+        )
+
     def _compute_pixel_track(
         self,
         ra: float,
@@ -961,14 +2262,17 @@ class RadportAccessor:
         freq_idx: int | None = None,
         freq_mhz: float | None = None,
         pol: int = 0,
+        progress_callback: RadportProgressCallback | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Compute per-time-step pixel indices for a fixed (RA, Dec).
 
         For each dataset time index, uses :meth:`coords_to_pixel` (via
         :meth:`_compute_pixel_at_time`) so pixel selection matches all other
-        extraction APIs, except when per-time ``right_ascension`` /
-        ``declination`` grids allow a time-chunked batched argmin on a
-        ``(time, l, m)`` grid (same horizon and distance rules as
+        extraction APIs, except when per-time ``wcs_header_str`` is stored
+        (bulk header parse + in-process ``world2pix`` via
+        :meth:`_compute_pixel_track_via_per_time_wcs`) or when per-time
+        ``right_ascension`` / ``declination`` grids allow a time-chunked batched
+        argmin on a ``(time, l, m)`` grid (same horizon and distance rules as
         :meth:`_compute_pixel_at_time`).
         Before the loop, LST for all times is computed once (see
         :meth:`_ensure_lst_deg_vector_cached`) so the analytical branch does not
@@ -1013,7 +2317,9 @@ class RadportAccessor:
         m_indices = np.empty(n_times, dtype=int)
         visible = np.zeros(n_times, dtype=bool)
 
-        self._ensure_lst_deg_vector_cached(observatory)
+        use_per_time_wcs = _has_per_time_wcs_header_str(self._obj)
+        if not use_per_time_wcs:
+            self._ensure_lst_deg_vector_cached(observatory)
 
         if freq_mhz is not None:
             fi = int(self.nearest_freq_idx(freq_mhz))
@@ -1022,6 +2328,23 @@ class RadportAccessor:
         else:
             fi = 0
 
+        # Per-time FITS WCS (zenith-tracking CRVAL): bulk headers + parallel world2pix.
+        if use_per_time_wcs:
+            l_indices, m_indices, visible = self._compute_pixel_track_via_per_time_wcs(
+                ra,
+                dec,
+                n_l=n_l,
+                n_m=n_m,
+                n_times=n_times,
+                progress_callback=progress_callback,
+            )
+            if not np.any(visible):
+                warnings.warn(
+                    f"Source (RA={ra}°, Dec={dec}°) is never above the horizon "
+                    f"during this observation. All output values will be NaN.",
+                    stacklevel=3,
+                )
+            return l_indices, m_indices, visible
         if self._pixel_track_can_batch_time_radec_grids():
             batched = self._compute_pixel_track_batched_radec_grid(
                 ra,
@@ -1037,6 +2360,13 @@ class RadportAccessor:
             )
             if batched is not None:
                 l_indices, m_indices, visible = batched
+                _emit_radport_progress(
+                    progress_callback,
+                    "track",
+                    n_times,
+                    n_times,
+                    "Mapped RA/Dec to image pixels (batched grid)",
+                )
                 if not np.any(visible):
                     warnings.warn(
                         f"Source (RA={ra}°, Dec={dec}°) is never above the horizon "
@@ -1045,24 +2375,41 @@ class RadportAccessor:
                     )
                 return l_indices, m_indices, visible
 
-        for ti in range(n_times):
-            try:
-                li, mi = self.coords_to_pixel(
-                    ra,
-                    dec,
-                    time_idx=ti,
-                    observatory=observatory,
-                    freq_idx=freq_idx,
-                    freq_mhz=freq_mhz,
-                    pol=pol,
-                )
-                l_indices[ti] = li
-                m_indices[ti] = mi
-                visible[ti] = True
-            except ValueError:
-                l_indices[ti] = n_l
-                m_indices[ti] = n_m
-                visible[ti] = False
+        _emit_radport_progress(
+            progress_callback,
+            "track",
+            0,
+            n_times,
+            "Mapping RA/Dec to image pixels",
+        )
+        batch_size = _radport_progress_batch_size(n_times)
+        for start in range(0, n_times, batch_size):
+            end = min(start + batch_size, n_times)
+            for ti in range(start, end):
+                try:
+                    li, mi = self.coords_to_pixel(
+                        ra,
+                        dec,
+                        time_idx=ti,
+                        observatory=observatory,
+                        freq_idx=freq_idx,
+                        freq_mhz=freq_mhz,
+                        pol=pol,
+                    )
+                    l_indices[ti] = li
+                    m_indices[ti] = mi
+                    visible[ti] = True
+                except ValueError:
+                    l_indices[ti] = n_l
+                    m_indices[ti] = n_m
+                    visible[ti] = False
+            _emit_radport_progress(
+                progress_callback,
+                "track",
+                end,
+                n_times,
+                "Mapping RA/Dec to image pixels",
+            )
 
         if not np.any(visible):
             warnings.warn(
@@ -1074,16 +2421,16 @@ class RadportAccessor:
         return l_indices, m_indices, visible
 
     def _use_persisted_wcs_for_pixel_mapping(self) -> bool:
-        """True when RA/Dec should map via stored FITS WCS rather than SIN drift."""
-        obj = self._obj
-        n_times = int(obj.sizes.get("time", 1))
-        if "wcs_header_str" in obj:
-            wv = obj["wcs_header_str"]
-            if wv.ndim == 1 and "time" in wv.dims and n_times > 1:
-                return True
-        if n_times <= 1 and _read_wcs_header_str(obj, time_idx=0) is not None:
+        """True when RA/Dec should map via stored FITS WCS rather than SIN drift.
+
+        Incremental OVRO-LWA Zarr stores one header per ``time`` step (zenith
+        ``CRVAL1``/``CRVAL2`` drift). The analytical LST+SIN fallback does not
+        follow that phase center and will mis-track fixed-sky sources.
+        """
+        if _has_per_time_wcs_header_str(self._obj):
             return True
-        return False
+        n_times = int(self._obj.sizes.get("time", 1))
+        return n_times <= 1 and _read_wcs_header_str(self._obj, time_idx=0) is not None
 
     def _coords_to_pixel_via_wcs(
         self,
@@ -1185,6 +2532,14 @@ class RadportAccessor:
             wcs_pixel = self._coords_to_pixel_via_wcs(ra, dec, time_idx)
             if wcs_pixel is not None:
                 return wcs_pixel
+            if _has_per_time_wcs_header_str(self._obj):
+                n_time = int(self._obj.sizes.get("time", 0))
+                msg = (
+                    f"Missing or invalid WCS metadata for time index {time_idx} "
+                    f"(dataset has {n_time} per-time wcs_header_str steps). "
+                    "Cannot map fixed (RA, Dec) without the slice WCS."
+                )
+                raise ValueError(msg)
 
         lst_deg = self._lst_deg_for_time_index(time_idx, observatory=observatory)
 
@@ -1320,6 +2675,7 @@ class RadportAccessor:
         freq_idx: int | None = None,
         freq_mhz: float | None = None,
         pol: int = 0,
+        progress_callback: RadportProgressCallback | None = None,
     ) -> (
         tuple[int, int]
         | tuple[np.ndarray, np.ndarray, np.ndarray]
@@ -1380,6 +2736,7 @@ class RadportAccessor:
                 freq_idx=freq_idx,
                 freq_mhz=freq_mhz,
                 pol=pol,
+                progress_callback=progress_callback,
             )
 
         # l/m path
@@ -2068,6 +3425,7 @@ class RadportAccessor:
         freq_idx: int | None = None,
         freq_mhz: float | None = None,
         observatory: Any = None,
+        progress_callback: RadportProgressCallback | None = None,
     ) -> xr.DataArray:
         """Extract a dynamic spectrum (time vs frequency) for a single pixel.
 
@@ -2101,6 +3459,10 @@ class RadportAccessor:
             Select frequency by MHz for the same purpose; overrides ``freq_idx``.
         observatory : astropy.coordinates.EarthLocation, optional
             Observatory location for RA/Dec tracking. Defaults to OVRO-LWA.
+        progress_callback : callable, optional
+            ``callback(stage, current, total, message)`` for UI progress.
+            Stages are ``track`` (RA/Dec → pixel mapping) and ``extract``
+            (per-time pixel I/O).  ``current`` and ``total`` count time steps.
 
         Returns
         -------
@@ -2133,14 +3495,29 @@ class RadportAccessor:
             freq_idx=freq_idx,
             freq_mhz=freq_mhz,
             pol=pol,
+            progress_callback=progress_callback,
         )
 
         if isinstance(result, tuple) and len(result) == 2:
             # Fixed pixel path (l/m) — single pixel across all times/freqs.
             # Eagerly load small results to avoid dask graph overhead.
             l_idx, m_idx = result
+            _emit_radport_progress(
+                progress_callback,
+                "extract",
+                0,
+                1,
+                "Reading tracked pixel (all times and frequencies)",
+            )
             da = _maybe_load(
                 self._obj[var].isel(l=l_idx, m=m_idx, polarization=pol)
+            )
+            _emit_radport_progress(
+                progress_callback,
+                "extract",
+                1,
+                1,
+                "Reading tracked pixel (all times and frequencies)",
             )
 
             if "time" in da.dims:
@@ -2162,8 +3539,8 @@ class RadportAccessor:
         l_indices, m_indices, visible = result
         data_var = self._obj[var].isel(polarization=pol)
 
-        n_times = self._obj.sizes["time"]
-        n_freqs = self._obj.sizes["frequency"]
+        n_times = int(self._obj.sizes["time"])
+        n_freqs = int(self._obj.sizes["frequency"])
 
         time_coords = self._obj.coords["time"].values
         freq_coords = self._obj.coords["frequency"].values
@@ -2171,34 +3548,15 @@ class RadportAccessor:
         # Build output array, NaN-filled
         out = np.full((n_times, n_freqs), np.nan)
 
-        # Extract per-time pixel values.
-        # Each time step may map to a different (l, m) pixel, so we
-        # select the exact pixel per time step rather than loading the
-        # full spatial grid (which would be e.g. 4096x4096 per step).
-        vis_mask = visible
-        if np.any(vis_mask):
-            vis_times = np.where(vis_mask)[0]
-            vis_l = l_indices[vis_mask]
-            vis_m = m_indices[vis_mask]
-
-            # Build per-time-step pixel selections (each is shape n_freqs)
-            pixel_arrays = [
-                data_var.isel(time=int(t), l=int(li), m=int(mi))
-                for t, li, mi in zip(vis_times, vis_l, vis_m)
-            ]
-
-            # Compute all pixels in one pass — dask deduplicates
-            # shared chunk reads automatically.
-            if hasattr(data_var, "chunks") and data_var.chunks is not None:
-                import dask
-
-                with _dask_progress("Extracting tracked pixels"):
-                    results = dask.compute(*pixel_arrays)
-            else:
-                results = [p.values for p in pixel_arrays]
-
-            for i, ti in enumerate(vis_times):
-                out[ti] = np.asarray(results[i])
+        vis_times, pixel_rows = self._extract_tracked_pixel_vectors(
+            data_var,
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+            progress_callback=progress_callback,
+        )
+        for ti, row in zip(vis_times, pixel_rows, strict=True):
+            out[int(ti)] = np.asarray(row)
 
         da = xr.DataArray(
             out,
@@ -2218,6 +3576,78 @@ class RadportAccessor:
 
         return da
 
+    def _extract_tracked_pixel_vectors(
+        self,
+        data_var: xr.DataArray,
+        *,
+        l_indices: np.ndarray,
+        m_indices: np.ndarray,
+        visible: np.ndarray,
+        progress_callback: RadportProgressCallback | None = None,
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        """Load one ``(frequency,)`` vector per visible tracked time step."""
+        vis_times = np.asarray(np.where(visible)[0], dtype=int)
+        vis_l = np.asarray(l_indices, dtype=int)[visible]
+        vis_m = np.asarray(m_indices, dtype=int)[visible]
+
+        if vis_times.size == 0:
+            return vis_times, []
+
+        total = int(vis_times.size)
+        extract_message = f"Extracting {total} tracked pixels"
+        _emit_radport_progress(
+            progress_callback,
+            "extract",
+            0,
+            total,
+            extract_message,
+        )
+
+        # One sky pixel for all visible times: single read instead of N graphs.
+        if np.all(vis_l == vis_l[0]) and np.all(vis_m == vis_m[0]):
+            li = int(vis_l[0])
+            mi = int(vis_m[0])
+            sel = data_var.isel(l=li, m=mi).isel(time=vis_times)
+            with _radport_progress_heartbeat(
+                progress_callback,
+                stage="extract",
+                total=total,
+                message=extract_message,
+            ):
+                loaded = _compute_xarray_dataarray(
+                    sel,
+                    label=extract_message,
+                    progress_callback=progress_callback,
+                )
+            plane = np.asarray(loaded.data, dtype=np.float64)
+            rows_out = _rows_from_tracked_pixel_plane(plane)
+            _emit_radport_progress(
+                progress_callback,
+                "extract",
+                total,
+                total,
+                extract_message,
+            )
+            return vis_times, rows_out
+
+        plane = _vectorized_tracked_pixel_values(
+            data_var,
+            vis_times,
+            vis_l,
+            vis_m,
+            progress_callback=progress_callback,
+            progress_message=extract_message,
+        )
+        rows_out = _rows_from_tracked_pixel_plane(plane)
+        _emit_radport_progress(
+            progress_callback,
+            "extract",
+            total,
+            total,
+            extract_message,
+        )
+        return vis_times, rows_out
+
     # =========================================================================
     # Patch Statistic Methods
     # =========================================================================
@@ -2230,12 +3660,16 @@ class RadportAccessor:
         visible: np.ndarray,
         var: str,
         pol: int,
-        radius: int,
+        radii: list[int],
+        progress_callback: RadportProgressCallback | None = None,
     ) -> tuple[np.ndarray, list[np.ndarray]]:
         """Load ``(frequency, l, m)`` patches for visible tracked time steps.
 
-        Uses one batched ``dask.compute`` call to avoid per-iteration scheduler
-        overhead on large time series.
+        ``radii`` gives the patch half-width in pixels for each visible time step
+        (one entry per visible time, in visitation order).
+
+        Patch reads are issued in batches so progress callbacks can report I/O
+        through long time axes on large datasets.
         """
         data_var = self._obj[var].isel(polarization=pol)
         n_l = int(self._obj.sizes["l"])
@@ -2245,24 +3679,64 @@ class RadportAccessor:
         vis_l = np.asarray(l_indices, dtype=int)[visible]
         vis_m = np.asarray(m_indices, dtype=int)[visible]
 
-        patch_arrays = []
-        for t, li, mi in zip(vis_times, vis_l, vis_m, strict=True):
-            l_sl = slice(max(0, int(li) - radius), min(n_l, int(li) + radius + 1))
-            m_sl = slice(max(0, int(mi) - radius), min(n_m, int(mi) + radius + 1))
-            patch_arrays.append(data_var.isel(time=int(t), l=l_sl, m=m_sl))
+        if len(radii) != len(vis_times):
+            msg = (
+                f"radii length {len(radii)} must match visible time steps "
+                f"{len(vis_times)}"
+            )
+            raise ValueError(msg)
 
-        if not patch_arrays:
+        if vis_times.size == 0:
             return vis_times, []
 
-        if hasattr(data_var, "chunks") and data_var.chunks is not None:
-            import dask
+        total = int(vis_times.size)
+        extract_message = f"Extracting {total} tracked patches"
+        _emit_radport_progress(
+            progress_callback,
+            "extract",
+            0,
+            total,
+            extract_message,
+        )
 
-            with _dask_progress("Extracting tracked patches"):
-                results = dask.compute(*patch_arrays)
-        else:
-            results = [np.asarray(p.values) for p in patch_arrays]
+        patch_arrays: list[xr.DataArray] = []
+        for t, li, mi, radius in zip(
+            vis_times,
+            vis_l,
+            vis_m,
+            radii,
+            strict=True,
+        ):
+            radius_i = int(radius)
+            l_sl = slice(
+                max(0, int(li) - radius_i), min(n_l, int(li) + radius_i + 1)
+            )
+            m_sl = slice(
+                max(0, int(mi) - radius_i), min(n_m, int(mi) + radius_i + 1)
+            )
+            patch_arrays.append(data_var.isel(time=int(t), l=l_sl, m=m_sl))
 
-        return vis_times, [np.asarray(r) for r in results]
+        with _radport_progress_heartbeat(
+            progress_callback,
+            stage="extract",
+            total=total,
+            message=extract_message,
+        ):
+            loaded = _compute_xarray_batch(
+                patch_arrays,
+                label=extract_message,
+                progress_callback=progress_callback,
+            )
+        patches_out = [np.asarray(r) for r in loaded]
+        _emit_radport_progress(
+            progress_callback,
+            "extract",
+            total,
+            total,
+            extract_message,
+        )
+
+        return vis_times, patches_out
 
     def patch_statistic(
         self,
@@ -2271,7 +3745,7 @@ class RadportAccessor:
         dec: float | None = None,
         l: float | None = None,
         m: float | None = None,
-        radius: int = 5,
+        scale: float = 3.0,
         statistic: PatchStatisticName = "std",
         var: Literal["SKY", "BEAM"] = "SKY",
         pol: int = 0,
@@ -2280,6 +3754,7 @@ class RadportAccessor:
         observatory: Any = None,
         threshold: float | None = None,
         comparison: PatchStatisticComparison = "gt",
+        progress_callback: RadportProgressCallback | None = None,
     ) -> PatchStatisticResult:
         """Compute a spatial statistic on a tracked patch for each time/frequency cell.
 
@@ -2303,9 +3778,9 @@ class RadportAccessor:
             across time when both are provided.
         l, m : float, optional
             Direction-cosine coordinates for a fixed patch centre.
-        radius : int, default 5
-            Patch half-width in pixels.  The patch spans
-            ``[center - radius, center + radius]`` along ``l`` and ``m``.
+        scale : float, default 3.0
+            Patch half-width is ``ceil(scale * max(beam FWHM))`` pixels at each
+            time step, using the largest synthesized beam over frequency channels.
         statistic : {'std', 'max', 'min', 'mean', 'mad'}, default 'std'
             Spatial reducer applied within each patch.  ``mad`` is the
             median absolute deviation from the patch median.
@@ -2326,6 +3801,10 @@ class RadportAccessor:
             comparison against ``threshold``.  For example, ``comparison='le'``
             selects cells with statistic less than or equal to ``threshold``;
             cells above the threshold are ``False``.
+        progress_callback : callable, optional
+            ``callback(stage, current, total, message)`` for UI progress.
+            Stages are ``extract`` (patch I/O) and ``reduce`` (per-time
+            statistics).  ``current`` and ``total`` count visible time steps.
 
         Returns
         -------
@@ -2344,8 +3823,8 @@ class RadportAccessor:
         if var not in self._obj.data_vars:
             available = sorted(self._obj.data_vars)
             raise ValueError(f"Variable '{var}' not found. Available: {available}")
-        if radius < 0:
-            msg = f"radius must be non-negative, got {radius}"
+        if scale <= 0:
+            msg = f"scale must be positive, got {scale}"
             raise ValueError(msg)
 
         track_freq_idx = freq_idx
@@ -2376,16 +3855,34 @@ class RadportAccessor:
         else:
             l_indices, m_indices, visible = resolved
 
+        vis_times = np.asarray(np.where(visible)[0], dtype=int)
+        radii = [
+            self.patch_radius_pixels(time_idx=int(ti), scale=scale, pol=pol, var=var)
+            for ti in vis_times
+        ]
         vis_times, patches = self._extract_tracked_patch_cubes(
             l_indices=l_indices,
             m_indices=m_indices,
             visible=visible,
             var=var,
             pol=pol,
-            radius=radius,
+            radii=radii,
+            progress_callback=progress_callback,
         )
-        for ti, patch in zip(vis_times, patches, strict=True):
-            stat_values[int(ti)] = _reduce_patch_cube_statistics(patch, statistic)
+        n_visible = len(patches)
+        parallel_reduce = n_visible > 1
+
+        for ti_int, row in _run_batched_time_step_work(
+            vis_times,
+            patches,
+            _process_patch_statistic_time,
+            process_args=(statistic,),
+            progress_callback=progress_callback,
+            stage="reduce",
+            progress_label=f"Computing patch {statistic}",
+            parallel=parallel_reduce,
+        ):
+            stat_values[int(ti_int)] = row
 
         selection_array: np.ndarray | None
         if threshold is not None:
@@ -2399,7 +3896,7 @@ class RadportAccessor:
 
         attrs: dict[str, Any] = {
             "statistic": statistic,
-            "radius": radius,
+            "scale": scale,
             "variable": var,
             "pol": pol,
             "tracking": tracking,
@@ -2447,7 +3944,7 @@ class RadportAccessor:
             threshold=threshold,
             comparison=comparison if threshold is not None else None,
             statistic=statistic,
-            radius=radius,
+            scale=scale,
             _accessor=self,
             _ra=ra,
             _dec=dec,
@@ -2467,31 +3964,38 @@ class RadportAccessor:
         dec: float | None = None,
         l: float | None = None,
         m: float | None = None,
-        radius: int = 5,
-        default_fwhm: float = 3.0,
+        scale: float = 3.0,
         max_reduced_chi_squared: float = 3.0,
+        allow_position_offset: bool = True,
         var: Literal["SKY", "BEAM"] = "SKY",
         pol: int = 0,
         freq_idx: int | None = None,
         freq_mhz: float | None = None,
         observatory: Any = None,
+        progress_callback: RadportProgressCallback | None = None,
     ) -> PatchFitResult:
         """Fit a 2D Gaussian to a tracked patch for each time/frequency cell.
 
         For each time step the patch is centred on the pixel nearest to the
-        given celestial or direction-cosine coordinates.  A centred Gaussian
-        with parameters ``peak``, ``widthx``, ``widthy``, and ``background`` is
-        fit independently on every frequency channel, producing four
-        ``(time, frequency)`` maps plus a reduced chi-squared quality map.
+        given celestial or direction-cosine coordinates.  A Gaussian with
+        parameters ``peak``, ``widthx``, ``widthy``, and ``background`` is fit
+        on every frequency channel.  When ``allow_position_offset`` is ``True``
+        (default), the peak may shift within the patch; offsets are recorded in
+        ``x_offset_map`` and ``y_offset_map``.
 
-        The Gaussian is centred on the patch centre.  ``widthx`` and ``widthy``
-        are full width at half maximum in pixels.  Initial guesses use
-        ``peak = max(patch)``, ``widthx = widthy = default_fwhm`` (3 pixels by
-        default), and ``background = min(patch)``.
+        Initial peak guesses use the patch maximum minus median background.
+        Gaussian width is fixed from synthesized beam ``BMAJ``/``BMIN`` (``BEAM``
+        variable or FITS header); only peak, position, and background are fit.
+        When the nonlinear fit does not converge, statistical estimates are
+        returned instead of NaN.
+
+        Diagnostic maps ``center_flux_map`` and ``patch_max_map`` compare the
+        tracked-centre pixel with the patch maximum.  Use
+        :meth:`PatchFitResult.cell_diagnostics` for a single-cell summary.
 
         When reduced chi-squared exceeds ``max_reduced_chi_squared`` (default
-        3), the fit parameters for that cell are set to NaN.  The reduced
-        chi-squared value is always retained in ``reduced_chi_squared_map``.
+        3), fit parameters are set to NaN but diagnostics and chi-squared are
+        retained.
 
         Parameters
         ----------
@@ -2500,16 +4004,15 @@ class RadportAccessor:
             across time when both are provided.
         l, m : float, optional
             Direction-cosine coordinates for a fixed patch centre.
-        radius : int, default 5
-            Patch half-width in pixels.  The patch spans
-            ``[center - radius, center + radius]`` along ``l`` and ``m``.
-        default_fwhm : float, default 3.0
-            Initial full width at half maximum in pixels for ``widthx`` and
-            ``widthy``.
+        scale : float, default 3.0
+            Patch half-width is ``ceil(scale * max(beam FWHM))`` pixels at each
+            time step, using the largest synthesized beam over frequency channels.
         max_reduced_chi_squared : float, default 3.0
             Maximum acceptable reduced chi-squared.  Cells above this threshold
-            have ``peak``, ``widthx``, ``widthy``, and ``background`` set to
-            NaN.
+            have fit parameters set to NaN.
+        allow_position_offset : bool, default True
+            When ``True``, fit the Gaussian peak position within the patch.
+            When ``False``, force the peak to remain at the tracked centre.
         var : {'SKY', 'BEAM'}, default 'SKY'
             Data variable to analyse.
         pol : int, default 0
@@ -2518,26 +4021,27 @@ class RadportAccessor:
             Passed to coordinate tracking for RA/Dec pixel mapping.
         observatory : astropy.coordinates.EarthLocation, optional
             Observatory location for RA/Dec tracking.
+        progress_callback : callable, optional
+            ``callback(stage, current, total, message)`` for UI progress.
+            Stages are ``extract`` (patch I/O) and ``fit`` (per-time Gaussian
+            fits).  ``current`` and ``total`` count visible time steps.
 
         Returns
         -------
         PatchFitResult
-            Container with parameter maps, ``reduced_chi_squared_map``, and
-            ``max_reduced_chi_squared``.
+            Parameter, diagnostic, and quality maps for the patch fit.
 
         Examples
         --------
-        >>> result = ds.radport.patch_fit(ra=299.868, dec=40.734, radius=5)
+        >>> result = ds.radport.patch_fit(ra=299.868, dec=40.734, scale=3.0)
         >>> peaks = result.peak_map
+        >>> result.cell_diagnostics(time_idx=0, frequency_idx=0)
         """
         if var not in self._obj.data_vars:
             available = sorted(self._obj.data_vars)
             raise ValueError(f"Variable '{var}' not found. Available: {available}")
-        if radius < 0:
-            msg = f"radius must be non-negative, got {radius}"
-            raise ValueError(msg)
-        if default_fwhm <= 0:
-            msg = f"default_fwhm must be positive, got {default_fwhm}"
+        if scale <= 0:
+            msg = f"scale must be positive, got {scale}"
             raise ValueError(msg)
         if max_reduced_chi_squared <= 0:
             msg = f"max_reduced_chi_squared must be positive, got {max_reduced_chi_squared}"
@@ -2561,10 +4065,14 @@ class RadportAccessor:
         n_times = int(self._obj.sizes["time"])
         n_freqs = int(self._obj.sizes["frequency"])
         peak_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        x_offset_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        y_offset_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
         widthx_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
         widthy_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
         background_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
         chi2_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        center_flux_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+        patch_max_values = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
         tracking = ra is not None and dec is not None
 
         if isinstance(resolved, tuple) and len(resolved) == 2:
@@ -2575,38 +4083,73 @@ class RadportAccessor:
         else:
             l_indices, m_indices, visible = resolved
 
+        vis_times = np.asarray(np.where(visible)[0], dtype=int)
+        radii = [
+            self.patch_radius_pixels(time_idx=int(ti), scale=scale, pol=pol, var=var)
+            for ti in vis_times
+        ]
+        patch_radius_values = np.full(n_times, np.nan, dtype=np.float64)
+        for ti, radius_px in zip(vis_times, radii, strict=True):
+            patch_radius_values[int(ti)] = float(radius_px)
+
+        beam_widths_by_time = {
+            int(ti): self.beam_fwhm_pixels_all_frequencies(
+                time_idx=int(ti),
+                pol=pol,
+                var=var,
+            )
+            for ti in vis_times
+        }
         vis_times, patches = self._extract_tracked_patch_cubes(
             l_indices=l_indices,
             m_indices=m_indices,
             visible=visible,
             var=var,
             pol=pol,
-            radius=radius,
+            radii=radii,
+            progress_callback=progress_callback,
         )
-        for ti, patch in zip(vis_times, patches, strict=True):
-            peaks, widthxs, widthys, backgrounds, chi2_red = _fit_patch_cube_gaussian(
-                patch,
-                default_fwhm=default_fwhm,
-            )
-            peaks, widthxs, widthys, backgrounds = _mask_patch_fit_by_chi2(
-                peaks,
-                widthxs,
-                widthys,
-                backgrounds,
-                chi2_red,
-                max_reduced_chi_squared=max_reduced_chi_squared,
-            )
-            ti_int = int(ti)
+        n_visible = len(patches)
+        parallel_fit = n_visible > 1
+
+        for (
+            ti_int,
+            peaks,
+            x_offs,
+            y_offs,
+            widthxs,
+            widthys,
+            backgrounds,
+            chi2_red,
+            center_flux,
+            patch_max,
+        ) in _run_batched_patch_fit_work(
+            vis_times,
+            patches,
+            beam_widths_by_time=beam_widths_by_time,
+            allow_position_offset=allow_position_offset,
+            max_reduced_chi_squared=max_reduced_chi_squared,
+            progress_callback=progress_callback,
+            parallel=parallel_fit,
+        ):
             peak_values[ti_int] = peaks
+            x_offset_values[ti_int] = x_offs
+            y_offset_values[ti_int] = y_offs
             widthx_values[ti_int] = widthxs
             widthy_values[ti_int] = widthys
             background_values[ti_int] = backgrounds
             chi2_values[ti_int] = chi2_red
+            center_flux_values[ti_int] = center_flux
+            patch_max_values[ti_int] = patch_max
+
+        fit_accepted_values = np.isfinite(chi2_values) & (
+            chi2_values <= max_reduced_chi_squared
+        )
 
         attrs: dict[str, Any] = {
-            "radius": radius,
-            "default_fwhm": default_fwhm,
+            "scale": scale,
             "max_reduced_chi_squared": max_reduced_chi_squared,
+            "allow_position_offset": allow_position_offset,
             "variable": var,
             "pol": pol,
             "tracking": tracking,
@@ -2658,6 +4201,48 @@ class RadportAccessor:
             attrs=attrs,
             name=f"{var}_patch_reduced_chi_squared",
         )
+        x_offset_map = xr.DataArray(
+            x_offset_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_x_offset",
+        )
+        y_offset_map = xr.DataArray(
+            y_offset_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_y_offset",
+        )
+        center_flux_map = xr.DataArray(
+            center_flux_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_center_flux",
+        )
+        patch_max_map = xr.DataArray(
+            patch_max_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_max",
+        )
+        fit_accepted_map = xr.DataArray(
+            fit_accepted_values,
+            dims=["time", "frequency"],
+            coords=coords,
+            attrs=attrs,
+            name=f"{var}_patch_fit_accepted",
+        )
+        patch_radius_map = xr.DataArray(
+            patch_radius_values,
+            dims=["time"],
+            coords={"time": self._obj.coords["time"].values},
+            attrs=attrs,
+            name=f"{var}_patch_radius",
+        )
 
         return PatchFitResult(
             peak_map=peak_map,
@@ -2665,9 +4250,15 @@ class RadportAccessor:
             widthy_map=widthy_map,
             background_map=background_map,
             reduced_chi_squared_map=reduced_chi_squared_map,
-            radius=radius,
-            default_fwhm=default_fwhm,
+            x_offset_map=x_offset_map,
+            y_offset_map=y_offset_map,
+            center_flux_map=center_flux_map,
+            patch_max_map=patch_max_map,
+            fit_accepted_map=fit_accepted_map,
+            patch_radius_map=patch_radius_map,
+            scale=scale,
             max_reduced_chi_squared=max_reduced_chi_squared,
+            allow_position_offset=allow_position_offset,
             _accessor=self,
             _ra=ra,
             _dec=dec,
@@ -3693,27 +5284,12 @@ class RadportAccessor:
 
         vis_mask = visible
         if np.any(vis_mask):
-            vis_times = np.where(vis_mask)[0]
-            vis_l = l_indices[vis_mask]
-            vis_m = m_indices[vis_mask]
-
-            # Select the exact pixel per time step rather than loading
-            # the full spatial grid (which can be e.g. 4096x4096).
-            pixel_arrays = [
-                data_var.isel(time=int(t), l=int(li), m=int(mi))
-                for t, li, mi in zip(vis_times, vis_l, vis_m)
-            ]
-
-            if hasattr(data_var, "chunks") and data_var.chunks is not None:
-                import dask
-
-                with _dask_progress("Extracting tracked pixels"):
-                    results = dask.compute(*pixel_arrays)
-            else:
-                results = [p.values for p in pixel_arrays]
-
+            vis_times = np.asarray(np.where(vis_mask)[0], dtype=int)
+            vis_l = np.asarray(l_indices[vis_mask], dtype=int)
+            vis_m = np.asarray(m_indices[vis_mask], dtype=int)
+            plane = _vectorized_tracked_pixel_values(data_var, vis_times, vis_l, vis_m)
             for i, ti in enumerate(vis_times):
-                out[ti] = float(results[i])
+                out[int(ti)] = float(np.asarray(plane[i]).ravel()[0])
 
         time_coords = self._obj.coords["time"].values
         lc = xr.DataArray(
@@ -4517,12 +6093,10 @@ class RadportAccessor:
     ) -> tuple[float, float]:
         """Convert pixel indices to celestial coordinates (RA, Dec).
 
-        Returns the FK5/J2000 position whose direction cosines ``(l, m)`` at
-        that pixel match the same mean sidereal time and SIN geometry as
-        :meth:`coords_to_pixel` — i.e. the sky coordinate of that pixel at the
-        chosen dataset time as the field rotates. A ``fits_wcs_header`` is only
-        used as a numerical seed for the inverse solve, not as the returned
-        static WCS solution.
+        When the dataset has per-time ``wcs_header_str`` (incremental Zarr), uses
+        the same slice WCS as :meth:`coords_to_pixel` via ``pixel_to_world``.
+        Otherwise inverts the analytical SIN + LST model to match legacy datasets
+        without per-time headers.
 
         You must pass **exactly one** of ``time_idx`` or ``time_mjd``.
 
@@ -4579,8 +6153,6 @@ class RadportAccessor:
                 "(pass time_idx or time_mjd)."
             )
 
-        wcs = self._get_wcs()
-
         from astropy.coordinates import EarthLocation
 
         if time_mjd is not None:
@@ -4591,6 +6163,15 @@ class RadportAccessor:
         n_time = self._obj.sizes["time"]
         if not (0 <= ti < n_time):
             raise ValueError(f"time index {ti} out of bounds [0, {n_time})")
+
+        if self._use_persisted_wcs_for_pixel_mapping():
+            from astropy import units as u
+
+            wcs_t = self._get_wcs(time_idx=ti)
+            world = wcs_t.pixel_to_world(l_idx, m_idx)
+            ra_wrapped = float(world.ra.wrap_at(360 * u.deg).deg)
+            dec_sol = float(world.dec.deg)
+            return ra_wrapped, dec_sol
 
         if observatory is None:
             from astropy import units as u
@@ -4605,6 +6186,7 @@ class RadportAccessor:
         lat_deg = float(observatory.lat.deg)
         lat_rad = np.deg2rad(lat_deg)
 
+        wcs = self._get_wcs(time_idx=ti)
         coord = wcs.pixel_to_world(l_idx, m_idx)
         ra0 = float(coord.ra.wrap_at("360d").deg)
         dec0 = float(coord.dec.deg)

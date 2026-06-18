@@ -23,6 +23,7 @@ from ovro_lwa_portal.io import (
     _validate_dataset,
     open_dataset,
     resolve_source,
+    validate_local_zarr_store,
 )
 
 
@@ -209,7 +210,7 @@ class TestOpenDataset:
         """Test opening a nonexistent local path raises FileNotFoundError."""
         nonexistent = tmp_path / "nonexistent.zarr"
 
-        with pytest.raises(FileNotFoundError, match="Local path does not exist"):
+        with pytest.raises(FileNotFoundError, match="Zarr store path does not exist"):
             open_dataset(nonexistent)
 
     def test_open_with_custom_chunks(self, tmp_path: Path) -> None:
@@ -336,10 +337,47 @@ class TestOpenDataset:
         mock_open_zarr.side_effect = Exception("Load failed")
 
         zarr_path = tmp_path / "test.zarr"
-        zarr_path.mkdir()
+        xr.Dataset({"SKY": (["time"], [1.0])}, coords={"time": [0]}).to_zarr(zarr_path)
 
         with pytest.raises(DataSourceError, match="Failed to load dataset"):
             open_dataset(zarr_path, validate=False)
+
+
+class TestValidateLocalZarrStore:
+    """Tests for validate_local_zarr_store (fast path checks)."""
+
+    def test_valid_store_returns_resolved_path(self, tmp_path: Path) -> None:
+        zarr_path = tmp_path / "obs.zarr"
+        xr.Dataset({"SKY": (["time"], [1.0])}, coords={"time": [0]}).to_zarr(zarr_path)
+        resolved = validate_local_zarr_store(zarr_path)
+        assert resolved.is_dir()
+        assert (resolved / ".zgroup").is_file()
+
+    def test_missing_path_lists_siblings(self, tmp_path: Path) -> None:
+        good = tmp_path / "I-Clean-Snapshot-5.zarr"
+        xr.Dataset({"SKY": (["time"], [1.0])}, coords={"time": [0]}).to_zarr(good)
+        bad = tmp_path / "I-Clean-Snapshot-6.zarr"
+
+        with pytest.raises(FileNotFoundError, match="does not exist") as exc_info:
+            validate_local_zarr_store(bad)
+
+        message = str(exc_info.value)
+        assert "Did you mean" in message
+        assert "I-Clean-Snapshot-5.zarr" in message
+
+    def test_existing_non_zarr_directory(self, tmp_path: Path) -> None:
+        empty = tmp_path / "not-a-store"
+        empty.mkdir()
+
+        with pytest.raises(DataSourceError, match="not a Zarr group store"):
+            validate_local_zarr_store(empty)
+
+    def test_existing_file_raises(self, tmp_path: Path) -> None:
+        file_path = tmp_path / "data.zarr"
+        file_path.write_text("not zarr", encoding="utf-8")
+
+        with pytest.raises(DataSourceError, match="is a file, not a directory"):
+            validate_local_zarr_store(file_path)
 
 
 class TestDOIResolution:

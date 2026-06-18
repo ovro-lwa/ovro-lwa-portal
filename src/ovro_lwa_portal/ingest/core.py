@@ -99,6 +99,9 @@ class ConversionConfig:
     consolidate_metadata_at_end : bool, optional
         When True (default), write consolidated ``.zmetadata`` after conversion.
         Set False for intermediate per-time Zarr appends (dewarp workflow).
+    global_frequency_coord_hz : numpy.ndarray | None, optional
+        Precomputed full-store ``frequency`` coordinate in Hz for the first Zarr
+        write when converting one time group at a time.
     """
 
     def __init__(
@@ -122,6 +125,7 @@ class ConversionConfig:
         discovery_filename_convention: Literal["image", "lst-color"] = "image",
         lm_reference_target_size: int | None = None,
         consolidate_metadata_at_end: bool = True,
+        global_frequency_coord_hz: Any | None = None,
     ) -> None:
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -142,6 +146,7 @@ class ConversionConfig:
         self.discovery_filename_convention = discovery_filename_convention
         self.lm_reference_target_size = lm_reference_target_size
         self.consolidate_metadata_at_end = consolidate_metadata_at_end
+        self.global_frequency_coord_hz = global_frequency_coord_hz
 
     @property
     def zarr_path(self) -> Path:
@@ -298,6 +303,7 @@ class FITSToZarrConverter:
                     filename_convention=self.config.discovery_filename_convention,
                     lm_reference_target_size=self.config.lm_reference_target_size,
                     consolidate_metadata_at_end=self.config.consolidate_metadata_at_end,
+                    global_frequency_coord_hz=self.config.global_frequency_coord_hz,
                 )
 
                 self._report_progress("complete", 1, 1, "Conversion complete")

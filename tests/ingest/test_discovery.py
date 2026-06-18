@@ -45,6 +45,27 @@ def test_prepare_ingest_time_groups_resume_uses_completed_filter(
     assert list(remaining.keys()) == ["20240602_120000"]
 
 
+def test_prepare_ingest_time_groups_skips_beam_filter_when_disabled(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Per-time ingest can defer BMAJ/BMIN checks until after beam repair."""
+    by_time = {"20240601_120000": [tmp_path / "a.fits"]}
+    called = False
+
+    def fake_beam_filter(groups: dict[str, list[Path]]) -> dict[str, list[Path]]:
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery._filter_invalid_beam_files",
+        fake_beam_filter,
+    )
+    remaining = prepare_ingest_time_groups(by_time, filter_invalid_beam=False)
+    assert not called
+    assert remaining == by_time
+
+
 def test_discover_time_grouped_fits_forwards_time_key_source(monkeypatch, tmp_path: Path) -> None:
     """IngestDiscoveryConfig.time_key_source is passed to _discover_groups."""
     seen: list[str] = []

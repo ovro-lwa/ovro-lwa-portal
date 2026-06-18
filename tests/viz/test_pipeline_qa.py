@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -202,6 +204,78 @@ def test_scan_coverage_finds_wideband_runs(tmp_path: Path) -> None:
     assert coverage.iloc[0]["latest_run"] == "Run_20241228_120000"
 
 
+def test_scan_coverage_defers_subband_listing(tmp_path: Path) -> None:
+    _write_qa_tree(tmp_path)
+    coverage = pq.scan_coverage(tmp_path)
+    assert pd.isna(coverage.iloc[0]["n_subbands"])
+    assert pd.isna(coverage.iloc[0]["subbands"])
+
+    pq.populate_subbands_for_day(coverage, "2024-12-28")
+    assert int(coverage.iloc[0]["n_subbands"]) == 1
+    assert coverage.iloc[0]["subbands"] == "82MHz"
+
+    table = pq.day_summary_table("2024-12-28", coverage)
+    assert int(table.iloc[0]["n_subbands"]) == 1
+
+
+def test_scan_coverage_globs_once_per_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    obs_date = "2024-12-28"
+    for stamp in ("120000", "130000"):
+        run_dir = tmp_path / "08h" / obs_date / f"Science_20241228_{stamp}"
+        qa_dir = run_dir / "QA"
+        qa_dir.mkdir(parents=True)
+        (qa_dir / f"20241228_{stamp}_thermal_noise_vs_freq.png").write_bytes(b"png")
+
+    calls: list[Path] = []
+    original = pq.thermal_noise_png_for_run
+
+    def _tracking(run_dir: Path, *, config: pq.PipelineQAConfig | None = None) -> Path | None:
+        calls.append(run_dir)
+        return original(run_dir, config=config)
+
+    monkeypatch.setattr(pq, "thermal_noise_png_for_run", _tracking)
+
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB_PHASE2,
+        v_fits_glob=pq.V_FITS_GLOB_PHASE2,
+        run_dir_prefix="Science_",
+        run_dir_pattern=r"Science_(\d{8})_(\d{6})",
+        qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
+        flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
+        flux_check_csv_per_run=True,
+    )
+    coverage = pq.scan_coverage(config=cfg)
+
+    assert len(coverage) == 1
+    assert len(calls) == 2
+    assert coverage.iloc[0]["n_wideband_runs"] == 2
+    assert coverage.iloc[0]["latest_run"] == "Science_20241228_130000"
+
+
+def test_populate_subbands_for_day_only_touches_selected_day(tmp_path: Path) -> None:
+    for obs_date in ("2024-12-27", "2024-12-28"):
+        run_dir = tmp_path / "08h" / obs_date / f"Run_{obs_date.replace('-', '')}_120000"
+        wideband = run_dir / "Wideband"
+        wideband.mkdir(parents=True)
+        (wideband / "thermal_noise_vs_subband.png").write_bytes(b"png")
+        subband = run_dir / "82MHz" / "I" / "deep"
+        subband.mkdir(parents=True)
+        if obs_date == "2024-12-28":
+            (run_dir / "23MHz").mkdir(parents=True)
+
+    coverage = pq.scan_coverage(tmp_path)
+    pq.populate_subbands_for_day(coverage, "2024-12-28")
+
+    row27 = coverage.loc[coverage["obs_date"].dt.strftime("%Y-%m-%d") == "2024-12-27"].iloc[0]
+    row28 = coverage.loc[coverage["obs_date"].dt.strftime("%Y-%m-%d") == "2024-12-28"].iloc[0]
+    assert pd.isna(row27["n_subbands"])
+    assert int(row28["n_subbands"]) == 2
+    assert row28["subbands"] == "23MHz, 82MHz"
+
+
 def test_default_select_day_prefers_earliest_with_i_zarr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -226,8 +300,113 @@ def test_zarr_status_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     i_zarr = pq.qa_zarr_path("I", "2024-12-28")
     i_zarr.mkdir(parents=True)
     (i_zarr / ".zgroup").write_text("{}")
+    monkeypatch.setattr(
+        pq,
+        "_zarr_store_exists",
+        lambda path: path == i_zarr,
+    )
     status = pq.zarr_status("2024-12-28")
     assert status == {"I": True, "V": False}
+
+
+def test_stage_symlinks_avoids_basename_collisions(tmp_path: Path) -> None:
+    run_a = tmp_path / "08h" / "2024-12-28" / "Science_20241228_120000" / "82MHz" / "I" / "deep"
+    run_b = tmp_path / "09h" / "2024-12-28" / "Science_20241228_130000" / "82MHz" / "I" / "deep"
+    run_a.mkdir(parents=True)
+    run_b.mkdir(parents=True)
+    name = "82MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    file_a = run_a / name
+    file_b = run_b / name
+    file_a.write_bytes(b"fits-a")
+    file_b.write_bytes(b"fits-b")
+
+    staging = tmp_path / "stage"
+    pq.stage_symlinks([file_a, file_b], staging)
+
+    assert (staging / name).is_symlink()
+    assert (staging / f"Science_20241228_130000__{name}").is_symlink()
+
+
+def test_fits_group_key_strips_run_prefix() -> None:
+    name = (
+        "Science_20241228_130000__"
+        "82MHz-I-NoTaper-3581s-Robust-0-20241218_033402-image.pbcorr_dewarped.fits"
+    )
+    assert pq.fits_group_key(Path(name)) == ("82MHz", "20241218_033402")
+
+
+def test_convert_missing_zarr_cleans_up_staging_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_root = tmp_path / "stage"
+    zarr_root = tmp_path / "zarr"
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=stage_root,
+        zarr_root=zarr_root,
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+    )
+    _write_qa_tree(tmp_path)
+    v_subband = (
+        tmp_path
+        / "08h"
+        / "2024-12-28"
+        / "Run_20241228_120000"
+        / "82MHz"
+        / "V"
+        / "deep"
+    )
+    v_subband.mkdir(parents=True)
+    v_name = "82MHz-V-Taper-Deep-image-20241228_120000.pbcorr.fits"
+    (v_subband / v_name).write_bytes(b"fits")
+
+    day_tag = "20241228"
+    staging_i = stage_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fits"
+    fixed_i = stage_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fixed"
+    staging_v = stage_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fits"
+    fixed_v = stage_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fixed"
+
+    def _fake_convert(*, input_dir: Path, out_dir: Path, zarr_name: str, **kwargs: object) -> Path:
+        out = out_dir / zarr_name
+        out.mkdir(parents=True, exist_ok=True)
+        (out / ".zgroup").write_text("{}")
+        fixed_dir = kwargs.get("fixed_dir")
+        if isinstance(fixed_dir, Path):
+            fixed_dir.mkdir(parents=True, exist_ok=True)
+            (fixed_dir / "stub_fixed.fits").write_bytes(b"fixed")
+        return out
+
+    def _fake_stage_symlinks(fits_paths: list[Path], staging_dir: Path) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in fits_paths:
+            (staging_dir / src.name).write_bytes(b"fits")
+        return staging_dir
+
+    def _fake_stage_v(
+        v_paths: list[Path],
+        _i_paths: list[Path],
+        staging_dir: Path,
+    ) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in v_paths:
+            (staging_dir / src.name).write_bytes(b"fits")
+        return staging_dir
+
+    monkeypatch.setattr(pq, "infer_target_size_from_82mhz", lambda *_args, **_kwargs: 64)
+    monkeypatch.setattr(pq, "convert_fits_dir_to_zarr", _fake_convert)
+    monkeypatch.setattr(pq, "stage_symlinks", _fake_stage_symlinks)
+    monkeypatch.setattr(pq, "stage_v_fits_with_beam_from_i", _fake_stage_v)
+    monkeypatch.setattr(pq, "_lm_reference_from_existing_zarr", lambda _path: object())
+
+    calls: list[str] = []
+    coverage = pq.scan_coverage(config=cfg)
+    pq.convert_missing_zarr("2024-12-28", coverage, calls.append, config=cfg)
+
+    for path in (staging_i, fixed_i, staging_v, fixed_v):
+        assert not path.exists(), f"expected staging dir removed: {path}"
+    assert any("Removed staging directory" in line for line in calls)
 
 
 def test_convert_missing_zarr_skips_existing(
@@ -351,8 +530,31 @@ def test_pipeline_qa_app_activity_log_is_fixed_height(
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
 
-    assert isinstance(app._log_pane, pn.pane.HTML)
+    assert isinstance(app._log_pane, pn.pane.IPyWidget)
     assert app._log_pane.height == ACTIVITY_LOG_HEIGHT_PX
+    app._log("hello")
+    assert "hello" in app._log_widget.value
+
+
+def test_push_dashboard_ui_refreshes_ipywidgets_activity_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app._build_layouts()
+    app._log("scan complete")
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._sync_all_notebook_views",
+        lambda *_views: None,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._push_panel_layout",
+        lambda *_views, **_kwargs: None,
+    )
+
+    app._push_dashboard_ui()
+
+    assert "scan complete" in app._log_widget.value
 
 
 def test_convert_button_label_and_disabled() -> None:
@@ -415,7 +617,7 @@ def test_initial_scan_does_not_auto_select_day(monkeypatch: pytest.MonkeyPatch) 
         "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
         lambda _coverage: ["2024-12-28"],
     )
-    monkeypatch.setattr(app, "_execute", lambda callback: callback())
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", lambda callback: callback())
 
     class _InlineThread:
         def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
@@ -436,24 +638,233 @@ def test_initial_scan_does_not_auto_select_day(monkeypatch: pytest.MonkeyPatch) 
     assert "2024-12-28" in app.param.select_day.objects
     assert load_calls == []
     assert "Select a day" in app.log_text
+    assert app.scanning is False
+
+
+def test_initial_scan_routes_completion_through_dashboard_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+
+    schedule_calls: list[str] = []
+
+    def _schedule(callback: Callable[[], None]) -> None:
+        schedule_calls.append("schedule")
+        callback()
+
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", _schedule)
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+
+    app._start_initial_scan()
+
+    assert schedule_calls == ["schedule"]
+    assert app.scanning is False
+
+
+def test_initial_scan_applies_state_when_panel_comm_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    app._build_layouts()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.notebook_views_registered",
+        lambda *_views: False,
+    )
+    push_calls: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_push_dashboard_ui",
+        lambda *, force=True: push_calls.append("push"),
+    )
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._schedule_ipython_main",
+        lambda callback: callback(),
+    )
+
+    app._start_initial_scan()
+
+    assert app.scanning is False
+    assert "2024-12-28" in app.param.select_day.objects
+    assert "Select a day" in app.log_text
+    assert push_calls == ["push"]
+
+
+def test_initial_scan_loads_day_selected_during_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", lambda callback: callback())
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+
+    load_calls: list[str] = []
+    monkeypatch.setattr(app, "_begin_load_day", lambda: load_calls.append("load"))
+    app.select_day = "2024-12-28"
+
+    app._start_initial_scan()
+
+    assert app.select_day == "2024-12-28"
+    assert load_calls == ["load"]
+    assert "Loading QA data for 2024-12-28" in app.log_text
+    assert app.scanning is False
 
 
 def test_day_selector_triggers_load_day(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
-    monkeypatch.setattr(app, "_begin_load_day", lambda: None)
     app.scanning = False
     app._coverage = pd.DataFrame({"obs_date": ["2024-12-27", "2024-12-28"]})
-    monkeypatch.setattr(app, "_begin_load_day", lambda: calls.append(app.select_day or ""))
+    monkeypatch.setattr(
+        app,
+        "_start_day_load_thread",
+        lambda select_day, load_seq: calls.append(select_day),
+    )
     _set_select_day(app, "2024-12-27", days=["2024-12-27", "2024-12-28"])
     app._loaded_day = "2024-12-27"
     calls.clear()
 
-    app.select_day = "2024-12-28"
+    app._handle_day_selection("2024-12-28", previous="2024-12-27")
 
     assert app.select_day == "2024-12-28"
     assert calls == ["2024-12-28"]
+
+
+def test_reselect_same_day_skips_when_already_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    app = PipelineQAApp()
+    app.scanning = False
+    app._coverage = _sample_coverage()
+    monkeypatch.setattr(app, "_begin_load_day", lambda: calls.append("load"))
+    _set_select_day(app, "2024-12-28", days=["2024-12-28"])
+    app._loaded_day = "2024-12-28"
+    calls.clear()
+
+    app._handle_day_selection("2024-12-28", previous="2024-12-28")
+
+    assert calls == []
+
+
+def test_finish_zenith_load_skips_stale_load_seq() -> None:
+    """Stale zenith finish must not clear ``loading_zenith`` owned by a newer load."""
+    app = PipelineQAApp()
+    app._load_seq = 2
+    app.loading_zenith = True
+
+    app._finish_zenith_load(load_seq=1)
+
+    assert app.loading_zenith is True
+
+
+def test_finish_zenith_load_clears_flag_for_current_seq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    app._load_seq = 2
+    app.loading_zenith = True
+    monkeypatch.setattr(app, "_dispatch_ui", lambda callback: callback())
+
+    app._finish_zenith_load(load_seq=2)
+
+    assert app.loading_zenith is False
+
+
+def test_day_change_during_zenith_load_starts_new_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    load_calls: list[str] = []
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    monkeypatch.setattr(
+        app,
+        "_start_day_load_thread",
+        lambda select_day, load_seq: load_calls.append(select_day),
+    )
+    app.scanning = False
+    app._coverage = _sample_coverage()
+    app._loaded_day = "2024-12-19"
+    app.loading_zenith = True
+    _set_select_day(app, "2024-12-19", days=["2024-12-19", "2024-12-20"])
+    load_calls.clear()
+
+    app._handle_day_selection("2024-12-20", previous="2024-12-19")
+
+    assert load_calls == ["2024-12-20"]
+    assert app.loading_zenith is False
+
+
+def test_day_selector_stays_enabled_during_zenith_load() -> None:
+    app = PipelineQAApp()
+    app.scanning = False
+    app.converting = False
+    app.loading_zenith = True
+    app.loading_day = True
+
+    app._sync_action_controls()
+
+    assert app._day_selector.disabled is False
 
 
 def test_stokes_review_holder_builds_both_sections(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1097,6 +1508,10 @@ def test_convert_success_schedules_refresh_after_clearing_converting(
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.convert_missing_zarr",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day, **kwargs: {"I": True, "V": False},
     )
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app._schedule_ipython_main",
@@ -1905,6 +2320,12 @@ def _write_phase2_qa_tree(root: Path, *, obs_date: str = "2025-01-11", hour: str
         "15.0,1.0,45.0,7.5,3C147,55.0\n",
         encoding="utf-8",
     )
+    (qa_dir / "20250111_05h_dewarp_summary.csv").write_text(
+        "freq_mhz,median_shift_arcmin\n"
+        "55,0.12\n"
+        "82,0.34\n",
+        encoding="utf-8",
+    )
     subband = run_dir / "55MHz" / "I" / "deep"
     subband.mkdir(parents=True)
     fits_name = (
@@ -2006,3 +2427,632 @@ def test_flux_ratio_grids_and_figures(tmp_path: Path) -> None:
     assert isinstance(panel_grid, pn.Column)
     assert len(panel_grid.objects) == 1
     assert panel_grid.max_width == FLUX_RATIO_GRID_TOTAL_WIDTH
+
+
+def _phase2_test_config(tmp_path: Path) -> pq.PipelineQAConfig:
+    return pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB_PHASE2,
+        v_fits_glob=pq.V_FITS_GLOB_PHASE2,
+        run_dir_prefix="Science_",
+        run_dir_pattern=r"Science_(\d{8})_(\d{6})",
+        qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
+        flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
+        flux_check_csv_per_run=True,
+        dewarp_summary_csv_glob="QA/*dewarp_summary.csv",
+    )
+
+
+def test_load_dewarp_summary_dataframe_phase2(tmp_path: Path) -> None:
+    _write_phase2_qa_tree(tmp_path)
+    cfg = _phase2_test_config(tmp_path)
+    coverage = pq.scan_coverage(config=cfg)
+    dewarp_df = pq.load_dewarp_summary_dataframe("2025-01-11", coverage, config=cfg)
+
+    assert len(dewarp_df) == 2
+    assert set(dewarp_df["frequency_mhz"]) == {55.0, 82.0}
+    assert dewarp_df["median_shift"].tolist() == [0.12, 0.34]
+    assert dewarp_df["lst_hour"].iloc[0] == "05h"
+
+
+def test_run_on_main_thread_from_worker_schedules_ipython_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as app
+
+    scheduled: list[Callable[[], None]] = []
+    executed_inline: list[int] = []
+
+    monkeypatch.setattr(
+        app,
+        "_schedule_ipython_main",
+        lambda callback: scheduled.append(callback),
+    )
+
+    def _fail_execute(callback: Callable[[], None]) -> None:
+        executed_inline.append(1)
+        callback()
+
+    monkeypatch.setattr(app.pn.state, "execute", _fail_execute)
+
+    import threading
+
+    worker_done = threading.Event()
+
+    def _worker() -> None:
+        app._run_on_main_thread(lambda: executed_inline.append(2))
+        worker_done.set()
+
+    threading.Thread(target=_worker).start()
+    worker_done.wait(timeout=2.0)
+
+    assert executed_inline == []
+    assert len(scheduled) == 1
+    scheduled[0]()
+    assert executed_inline == [2]
+
+
+def test_schedule_ipython_main_from_worker_never_runs_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as app
+
+    monkeypatch.setattr(app, "_IPYTHON_IO_LOOP", None)
+    monkeypatch.setattr(app, "_resolve_ipython_event_loop", lambda: None)
+    executed: list[int] = []
+
+    import threading
+
+    worker_done = threading.Event()
+
+    def _worker() -> None:
+        app._schedule_ipython_main(lambda: executed.append(1))
+        worker_done.set()
+
+    threading.Thread(target=_worker).start()
+    worker_done.wait(timeout=2.0)
+
+    assert executed == []
+    assert len(app._PENDING_MAIN_CALLBACKS) >= 1
+    app._flush_pending_main_callbacks()
+    assert executed == [1]
+    assert app._PENDING_MAIN_CALLBACKS == []
+
+
+def test_dewarp_shift_grid_and_figure(tmp_path: Path) -> None:
+    from bokeh.models import ColorBar, HoverTool
+
+    from ovro_lwa_portal.viz.dewarp_summary_plots import (
+        build_dewarp_shift_figure,
+        build_dewarp_shift_panel,
+    )
+
+    _write_phase2_qa_tree(tmp_path)
+    cfg = _phase2_test_config(tmp_path)
+    coverage = pq.scan_coverage(config=cfg)
+    dewarp_df = pq.load_dewarp_summary_dataframe("2025-01-11", coverage, config=cfg)
+    grid = pq.dewarp_shift_grid(dewarp_df)
+
+    lst_num = int(coverage.iloc[0]["lst_hour_num"])
+    assert grid.loc[lst_num, 55.0] == 0.12
+    assert grid.loc[lst_num, 82.0] == 0.34
+
+    figure = build_dewarp_shift_figure(grid)
+    assert figure.select_one({"type": ColorBar}) is not None
+    hover_tools = [tool for tool in figure.tools if isinstance(tool, HoverTool)]
+    assert len(hover_tools) == 1
+
+    panel = build_dewarp_shift_panel(dewarp_df)
+    assert isinstance(panel, pn.Column)
+    assert len(panel.objects) == 1
+
+
+class _FakeCallbacks:
+    def __init__(self) -> None:
+        self._hold: str | None = None
+
+    @property
+    def hold_value(self) -> str | None:
+        return self._hold
+
+    def hold(self, policy: str = "combine") -> None:
+        self._hold = policy
+
+    def unhold(self) -> None:
+        self._hold = None
+
+
+class _FakeDoc:
+    def __init__(self) -> None:
+        self.callbacks = _FakeCallbacks()
+
+    def hold(self, policy: str = "combine") -> None:
+        self.callbacks.hold(policy)
+
+    def unhold(self) -> None:
+        self.callbacks.unhold()
+
+
+class _FakeRoot:
+    tags: list[str] = []
+
+
+class _FakeView:
+    def __init__(self, ref: str, *, children: tuple["_FakeView", ...] = ()) -> None:
+        self._models = {ref: object()}
+        self.objects = children
+
+
+def _install_fake_view(
+    monkeypatch: pytest.MonkeyPatch, *, ref: str = "root-1"
+) -> tuple[_FakeView, _FakeDoc, list[Any]]:
+    """Register one fake Panel view/document in panel state and capture pushes."""
+    from panel.io.state import state
+
+    doc = _FakeDoc()
+    comm = object()
+    monkeypatch.setattr(state, "_views", {ref: (object(), _FakeRoot(), doc, comm)})
+
+    pushed: list[Any] = []
+    monkeypatch.setattr(
+        "panel.io.notebook.push", lambda d, c, *a, **k: pushed.append((d, c))
+    )
+    return _FakeView(ref), doc, pushed
+
+
+def test_notebook_doc_comms_walks_nested_viewables(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _notebook_doc_comms
+    from panel.io.state import state
+
+    doc = _FakeDoc()
+    comm = object()
+    child = pn.pane.HTML("child")
+    parent = pn.Column(child)
+    child_ref = "child-ref"
+    child._models = {child_ref: object()}  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        state,
+        "_views",
+        {
+            child_ref: (child, _FakeRoot(), doc, comm),
+        },
+    )
+
+    docs = _notebook_doc_comms(parent)
+    assert len(docs) == 1
+    assert docs[id(doc)][1] is comm
+
+
+def test_hold_and_push_enters_panel_hold_with_comm(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push
+
+    view, doc, pushed = _install_fake_view(monkeypatch)
+
+    with hold_and_push(view):
+        pass
+
+    assert doc.callbacks.hold_value is None
+    assert pushed == [(doc, pushed[0][1])]
+
+
+def test_hold_and_push_noops_when_views_not_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push
+    from panel.io.state import state
+
+    monkeypatch.setattr(state, "_views", {})
+    pushed: list[Any] = []
+    monkeypatch.setattr(
+        "panel.io.notebook.push",
+        lambda *args, **kwargs: pushed.append(args),
+    )
+
+    with hold_and_push(_FakeView("missing")):
+        pass
+
+    assert pushed == []
+
+
+def test_sync_pane_to_notebook_uses_layout_root_when_pane_ref_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import sync_pane_to_notebook
+    from panel.io.state import state
+
+    doc = _FakeDoc()
+    comm = object()
+    layout_ref = "layout-ref"
+    pane_ref = "pane-ref"
+    layout = _FakeView(layout_ref)
+    pane = _FakeView(pane_ref)
+    parent = object()
+    root = _FakeRoot()
+    pane._models = {pane_ref: (object(), parent)}  # type: ignore[attr-defined]
+    updates: list[tuple[str, Any, Any, Any, Any, Any]] = []
+
+    def _update_object(ref: str, doc_arg: Any, root: Any, parent: Any, comm_arg: Any) -> None:
+        updates.append((ref, doc_arg, root, parent, comm_arg))
+
+    pane._update_object = _update_object  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        state,
+        "_views",
+        {layout_ref: (layout, root, doc, comm)},
+    )
+
+    sync_pane_to_notebook(pane, layout)
+
+    assert updates == [(pane_ref, doc, root, parent, comm)]
+
+
+def test_dispatch_notebook_ui_runs_inside_hold_when_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    view, doc, _pushed = _install_fake_view(monkeypatch)
+    ran: list[str] = []
+
+    monkeypatch.setattr(pqa, "_schedule_ipython_main", lambda fn: fn())
+
+    pqa.dispatch_notebook_ui(lambda: ran.append("done"), view)
+
+    assert ran == ["done"]
+    assert doc.callbacks.hold_value is None
+
+
+def test_dispatch_notebook_ui_reentrant_runs_inline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    view, _doc, _pushed = _install_fake_view(monkeypatch)
+    scheduled: list[Callable[[], None]] = []
+    ran: list[str] = []
+
+    monkeypatch.setattr(pqa, "_schedule_ipython_main", lambda fn: scheduled.append(fn))
+    depth: ContextVar[int] = pqa._NOTEBOOK_UI_DEPTH
+    token = depth.set(1)
+    try:
+        pqa.dispatch_notebook_ui(lambda: ran.append("inline"), view)
+    finally:
+        depth.reset(token)
+
+    assert ran == ["inline"]
+    assert scheduled == []
+
+
+def test_hold_and_push_real_document_pushes_nested_html_pane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration: real Bokeh doc + sync_pane_to_notebook inside hold."""
+    import param
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, sync_pane_to_notebook
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    log_pane = pn.pane.HTML("<p>before</p>")
+    layout = pn.Column(log_pane)
+    harness.mount_layout_only(layout)
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, log_pane):
+            with param.parameterized.discard_events(log_pane):
+                log_pane.object = "<p>after</p>"
+            sync_pane_to_notebook(log_pane, layout)
+
+    assert pushed == [(harness.doc, harness.comm)]
+    assert log_pane.object == "<p>after</p>"
+
+
+def test_set_notebook_pane_object_replaces_bokeh_figure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bokeh pane figure swap inside hold uses discard_events + sync."""
+    from bokeh.plotting import figure
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, set_notebook_pane_object
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    def _make_fig(values: np.ndarray):
+        n_t, n_f = values.shape
+        plot = figure(width=400, height=200, x_range=(0, n_t), y_range=(0, n_f))
+        plot.image(image=[values.T], x=0, y=0, dw=n_t, dh=n_f)
+        return plot
+
+    harness = PanelUITestHarness()
+    zeros = np.zeros((4, 6))
+    pane = pn.pane.Bokeh(_make_fig(zeros), height=200, sizing_mode="stretch_width")
+    layout = pn.Column(pane)
+    harness.mount(layout)
+    layout_ref = harness.layout_ref(layout)
+    root = harness.doc.roots[0]
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, pane):
+            set_notebook_pane_object(
+                pane, _make_fig(np.arange(24.0).reshape(4, 6)), layout
+            )
+
+    assert pushed == [(harness.doc, harness.comm)]
+    new_model = pane._models[layout_ref][0]
+    assert root.children[0] is new_model
+
+
+def test_sync_widget_to_notebook_updates_autocomplete_inside_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Widgets need sync_widget_to_notebook; sync_pane alone is a no-op."""
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, set_notebook_widget_params
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    coord = pn.widgets.AutocompleteInput(
+        name="Coordinate", value="", value_input="", restrict=False
+    )
+    layout = pn.Column(coord)
+    harness.mount(layout)
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, coord):
+            set_notebook_widget_params(
+                coord,
+                layout,
+                value="123.4, 56.7",
+                value_input="123.4, 56.7",
+                options=[],
+            )
+
+    model = harness.bokeh_model(coord, layout)
+    assert pushed == [(harness.doc, harness.comm)]
+    assert model.value == "123.4, 56.7"
+    assert model.value_input == "123.4, 56.7"
+
+
+def test_set_notebook_widget_params_spinner_spins_inside_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LoadingSpinner needs synthetic events — empty events skip CSS ``spin`` class."""
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, set_notebook_widget_params
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    spinner = pn.indicators.LoadingSpinner(value=False, size=24)
+    layout = pn.Column(spinner)
+    harness.mount(layout)
+
+    with harness.capture_notebook_pushes(monkeypatch) as pushed:
+        with hold_and_push(layout, spinner):
+            set_notebook_widget_params(
+                spinner,
+                layout,
+                value=True,
+                visible=True,
+            )
+
+    model = harness.bokeh_model(spinner, layout)
+    assert pushed == [(harness.doc, harness.comm)]
+    assert spinner.value is True
+    assert "spin" in model.css_classes
+
+
+def test_defer_after_notebook_hold_runs_bokeh_publish_after_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bokeh figure assign must not run inside hold_and_push (Jupiter path)."""
+    from bokeh.plotting import figure
+
+    from ovro_lwa_portal.viz.pipeline_qa_app import hold_and_push, publish_bokeh_pane_to_notebook
+    from ovro_lwa_portal.viz.source_review_app import _placeholder_heatmap_figure
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    pane = pn.pane.Bokeh(_placeholder_heatmap_figure(), height=420, sizing_mode="stretch_width")
+    layout = pn.Column(pane)
+    harness.mount(layout)
+
+    new_fig = figure(width=100, height=100, title="AFTER HOLD")
+
+    with hold_and_push(layout, pane):
+        publish_bokeh_pane_to_notebook(pane, new_fig, layout)
+
+    model = harness.bokeh_model(pane, layout)
+    assert model.title.text == "AFTER HOLD"
+
+
+def test_discard_events_blocks_bokeh_pane_push(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: discard_events + push leaves the browser on the placeholder."""
+    import param
+    from bokeh.plotting import figure
+
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+    from ovro_lwa_portal.viz.source_review_app import _placeholder_heatmap_figure
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    pane = pn.pane.Bokeh(_placeholder_heatmap_figure(), height=420, sizing_mode="stretch_width")
+    layout = pn.Column(pane)
+    harness.mount(layout)
+
+    pushed: list[Any] = []
+
+    def _capture_push(*args: Any, **kwargs: Any) -> None:
+        pushed.append(args)
+
+    monkeypatch.setattr(pqa, "_push_panel_layout", _capture_push)
+
+    new_fig = figure(width=100, height=100, title="SHOULD NOT STICK")
+    with param.parameterized.discard_events(pane):
+        pane.object = new_fig
+    pqa._push_panel_layout(layout, pane)
+
+    model = harness.bokeh_model(pane, layout)
+    assert pane.object.title.text == "SHOULD NOT STICK"
+    assert model.title.text != "SHOULD NOT STICK"
+
+
+def test_publish_panel_widget_to_notebook_updates_autocomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+    from ovro_lwa_portal.viz.pipeline_qa_app import publish_panel_widget_to_notebook
+    from tests.viz.panel_ui_testkit import PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    coord = pn.widgets.AutocompleteInput(value="", value_input="", restrict=False)
+    layout = pn.Column(coord)
+    harness.mount(layout)
+
+    pushed: list[Any] = []
+
+    def _capture_push(*args: Any, **kwargs: Any) -> None:
+        pushed.append(args)
+
+    monkeypatch.setattr(pqa, "_push_panel_layout", _capture_push)
+
+    publish_panel_widget_to_notebook(
+        coord, layout, value="12.3, 45.6", value_input="12.3, 45.6", options=[]
+    )
+
+    model = harness.bokeh_model(coord, layout)
+    assert len(pushed) == 1
+    assert coord.value == "12.3, 45.6"
+    assert model.value == "12.3, 45.6"
+    assert model.value_input == "12.3, 45.6"
+
+
+def test_stokes_review_controls_row_property(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import _StokesReviewHolder
+
+    holder = _StokesReviewHolder()
+    assert holder.controls_row is holder._controls_row
+
+
+def test_notebook_ui_views_includes_zenith_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self, **kwargs: None,
+    )
+    app = PipelineQAApp()
+    app.panel()
+    views = app._notebook_ui_views()
+    assert app._layout in views
+    assert app._zenith_slot in views
+    assert app._stokes_review.controls_row in views
+
+
+def test_mount_zenith_sections_skips_stale_load_seq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self, **kwargs: None,
+    )
+    app = PipelineQAApp()
+    app.panel()
+    app._load_seq = 2
+    banner_before = app._zenith_banner.object
+    content_before = list(app._zenith_section_content["I"].objects)
+    stale = pn.pane.Markdown("STALE MOUNT")
+    publish_calls: list[str] = []
+
+    monkeypatch.setattr(app, "_publish_zenith_heatmaps", lambda: publish_calls.append("publish"))
+
+    app._mount_zenith_sections(
+        {"I": stale, "V": stale},
+        banner="STALE BANNER",
+        load_seq=1,
+    )
+
+    assert app._zenith_banner.object == banner_before
+    assert list(app._zenith_section_content["I"].objects) == content_before
+    assert publish_calls == []
+
+
+def test_publish_zenith_heatmaps_uses_ui_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz.pipeline_qa_app import ZenithReviewPanel
+
+    monkeypatch.setattr(
+        PipelineQAApp,
+        "_start_initial_scan",
+        lambda self, **kwargs: None,
+    )
+    app = PipelineQAApp()
+    app.panel()
+    dataset = _mock_zenith_dataset()
+    stat_map = np.ones((dataset.sizes["time"], dataset.sizes["frequency"]))
+    panel = ZenithReviewPanel(
+        dataset,
+        stat_map,
+        slice_selection=app._stokes_review.slice_selection,
+        stokes_label="I",
+        metric_label="STD",
+    )
+    app._stokes_review._panels["I"] = panel
+    published: list[tuple[Any, Any]] = []
+
+    class _RecordingUI:
+        def publish_bokeh_figure(self, pane: Any, figure: Any) -> None:
+            published.append((pane, figure))
+
+    app._ui_session = _RecordingUI()
+    app._publish_zenith_heatmaps()
+
+    assert len(published) == 1
+    assert published[0][0] is panel._heatmap.pane
+    assert published[0][1] is panel._heatmap._plot
+
+
+def test_zenith_heatmap_set_data_publishes_with_root_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    stat_map = np.ones((3, 5))
+    lst_hours = np.array([12.0, 13.0, 14.0])
+    freq_mhz = np.linspace(70.0, 90.0, 5)
+    published: list[tuple[Any, Any, tuple[Any, ...]]] = []
+
+    monkeypatch.setattr(
+        pqa,
+        "publish_bokeh_pane_to_notebook",
+        lambda pane, figure, *roots: published.append((pane, figure, roots)),
+    )
+
+    selector = pqa._ZenithHeatmapSelector(
+        stat_map,
+        metric_label="STD",
+        lst_hours=lst_hours,
+        freq_mhz=freq_mhz,
+        on_select=lambda _t, _f: None,
+    )
+    layout = pn.Column(selector.pane)
+    new_map = np.full((3, 5), 2.0)
+    selector.set_data(new_map, lst_hours=lst_hours, freq_mhz=freq_mhz, root_views=(layout,))
+
+    assert len(published) == 1
+    assert published[0][0] is selector.pane
+    assert published[0][2] == (layout,)
+
+
+def test_configure_pipeline_qa_notebook_patches_wcs_and_io_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    calls: list[str] = []
+    monkeypatch.setattr(pqa, "_patch_astrowidget_get_wcs", lambda: calls.append("wcs"))
+    monkeypatch.setattr(pqa, "_capture_ipython_io_loop", lambda: calls.append("io_loop"))
+    monkeypatch.setattr(pqa.pn, "extension", lambda *args, **kwargs: calls.append("ext"))
+
+    pqa.configure_pipeline_qa_notebook()
+
+    assert calls[0] == "wcs"
+    assert "ext" in calls
+    assert calls[-1] == "io_loop"

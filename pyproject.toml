@@ -31,6 +31,7 @@ dependencies = [
     "portalocker>=2.8.0",
     "universal-pathlib>=0.2",
     "matplotlib>=3.8,<4",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
@@ -97,6 +98,9 @@ local_scheme = "no-local-version"
 
 [tool.hatch.build.targets.sdist]
 exclude = ["/tests"]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"jupyter-config/jupyter_server_config.d" = "etc/jupyter/jupyter_server_config.d"
 
 [tool.pytest.ini_options]
 # Prefer the in-repo package under src/ so tests do not pick up a stale

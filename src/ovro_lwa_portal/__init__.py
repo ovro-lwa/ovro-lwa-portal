@@ -14,6 +14,16 @@ except ImportError:
 
 from . import accessor  # Register xarray accessor on import
 from . import fits_to_zarr_xradio
-from .io import open_dataset, resolve_source
+from .io import open_dataset, resolve_source, validate_local_zarr_store
+from .name_resolution import CoordinateResolution, resolve_coordinate_string
 
-__all__ = ["__version__", "fits_to_zarr_xradio", "open_dataset", "resolve_source", "accessor"]
+__all__ = [
+    "__version__",
+    "accessor",
+    "CoordinateResolution",
+    "fits_to_zarr_xradio",
+    "open_dataset",
+    "resolve_coordinate_string",
+    "resolve_source",
+    "validate_local_zarr_store",
+]

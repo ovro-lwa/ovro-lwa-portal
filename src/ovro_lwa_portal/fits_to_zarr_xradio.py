@@ -51,8 +51,8 @@ Notes
   a mismatch raises a RuntimeError.
 * Within a single time step, mixed LM shapes are regridded onto the reference grid before combine.
   The reference contributes only the *pixel grid* (``CRPIX``/``CDELT``/projection); per-time
-  ``CRVAL1``/``CRVAL2`` (FK5 zenith stamped by :func:`_fix_headers`) is taken from each source
-  subband so all subbands at one time step share identical ``right_ascension``/``declination``.
+  ``CRVAL1``/``CRVAL2`` from each source FITS header is taken from that source subband so all
+  subbands at one time step share identical ``right_ascension``/``declination``.
 * After stacking subbands along ``frequency``, ``right_ascension`` / ``declination`` are
   collapsed to a single ``(l, m)`` frame taken from the lowest-frequency slice. If sampled
   sky positions differ from that reference by more than ~one arcminute between slices, a
@@ -68,6 +68,7 @@ Notes
 
 from __future__ import annotations
 
+import functools
 import os
 import logging
 import re
@@ -76,7 +77,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 import xarray as xr
@@ -92,6 +93,7 @@ __all__ = [
     "InvalidBeamError",
     "convert_fits_dir_to_zarr",
     "fix_fits_headers",
+    "repair_zarr_crval_from_fits",
     "repair_zarr_store",
     "validate_zarr_store",
 ]
@@ -191,6 +193,10 @@ def _read_fits_via_xradio(
 # ``frequency`` planes in the Zarr from one logical band. Bins of 23~kHz merge that jitter
 # while keeping distinct LWA subbands (MHz-scale) separate.
 _DISCOVERY_FREQ_BIN_HZ: float = 23_000.0
+# Header-only scan limit when choosing the global LM reference grid. OVRO-LWA snapshot
+# products use a stable per-subband pixel grid; the largest shape in the first few time
+# groups matches the dataset-wide maximum without reading every file on Lustre.
+_LM_REF_SCAN_TIME_GROUPS: int = 5
 
 # Log a warning when any stacked frequency slice disagrees with the reference slice by
 # more than this on-sky separation (sampled on the LM grid). Used after ``combine`` so
@@ -205,18 +211,46 @@ _OVRO_LWA_DEFAULT_LON_DEG = -118.28340511
 _OVRO_LWA_DEFAULT_LAT_DEG = 37.23338698
 _OVRO_LWA_DEFAULT_HEIGHT_M = 1188.6
 
-# Cache expensive sky-coordinate transforms keyed by celestial WCS header + LM shape.
-# Many OVRO-LWA subbands at one time share the same LM grid, so recomputing
-# all_pix2world for every file dominates runtime.
-_SKY_COORD_CACHE: Dict[Tuple[int, int, str], Tuple[NDArray[np.floating], NDArray[np.floating], str]] = {}
+# LRU cache for RA/Dec ``all_pix2world`` grids within one time step (~15 subbands).
+# Cleared after each :func:`_combine_time_step` so multi-hour ingest runs do not retain
+# one entry per observation epoch (per-time CRVAL may differ across time groups).
+_SKY_COORD_CACHE_MAXSIZE = 48
 
 
-# Subband MHz in OVRO-style basenames, e.g. ``..._41MHz_...``, ``...__18MHz-I-...``
-# (dewarp staging uses ``{time_key}__{original_name}``; product tags use a hyphen after MHz).
-MHZ_RE = re.compile(r"_(\d+)MHz(?:_|-|\.|$)")
+@functools.lru_cache(maxsize=_SKY_COORD_CACHE_MAXSIZE)
+def _compute_sky_coord_arrays(
+    ny: int, nx: int, hdr_str: str
+) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+    """Compute RA/Dec at pixel centers for a 2D celestial WCS header string."""
+    w2d = WCS(fits.Header.fromstring(hdr_str, sep="\n")).celestial
+    yy, xx = np.indices((ny, nx), dtype=float)
+    ra2d, dec2d = w2d.all_pix2world(xx, yy, 0)
+    return ra2d, dec2d
 
-# OVRO-LWA ``...-image-YYYYMMDD_HHMMSS...`` segment (UTC wall-clock for the map).
+
+def _clear_sky_coord_cache() -> None:
+    """Drop cached RA/Dec grids (call after each time step to bound RSS)."""
+    _compute_sky_coord_arrays.cache_clear()
+
+
+def _sky_coord_cache_size() -> int:
+    """Return the number of entries in the sky-coordinate LRU cache (for tests)."""
+    return _compute_sky_coord_arrays.cache_info().currsize
+
+
+# Subband MHz in OVRO-style basenames, e.g. ``82MHz-I-...``, ``..._41MHz_...``,
+# ``...__18MHz-I-...`` (dewarp staging uses ``{time_key}__{original_name}``).
+MHZ_RE = re.compile(r"(?:^|_)(\d+)MHz(?:_|-|\.|$)")
+
+# OVRO-LWA observation-time tokens in basenames (UTC wall-clock for the map).
+# Phase1: ``...-image-YYYYMMDD_HHMMSS...``; phase2 dewarped: ``...YYYYMMDD_HHMMSS-image...``.
 _IMAGE_TIME_RE = re.compile(r"-image-(\d{8})_(\d{6})")
+_IMAGE_TIME_BEFORE_IMAGE_RE = re.compile(r"(\d{8})_(\d{6})-image", re.IGNORECASE)
+
+# LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
+_LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
+
+DiscoveryFilenameConvention = Literal["image", "lst-color"]
 
 # LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
 _LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
@@ -241,6 +275,24 @@ def _mhz_from_name(p: Path) -> int:
     return int(m.group(1)) if m else 10**9
 
 
+def _observation_time_from_header(header: fits.Header) -> Time | None:
+    """Parse ``DATE-OBS`` / ``TIME-OBS`` into an astropy ``Time`` (UTC), or ``None``."""
+    date_obs = header.get("DATE-OBS")
+    if not date_obs:
+        return None
+    date_obs = str(date_obs).strip()
+    time_obs = header.get("TIME-OBS")
+    if time_obs and "T" not in date_obs:
+        dt_value = f"{date_obs}T{str(time_obs).strip()}"
+    else:
+        dt_value = date_obs
+    try:
+        return Time(dt_value, format="isot", scale="utc")
+    except Exception:
+        logger.debug("Could not parse DATE-OBS/TIME-OBS timestamp: %s", dt_value)
+        return None
+
+
 def _time_key_from_header(header: fits.Header) -> Optional[str]:
     """Extract observation time from FITS headers as ``YYYYMMDD_HHMMSS``.
 
@@ -249,21 +301,18 @@ def _time_key_from_header(header: fits.Header) -> Optional[str]:
 
     Returns ``None`` when no usable ``DATE-OBS`` timestamp is found.
     """
-    date_obs = header.get("DATE-OBS")
-    if date_obs:
-        date_obs = str(date_obs).strip()
-        time_obs = header.get("TIME-OBS")
-        if time_obs and "T" not in date_obs:
-            dt_value = f"{date_obs}T{str(time_obs).strip()}"
-        else:
-            dt_value = date_obs
-        try:
-            t = Time(dt_value, format="isot", scale="utc")
-            return t.to_datetime().strftime("%Y%m%d_%H%M%S")
-        except Exception:
-            logger.debug(f"Could not parse DATE-OBS/TIME-OBS timestamp: {dt_value}")
+    t = _observation_time_from_header(header)
+    if t is None:
+        return None
+    return t.to_datetime().strftime("%Y%m%d_%H%M%S")
 
-    return None
+
+def _mjd_from_header(header: fits.Header) -> float | None:
+    """Return the observation MJD written to Zarr ``time`` (from ``DATE-OBS``)."""
+    t = _observation_time_from_header(header)
+    if t is None:
+        return None
+    return float(t.mjd)
 
 
 def _frequency_hz_from_header(header: fits.Header) -> Optional[float]:
@@ -877,6 +926,329 @@ def repair_zarr_store(
     }
 
 
+def _patch_celestial_crval_in_header_str(ref_hdr_str: str, src_hdr: fits.Header) -> str:
+    """Keep the pixel grid in *ref_hdr_str* but adopt celestial reference keys from *src_hdr*."""
+    ref_hdr = fits.Header.fromstring(ref_hdr_str, sep="\n")
+    new_hdr = ref_hdr.copy()
+    for key in ("CRVAL1", "CRVAL2", "RADESYS", "EQUINOX", "DATE-OBS", "MJD-OBS"):
+        if key in src_hdr:
+            new_hdr[key] = src_hdr[key]
+    if "CRVAL2" in src_hdr:
+        new_hdr["LATPOLE"] = float(src_hdr["CRVAL2"])
+    return WCS(new_hdr).celestial.to_header(relax=True).tostring(sep="\n")
+
+
+def _crval_pair_from_header_str(hdr_str: str) -> Optional[Tuple[float, float]]:
+    if not hdr_str.strip():
+        return None
+    hdr = fits.Header.fromstring(hdr_str, sep="\n")
+    if "CRVAL1" not in hdr or "CRVAL2" not in hdr:
+        return None
+    return float(hdr["CRVAL1"]), float(hdr["CRVAL2"])
+
+
+def _seconds_between_time_keys(left: str, right: str) -> float:
+    """Absolute UTC seconds between two ``YYYYMMDD_HHMMSS`` keys."""
+    fmt = "%Y%m%d_%H%M%S"
+    ldt = datetime.strptime(left, fmt).replace(tzinfo=timezone.utc)
+    rdt = datetime.strptime(right, fmt).replace(tzinfo=timezone.utc)
+    return abs((ldt - rdt).total_seconds())
+
+
+def _resolve_discovery_keys_for_zarr_times(
+    z_time: np.ndarray,
+    by_time: Dict[str, Sequence[Path]],
+    *,
+    max_delta_sec: float = 6.0,
+) -> Tuple[List[Optional[str]], Dict[str, int]]:
+    """Map each Zarr time index to a filename discovery key in *by_time*.
+
+    Ingest groups files by the basename ``-image-YYYYMMDD_HHMMSS`` stamp while
+    ``xradio`` writes the Zarr ``time`` coordinate from ``DATE-OBS`` (see
+    :func:`_discovery_time_key_completed_in_zarr`). Those one-second keys can
+    differ by a few seconds on OVRO-LWA products, so exact string equality is
+    not reliable for repair lookups.
+    """
+    zarr_keys = [_normalize_time_key(v) for v in np.atleast_1d(z_time)]
+    discovery_keys = sorted(by_time.keys())
+    n_z = len(zarr_keys)
+    n_d = len(discovery_keys)
+
+    index_aligned = (
+        n_z == n_d
+        and n_z > 0
+        and all(
+            zk is not None
+            and _seconds_between_time_keys(zk, discovery_keys[i]) <= max_delta_sec
+            for i, zk in enumerate(zarr_keys)
+        )
+    )
+
+    stats = {"exact": 0, "index": 0, "nearest": 0, "unresolved": 0}
+    resolved: List[Optional[str]] = []
+    for i, zk in enumerate(zarr_keys):
+        if zk is None:
+            stats["unresolved"] += 1
+            resolved.append(None)
+            continue
+        if zk in by_time:
+            stats["exact"] += 1
+            resolved.append(zk)
+            continue
+        if index_aligned:
+            stats["index"] += 1
+            resolved.append(discovery_keys[i])
+            continue
+
+        best: Optional[str] = None
+        best_delta = max_delta_sec + 1.0
+        for dk in discovery_keys:
+            delta = _seconds_between_time_keys(zk, dk)
+            if delta <= max_delta_sec and delta < best_delta:
+                best_delta = delta
+                best = dk
+        if best is None:
+            stats["unresolved"] += 1
+        else:
+            stats["nearest"] += 1
+        resolved.append(best)
+
+    if index_aligned and stats["index"] > 0:
+        logger.info(
+            "Zarr time keys differ from filename stamps; using index-aligned pairing "
+            "for %d step(s) (max delta %.1f s)",
+            stats["index"],
+            max_delta_sec,
+        )
+    return resolved, stats
+
+
+class _FitsPathsResolver(Protocol):
+    def __call__(self, discovery_key: str) -> Sequence[Path]:
+        """Return uncompressed ``.fits`` paths for one filename discovery key."""
+
+
+def repair_zarr_crval_from_fits(
+    out_zarr: str | Path,
+    by_time: Dict[str, Sequence[Path]],
+    *,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    backup_suffix: str = ".backup-before-crval-repair",
+    skip_backup: bool = False,
+    dry_run: bool = False,
+    max_time_delta_sec: float = 6.0,
+    resolve_fits_paths: _FitsPathsResolver | None = None,
+) -> Dict[str, object]:
+    """Patch ``wcs_header_str`` CRVAL rows from native FITS headers (no re-ingest).
+
+    For each Zarr time index, resolves the matching filename discovery group in
+    *by_time* (exact key, index-aligned, or nearest within *max_time_delta_sec*),
+    reads the native celestial reference from the corresponding pipeline FITS files,
+    and updates the stored header strings while preserving the existing LM pixel
+    grid (``CRPIX``/``CDELT``/projection).
+
+    Parameters
+    ----------
+    out_zarr
+        Existing Zarr store with ``time`` and ``wcs_header_str`` arrays.
+    by_time
+        Mapping of ``YYYYMMDD_HHMMSS`` time keys to uncompressed ``.fits`` paths for
+        that integration (lowest-frequency file used when only one header row exists).
+    group_metadata_source
+        Passed to :func:`_discovery_frequency_sort_tuple` when ordering subbands.
+    backup_suffix
+        Suffix for a full-store copy created before in-place writes (skipped when
+        *dry_run* is true or *skip_backup* is true).
+    skip_backup
+        When true, patch ``wcs_header_str`` in place without copying the full store.
+        Use when disk cannot hold a duplicate of a large Zarr (CRVAL repair only
+        touches small metadata arrays).
+    dry_run
+        When true, report planned CRVAL deltas without modifying the store.
+    max_time_delta_sec
+        Maximum UTC separation allowed when pairing Zarr ``DATE-OBS`` times with
+        filename ``-image-`` discovery keys.
+    resolve_fits_paths
+        Optional callback mapping a filename discovery key to uncompressed FITS
+        paths for that step (e.g. funpack-on-demand). When omitted, *by_time* must
+        already contain readable ``.fits`` paths.
+
+    Returns
+    -------
+    dict
+        Summary with counts, max CRVAL delta, and optional backup path.
+    """
+    out_zarr = Path(out_zarr)
+    if not out_zarr.exists():
+        msg = f"Zarr store does not exist: {out_zarr}"
+        raise FileNotFoundError(msg)
+
+    zg_read = zarr.open_group(str(out_zarr), mode="r")
+    if "wcs_header_str" not in zg_read:
+        msg = f"{out_zarr} has no wcs_header_str array"
+        raise KeyError(msg)
+    if "time" not in zg_read:
+        msg = f"{out_zarr} has no time coordinate"
+        raise KeyError(msg)
+
+    z_time = np.atleast_1d(np.asarray(zg_read["time"][:], dtype=np.float64))
+    wcs_arr = zg_read["wcs_header_str"]
+    n_time = int(z_time.size)
+    if int(wcs_arr.shape[0]) != n_time:
+        msg = (
+            f"wcs_header_str length {wcs_arr.shape[0]} != time length {n_time}; "
+            f"shape={wcs_arr.shape}"
+        )
+        raise ValueError(msg)
+
+    n_freq = int(wcs_arr.shape[1]) if wcs_arr.ndim >= 2 else 1
+    sort_key = lambda p: _discovery_frequency_sort_tuple(p, group_metadata_source=group_metadata_source)
+
+    backup_path: Optional[Path] = None
+    if not dry_run and not skip_backup:
+        backup_path = out_zarr.with_name(out_zarr.name + backup_suffix)
+        if backup_path.exists():
+            msg = (
+                f"Backup path already exists: {backup_path}. Remove it or pass "
+                "skip_backup=True to patch wcs_header_str without a full copy."
+            )
+            raise FileExistsError(msg)
+        shutil.copytree(out_zarr, backup_path)
+        zg = zarr.open_group(str(out_zarr), mode="a")
+        wcs_arr = zg["wcs_header_str"]
+    elif dry_run:
+        zg = zg_read
+    else:
+        zg = zarr.open_group(str(out_zarr), mode="a")
+        wcs_arr = zg["wcs_header_str"]
+
+    discovery_keys, match_stats = _resolve_discovery_keys_for_zarr_times(
+        z_time,
+        by_time,
+        max_delta_sec=max_time_delta_sec,
+    )
+
+    patched_rows = 0
+    skipped_no_fits = 0
+    skipped_empty = 0
+    max_dra = 0.0
+    max_ddec = 0.0
+    samples: List[Dict[str, object]] = []
+
+    for ti in range(n_time):
+        zarr_key = _normalize_time_key(z_time[ti])
+        discovery_key = discovery_keys[ti]
+        if zarr_key is None:
+            skipped_empty += 1
+            continue
+        if discovery_key is None:
+            skipped_no_fits += 1
+            logger.warning(
+                "No discovery group for Zarr time index %d (zarr_key=%s)",
+                ti,
+                zarr_key,
+            )
+            continue
+
+        if resolve_fits_paths is not None:
+            files = sorted(resolve_fits_paths(discovery_key), key=sort_key)
+        else:
+            files = sorted(by_time.get(discovery_key, ()), key=sort_key)
+        if not files:
+            skipped_no_fits += 1
+            logger.warning(
+                "No FITS files for Zarr time index %d (zarr_key=%s discovery_key=%s)",
+                ti,
+                zarr_key,
+                discovery_key,
+            )
+            continue
+
+        row_changed = False
+        if wcs_arr.ndim >= 2:
+            row = wcs_arr[ti, :].copy()
+            for fi in range(n_freq):
+                fp = files[min(fi, len(files) - 1)]
+                raw = row[fi]
+                old_hdr = _decode_wcs_header_payload(raw)
+                if not old_hdr.strip():
+                    skipped_empty += 1
+                    continue
+                src_hdr = _getheader_for_ingest(fp)
+                new_hdr = _patch_celestial_crval_in_header_str(old_hdr, src_hdr)
+                old_crval = _crval_pair_from_header_str(old_hdr)
+                new_crval = _crval_pair_from_header_str(new_hdr)
+                if old_crval and new_crval:
+                    max_dra = max(max_dra, abs(new_crval[0] - old_crval[0]))
+                    max_ddec = max(max_ddec, abs(new_crval[1] - old_crval[1]))
+                if new_hdr != old_hdr:
+                    row[fi] = np.bytes_(new_hdr.encode("utf-8"))
+                    row_changed = True
+                    if len(samples) < 5:
+                        samples.append(
+                            {
+                                "time_idx": ti,
+                                "zarr_time_key": zarr_key,
+                                "discovery_time_key": discovery_key,
+                                "freq_idx": fi,
+                                "fits": fp.name,
+                                "old_crval": old_crval,
+                                "new_crval": new_crval,
+                            }
+                        )
+            if row_changed and not dry_run:
+                wcs_arr[ti, :] = row
+        else:
+            raw = wcs_arr[ti]
+            old_hdr = _decode_wcs_header_payload(raw)
+            if not old_hdr.strip():
+                skipped_empty += 1
+                continue
+            fp = files[0]
+            src_hdr = _getheader_for_ingest(fp)
+            new_hdr = _patch_celestial_crval_in_header_str(old_hdr, src_hdr)
+            old_crval = _crval_pair_from_header_str(old_hdr)
+            new_crval = _crval_pair_from_header_str(new_hdr)
+            if old_crval and new_crval:
+                max_dra = max(max_dra, abs(new_crval[0] - old_crval[0]))
+                max_ddec = max(max_ddec, abs(new_crval[1] - old_crval[1]))
+            if new_hdr != old_hdr:
+                row_changed = True
+                if not dry_run:
+                    wcs_arr[ti] = np.bytes_(new_hdr.encode("utf-8"))
+                if len(samples) < 5:
+                    samples.append(
+                        {
+                            "time_idx": ti,
+                            "zarr_time_key": zarr_key,
+                            "discovery_time_key": discovery_key,
+                            "freq_idx": None,
+                            "fits": fp.name,
+                            "old_crval": old_crval,
+                            "new_crval": new_crval,
+                        }
+                    )
+
+        if row_changed:
+            patched_rows += 1
+
+    if not dry_run:
+        _consolidate_zarr_metadata(out_zarr)
+
+    return {
+        "store": str(out_zarr),
+        "backup": str(backup_path) if backup_path is not None else None,
+        "dry_run": dry_run,
+        "time_steps": n_time,
+        "patched_rows": patched_rows,
+        "skipped_no_fits": skipped_no_fits,
+        "skipped_empty": skipped_empty,
+        "time_match_stats": match_stats,
+        "max_crval_delta_deg": {"ra": max_dra, "dec": max_ddec},
+        "samples": samples,
+    }
+
+
 def _frequency_sort_tuple(fp: Path) -> Tuple[float, str]:
     """Sort key for deterministic frequency ordering with fallback."""
     return _discovery_frequency_sort_tuple(fp, group_metadata_source="fits")
@@ -899,24 +1271,28 @@ def _earth_location_from_header(hdr: fits.Header) -> EarthLocation:
 
 
 def _obstime_from_fits_filename(path: Path) -> Optional[Time]:
-    """Parse ``-image-YYYYMMDD_HHMMSS`` from a FITS basename as UTC :class:`~astropy.time.Time`.
+    """Parse an observation-time token from a FITS basename as UTC :class:`~astropy.time.Time`.
 
-    Returns ``None`` if the pattern is missing or digits are not a valid civil time.
+    Supports phase1 ``-image-YYYYMMDD_HHMMSS`` and phase2 dewarped
+    ``YYYYMMDD_HHMMSS-image`` segments. Returns ``None`` when no pattern matches or
+    digits are not a valid civil time.
     """
-    m = _IMAGE_TIME_RE.search(path.name)
-    if not m:
-        return None
-    ymd, hms = m.group(1), m.group(2)
-    try:
-        naive = datetime.strptime(ymd + hms, "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-    utc = naive.replace(tzinfo=timezone.utc)
-    return Time(utc)
+    for pattern in (_IMAGE_TIME_RE, _IMAGE_TIME_BEFORE_IMAGE_RE):
+        match = pattern.search(path.name)
+        if match is None:
+            continue
+        ymd, hms = match.group(1), match.group(2)
+        try:
+            naive = datetime.strptime(ymd + hms, "%Y%m%d%H%M%S")
+        except ValueError:
+            continue
+        utc = naive.replace(tzinfo=timezone.utc)
+        return Time(utc)
+    return None
 
 
 def _time_key_from_filename(fp: Path) -> Optional[str]:
-    """Observation time key from ``-image-YYYYMMDD_HHMMSS`` in the basename.
+    """Observation time key from a basename image-time token when present.
 
     Same ``%Y%m%d_%H%M%S`` formatting as :func:`_time_key_from_header`. Returns ``None``
     when the filename pattern is absent or not parseable.
@@ -988,10 +1364,9 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
       via :func:`_filter_invalid_beam_files` so this path is only reachable when
       callers invoke :func:`_fix_headers` (or :func:`fix_fits_headers`) directly on
       an unfiltered set.
-      For celestial ``RA``/``DEC`` axes, ``CRVAL1``/``CRVAL2`` are set to the FK5
-      zenith at the UTC instant parsed from ``-image-YYYYMMDD_HHMMSS`` in the input
-      filename. If that pattern is absent, ``CRVAL1``/``CRVAL2`` are left unchanged.
-      Geodetic position comes from ``OBSGEO-*`` when present, otherwise OVRO-LWA defaults.
+      Celestial ``CRVAL1``/``CRVAL2`` (and ``LATPOLE`` when present) are preserved from
+      the input FITS. Filename ``-image-YYYYMMDD_HHMMSS`` tokens are used only for
+      discovery/grouping, not to overwrite the phase center.
 
     Parameters
     ----------
@@ -1001,7 +1376,8 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         Output fixed FITS file path.
     """
     with fits.open(path_in, memmap=True) as hdul:
-        hdu = hdul[0]
+        img_idx = _image_hdu_index_hdul(hdul)
+        hdu = hdul[img_idx]
         data = hdu.data
         hdr = hdu.header.copy()
 
@@ -1089,14 +1465,6 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         phdu = fits.PrimaryHDU(data=data, header=hdr)
         H = phdu.header
 
-        obs_time = _obstime_from_fits_filename(path_in)
-        if obs_time is None:
-            logger.warning(
-                "No -image-YYYYMMDD_HHMMSS timestamp in filename %s; "
-                "leaving CRVAL1/CRVAL2 unchanged.",
-                path_in.name,
-            )
-
         # Spectral / frame basics (do not treat Stokes CRVAL4 as a rest frequency)
         ct3 = str(H.get("CTYPE3", "")).strip().upper()
         if "CRVAL3" in H and (
@@ -1107,20 +1475,11 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         H["SPECSYS"] = "LSRK"
         H["TIMESYS"] = "UTC"
         H["RADESYS"] = "FK5"
-        H["LATPOLE"] = 90.0
-
-        if obs_time is not None:
-            zc = _zenith_fk5_crvals_deg(H, obs_time)
-            if zc is not None:
-                cr1, cr2 = zc
-                H["CRVAL1"] = cr1
-                H["CRVAL2"] = cr2
-                logger.debug(
-                    "Set CRVAL1/CRVAL2 to FK5 zenith at filename time for %s: %.6f, %.6f deg",
-                    path_in.name,
-                    cr1,
-                    cr2,
-                )
+        if "LATPOLE" not in H:
+            if "CRVAL2" in H:
+                H["LATPOLE"] = float(H["CRVAL2"])
+            else:
+                H["LATPOLE"] = 90.0
 
         # Identity PC for LM axes
         H["PC1_1"] = 1.0
@@ -1376,14 +1735,7 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
     nx = int(xds.sizes["l"])
     cel_hdr = w2d.to_header()
     hdr_str = cel_hdr.tostring(sep="\n")
-    cache_key = (ny, nx, hdr_str)
-    cached = _SKY_COORD_CACHE.get(cache_key)
-    if cached is None:
-        yy, xx = np.indices((ny, nx), dtype=float)
-        ra2d, dec2d = w2d.all_pix2world(xx, yy, 0)  # degrees, shape (nm, nl) = (NAXIS2, NAXIS1)
-        _SKY_COORD_CACHE[cache_key] = (ra2d, dec2d, hdr_str)
-    else:
-        ra2d, dec2d, hdr_str = cached
+    ra2d, dec2d = _compute_sky_coord_arrays(ny, nx, hdr_str)
 
     # 4) Attach coords on the standard (l, m) grid (transpose of FITS row-major plane)
     ra_lm = np.transpose(ra2d)
@@ -1406,15 +1758,17 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
     if chunk_lm and {"l", "m"} <= set(xds.dims):
         xds = xds.chunk({"l": chunk_lm, "m": chunk_lm})
 
-    # ---- persist the exact celestial WCS header redundantly ----
+    # ---- persist celestial WCS for combine/regrid (in-memory only) ----
+    # Zarr export uses wcs_header_str(time) only; strip_redundant_fits_wcs_header_attrs
+    # removes fits_wcs_header attrs before write (see AGENTS.md Per-Time WCS).
     # 2) 0-D variable that always survives (NumPy ≥ 2.0: use np.bytes_)
     xds = xds.assign(wcs_header_str=((), np.bytes_(hdr_str.encode("utf-8"))))
 
-    # 3) per-variable attrs (survive merges)
+    # 3) per-variable attrs (in-memory merges; not written to multi-time Zarr)
     for dv in xds.data_vars:
         xds[dv].attrs["fits_wcs_header"] = hdr_str
 
-    # 4) also stash on coords for convenience
+    # 4) also stash on coords for convenience (in-memory only)
     xds["right_ascension"].attrs["fits_wcs_header"] = hdr_str
     xds["declination"].attrs["fits_wcs_header"] = hdr_str
 
@@ -1453,18 +1807,50 @@ def _select_reference_shape_index(shapes: List[Tuple[int, int]]) -> int:
     return best_idx
 
 
-def _peek_lm_shape(fp: Path) -> Tuple[int, int]:
-    """Return LM shape ``(l, m)`` from FITS header without loading pixel data.
+def _image_hdu_index_hdul(hdul: fits.HDUList) -> int:
+    """Index of the HDU holding image pixels and beam keywords in an open HDU list."""
+    if len(hdul) > 1 and int(hdul[0].header.get("NAXIS", 0)) == 0:
+        return 1
+    return 0
 
-    Uses ``NAXIS1`` × ``NAXIS2`` as ``(l, m)`` to match the on-disk FITS axis order.
+
+def _image_hdu_index_for_header(fp: Path) -> int:
+    """HDU index used for image metadata checks (shape, ``BMAJ``/``BMIN``).
+
+    Pipeline fpacked products (e.g. ``*.fits.fs``) often ship an empty primary HDU
+    (``NAXIS=0``) with the real image and beam keywords on extension 1. Unpacked
+    FITS use index 0 as usual.
     """
-    header = fits.getheader(fp, ext=0)
+    try:
+        hdr0 = fits.getheader(fp, ext=0, memmap=False)
+        if int(hdr0.get("NAXIS", 0)) == 0:
+            try:
+                fits.getheader(fp, ext=1, memmap=False)
+            except Exception:
+                return 0
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def _getheader_for_ingest(fp: Path) -> fits.Header:
+    """Primary header for ingest validation; uses the image HDU when primary is empty."""
+    return fits.getheader(fp, ext=_image_hdu_index_for_header(fp))
+
+
+def _lm_shape_from_header(header: fits.Header) -> Tuple[int, int]:
+    """Return LM shape ``(l, m)`` from a FITS image header (``NAXIS1`` × ``NAXIS2``)."""
     naxis = int(header.get("NAXIS", 0))
     if naxis < 2:
-        msg = f"FITS file {fp} has NAXIS={naxis}; expected at least 2 for LM dimensions."
+        msg = f"FITS header has NAXIS={naxis}; expected at least 2 for LM dimensions."
         raise RuntimeError(msg)
-
     return int(header["NAXIS1"]), int(header["NAXIS2"])
+
+
+def _peek_lm_shape(fp: Path) -> Tuple[int, int]:
+    """Return LM shape ``(l, m)`` from FITS header without loading pixel data."""
+    return _lm_shape_from_header(_getheader_for_ingest(fp))
 
 
 def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:
@@ -1689,21 +2075,36 @@ def _load_global_lm_reference_dataset(
     fix_headers_on_demand: bool,
     target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    max_time_groups: int | None = _LM_REF_SCAN_TIME_GROUPS,
     filename_convention: DiscoveryFilenameConvention = "image",
 ) -> xr.Dataset:
-    """Load the dataset whose LM grid has the largest shape across *all* time steps.
+    """Load the dataset whose LM grid has the largest shape for use as the global reference.
 
     Per-time reprojection alone is insufficient: different observation times can
     imply different in-step max shapes (e.g. only 3122² files in one step and
     mixed 4096²+3122² in another). A single global reference ensures every step
     normalizes to the same ``l``/``m`` so :func:`_assert_same_lm` can succeed.
 
+    By default only the first :data:`_LM_REF_SCAN_TIME_GROUPS` observation times are
+    scanned (header-only) to pick the reference file. Subband pixel grids are stable
+    across OVRO-LWA snapshots, so this avoids reading every FITS on Lustre at startup.
+    Pass ``max_time_groups=None`` to scan all time keys.
+
     If ``target_size`` is set, the chosen reference is loaded at native resolution
     then reprojected onto a ``target_size`` square grid (same WCS scaling as
     image-plane-correction ``calcflow``) so the LM grid matches dewarped outputs.
     """
+    time_keys = sorted(by_time.keys())
+    if max_time_groups is not None:
+        time_keys = time_keys[:max_time_groups]
+        logger.info(
+            "Scanning first %d of %d time group(s) for global LM reference grid.",
+            len(time_keys),
+            len(by_time),
+        )
+
     candidates: List[Tuple[Path, Tuple[int, int]]] = []
-    for tkey in sorted(by_time.keys()):
+    for tkey in time_keys:
         files = by_time[tkey]
         # Avoid eagerly fixing every FITS file just to inspect LM shape.
         # Header LM dimensions (NAXIS1/NAXIS2) are sufficient for choosing
@@ -1723,10 +2124,22 @@ def _load_global_lm_reference_dataset(
                 filename_convention=filename_convention,
             )
         for fp in shape_paths:
-            candidates.append((fp, _peek_lm_shape(fp)))
+            if fix_headers_on_demand:
+                hdr = _getheader_for_ingest(fp)
+                if _invalid_beam_reason(hdr) is not None:
+                    continue
+                shape = _lm_shape_from_header(hdr)
+            else:
+                shape = _peek_lm_shape(fp)
+            candidates.append((fp, shape))
 
     if not candidates:
-        msg = "No FITS paths available to build a global LM reference."
+        msg = (
+            "No FITS paths with a usable synthesized beam available to build a "
+            "global LM reference."
+            if fix_headers_on_demand
+            else "No FITS paths available to build a global LM reference."
+        )
         raise RuntimeError(msg)
 
     shapes = [sh for _, sh in candidates]
@@ -1738,7 +2151,11 @@ def _load_global_lm_reference_dataset(
         ref_fp.name,
     )
     if fix_headers_on_demand and not ref_fp.name.endswith("_fixed.fits"):
-        ref_fp = fix_fits_headers([ref_fp], fixed_dir, skip_existing=True)[0]
+        fixed = fix_fits_headers([ref_fp], fixed_dir, skip_existing=True)
+        if not fixed:
+            msg = f"Could not fix headers for LM reference file {ref_fp.name}"
+            raise RuntimeError(msg)
+        ref_fp = fixed[0]
     xds = _load_for_combine(ref_fp, chunk_lm=chunk_lm)
     if target_size is not None:
         xds = _resample_lm_reference_to_target_size(
@@ -1806,8 +2223,8 @@ def _wcs_header_from_ref_grid_and_source_crval(
     """Build a 2D celestial WCS header from ``ref``'s pixel grid + ``xds``'s CRVAL.
 
     The LM reference defines only the pixel grid (CRPIX/CDELT/CTYPE/projection); the
-    per-time celestial reference (CRVAL1/CRVAL2, FK5 zenith at the source's obs time,
-    stamped by :func:`_fix_headers`) lives on each source FITS. Combining them lets
+    per-time celestial reference (CRVAL1/CRVAL2 from each source FITS header) lives on
+    each source FITS. Combining them lets
     every subband at one time step emit identical ``right_ascension``/``declination``
     while keeping the LM reference's role as a grid-shape template across time steps.
 
@@ -1850,7 +2267,7 @@ def _regrid_to_reference_lm(
 
     Uses linear interpolation in ``(l, m)``. The reference contributes **only the
     pixel grid** (``CRPIX``/``CDELT``/projection); per-time celestial reference
-    (``CRVAL1``/``CRVAL2``, FK5 zenith stamped by :func:`_fix_headers`) is taken from
+    (``CRVAL1``/``CRVAL2`` from the source FITS header) is taken from
     ``xds`` so all subbands at one time step end up with identical
     ``right_ascension``/``declination``. No-op when ``xds`` already matches ``ref``'s
     LM shape **and** ``l``/``m`` index coordinates within tolerance — in that case the
@@ -2124,6 +2541,108 @@ def _harmonize_celestial_coords_independent_of_frequency(
     return out
 
 
+def _parse_discovery_time_key(time_key: str) -> datetime:
+    """Parse ``YYYYMMDD_HHMMSS`` observation keys for temporal distance."""
+    return datetime.strptime(time_key, "%Y%m%d_%H%M%S")
+
+
+def _same_frequency_subband(a: Path, b: Path) -> bool:
+    """True when both paths share the same ``_NNNMHz_`` basename token."""
+    mhz_a = _mhz_from_name(a)
+    mhz_b = _mhz_from_name(b)
+    if mhz_a == 10**9 or mhz_b == 10**9:
+        return False
+    return mhz_a == mhz_b
+
+
+def _beam_keywords_from_path(fp: Path) -> Dict[str, float]:
+    hdr = _getheader_for_ingest(fp)
+    return {k: float(hdr[k]) for k in ("BMAJ", "BMIN", "BPA") if k in hdr}
+
+
+def beam_donor_at_nearby_time(
+    target: Path,
+    time_key: str,
+    by_time: Dict[str, List[Path]],
+    *,
+    freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
+) -> Optional[Path]:
+    """Return a pipeline file at the same frequency with a valid beam at the nearest other time.
+
+    Frequency matching uses the discovery frequency bin (from filename ``_NNNMHz_`` when
+    present). Among other observation times with a usable synthesized beam, the donor
+    with the smallest absolute time delta is chosen.
+    """
+    del freq_bin_hz  # same-frequency matching uses MHz basename tokens
+    target_time = _parse_discovery_time_key(time_key)
+    best: Optional[Tuple[float, Path]] = None
+
+    for other_key, files in by_time.items():
+        if other_key == time_key:
+            continue
+        other_time = _parse_discovery_time_key(other_key)
+        delta_s = abs((other_time - target_time).total_seconds())
+        for fp in files:
+            if not _same_frequency_subband(target, fp):
+                continue
+            if _invalid_beam_reason(_getheader_for_ingest(fp)) is not None:
+                continue
+            if best is None or delta_s < best[0]:
+                best = (delta_s, fp)
+
+    return best[1] if best else None
+
+
+def repair_zero_beam_from_nearby_time(
+    sources: Sequence[Path],
+    unpacked: Sequence[Path],
+    time_key: str,
+    by_time: Dict[str, List[Path]],
+    *,
+    freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
+) -> int:
+    """Copy ``BMAJ``/``BMIN``/``BPA`` from the nearest other time at the same frequency.
+
+    For each source in *sources* whose header has placeholder beam keywords, looks up a
+    donor in *by_time* at a different ``time_key`` but the same MHz subband, then writes
+    the beam into the matching funpack output in *unpacked* (same order as *sources*).
+
+    Returns
+    -------
+    int
+        Number of funpack outputs updated.
+    """
+    if len(sources) != len(unpacked):
+        msg = "sources and unpacked must have the same length"
+        raise ValueError(msg)
+
+    updated = 0
+    for src, out_fits in zip(sources, unpacked, strict=True):
+        if _invalid_beam_reason(_getheader_for_ingest(src)) is None:
+            continue
+        donor = beam_donor_at_nearby_time(
+            src, time_key, by_time, freq_bin_hz=freq_bin_hz
+        )
+        if donor is None:
+            logger.warning(
+                "No nearby-time beam donor at same frequency for %s (time=%s).",
+                src.name,
+                time_key,
+            )
+            continue
+        beam = _beam_keywords_from_path(donor)
+        with fits.open(out_fits, mode="update") as hdul:
+            hdul[0].header.update(beam)
+            hdul.flush()
+        updated += 1
+        logger.info(
+            "Copied synthesized beam from %s (nearest same-frequency time) onto %s.",
+            donor.name,
+            out_fits.name,
+        )
+    return updated
+
+
 def _invalid_beam_reason(header: fits.Header) -> Optional[str]:
     """Return a short reason if the FITS header has no usable synthesized beam, else ``None``.
 
@@ -2242,10 +2761,10 @@ def _filter_invalid_beam_files(
                 n_dropped_files += 1
                 continue
             try:
-                hdr = fits.getheader(fp, ext=0)
+                hdr = _getheader_for_ingest(fp)
             except Exception as exc:
                 logger.warning(
-                    "Skipping %s: could not read primary header to check beam (%s); "
+                    "Skipping %s: could not read image HDU header to check beam (%s); "
                     "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
                     fp.name,
                     exc,
@@ -2281,6 +2800,57 @@ def _filter_invalid_beam_files(
             len(filtered),
         )
     return filtered
+
+
+def _completed_times_in_zarr(
+    out_zarr: Path,
+    *,
+    rebuild: bool,
+) -> tuple[set[str], np.ndarray]:
+    """Return UTC time keys and MJDs already present in *out_zarr*.
+
+    See :func:`_completed_time_keys_in_zarr` for semantics of the key set. The MJD
+    array is the raw ``time`` coordinate (finite values only) for duplicate detection.
+    """
+    if rebuild or not out_zarr.exists():
+        return set(), np.array([], dtype=np.float64)
+    try:
+        existing = xr.open_zarr(str(out_zarr), consolidated=False)
+    except Exception as exc:
+        logger.warning(
+            "Could not open existing Zarr %s to check completed time keys (%s); "
+            "treating all discovered times as new.",
+            out_zarr,
+            exc,
+        )
+        return set(), np.array([], dtype=np.float64)
+    try:
+        if "time" not in existing.coords:
+            return set(), np.array([], dtype=np.float64)
+        time_values = np.atleast_1d(np.asarray(existing["time"].values, dtype=np.float64))
+    finally:
+        existing.close()
+
+    keys: set[str] = set()
+    mjds: list[float] = []
+    for raw in time_values:
+        try:
+            mjd = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(mjd):
+            continue
+        mjds.append(mjd)
+        try:
+            t = Time(mjd, format="mjd", scale="utc")
+            keys.add(t.to_datetime().strftime("%Y%m%d_%H%M%S"))
+        except Exception as exc:
+            logger.debug(
+                "Could not convert existing Zarr time=%r to a time key (%s); ignoring.",
+                raw,
+                exc,
+            )
+    return keys, np.asarray(mjds, dtype=np.float64)
 
 
 def _filter_lst_color_groups_with_mismatched_header_times(
@@ -2372,79 +2942,68 @@ def _completed_time_keys_in_zarr(
     * NaN ``time`` rows (which can appear if a future append step ever writes a
       placeholder row) are ignored rather than producing a spurious key.
     """
-    if rebuild or not out_zarr.exists():
-        return set()
-    try:
-        existing = xr.open_zarr(str(out_zarr), consolidated=False)
-    except Exception as exc:
-        logger.warning(
-            "Could not open existing Zarr %s to check completed time keys (%s); "
-            "treating all discovered times as new.",
-            out_zarr,
-            exc,
-        )
-        return set()
-    try:
-        if "time" not in existing.coords:
-            return set()
-        time_values = np.atleast_1d(np.asarray(existing["time"].values))
-    finally:
-        existing.close()
-
-    keys: set[str] = set()
-    for raw in time_values:
-        try:
-            mjd = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if not np.isfinite(mjd):
-            continue
-        try:
-            t = Time(mjd, format="mjd", scale="utc")
-            keys.add(t.to_datetime().strftime("%Y%m%d_%H%M%S"))
-        except Exception as exc:
-            logger.debug(
-                "Could not convert existing Zarr time=%r to a time key (%s); ignoring.",
-                raw,
-                exc,
-            )
+    keys, _ = _completed_times_in_zarr(out_zarr, rebuild=rebuild)
     return keys
+
+
+def _mjd_matches_completed(mjd: float, completed_mjds: np.ndarray) -> bool:
+    """Return True when *mjd* matches any value in *completed_mjds* (append tolerance)."""
+    if completed_mjds.size == 0:
+        return False
+    return bool(np.any(np.isclose(completed_mjds, mjd, rtol=1e-12, atol=1e-9)))
 
 
 def _header_time_key_for_files(files: Sequence[Path]) -> Optional[str]:
     """Return the ``DATE-OBS`` time key for the first file in a discovery group."""
+    header = _ingest_header_for_files(files)
+    if header is None:
+        return None
+    return _time_key_from_header(header)
+
+
+def _mjd_for_files(files: Sequence[Path]) -> float | None:
+    """Return the observation MJD for the first file in a discovery group."""
+    header = _ingest_header_for_files(files)
+    if header is None:
+        return None
+    return _mjd_from_header(header)
+
+
+def _ingest_header_for_files(files: Sequence[Path]) -> fits.Header | None:
+    """Read the image HDU header used for ingest/resume checks."""
     if not files:
         return None
     try:
-        header = fits.getheader(files[0], ext=0)
-    except OSError as exc:
+        return _getheader_for_ingest(files[0])
+    except Exception as exc:
         logger.debug(
-            "Could not read header from %s for resume header-key lookup (%s).",
+            "Could not read ingest header from %s for resume lookup (%s).",
             files[0],
             exc,
         )
         return None
-    return _time_key_from_header(header)
 
 
 def _discovery_time_key_completed_in_zarr(
     discovery_key: str,
     files: Sequence[Path],
-    completed: set[str],
+    completed_keys: set[str],
+    completed_mjds: np.ndarray,
 ) -> bool:
-    """Return whether a discovered time key is already represented in *completed*.
+    """Return whether a discovered time key is already represented in the Zarr store.
 
     Discovery often groups by the filename ``-image-YYYYMMDD_HHMMSS`` stamp while
     ``xradio`` writes the Zarr ``time`` coordinate from ``DATE-OBS`` in the FITS
-    header. Those strings differ by a systematic offset on OVRO-LWA products, so a
-    straight set intersection would treat every row as new and re-dewarp already
-    written observations. When the header key for the group is already in the store,
-    treat the filename discovery key as complete as well.
+    header. Those strings can differ on OVRO-LWA products, so resume also matches
+    ``DATE-OBS`` keys and MJDs from the image HDU (not the empty fpacked primary).
     """
-    if discovery_key in completed:
+    if discovery_key in completed_keys:
         return True
     header_key = _header_time_key_for_files(files)
-    return bool(header_key and header_key in completed)
+    if header_key and header_key in completed_keys:
+        return True
+    mjd = _mjd_for_files(files)
+    return mjd is not None and _mjd_matches_completed(mjd, completed_mjds)
 
 
 def _filter_completed_time_keys(
@@ -2483,31 +3042,39 @@ def _filter_completed_time_keys(
     Dict[str, List[Path]]
         Same shape as *by_time* but with already-completed time keys removed.
     """
-    completed = _completed_time_keys_in_zarr(out_zarr, rebuild=rebuild)
-    if not completed:
+    completed_keys, completed_mjds = _completed_times_in_zarr(out_zarr, rebuild=rebuild)
+    if not completed_keys and completed_mjds.size == 0:
         return by_time
     skipped_exact: list[str] = []
     skipped_header_alias: list[str] = []
+    skipped_mjd: list[str] = []
     remaining: Dict[str, List[Path]] = {}
     for discovery_key, files in by_time.items():
-        if not _discovery_time_key_completed_in_zarr(discovery_key, files, completed):
+        if not _discovery_time_key_completed_in_zarr(
+            discovery_key, files, completed_keys, completed_mjds
+        ):
             remaining[discovery_key] = files
             continue
-        if discovery_key in completed:
+        if discovery_key in completed_keys:
             skipped_exact.append(discovery_key)
         else:
-            skipped_header_alias.append(discovery_key)
-    skipped_total = len(skipped_exact) + len(skipped_header_alias)
+            header_key = _header_time_key_for_files(files)
+            if header_key and header_key in completed_keys:
+                skipped_header_alias.append(discovery_key)
+            else:
+                skipped_mjd.append(discovery_key)
+    skipped_total = len(skipped_exact) + len(skipped_header_alias) + len(skipped_mjd)
     if not skipped_total:
         return by_time
     logger.info(
         "[%s] Resume from %s: %d time key(s) already present (%d by discovery key, "
-        "%d by FITS header time), %d remaining to process.",
+        "%d by DATE-OBS key, %d by MJD), %d remaining to process.",
         context,
         out_zarr,
         skipped_total,
         len(skipped_exact),
         len(skipped_header_alias),
+        len(skipped_mjd),
         len(remaining),
     )
     if skipped_exact:
@@ -2521,6 +3088,12 @@ def _filter_completed_time_keys(
             "[%s] Skipping discovery keys whose DATE-OBS is already in Zarr: %s",
             context,
             ", ".join(sorted(skipped_header_alias)),
+        )
+    if skipped_mjd:
+        logger.debug(
+            "[%s] Skipping discovery keys whose observation MJD is already in Zarr: %s",
+            context,
+            ", ".join(sorted(skipped_mjd)),
         )
     return remaining
 
@@ -2760,90 +3333,93 @@ def _combine_time_step(
 
     xds_list: List[xr.Dataset] = []
     freqs_seen: List[float] = []
-    for fp in fixed_paths:
-        xds = _load_for_combine(fp, chunk_lm=chunk_lm)
-        xds = _assign_canonical_frequency_for_stack(
-            xds,
-            fp,
-            group_metadata_source=group_metadata_source,
-            filename_convention=filename_convention,
-        )
-        fvals = np.atleast_1d(xds.frequency.values)
-        freqs_seen.extend([float(f) for f in fvals])
-        xds_list.append(xds)
-
-    lm_shapes = [_lm_shape(xds) for xds in xds_list]
-    reference_idx = _select_reference_shape_index(lm_shapes)
-    unique_shapes = sorted(set(lm_shapes))
-
-    if lm_reference_ds is not None:
-        ref_ds = lm_reference_ds
-        if len(unique_shapes) > 1 or any(_lm_shape(xds) != _lm_shape(ref_ds) for xds in xds_list):
-            logger.info(
-                "Using global LM reference grid (l,m)=%s; this time step shapes: %s",
-                _lm_shape(ref_ds),
-                unique_shapes,
-            )
-    else:
-        ref_ds = xds_list[reference_idx]
-        if len(unique_shapes) > 1:
-            logger.info(
-                "Detected mixed LM shapes %s; selected reference shape %s from %s",
-                unique_shapes,
-                lm_shapes[reference_idx],
-                fixed_paths[reference_idx].name,
-            )
-    for i, xds in enumerate(xds_list):
-        if _lm_shape(xds) != _lm_shape(ref_ds):
-            logger.info(
-                "Regridding %s from LM shape %s onto reference %s",
-                fixed_paths[i].name,
-                _lm_shape(xds),
-                _lm_shape(ref_ds),
-            )
-        xds_list[i] = _regrid_to_reference_lm(xds, ref_ds, source_label=str(fixed_paths[i]))
-
     try:
-        xds_t = xr.combine_by_coords(
-            xds_list,
-            combine_attrs="drop",
-            data_vars="minimal",
-            coords="minimal",
-            compat="no_conflicts",
-        )
-    except Exception:
-        # Fallback requires each subband to have frequency size == 1
-        for ds in xds_list:
-            if "frequency" in ds.dims and ds.sizes["frequency"] != 1:
-                msg = "A subband has frequency dimension != 1; cannot concat."
-                raise RuntimeError(msg)
-        xds_t = xr.concat(xds_list, dim="frequency")
-
-    if "frequency" in xds_t.coords:
-        fv = np.asarray(xds_t["frequency"].values, dtype=np.float64).ravel()
-        if fv.size > 1 and len(np.unique(fv)) < len(fv):
-            names = ", ".join(p.name for p in fixed_paths)
-            msg = (
-                "Duplicate ``frequency`` coordinate values after stacking subbands for one "
-                "time step (``xarray`` cannot sort or write this). Usually dewarped FITS share "
-                "the same RESTFREQ/CRVAL3 while basenames omit distinct ``_NNNMHz_`` tags. "
-                f"Files: {names}"
+        for fp in fixed_paths:
+            xds = _load_for_combine(fp, chunk_lm=chunk_lm)
+            xds = _assign_canonical_frequency_for_stack(
+                xds,
+                fp,
+                group_metadata_source=group_metadata_source,
+                filename_convention=filename_convention,
             )
-            raise RuntimeError(msg)
-        xds_t = xds_t.sortby("frequency")
-    if "time" in xds_t.coords:
-        xds_t = xds_t.sortby("time")
+            fvals = np.atleast_1d(xds.frequency.values)
+            freqs_seen.extend([float(f) for f in fvals])
+            xds_list.append(xds)
 
-    xds_t.attrs = {}
-    for v in xds_t.data_vars:
-        xds_t[v].encoding = {}
+        lm_shapes = [_lm_shape(xds) for xds in xds_list]
+        reference_idx = _select_reference_shape_index(lm_shapes)
+        unique_shapes = sorted(set(lm_shapes))
 
-    xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
-    xds_t = _collapse_wcs_header_str_variable(xds_t)
+        if lm_reference_ds is not None:
+            ref_ds = lm_reference_ds
+            if len(unique_shapes) > 1 or any(_lm_shape(xds) != _lm_shape(ref_ds) for xds in xds_list):
+                logger.info(
+                    "Using global LM reference grid (l,m)=%s; this time step shapes: %s",
+                    _lm_shape(ref_ds),
+                    unique_shapes,
+                )
+        else:
+            ref_ds = xds_list[reference_idx]
+            if len(unique_shapes) > 1:
+                logger.info(
+                    "Detected mixed LM shapes %s; selected reference shape %s from %s",
+                    unique_shapes,
+                    lm_shapes[reference_idx],
+                    fixed_paths[reference_idx].name,
+                )
+        for i, xds in enumerate(xds_list):
+            if _lm_shape(xds) != _lm_shape(ref_ds):
+                logger.info(
+                    "Regridding %s from LM shape %s onto reference %s",
+                    fixed_paths[i].name,
+                    _lm_shape(xds),
+                    _lm_shape(ref_ds),
+                )
+            xds_list[i] = _regrid_to_reference_lm(xds, ref_ds, source_label=str(fixed_paths[i]))
 
-    xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
+        try:
+            xds_t = xr.combine_by_coords(
+                xds_list,
+                combine_attrs="drop",
+                data_vars="minimal",
+                coords="minimal",
+                compat="no_conflicts",
+            )
+        except Exception:
+            # Fallback requires each subband to have frequency size == 1
+            for ds in xds_list:
+                if "frequency" in ds.dims and ds.sizes["frequency"] != 1:
+                    msg = "A subband has frequency dimension != 1; cannot concat."
+                    raise RuntimeError(msg)
+            xds_t = xr.concat(xds_list, dim="frequency")
 
-    return xds_t, sorted(set(freqs_seen)), created_fixed_paths
+        if "frequency" in xds_t.coords:
+            fv = np.asarray(xds_t["frequency"].values, dtype=np.float64).ravel()
+            if fv.size > 1 and len(np.unique(fv)) < len(fv):
+                names = ", ".join(p.name for p in fixed_paths)
+                msg = (
+                    "Duplicate ``frequency`` coordinate values after stacking subbands for one "
+                    "time step (``xarray`` cannot sort or write this). Usually dewarped FITS share "
+                    "the same RESTFREQ/CRVAL3 while basenames omit distinct ``_NNNMHz_`` tags. "
+                    f"Files: {names}"
+                )
+                raise RuntimeError(msg)
+            xds_t = xds_t.sortby("frequency")
+        if "time" in xds_t.coords:
+            xds_t = xds_t.sortby("time")
+
+        xds_t.attrs = {}
+        for v in xds_t.data_vars:
+            xds_t[v].encoding = {}
+
+        xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
+        xds_t = _collapse_wcs_header_str_variable(xds_t)
+
+        xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
+
+        return xds_t, sorted(set(freqs_seen)), created_fixed_paths
+    finally:
+        _clear_sky_coord_cache()
 
 
 def _rechunk_nonuniform_aux_vars_for_zarr(xds: xr.Dataset) -> xr.Dataset:
@@ -3120,13 +3696,14 @@ def _write_or_append_zarr(
     first_write: bool,
     *,
     chunk_lm: int,
+    overwrite_existing_time: bool = False,
 ) -> None:
     """Write or append one time step to a Zarr store without re-writing existing times.
 
     First write replaces any existing store at *out_zarr* when *first_write* is True.
     Append uses ``to_zarr(..., mode='a', append_dim='time')``. If the new step's
-    ``time`` already exists in the store (e.g. resume repair), that row is
-    overwritten via a region write (``keep='last'`` semantics).
+    ``time`` already exists in the store, the write is skipped unless
+    *overwrite_existing_time* is True (in which case that row is replaced in-place).
     """
     from shutil import rmtree
 
@@ -3145,6 +3722,10 @@ def _write_or_append_zarr(
         to_write = to_write.sortby("time")
     if "frequency" in to_write.coords:
         to_write = to_write.sortby("frequency")
+
+    from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
+
+    to_write = strip_redundant_fits_wcs_header_attrs(to_write)
 
     if first_write or not out_zarr.exists():
         if out_zarr.exists():
@@ -3172,6 +3753,14 @@ def _write_or_append_zarr(
             dup_idx = i
 
     if dup_idx is not None:
+        if not overwrite_existing_time:
+            logger.info(
+                "Skipping write: time row %d (MJD %.8f) already present in %s.",
+                dup_idx,
+                new_t,
+                out_zarr,
+            )
+            return
         logger.info(
             "Overwriting existing time row %d (MJD %.8f) in %s; n_time will not grow.",
             dup_idx,
@@ -3234,6 +3823,7 @@ def convert_fits_dir_to_zarr(
     time_key_source: Literal["header", "filename"] = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
     consolidate_metadata_at_end: bool = True,
+    global_frequency_coord_hz: np.ndarray | None = None,
 ) -> Path:
     """Convert all matching FITS in a directory into a single LM-only Zarr store.
 
@@ -3294,10 +3884,16 @@ def convert_fits_dir_to_zarr(
         pending time steps in this run are written (or when resume finds nothing
         left to do). Set False for intermediate per-time calls (e.g. dewarp
         append-each-time) and consolidate once after the full batch.
+    global_frequency_coord_hz
+        If set, use this sorted Hz coordinate for the store's ``frequency`` axis
+        on the first write instead of inferring it only from FITS discovered in
+        *input_dir*. Use when converting one time group at a time but the axis
+        must reflect all subbands across the full observation set.
     resume
         When True (default) and *rebuild* is False, skip time keys already present in
         an existing output Zarr via :func:`_filter_completed_time_keys`. Set False to
-        reprocess every discovered time (overwriting rows with the same MJD).
+        reprocess every discovered time (duplicate MJDs are skipped on write unless
+        ``overwrite_existing_time=True``).
 
     After discovery, files whose primary FITS header is missing or has a zero/negative
     ``BMAJ``/``BMIN`` are dropped via :func:`_filter_invalid_beam_files`. Their
@@ -3316,8 +3912,8 @@ def convert_fits_dir_to_zarr(
     ``resume=False`` to reprocess every discovered time. Use ``rebuild=True`` to
     replace the entire Zarr store. If every discovered time key is already present,
     the function returns the existing Zarr path without writing.
-    :func:`_write_or_append_zarr` overwrites an existing ``time`` row in-place when
-    the same MJD timestamp is written again (``keep='last'`` semantics).
+  :func:`_write_or_append_zarr` skips a write when the same MJD is already in the
+    store (default). Pass ``overwrite_existing_time=True`` to replace that row in-place.
 
     Within each observation time step, after subbands are stacked along ``frequency``,
     ``right_ascension`` / ``declination`` are reduced to a single ``(l, m)`` celestial
@@ -3419,6 +4015,14 @@ def convert_fits_dir_to_zarr(
         logger.info(
             "Using frequency axis from existing Zarr (%d channel(s)).",
             int(freq_coord_hz.size),
+        )
+    elif global_frequency_coord_hz is not None:
+        freq_coord_hz = np.asarray(global_frequency_coord_hz, dtype=np.float64)
+        logger.info(
+            "Using precomputed global frequency axis (%d channel(s), %.3f–%.3f MHz).",
+            int(freq_coord_hz.size),
+            float(np.min(freq_coord_hz)) / 1e6,
+            float(np.max(freq_coord_hz)) / 1e6,
         )
     else:
         freq_coord_hz = _global_frequency_coord_hz(

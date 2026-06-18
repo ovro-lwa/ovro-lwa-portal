@@ -61,9 +61,17 @@ def prepare_ingest_time_groups(
     resume: bool = True,
     require_73mhz: bool = False,
     context: str = "convert",
+    filter_invalid_beam: bool = True,
 ) -> Dict[str, List[Path]]:
-    """Apply truncation/beam validity, optional 73 MHz, and optional resume filters."""
-    filtered = _filter_invalid_beam_files(by_time)
+    """Apply truncation/beam validity, optional 73 MHz, and optional resume filters.
+
+    Set ``filter_invalid_beam=False`` when a downstream step repairs placeholder
+    ``BMAJ``/``BMIN`` (e.g. per-time funpack + nearby-time beam copy) before convert.
+    """
+    if filter_invalid_beam:
+        filtered = _filter_invalid_beam_files(by_time)
+    else:
+        filtered = dict(by_time)
     if require_73mhz:
         from ovro_lwa_portal.ingest.dewarp_convert import (
             _filter_time_groups_without_cascade_reference,

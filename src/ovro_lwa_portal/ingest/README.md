@@ -225,35 +225,53 @@ The resulting Zarr store contains:
   - `right_ascension`, `declination`: 2D celestial coordinates (degrees,
     FK5/J2000)
 - **Data Variables**: Intensity values (e.g., `SKY`, `BEAM`)
-- **Metadata**: WCS header for FITS-free plotting
+- **Metadata**: Per-time celestial WCS in `wcs_header_str(time)` (see below)
+
+### WCS metadata in the Zarr store
+
+Snapshot ingest stores **one FITS WCS header per time step** (zenith-tracking;
+`CRVAL1`/`CRVAL2` change with time). The canonical on-disk field is the data
+variable **`wcs_header_str`**, indexed by `time` (sometimes `(time, frequency)`
+before collapse).
+
+**Do not rely on `fits_wcs_header` in `SKY.attrs` or dataset attrs** on
+multi-time stores: Zarr array metadata is written once per array and would
+freeze the time-0 phase center after incremental append. Before every Zarr
+write/append and on load, the library strips those attrs when `wcs_header_str`
+is present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called
+from `_write_or_append_zarr` and `open_dataset`). See **Per-Time WCS and CRVAL**
+in `AGENTS.md`.
+
+Audit per-time CRVAL drift:
+
+```bash
+pixi run python scripts/audit_zarr_wcs_timeline.py /path/to/store.zarr
+```
 
 ### Reading the Output
 
 ```python
-import xarray as xr
+import ovro_lwa_portal as ovro
 
-# Load the Zarr store
-ds = xr.open_zarr("/path/to/output/ovro_lwa_full_lm_only.zarr")
+# Prefer open_dataset (strips stale fits_wcs_header attrs on legacy stores)
+ds = ovro.open_dataset("/path/to/output/ovro_lwa_full_lm_only.zarr")
 
-# Access data
 print(ds)
 print(f"Time range: {ds.time.values[0]} to {ds.time.values[-1]}")
 print(f"Frequency range: {ds.frequency.values.min():.2e} to {ds.frequency.values.max():.2e} Hz")
 
+# WCS for one time index (required when the store has multiple times)
+time_idx = 0
+wcs = ds.radport._get_wcs(time_idx=time_idx)
+
 # Plot with WCS coordinates
 import matplotlib.pyplot as plt
-from astropy.wcs import WCS
 
-# Reconstruct WCS from stored header
-wcs_header_str = ds.attrs.get('fits_wcs_header') or ds.wcs_header_str.item().decode('utf-8')
-wcs = WCS(wcs_header_str)
-
-# Create WCS-aware plot
 fig = plt.figure()
 ax = fig.add_subplot(111, projection=wcs)
-ax.imshow(ds.SKY.isel(time=0, frequency=0, polarization=0).values)
-ax.set_xlabel('RA')
-ax.set_ylabel('Dec')
+ax.imshow(ds.SKY.isel(time=time_idx, frequency=0, polarization=0).values)
+ax.set_xlabel("RA")
+ax.set_ylabel("Dec")
 plt.show()
 ```
 
@@ -290,6 +308,21 @@ plt.show()
 - Check FITS headers for consistent NAXIS1, NAXIS2, CDELT1, CDELT2, CRPIX1,
   CRPIX2
 
+### Sky view or maps stuck at time-0 coordinates
+
+**Symptoms:** RA/Dec grid or source tracking looks correct at the first time
+step but not when stepping through a multi-time incremental store.
+
+**Cause:** Reading `SKY.attrs["fits_wcs_header"]` or
+`ds.attrs["fits_wcs_header"]` from a legacy Zarr (time-0 only), or plotting
+without selecting `time_idx`.
+
+**Solution:** Load with `ovro_lwa_portal.open_dataset`, use
+`ds.radport._get_wcs(time_idx=…)` / `_read_wcs_header_str(ds, time_idx=…)`, and
+for SkyWidget call `_patch_astrowidget_get_wcs()` before `update_slice`. New
+ingest from current `fits_to_zarr_xradio` does not persist misleading
+`fits_wcs_header` attrs.
+
 ### Memory Issues
 
 For very large datasets, reduce memory usage:
@@ -325,9 +358,13 @@ When contributing to the ingest module:
 3. Write tests for new features
 4. Update this README for user-facing changes
 5. Ensure core logic remains framework-independent
+6. For WCS/Zarr metadata changes, update `AGENTS.md` (Per-Time WCS) and
+   `specs/001-build-an-ingest/data-model.md` in the same PR
 
 ## References
 
+- [AGENTS.md — Per-Time WCS and CRVAL](../../../AGENTS.md) (canonical metadata
+  rules)
 - [OVRO-LWA Portal Documentation](https://github.com/uw-ssec/ovro-lwa-portal)
 - [xradio Documentation](https://xradio.readthedocs.io/)
 - [Zarr Documentation](https://zarr.readthedocs.io/)

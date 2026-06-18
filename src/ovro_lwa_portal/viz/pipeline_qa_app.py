@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +36,7 @@ from ovro_lwa_portal.viz.pipeline_qa import (
     convert_button_label,
     convert_missing_zarr,
     day_summary_table,
+    load_dewarp_summary_dataframe,
     load_flux_check_hybrid_dataframe,
     load_qa_datasets,
     qa_days,
@@ -42,6 +45,7 @@ from ovro_lwa_portal.viz.pipeline_qa import (
     zarr_status,
 )
 from ovro_lwa_portal.accessor import _has_per_time_wcs_header_str, _read_wcs_header_str
+from ovro_lwa_portal.viz.dewarp_summary_plots import build_dewarp_shift_panel
 from ovro_lwa_portal.viz.flux_check_plots import (
     build_flux_ratio_figures,
     build_flux_ratio_panel_grid,
@@ -87,6 +91,17 @@ def _patch_astrowidget_get_wcs() -> None:
 
 _patch_astrowidget_get_wcs()
 
+
+def bind_sky_widget_dataset(
+    widget: SkyWidget,
+    dataset: xr.Dataset,
+    *,
+    max_size: int = 1024,
+) -> None:
+    """Load the SKY cube without displaying; call :meth:`~astrowidget.SkyWidget.update_slice` next."""
+    widget.set_dataset(dataset, max_size=max_size, defer_display=True)
+
+
 logger = logging.getLogger(__name__)
 
 ZENITH_L = 0.0
@@ -97,39 +112,227 @@ DEFAULT_FOV_DEG = 25.0
 THERMAL_NOISE_GRID_COLS = 4
 
 
-def _schedule_ipython_main(callback: Callable[[], None]) -> None:
-    """Run callback on the IPython kernel event loop."""
+_IPYTHON_IO_LOOP: Any = None
+_PENDING_MAIN_CALLBACKS: list[Callable[[], None]] = []
+_PENDING_MAIN_LOCK = threading.Lock()
+_ONLOAD_FLUSH_REGISTERED = False
+_NOTEBOOK_UI_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "_NOTEBOOK_UI_DEPTH",
+    default=0,
+)
+_AFTER_HOLD_CALLBACKS: contextvars.ContextVar[list[Callable[[], None]] | None] = (
+    contextvars.ContextVar("_AFTER_HOLD_CALLBACKS", default=None)
+)
+DEFAULT_NOTEBOOK_UI_MAX_ATTEMPTS = 50
+
+
+def notebook_ui_hold_active() -> bool:
+    """True while inside :func:`dispatch_notebook_ui` / :func:`hold_and_push`."""
+    return _NOTEBOOK_UI_DEPTH.get() > 0
+
+
+def defer_after_notebook_hold(callback: Callable[[], None]) -> None:
+    """Run ``callback`` after the active :func:`hold_and_push` cycle completes.
+
+    Bokeh heatmap figure swaps and coordinate-field Jupiter pushes must not run
+    inside ``doc.hold('combine')`` — assign + push is lost or never reaches the
+    browser. Queue those updates here when a hold queue is active; otherwise
+    run on the kernel io_loop in Jupyter or inline in headless tests.
+    """
+    queue = _AFTER_HOLD_CALLBACKS.get()
+    if queue is not None:
+        queue.append(callback)
+    else:
+        _run_after_hold(callback)
+
+
+def _is_jupyter_kernel_context() -> bool:
+    try:
+        from panel.io.state import state
+
+        return bool(getattr(state, "_jupyter_kernel_context", False))
+    except Exception:
+        return False
+
+
+def _run_after_hold(callback: Callable[[], None]) -> None:
+    """Flush after-hold work on the kernel io_loop (Jupyter) or inline (tests)."""
+    if _IPYTHON_IO_LOOP is not None or _is_jupyter_kernel_context():
+        _schedule_ipython_main(callback)
+    else:
+        callback()
+
+
+def _resolve_ipython_event_loop() -> Any:
+    """Return the IPython kernel event loop when running inside Jupyter."""
+    global _IPYTHON_IO_LOOP
+    if _IPYTHON_IO_LOOP is not None:
+        return _IPYTHON_IO_LOOP
     try:
         from IPython import get_ipython
 
         ip = get_ipython()
         kernel = getattr(ip, "kernel", None) if ip is not None else None
-        io_loop = getattr(kernel, "io_loop", None) if kernel is not None else None
-        if io_loop is not None:
-            io_loop.add_callback(callback)
-            return
+        if kernel is not None:
+            loop = getattr(kernel, "io_loop", None)
+            if loop is not None:
+                _IPYTHON_IO_LOOP = loop
+                return loop
     except Exception:
         pass
-    callback()
+    try:
+        from tornado.ioloop import IOLoop
+
+        loop = IOLoop.current()
+        if loop is not None:
+            return loop
+    except Exception:
+        pass
+    return None
+
+
+def _capture_ipython_io_loop() -> None:
+    """Cache the IPython kernel event loop from the main thread.
+
+    Background worker threads cannot call ``get_ipython()`` reliably in
+    Jupyter. Call this once from a notebook setup cell (after imports), and
+    again when a Panel layout is first shown.
+    """
+    _resolve_ipython_event_loop()
+    _ensure_panel_onload_flush()
+
+
+def _ensure_panel_onload_flush() -> None:
+    """Drain queued UI callbacks once the embedded Panel comm is ready."""
+    global _ONLOAD_FLUSH_REGISTERED
+    if _ONLOAD_FLUSH_REGISTERED:
+        return
+    _ONLOAD_FLUSH_REGISTERED = True
+    try:
+        if pn.state.loaded:
+            _schedule_ipython_main(_flush_pending_main_callbacks)
+        else:
+            pn.state.onload(lambda: _schedule_ipython_main(_flush_pending_main_callbacks))
+    except Exception:
+        logger.debug("Could not register Panel onload flush", exc_info=True)
+
+
+def _enqueue_pending_main(callback: Callable[[], None]) -> None:
+    with _PENDING_MAIN_LOCK:
+        _PENDING_MAIN_CALLBACKS.append(callback)
+    _ensure_panel_onload_flush()
+
+
+def _flush_pending_main_callbacks() -> None:
+    """Run UI callbacks that could not be scheduled from worker threads."""
+    with _PENDING_MAIN_LOCK:
+        pending = list(_PENDING_MAIN_CALLBACKS)
+        _PENDING_MAIN_CALLBACKS.clear()
+    for callback in pending:
+        try:
+            callback()
+        except Exception as exc:
+            logger.debug("Pending notebook UI callback failed: %s", exc, exc_info=True)
+
+
+def _schedule_on_event_loop(loop: Any, callback: Callable[[], None]) -> bool:
+    """Schedule ``callback`` on a Tornado or asyncio event loop."""
+    add_callback = getattr(loop, "add_callback", None)
+    if add_callback is not None:
+        try:
+            add_callback(callback)
+            return True
+        except Exception:
+            pass
+    call_soon_threadsafe = getattr(loop, "call_soon_threadsafe", None)
+    if call_soon_threadsafe is not None:
+        try:
+            call_soon_threadsafe(callback)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _schedule_ipython_main(callback: Callable[[], None]) -> None:
+    """Run callback on the IPython kernel event loop.
+
+    Never executes inline on a background worker thread: Panel/Bokeh comm
+    updates from workers are silently dropped by the browser.
+    """
+    loop = _resolve_ipython_event_loop()
+    if loop is not None and _schedule_on_event_loop(loop, callback):
+        return
+    if threading.current_thread() is threading.main_thread():
+        callback()
+        _flush_pending_main_callbacks()
+        return
+    _enqueue_pending_main(callback)
+
+
+def schedule_when_panel_loaded(callback: Callable[[], None]) -> None:
+    """Run ``callback`` after the embedded Panel layout comm is ready."""
+    _capture_ipython_io_loop()
+
+    def _run() -> None:
+        callback()
+        _flush_pending_main_callbacks()
+
+    if pn.state.loaded:
+        _schedule_ipython_main(_run)
+    else:
+        pn.state.onload(_run)
+
+
+def configure_pipeline_qa_notebook() -> None:
+    """One-time notebook setup for ``display_pipeline_qa_app`` (phase1/phase2 QA).
+
+    Captures the kernel ``io_loop``, patches astrowidget WCS lookup, and loads
+    Panel extensions. Safe to call once per kernel before displaying the dashboard.
+    """
+    _patch_astrowidget_get_wcs()
+    try:
+        pn.extension("tabulator", "ipywidgets")
+    except Exception:
+        try:
+            pn.extension("tabulator")
+        except Exception as exc:
+            logger.debug("Panel tabulator extension unavailable: %s", exc)
+    _capture_ipython_io_loop()
 
 
 def _run_on_main_thread(callback: Callable[[], None]) -> None:
-    """Run a callback on the active notebook/UI thread when possible."""
+    """Run a callback on the IPython/Panel notebook UI thread.
+
+    Background worker threads must not call :func:`pn.state.execute` directly:
+    without an active Bokeh ``curdoc`` Panel runs the callback inline on the
+    worker, so Param/HTML/Bokeh updates never reach the notebook comm. Schedule
+    those callbacks on the IPython ``io_loop`` instead.
+
+    When a Bokeh heatmap tap handler runs with ``state.curdoc`` set, use
+    :func:`pn.state.execute` so the document lock is acquired before Param
+    widgets elsewhere in the layout are updated.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        _schedule_ipython_main(callback)
+        return
     try:
         from panel.io.state import state
 
-        if state.curdoc is not None:
-            callback()
+        doc = state.curdoc
+        if doc is not None and doc.session_context is not None:
+            state.execute(callback)
             return
     except Exception:
         pass
-    try:
-        pn.state.execute(callback)
-    except Exception:
-        _schedule_ipython_main(callback)
+    _schedule_ipython_main(callback)
 
 
-def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
+def _push_panel_layout(
+    *views: pn.viewable.Viewable,
+    _retry: bool = True,
+    _force: bool = False,
+) -> None:
     """Push Panel layout changes to the notebook frontend."""
     try:
         from panel.io.notebook import push, push_on_root
@@ -148,7 +351,7 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
             _viewable, root, doc, comm = state._views[ref]
             if comm and "embedded" not in root.tags:
                 doc_id = id(doc)
-                if doc_id in pushed_docs:
+                if doc_id in pushed_docs and not _force:
                     continue
                 try:
                     push(doc, comm)
@@ -161,6 +364,398 @@ def _push_panel_layout(*views: pn.viewable.Viewable) -> None:
                     pushed_roots.add(ref)
                 except Exception as exc:
                     logger.debug("Panel push_on_root failed: %s", exc, exc_info=True)
+
+    if _retry and views and not pushed_docs and not pushed_roots:
+        # Models may not be registered yet (e.g. first Bokeh heatmap assign from a
+        # worker-thread callback that ran before the notebook comm was ready).
+        pending = views
+
+        def _retry_push() -> None:
+            _push_panel_layout(*pending, _retry=False)
+
+        _schedule_ipython_main(_retry_push)
+
+
+def _iter_panel_viewables(view: pn.viewable.Viewable) -> Iterator[pn.viewable.Viewable]:
+    """Yield ``view`` and every nested Panel viewable child."""
+    yield view
+    objects = getattr(view, "objects", None)
+    if not objects:
+        return
+    for child in objects:
+        if isinstance(child, pn.viewable.Viewable):
+            yield from _iter_panel_viewables(child)
+
+
+def _notebook_doc_comms(*views: pn.viewable.Viewable) -> dict[int, tuple[Any, Any]]:
+    """Return unique ``(doc, comm)`` pairs registered for notebook ``views``."""
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return {}
+
+    docs: dict[int, tuple[Any, Any]] = {}
+    for view in views:
+        for panel_view in _iter_panel_viewables(view):
+            for ref in getattr(panel_view, "_models", {}) or {}:
+                if ref not in state._views:
+                    continue
+                _viewable, root, doc, comm = state._views[ref]
+                if comm and "embedded" not in root.tags:
+                    docs[id(doc)] = (doc, comm)
+    return docs
+
+
+def notebook_views_registered(*views: pn.viewable.Viewable) -> bool:
+    """True when at least one view has a live notebook comm in ``state._views``."""
+    return bool(_notebook_doc_comms(*views))
+
+
+def _primary_notebook_ref(*views: pn.viewable.Viewable) -> str | None:
+    """Return the first ``state._views`` ref found walking nested ``views``."""
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return None
+    for view in views:
+        for panel_view in _iter_panel_viewables(view):
+            for ref in getattr(panel_view, "_models", {}) or {}:
+                if ref in state._views:
+                    return ref
+    return None
+
+
+def _is_panel_layout_container(view: pn.viewable.Viewable) -> bool:
+    """True for Column/Row-like containers that must not be widget-synced wholesale."""
+    if isinstance(view, pn.pane.IPyWidget):
+        return False
+    if callable(getattr(view, "_update_object", None)):
+        return False
+    return hasattr(view, "objects")
+
+
+def _sync_all_notebook_views(*views: pn.viewable.Viewable) -> None:
+    """Force-sync every nested Panel viewable (except ipywidgets) to the notebook."""
+    for view in views:
+        for panel_view in _iter_panel_viewables(view):
+            if isinstance(panel_view, pn.pane.IPyWidget):
+                continue
+            if _is_panel_layout_container(panel_view):
+                continue
+            sync_pane_to_notebook(panel_view, *views)
+
+
+def sync_widget_to_notebook(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    changes: Mapping[str, Any] | None = None,
+) -> None:
+    """Force-sync a Panel widget model without calling ``push``.
+
+    Widgets (``AutocompleteInput``, ``LoadingSpinner``, …) use ``_update_model``,
+    not ``_update_object``. :func:`sync_pane_to_notebook` cannot sync them; call
+    this helper inside :func:`hold_and_push` instead.
+    """
+    if not getattr(widget, "_models", None):
+        return
+    layout_ref = _primary_notebook_ref(*root_views)
+    if layout_ref is None:
+        return
+    process_change = getattr(widget, "_process_param_change", None)
+    update_model = getattr(widget, "_update_model", None)
+    if not callable(process_change) or not callable(update_model):
+        return
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return
+    if changes is None:
+        changes = {
+            name: getattr(widget, name)
+            for name in getattr(widget, "_synced_params", ())
+            if name in widget.param
+        }
+    if not changes:
+        return
+    try:
+        msg = process_change(dict(changes))
+    except Exception:  # noqa: BLE001
+        logger.debug("Notebook widget param sync failed for %r", widget, exc_info=True)
+        return
+    if not msg:
+        return
+    # BooleanIndicator._update_model returns immediately when ``events`` is empty,
+    # so LoadingSpinner never gets the ``spin`` CSS class in the browser.
+    synthetic_events = {
+        name: param.parameterized.Event(
+            "changed",
+            name,
+            widget,
+            type(widget),
+            None,
+            changes[name],
+            "changed",
+        )
+        for name in changes
+    }
+    _viewable, root, doc, comm = state._views[layout_ref]
+    for ref, (model, _parent) in widget._models.copy().items():
+        try:
+            update_model(synthetic_events, msg, root, model, doc, comm)
+        except Exception:  # noqa: BLE001
+            logger.debug("Notebook widget model sync failed for %r", widget, exc_info=True)
+
+
+def sync_pane_to_notebook(
+    pane: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Force-sync a nested pane's Bokeh model through the layout document comm.
+
+    Nested panes (``pn.pane.HTML`` inside a ``Column``) often have model refs
+    that are **not** registered in ``state._views`` even though the layout root
+    is. Panel's ``_update_pane`` then skips the update and ``push`` diffs an
+    empty event list — Python state changes but the browser UI freezes.
+
+    Panel **widgets** (``AutocompleteInput``, ``LoadingSpinner``) have no
+    ``_update_object``; use :func:`sync_widget_to_notebook` for those.
+
+    Call while :func:`hold_and_push` is active (inside
+    :func:`dispatch_notebook_ui`). Uses the registered layout root from
+    :func:`_primary_notebook_ref` to invoke ``pane._update_object(...)`` directly.
+    """
+    if not getattr(pane, "_models", None):
+        return
+    if _is_panel_layout_container(pane):
+        return
+    layout_ref = _primary_notebook_ref(*root_views)
+    if layout_ref is None:
+        return
+    try:
+        from panel.io.state import state
+    except ImportError:
+        return
+    update_object = getattr(pane, "_update_object", None)
+    if not callable(update_object):
+        sync_widget_to_notebook(pane, *root_views)
+        return
+    _viewable, root, doc, comm = state._views[layout_ref]
+    for ref, (_model, parent) in pane._models.copy().items():
+        try:
+            update_object(ref, doc, root, parent, comm)
+        except Exception:  # noqa: BLE001
+            logger.debug("Notebook pane sync failed for %r", pane, exc_info=True)
+
+
+def set_notebook_widget_params(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    **param_values: Any,
+) -> None:
+    """Assign widget params and sync without Panel's mid-hold ``push``.
+
+    Use for ``AutocompleteInput``, ``LoadingSpinner``, and other widgets when
+    :func:`notebook_ui_hold_active` is true.
+    """
+    if not param_values:
+        return
+    with param.parameterized.discard_events(widget):
+        for name, value in param_values.items():
+            setattr(widget, name, value)
+    applied = {name: getattr(widget, name) for name in param_values}
+    sync_widget_to_notebook(widget, *root_views, changes=applied)
+
+
+def set_notebook_pane_object(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+) -> None:
+    """Assign ``pane.object`` and sync without Panel's premature notebook push.
+
+    Replacing ``pn.pane.Bokeh.object`` (or any pane with ``object`` in
+    ``_rerender_params``) fires Panel's ``_update_pane`` watcher, which calls
+    ``push()`` immediately. Inside an active ``doc.hold('combine')`` that
+    mid-hold push is lost in Jupyter — the browser keeps the old figure even
+    though Python state is correct. Suppress the watcher and sync explicitly
+    instead; call only from inside :func:`hold_and_push` /
+    :func:`dispatch_notebook_ui`.
+    """
+    replacing_bokeh = (
+        isinstance(pane, pn.pane.Bokeh)
+        and pane.object is not None
+        and value is not None
+        and pane.object is not value
+    )
+    with param.parameterized.discard_events(pane):
+        if replacing_bokeh:
+            pane.object = None
+        pane.object = value
+    sync_pane_to_notebook(pane, *root_views)
+
+
+def publish_panel_widget_to_notebook(
+    widget: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    **param_values: Any,
+) -> None:
+    """Push Panel widget changes with assign + :func:`_push_panel_layout`.
+
+    Schedule on the io_loop **after** an active ``hold_and_push`` cycle when
+    updating widgets from a callback that also syncs other panes (e.g. sky click
+    → coordinate field while status updates in the same hold).
+    """
+    if not param_values:
+        return
+    for name, value in param_values.items():
+        setattr(widget, name, value)
+    _push_panel_layout(*root_views, widget)
+
+
+def _assign_bokeh_pane_for_notebook(
+    pane: pn.viewable.Viewable,
+    value: Any,
+) -> None:
+    """Assign a Bokeh figure to a ``pn.pane.Bokeh`` without pushing the layout comm."""
+    if (
+        isinstance(pane, pn.pane.Bokeh)
+        and pane.object is not None
+        and value is not None
+        and pane.object is not value
+    ):
+        pane.object = None
+    pane.object = value
+
+
+def publish_bokeh_pane_to_notebook(
+    pane: pn.viewable.Viewable,
+    value: Any,
+    *root_views: pn.viewable.Viewable,
+    force_push: bool = False,
+) -> None:
+    """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
+
+    Match ``jupiter_flux_review``: assign ``pane.object`` (do **not** wrap in
+    ``discard_events``), ``sync_pane_to_notebook``, then force-push the layout comm.
+    """
+    _assign_bokeh_pane_for_notebook(pane, value)
+    sync_pane_to_notebook(pane, *root_views)
+    _push_panel_layout(*root_views, pane, _force=force_push)
+
+
+def dispatch_notebook_ui(
+    callback: Callable[[], None],
+    *views: pn.viewable.Viewable,
+    _attempt: int = 0,
+    max_attempts: int = DEFAULT_NOTEBOOK_UI_MAX_ATTEMPTS,
+) -> None:
+    """Single entry point for notebook UI mutations outside Bokeh callbacks.
+
+    Background threads, ipywidgets observers, and io-loop handlers must not
+    mutate Panel panes directly. Schedule on the kernel ``io_loop``, wait until
+    the layout comm is registered, then run ``callback`` inside
+    ``hold(doc, comm=comm)`` so model changes reach the browser.
+
+    Re-entrant calls (e.g. ``_log`` invoked from a callback already inside this
+    wrapper) run inline without re-scheduling.
+    """
+    if _NOTEBOOK_UI_DEPTH.get() > 0:
+        callback()
+        return
+
+    def _wrapped() -> None:
+        if not notebook_views_registered(*views):
+            if _attempt < max_attempts:
+                dispatch_notebook_ui(
+                    callback,
+                    *views,
+                    _attempt=_attempt + 1,
+                    max_attempts=max_attempts,
+                )
+            else:
+                logger.error(
+                    "Notebook Panel comm not registered after %d attempts; "
+                    "skipped UI update callback %r",
+                    max_attempts,
+                    callback,
+                )
+            return
+        token = _NOTEBOOK_UI_DEPTH.set(_NOTEBOOK_UI_DEPTH.get() + 1)
+        try:
+            with hold_and_push(*views):
+                callback()
+        finally:
+            _NOTEBOOK_UI_DEPTH.reset(token)
+
+    _schedule_ipython_main(_wrapped)
+
+
+def defer_notebook_ui(
+    callback: Callable[[], None],
+    *views: pn.viewable.Viewable,
+) -> None:
+    """Schedule a **new** hold/push cycle after the current one finishes.
+
+    Re-entrant :func:`dispatch_notebook_ui` runs inline inside an active hold.
+    Bokeh figure replacement bundled with widget/status syncs in the same hold
+    can fail to reach the browser; defer the figure publish to its own cycle.
+    """
+    def _wrapped() -> None:
+        dispatch_notebook_ui(callback, *views)
+
+    _schedule_ipython_main(_wrapped)
+
+
+@contextmanager
+def hold_and_push(*views: pn.viewable.Viewable) -> Iterator[None]:
+    """Hold notebook document(s) for ``views`` during the body, sync, then push.
+
+    Background-thread and io-loop callbacks mutate Panel/Bokeh models *outside*
+    any Bokeh event callback. In Jupyter, :func:`panel.io.document.unlocked` is a
+    no-op and plain :func:`panel.io.notebook.push` diffs an empty held-event list,
+    so the browser freezes even though Python state is correct.
+
+    Uses explicit ``doc.hold('combine')`` plus a final ``sync_pane_to_notebook``
+    sweep and ``push(doc, comm)`` — do not rely on Panel's ``hold()`` main-thread
+    path, which is a no-op under ``state._jupyter_kernel_context``.
+    """
+    try:
+        from panel.io.notebook import push
+        from panel.io.state import set_curdoc
+    except ImportError:
+        yield
+        return
+
+    docs = _notebook_doc_comms(*views)
+    if not docs:
+        yield
+        return
+
+    held: list[tuple[Any, Any]] = []
+    after_hold: list[Callable[[], None]] = []
+    after_hold_token = _AFTER_HOLD_CALLBACKS.set(after_hold)
+    with ExitStack() as stack:
+        for doc, comm in docs.values():
+            stack.enter_context(set_curdoc(doc))
+            doc.hold("combine")
+            held.append((doc, comm))
+        try:
+            yield
+        finally:
+            _sync_all_notebook_views(*views)
+            for doc, comm in held:
+                try:
+                    push(doc, comm)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Notebook push failed: %s", exc, exc_info=True)
+                try:
+                    if doc.callbacks.hold_value:
+                        doc.unhold()
+                except Exception:  # noqa: BLE001
+                    logger.debug("Document unhold failed", exc_info=True)
+            _AFTER_HOLD_CALLBACKS.reset(after_hold_token)
+            for deferred in after_hold:
+                _run_after_hold(deferred)
 
 
 ACTIVITY_LOG_HEIGHT_PX = 150
@@ -253,7 +848,11 @@ def build_thermal_noise_grid(
         grid_rows.append(
             pn.Row(*tiles[start : start + n_cols], sizing_mode="stretch_width")
         )
-    return pn.Column(*grid_rows, sizing_mode="stretch_width")
+    return pn.Column(
+        *grid_rows,
+        sizing_mode="stretch_width",
+        max_width=ZENITH_REVIEW_ROW_WIDTH,
+    )
 
 
 class ScrollLog:
@@ -338,15 +937,34 @@ def sky_view_center(dataset: xr.Dataset, time_idx: int) -> SkyCoord:
     return zenith_lm_coord(dataset, time_idx)
 
 
-def compute_zenith_std_map(dataset: xr.Dataset, radius: int = ZENITH_PATCH_RADIUS) -> np.ndarray:
-    """Spatial STD in a fixed (l=0, m=0) patch for each (time, frequency) cell."""
-    result = dataset.radport.patch_statistic(
-        l=ZENITH_L,
-        m=ZENITH_M,
-        statistic="std",
-        radius=radius,
-    )
-    return np.asarray(result.stat_map.values, dtype=np.float64)
+def compute_zenith_std_map(
+    dataset: xr.Dataset,
+    radius: int = ZENITH_PATCH_RADIUS,
+) -> np.ndarray:
+    """Spatial STD in a fixed (l, m) patch for each (time, frequency) cell.
+
+    Uses a fixed pixel half-width so zenith QA works on stores without synthesized
+    beam metadata (common for pipeline QA Zarr until BEAM is populated).
+    """
+    l_idx, m_idx = dataset.radport.nearest_lm_idx(ZENITH_L, ZENITH_M)
+    sky = dataset["SKY"].isel(polarization=0)
+    n_times = int(sky.sizes["time"])
+    n_freqs = int(sky.sizes["frequency"])
+    n_l = int(sky.sizes["l"])
+    n_m = int(sky.sizes["m"])
+    r = max(0, int(radius))
+    stat = np.full((n_times, n_freqs), np.nan, dtype=np.float64)
+    li0 = int(l_idx)
+    mi0 = int(m_idx)
+    l_sl = slice(max(0, li0 - r), min(n_l, li0 + r + 1))
+    m_sl = slice(max(0, mi0 - r), min(n_m, mi0 + r + 1))
+    for t in range(n_times):
+        for f in range(n_freqs):
+            patch = sky.isel(time=t, frequency=f, l=l_sl, m=m_sl).values
+            finite = patch[np.isfinite(patch)]
+            if finite.size:
+                stat[t, f] = float(np.std(finite))
+    return stat
 
 
 def _time_days_since_start(time_values: np.ndarray) -> np.ndarray:
@@ -597,7 +1215,12 @@ class _ZenithHeatmapSelector:
         n_times, n_freqs = self._stat_map.shape
         time_idx = _heatmap_index_from_coord(event.x, n_times)
         freq_idx = _heatmap_index_from_coord(event.y, n_freqs)
-        self._on_select(time_idx, freq_idx)
+
+        def _dispatch() -> None:
+            self._on_select(time_idx, freq_idx)
+
+        # Bokeh tap callbacks run on the heatmap document; schedule on the kernel loop.
+        _schedule_ipython_main(_dispatch)
 
     def set_data(
         self,
@@ -605,12 +1228,20 @@ class _ZenithHeatmapSelector:
         *,
         lst_hours: np.ndarray,
         freq_mhz: np.ndarray,
+        root_views: tuple[pn.viewable.Viewable, ...] = (),
     ) -> None:
         self._stat_map = stat_map
         self._lst_hours = np.asarray(lst_hours, dtype=np.float64)
         self._freq_mhz = np.asarray(freq_mhz, dtype=np.float64)
         self._plot = self._build_plot()
-        self.pane.object = self._plot
+        if root_views:
+            publish_bokeh_pane_to_notebook(self.pane, self._plot, *root_views)
+        else:
+            self.pane.object = self._plot
+
+    def publish_to_notebook(self, *root_views: pn.viewable.Viewable) -> None:
+        """Assign the heatmap figure and push via the validated Bokeh publish path."""
+        publish_bokeh_pane_to_notebook(self.pane, self._plot, *root_views)
 
     def dispose(self) -> None:
         return
@@ -766,6 +1397,10 @@ class ZenithReviewPanel(param.Parameterized):
     def heatmap_column(self) -> pn.Column:
         """Header and heatmap for side-by-side zenith review layout."""
         return self._layout
+
+    def publish_heatmap(self, *root_views: pn.viewable.Viewable) -> None:
+        """Push the zenith heatmap Bokeh model to the notebook frontend."""
+        self._heatmap.publish_to_notebook(*root_views)
 
     def dispose(self) -> None:
         self._heatmap.dispose()
@@ -960,6 +1595,11 @@ class _StokesReviewHolder(param.Parameterized):
         return self._zenith_footer
 
     @property
+    def controls_row(self) -> pn.Row:
+        """Shared time/frequency sliders and Stokes toggle (hoisted for notebook push)."""
+        return self._controls_row
+
+    @property
     def heatmap_status_row(self) -> pn.Row:
         """Per-Stokes slice summary above heatmaps (hoisted for JupyterLab push)."""
         return self._heatmap_status_row
@@ -992,6 +1632,27 @@ class _StokesReviewHolder(param.Parameterized):
                 pane.object = panel._format_slice_status(time_idx, freq_idx)
             else:
                 pane.object = ""
+
+    def _sync_slice_controls_to_ui(self) -> None:
+        """Mirror shared slice params on sliders and push embedded Panel views."""
+        time_idx = int(self._slice_selection.time_idx)
+        freq_idx = int(self._slice_selection.freq_idx)
+        if int(self._time_slider.value) != time_idx:
+            self._time_slider.value = time_idx
+        if int(self._freq_slider.value) != freq_idx:
+            self._freq_slider.value = freq_idx
+        if self._heatmap_status_row.visible:
+            self._refresh_heatmap_status_row()
+        _push_panel_layout(
+            self._controls_row,
+            self._time_slider,
+            self._freq_slider,
+            self._heatmap_status_row,
+            self._zenith_footer,
+        )
+        push = self._slice_selection._push_root
+        if push is not None:
+            push()
 
     def _push_zenith_ui(self) -> None:
         """Push hoisted heatmap status row and dashboard root (JupyterLab embedded layout)."""
@@ -1222,11 +1883,10 @@ class _StokesReviewHolder(param.Parameterized):
         self._request_sky_update()
 
     def _on_slice_indices_changed(self, *_events: param.parameterized.Event) -> None:
-        """Refresh heatmap status text and push to the JupyterLab frontend."""
-        if not self._heatmap_status_row.visible:
+        """Refresh heatmap status text and push sliders to the JupyterLab frontend."""
+        if not self._controls_row.visible:
             return
-        self._refresh_heatmap_status_row()
-        self._push_zenith_ui()
+        self._sync_slice_controls_to_ui()
 
     def _sync_zenith_status_lines(self, *, push: bool = True) -> None:
         """Refresh hoisted heatmap status markdown and push to the JupyterLab frontend."""
@@ -1262,6 +1922,7 @@ class _StokesReviewHolder(param.Parameterized):
                     self._slice_selection.freq_idx = freq_idx
                 self._pending_reset_center = True
                 self._request_sky_update()
+                self._sync_slice_controls_to_ui()
             finally:
                 self._skip_sky_watch = False
                 self._suppress_post_heatmap_sky_watchers = False
@@ -1272,7 +1933,7 @@ class _StokesReviewHolder(param.Parameterized):
     @staticmethod
     def _bind_sky_dataset(widget: SkyWidget, dataset: xr.Dataset) -> None:
         """Load cube only; first frame comes from :meth:`update_slice`."""
-        widget.set_dataset(dataset, max_size=1024, defer_display=True)
+        bind_sky_widget_dataset(widget, dataset)
 
     def bind_datasets(self, datasets: dict[str, xr.Dataset]) -> None:
         """Remember loaded Stokes datasets and constrain the sky-view toggle."""
@@ -1468,6 +2129,12 @@ class _StokesReviewHolder(param.Parameterized):
         self._configure_slice_selection()
         self._sync_zenith_status_lines()
 
+    def publish_heatmap_panes(self, *root_views: pn.viewable.Viewable) -> None:
+        """Publish each mounted Stokes zenith heatmap through ``publish_bokeh_pane_to_notebook``."""
+        for panel in self._panels.values():
+            if panel is not None:
+                panel.publish_heatmap(*root_views)
+
     def build_no_zarr_contents(self) -> dict[str, pn.viewable.Viewable]:
         """Placeholder content when the selected day has no QA Zarr stores."""
         self._dispose_panels()
@@ -1620,7 +2287,10 @@ class PipelineQAApp(param.Parameterized):
         )
         self._zenith_load_button.on_click(self._on_zenith_load_click)
         self._qa_grid = pn.Column(
-            pn.pane.Markdown("*Select an observation day to build the thermal-noise QA grid.*"),
+            pn.pane.Markdown(
+                "*Select an observation day to build the thermal-noise PNG grid "
+                "and dewarp summary heatmap.*"
+            ),
             sizing_mode="stretch_width",
         )
         self._flux_ratio_grid = pn.Column(
@@ -1634,7 +2304,8 @@ class PipelineQAApp(param.Parameterized):
             name="Observation day",
             width=220,
         )
-        self.param.watch(self._on_select_day_changed, "select_day")
+        self._day_selector.param.watch(self._on_day_selector_value, "value")
+        self._programmatic_day_sync = False
         self._convert_button = pn.widgets.Button(
             name="Convert FITS → Zarr",
             button_type="primary",
@@ -1644,8 +2315,16 @@ class PipelineQAApp(param.Parameterized):
         self._close_modal_button = pn.widgets.Button(name="Close", button_type="default")
         self._close_modal_button.on_click(lambda _event: self._close_modal())
         self._modal_container = pn.Column(sizing_mode="stretch_width")
-        self._log_pane = pn.pane.HTML(
-            _format_activity_log_html(""),
+        self._log_widget = widgets.HTML(
+            value=_format_activity_log_html(""),
+            layout=widgets.Layout(
+                width="100%",
+                height=f"{ACTIVITY_LOG_HEIGHT_PX}px",
+                border="1px solid #ccc",
+            ),
+        )
+        self._log_pane = pn.pane.IPyWidget(
+            self._log_widget,
             sizing_mode="stretch_width",
             height=ACTIVITY_LOG_HEIGHT_PX,
         )
@@ -1657,6 +2336,7 @@ class PipelineQAApp(param.Parameterized):
         self._scan_started = False
         self._load_seq = 0
         self._active_datasets: dict[str, xr.Dataset] = {}
+        self._ui_session: Any = None
 
     @property
     def busy(self) -> bool:
@@ -1667,7 +2347,11 @@ class PipelineQAApp(param.Parameterized):
 
     @param.depends("log_text", watch=True)
     def _sync_log_pane(self) -> None:
-        self._log_pane.object = _format_activity_log_html(self.log_text)
+        self._refresh_log_widget()
+
+    def _refresh_log_widget(self) -> None:
+        """Update the ipywidgets activity log (separate comm from Panel layout)."""
+        self._log_widget.value = _format_activity_log_html(self.log_text)
 
     @param.depends("error_message")
     def _error_alert_view(self) -> pn.viewable.Viewable:
@@ -1694,7 +2378,8 @@ class PipelineQAApp(param.Parameterized):
     )
     def _sync_action_controls(self) -> None:
         """Keep day selector and action buttons aligned with Param state."""
-        self._day_selector.disabled = self.busy
+        # Keep the day dropdown interactive while QA/zenith loads run in the background.
+        self._day_selector.disabled = self.scanning or self.converting
         self._sync_convert_button()
         self._sync_zenith_button()
 
@@ -1706,8 +2391,97 @@ class PipelineQAApp(param.Parameterized):
 
     def _push_panel_roots(self) -> None:
         """Push the dashboard layout to the notebook frontend."""
-        if self._layout is not None:
-            _push_panel_layout(self._layout)
+        views = self._notebook_ui_views()
+        if views:
+            _push_panel_layout(*views)
+
+    def _notebook_ui_views(self) -> tuple[pn.viewable.Viewable, ...]:
+        """Panel viewables that must receive comm pushes after zenith QA updates."""
+        if self._layout is None:
+            return ()
+        return (
+            self._layout,
+            self._zenith_slot,
+            self._zenith_review_row,
+            self._stokes_review.heatmap_status_row,
+            self._stokes_review.zenith_footer,
+            self._stokes_review.controls_row,
+        )
+
+    @property
+    def _ui(self) -> Any:
+        """Lazy ``JupyterPanelUISession`` for zenith QA comm (avoids import cycle)."""
+        if self._ui_session is None:
+            from ovro_lwa_portal.viz.panel_ui_session import JupyterPanelUISession
+
+            self._ui_session = JupyterPanelUISession(self._notebook_ui_views)
+        return self._ui_session
+
+    def _dispatch_ui(self, callback: Callable[[], None]) -> None:
+        """Run a UI mutation on the kernel io_loop with batch assign + push."""
+        self._ui.dispatch(callback)
+
+    def _push_dashboard_ui(self, *, force: bool = True) -> None:
+        """Sync nested Panel widgets and push the dashboard layout comm."""
+        if self._layout is None:
+            return
+        views = self._notebook_ui_views()
+        if not views:
+            return
+        _sync_all_notebook_views(*views)
+        _push_panel_layout(*views, _force=force)
+        self._refresh_log_widget()
+
+    def _schedule_dashboard_ui(self, callback: Callable[[], None]) -> None:
+        """Apply dashboard state on the io_loop and push (never drop the callback)."""
+
+        def _run() -> None:
+            callback()
+            self._push_dashboard_ui()
+
+        _schedule_ipython_main(_run)
+
+    def _apply_initial_scan_results(self, coverage: pd.DataFrame, days: list[str]) -> None:
+        """Update coverage, day selector, and log after ``scan_coverage`` finishes."""
+        pending_day = self.select_day
+        self._coverage = coverage
+        self.scanning = False
+        if not days:
+            self._log_error(
+                f"No {self._qa_config.qa_run_label} QA days found under the pipeline root."
+            )
+            self._sync_day_selector([], None)
+        else:
+            self._clear_error()
+            preferred = pending_day if pending_day in days else None
+            self._sync_day_selector(days, preferred)
+            if preferred is not None:
+                self._begin_load_day()
+                self._log(
+                    f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
+                    f"Loading QA data for {preferred}…"
+                )
+            else:
+                self._log(
+                    f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
+                    "Select a day from the dropdown to load QA data."
+                )
+        self._sync_log()
+
+    def _publish_zenith_heatmaps(self) -> None:
+        """Deferred Bokeh publish for each Stokes zenith heatmap (after dispatch batch)."""
+        for panel in self._stokes_review._panels.values():
+            if panel is not None:
+                self._ui.publish_bokeh_figure(panel._heatmap.pane, panel._heatmap._plot)
+
+    def _reset_thermal_qa_section(self) -> None:
+        """Restore thermal-noise PNG grid and dewarp summary placeholders."""
+        self._qa_grid.objects = [
+            pn.pane.Markdown(
+                "*Select an observation day to build the thermal-noise PNG grid "
+                "and dewarp summary heatmap.*"
+            ),
+        ]
 
     def _reset_flux_ratio_grid(self) -> None:
         """Restore flux ratio placeholder content."""
@@ -1716,6 +2490,33 @@ class PipelineQAApp(param.Parameterized):
                 "*Hybrid flux ratio plots (imfit / model) appear after a day is loaded.*"
             ),
         ]
+
+    def _build_thermal_qa_section(self, select_day: str) -> pn.Column:
+        """Thermal-noise PNG tile grid with dewarp median-shift heatmap below."""
+        thermal_grid = build_thermal_noise_grid(
+            self._summary_df,
+            select_day,
+            n_cols=self._qa_config.thermal_noise_grid_cols,
+            thermal_noise_plot_name=self._qa_config.thermal_noise_plot_name,
+            open_full_size=self._open_modal,
+        )
+        dewarp_df = load_dewarp_summary_dataframe(
+            select_day,
+            self._coverage,
+            config=self._qa_config,
+        )
+        dewarp_panel = build_dewarp_shift_panel(dewarp_df)
+        if not dewarp_df.empty:
+            self._log(
+                f"Built dewarp median-shift heatmap from {len(dewarp_df)} row(s) "
+                f"({self._qa_config.dewarp_summary_csv_glob})."
+            )
+        return pn.Column(
+            thermal_grid,
+            pn.pane.Markdown("#### Dewarp median shift (LST × frequency)"),
+            dewarp_panel,
+            sizing_mode="stretch_width",
+        )
 
     def _build_flux_ratio_grid(self, select_day: str) -> pn.Column:
         """Load flux-check CSVs and build the Bokeh heatmap grid for one day."""
@@ -1754,11 +2555,15 @@ class PipelineQAApp(param.Parameterized):
         section_contents: dict[str, pn.viewable.Viewable],
         *,
         banner: str,
+        load_seq: int,
     ) -> None:
         """Populate stable zenith section slots and mount sky widgets below."""
+        if not self._is_current_load(load_seq):
+            return
         self._zenith_banner.object = banner
-        # Push zenith row + full layout (nested status panes may not have their own comms).
-        self._stokes_review.set_push_root(self._push_zenith_root)
+        self._stokes_review.set_push_root(
+            lambda: self._dispatch_ui(lambda: None),
+        )
         self._stokes_review.set_extra_push_views(
             lambda: [
                 self._stokes_review.heatmap_status_row,
@@ -1771,34 +2576,74 @@ class PipelineQAApp(param.Parameterized):
                 section_contents[spec.stokes],
             ]
         self._stokes_review.mount_sky()
-        self._execute(self._push_zenith_root)
+        self._publish_zenith_heatmaps()
 
     def _sync_day_selector(self, days: list[str], value: str | None) -> None:
         """Update day options and selection from scan results."""
-        with param.parameterized.batch_call_watchers(self):
-            self.param.select_day.objects = days
-            self.select_day = value
+        normalized_days = [str(day) for day in days]
+        normalized_value = str(value) if value is not None else None
+        self._programmatic_day_sync = True
+        try:
+            with param.parameterized.batch_call_watchers(self):
+                self.param.select_day.objects = normalized_days
+                self.select_day = normalized_value
+        finally:
+            self._programmatic_day_sync = False
 
-    def _on_select_day_changed(self, event: param.parameterized.Event) -> None:
+    def _supersede_inflight_work(self) -> None:
+        """Cancel in-flight zenith/day work so a new observation day can load."""
+        self._load_seq += 1
+        self.loading_zenith = False
+        self.loading_day = False
+
+    def _on_day_selector_value(self, event: param.parameterized.Event) -> None:
+        """Handle user-driven changes from the Panel day dropdown."""
+        if self._programmatic_day_sync:
+            return
         new_day = event.new
         if new_day is None:
             return
-        old_day = event.old
-        if old_day not in (None, param.Undefined) and old_day == new_day:
+        self._handle_day_selection(str(new_day), previous=event.old)
+
+    def _handle_day_selection(self, new_day: str, *, previous: Any = None) -> None:
+        """Load QA content for one observation day selected in the dropdown."""
+        if self.scanning or self._coverage.empty:
+            return
+        old_day = previous
+        if (
+            old_day not in (None, param.Undefined)
+            and str(old_day) == new_day
+            and self._loaded_day == new_day
+        ):
             return
         if self._loaded_day != new_day:
+            self._supersede_inflight_work()
             self._release_active_datasets()
             self._reset_zenith_sections()
             self._reset_flux_ratio_grid()
+            self._reset_thermal_qa_section()
             self._qa_grid.objects = [
-                pn.pane.Markdown("*Loading thermal-noise QA grid…*"),
+                pn.pane.Markdown("*Loading thermal-noise QA grid and dewarp summary…*"),
             ]
 
             def _push() -> None:
                 self._push_panel_roots()
 
             self._execute(_push)
+        if self.select_day != new_day:
+            self._programmatic_day_sync = True
+            try:
+                with param.parameterized.batch_call_watchers(self):
+                    self.select_day = new_day
+            finally:
+                self._programmatic_day_sync = False
         self._begin_load_day()
+
+    def _on_select_day_changed(self, event: param.parameterized.Event) -> None:
+        """Backward-compatible alias; prefer :meth:`_handle_day_selection`."""
+        if event.new is None:
+            return
+        self._handle_day_selection(str(event.new), previous=event.old)
 
     def _on_zenith_load_click(self, _event: Any) -> None:
         self._begin_zenith_load()
@@ -1821,10 +2666,12 @@ class PipelineQAApp(param.Parameterized):
 
             def _push() -> None:
                 self.log_text = text
+                self._refresh_log_widget()
 
             self._execute(_push)
         else:
             self.log_text = text
+            self._refresh_log_widget()
 
     def _log(self, message: str, *, sync: bool = True, defer: bool = False) -> None:
         self._scroll_log.append(message)
@@ -1873,44 +2720,35 @@ class PipelineQAApp(param.Parameterized):
         self.scanning = True
         self._scroll_log.clear()
         self._sync_log()
-        self._log("Scanning pipeline tree…", sync=False)
-        self._sync_log()
+        self._log("Scanning pipeline tree…")
+        self._refresh_log_widget()
 
         def _run() -> None:
             try:
                 coverage = scan_coverage(config=self._qa_config)
                 days = qa_days(coverage)
+                self._schedule_dashboard_ui(
+                    lambda: self._apply_initial_scan_results(coverage, days)
+                )
+            except Exception as exc:
+                err = exc
 
-                def _apply() -> None:
-                    self._coverage = coverage
+                def _fail(err: BaseException = err) -> None:
                     self.scanning = False
-                    if not days:
-                        self._log_error(
-                            f"No {self._qa_config.qa_run_label} QA days found under the pipeline root."
-                        )
-                        self._sync_day_selector([], None)
-                    else:
-                        self._clear_error()
-                        self._sync_day_selector(days, None)
-                        self._log(
-                            f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
-                            "Select a day from the dropdown to load QA data."
-                        )
+                    self._log_error(f"Scan failed: {err}")
                     self._sync_log()
 
-                self._execute(_apply)
-            except Exception as exc:
-                def _fail() -> None:
-                    self.scanning = False
-                    self._log_error(f"Scan failed: {exc}")
-
-                self._execute(_fail)
+                self._schedule_dashboard_ui(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
     def _begin_load_day(self) -> None:
         """Load thermal-noise summary and QA grid for the selected day."""
-        if self.converting or self.loading_zenith or self.select_day is None or self._coverage.empty:
+        if self.converting:
+            return
+        if self.select_day is None:
+            return
+        if self._coverage.empty:
             return
 
         select_day = self.select_day
@@ -1921,7 +2759,15 @@ class PipelineQAApp(param.Parameterized):
         self._flush_log()
         self._release_active_datasets()
         self._stokes_review.dispose()
-        self._run_day_load(select_day, load_seq)
+        self._start_day_load_thread(select_day, load_seq)
+
+    def _start_day_load_thread(self, select_day: str, load_seq: int) -> None:
+        """Run day QA loading off the notebook UI thread."""
+
+        def _run() -> None:
+            self._run_day_load(select_day, load_seq)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _auto_load_zenith_if_ready(self, load_seq: int) -> None:
         """Start zenith review automatically after a successful day load."""
@@ -1951,12 +2797,15 @@ class PipelineQAApp(param.Parameterized):
             return
 
         select_day = self.select_day
-        self.loading_zenith = True
-        self._log(f"Loading zenith review panels for {select_day}…")
-        self._flush_log()
-        self._release_active_datasets()
-        self._reset_zenith_sections(banner="*Loading zenith panels…*")
-        self._execute(self._push_zenith_root)
+
+        def _start_ui() -> None:
+            self.loading_zenith = True
+            self._log(f"Loading zenith review panels for {select_day}…")
+            self._flush_log()
+            self._release_active_datasets()
+            self._reset_zenith_sections(banner="*Loading zenith panels…*")
+
+        self._dispatch_ui(_start_ui)
 
         def _run() -> None:
             try:
@@ -1992,31 +2841,38 @@ class PipelineQAApp(param.Parameterized):
                     if not self._is_current_load(load_seq):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
-                    self._mount_zenith_sections(section_contents, banner=banner)
+                    self._mount_zenith_sections(
+                        section_contents,
+                        banner=banner,
+                        load_seq=load_seq,
+                    )
                     self._clear_error()
                     self._log(f"Zenith review panels ready for {select_day}.")
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_mount)
+                self._dispatch_ui(_mount)
             except _LoadSuperseded:
 
                 def _abort() -> None:
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_abort)
+                self._dispatch_ui(_abort)
             except Exception as exc:
                 import traceback
 
-                def _fail() -> None:
+                err = exc
+                tb = traceback.format_exc()
+
+                def _fail(err: BaseException = err, tb: str = tb) -> None:
                     if not self._is_current_load(load_seq):
                         self._finish_zenith_load(load_seq=load_seq)
                         return
-                    self._log_error(f"Failed to load zenith panels for {select_day}: {exc}")
-                    self._log(traceback.format_exc(), sync=False)
+                    self._log_error(f"Failed to load zenith panels for {select_day}: {err}")
+                    self._log(tb, sync=False)
                     self._reset_zenith_sections()
                     self._finish_zenith_load(load_seq=load_seq)
 
-                _schedule_ipython_main(_fail)
+                self._dispatch_ui(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -2024,13 +2880,16 @@ class PipelineQAApp(param.Parameterized):
         """Clear zenith loading state and refresh controls."""
         if load_seq is not None and not self._is_current_load(load_seq):
             return
-        self.loading_zenith = False
-        self._flush_log()
-        self._execute(self._push_zenith_root)
+
+        def _clear() -> None:
+            self.loading_zenith = False
+            self._flush_log()
+
+        self._dispatch_ui(_clear)
 
     def _push_zenith_root(self) -> None:
         """Push zenith heatmaps after nested panel updates."""
-        self._push_panel_roots()
+        self._dispatch_ui(lambda: None)
 
     def _run_day_load(self, select_day: str, load_seq: int) -> None:
         """Fetch Zarr data and rebuild widgets on the main thread."""
@@ -2099,14 +2958,7 @@ class PipelineQAApp(param.Parameterized):
         self._active_datasets.clear()
         self._reset_zenith_sections()
         self._summary_df = payload.summary_df
-        thermal_grid = build_thermal_noise_grid(
-            payload.summary_df,
-            select_day,
-            n_cols=self._qa_config.thermal_noise_grid_cols,
-            thermal_noise_plot_name=self._qa_config.thermal_noise_plot_name,
-            open_full_size=self._open_modal,
-        )
-        self._qa_grid.objects = [thermal_grid]
+        self._qa_grid.objects = [self._build_thermal_qa_section(select_day)]
         self._flux_ratio_grid.objects = [self._build_flux_ratio_grid(select_day)]
         self._clear_error()
         self._log(
@@ -2142,9 +2994,9 @@ class PipelineQAApp(param.Parameterized):
         load_seq: int | None = None,
         auto_zenith: bool = False,
     ) -> None:
+        self.loading_day = False
         if load_seq is not None and not self._is_current_load(load_seq):
             return
-        self.loading_day = False
         if auto_zenith and load_seq is not None:
             self._auto_load_zenith_if_ready(load_seq)
 
@@ -2161,7 +3013,7 @@ class PipelineQAApp(param.Parameterized):
             self._log(f"Refreshing QA data for {select_day}…")
             self._flush_log()
         self._release_active_datasets()
-        self._run_day_load(select_day, load_seq)
+        self._start_day_load_thread(select_day, load_seq)
 
     def _open_modal(self, png_path: str, title: str) -> None:
         self._modal_container.objects = [
@@ -2193,10 +3045,11 @@ class PipelineQAApp(param.Parameterized):
                     config=self._qa_config,
                 )
             except Exception as exc:
+                err = exc
 
-                def _fail() -> None:
+                def _fail(err: BaseException = err) -> None:
                     self.converting = False
-                    self._log_error(f"Conversion failed: {exc}")
+                    self._log_error(f"Conversion failed: {err}")
                     self._sync_log()
 
                 _schedule_ipython_main(_fail)
@@ -2205,7 +3058,14 @@ class PipelineQAApp(param.Parameterized):
             def _after_convert() -> None:
                 # Clear converting before refresh so _auto_load_zenith_if_ready is not blocked.
                 self.converting = False
-                self._load_day(silent=False)
+                status = zarr_status(select_day, config=self._qa_config)
+                if not (status["I"] or status["V"]):
+                    self._log_error(
+                        "Conversion finished but no QA Zarr store was created. "
+                        "Check the notebook/kernel log for errors after the staging line."
+                    )
+                else:
+                    self._load_day(silent=False)
                 self._sync_log()
 
             _schedule_ipython_main(_after_convert)
@@ -2220,7 +3080,7 @@ class PipelineQAApp(param.Parameterized):
         header = pn.pane.Markdown(
             "# Pipeline QA check\n\n"
             "Scan finds available days automatically. Select a day to load Stokes I/V "
-            "zenith review, hybrid flux ratio plots, and the thermal-noise QA grid. "
+            "zenith review, hybrid flux ratio plots, thermal-noise PNG grid, and dewarp summary. "
             "A shared sky view appears below the heatmaps."
         )
         log_section = pn.Column(
@@ -2242,7 +3102,7 @@ class PipelineQAApp(param.Parameterized):
             self._zenith_slot,
             pn.pane.Markdown("### Hybrid flux ratio (imfit / model)"),
             self._flux_ratio_grid,
-            pn.pane.Markdown("### Thermal-noise QA by LST hour"),
+            pn.pane.Markdown("### Thermal-noise QA (PNG grid & dewarp summary)"),
             self._qa_grid,
             self._modal_container,
             sizing_mode="stretch_width",
@@ -2252,12 +3112,18 @@ class PipelineQAApp(param.Parameterized):
         """Return the JupyterLab dashboard layout."""
         self._build_layouts()
 
-        if not self._scan_started:
-            self._scan_started = True
-            pn.state.onload(self._start_initial_scan)
+        _schedule_initial_scan(self)
 
         assert self._layout is not None
         return self._layout
+
+
+def _schedule_initial_scan(app: PipelineQAApp) -> None:
+    """Start the pipeline scan once the embedded Panel layout comm is ready."""
+    if app._scan_started:
+        return
+    app._scan_started = True
+    schedule_when_panel_loaded(app._start_initial_scan)
 
 
 def display_pipeline_qa_app(
@@ -2290,10 +3156,7 @@ def display_pipeline_qa_app(
     """
     from IPython.display import display
 
-    try:
-        pn.extension("ipywidgets")
-    except Exception as exc:
-        logger.debug("Panel ipywidgets extension unavailable: %s", exc)
+    configure_pipeline_qa_notebook()
 
     resolved_config = resolve_pipeline_qa_config(
         config=qa_config,
@@ -2306,10 +3169,7 @@ def display_pipeline_qa_app(
     app = app or PipelineQAApp(qa_config=resolved_config)
     app._build_layouts()
 
-    if not app._scan_started:
-        app._scan_started = True
-        pn.state.onload(app._start_initial_scan)
-
     assert app._layout is not None
     display(app._layout)
+    _schedule_initial_scan(app)
     return app

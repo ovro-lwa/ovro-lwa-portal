@@ -6,6 +6,7 @@ multiple sources including local paths, remote URLs, and DOI identifiers.
 
 from __future__ import annotations
 
+import difflib
 import re
 import warnings
 from pathlib import Path
@@ -14,7 +15,12 @@ from urllib.parse import urlparse
 
 import xarray as xr
 
-__all__ = ["open_dataset", "resolve_source", "DataSourceError"]
+__all__ = [
+    "DataSourceError",
+    "open_dataset",
+    "resolve_source",
+    "validate_local_zarr_store",
+]
 
 # DOI pattern: matches both "doi:10.xxxx/xxxxx" and "10.xxxx/xxxxx"
 DOI_PATTERN = re.compile(r"^(?:doi:)?(10\.\S+)$", re.IGNORECASE)
@@ -241,6 +247,118 @@ def _detect_source_type(source: str | Path) -> tuple[str, str]:
 
     # Default to local path
     return ("local", source_str)
+
+
+def _is_zarr_group_directory(path: Path) -> bool:
+    """Return True if *path* looks like a Zarr v2 group or Zarr v3 store root."""
+    return (path / ".zgroup").is_file() or (path / "zarr.json").is_file()
+
+
+def _zarr_store_candidates_in_directory(directory: Path) -> list[Path]:
+    """List child paths under *directory* that appear to be Zarr group roots."""
+    if not directory.is_dir():
+        return []
+    candidates: list[Path] = []
+    for child in sorted(directory.iterdir()):
+        if child.is_dir() and _is_zarr_group_directory(child):
+            candidates.append(child.resolve())
+        elif child.is_file() and child.name.endswith(".zarr"):
+            # Some deployments use a single-file store name; still report it.
+            candidates.append(child.resolve())
+    return candidates
+
+
+def _format_zarr_path_suggestions(requested: Path, candidates: list[Path]) -> str:
+    """Build a short hint listing likely alternate Zarr paths."""
+    if not candidates:
+        return ""
+    names = [c.name for c in candidates]
+    close_names = difflib.get_close_matches(requested.name, names, n=5, cutoff=0.4)
+    if close_names:
+        chosen = [c for c in candidates if c.name in close_names]
+    else:
+        chosen = candidates[:5]
+    lines = ["Did you mean one of these Zarr stores?"]
+    lines.extend(f"  {path}" for path in chosen)
+    return "\n".join(lines)
+
+
+def validate_local_zarr_store(source: str | Path) -> Path:
+    """Validate that a local path exists and is a readable Zarr group root.
+
+    Call this before expensive ``open_dataset`` work to fail fast on typos in
+    ``ZARR_PATH`` or notebook configuration.
+
+    Parameters
+    ----------
+    source : str or Path
+        Path to a ``.zarr`` directory (trailing slash optional).
+
+    Returns
+    -------
+    Path
+        Resolved absolute path to the store.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the path or an obvious parent is missing.
+    DataSourceError
+        If the path exists but is not a Zarr group (wrong directory, file, etc.).
+    NotADirectoryError
+        If the path exists but is a regular file.
+    """
+    requested = Path(source).expanduser()
+    try:
+        resolved = requested.resolve(strict=True)
+    except FileNotFoundError:
+        resolved = None
+
+    if resolved is None or not resolved.exists():
+        lines = [f"Zarr store path does not exist:\n  {requested}"]
+        parent = requested.parent
+        if parent.is_dir():
+            hint = _format_zarr_path_suggestions(
+                requested, _zarr_store_candidates_in_directory(parent)
+            )
+            if hint:
+                lines.append(hint)
+        elif parent.parent.is_dir():
+            lines.append(f"Parent directory is also missing:\n  {parent}")
+            hint = _format_zarr_path_suggestions(
+                requested, _zarr_store_candidates_in_directory(parent.parent)
+            )
+            if hint:
+                lines.append(f"In {parent.parent}:")
+                lines.append(hint)
+        msg = "\n".join(lines)
+        raise FileNotFoundError(msg)
+
+    if resolved.is_file():
+        msg = (
+            f"Zarr store path is a file, not a directory:\n  {resolved}\n"
+            "Expected a directory ending in .zarr with a .zgroup marker inside."
+        )
+        raise DataSourceError(msg)
+
+    if not resolved.is_dir():
+        msg = f"Zarr store path is not a directory:\n  {resolved}"
+        raise DataSourceError(msg)
+
+    if not _is_zarr_group_directory(resolved):
+        lines = [
+            "Path exists but is not a Zarr group store "
+            "(missing .zgroup or zarr.json at the store root):",
+            f"  {resolved}",
+        ]
+        hint = _format_zarr_path_suggestions(
+            requested, _zarr_store_candidates_in_directory(resolved.parent)
+        )
+        if hint:
+            lines.append(hint)
+        raise DataSourceError("\n".join(lines))
+
+    return resolved
 
 
 def _validate_dataset(ds: xr.Dataset) -> None:
@@ -522,7 +640,9 @@ def open_dataset(
     validate : bool, default True
         If True, validate that loaded data conforms to OVRO-LWA data model.
     **kwargs
-        Additional arguments passed to the underlying loader (xr.open_zarr, etc.)
+        Additional arguments passed to the underlying loader (xr.open_zarr, etc.).
+        For very large local Zarr stores, ``consolidated=False`` avoids slow
+        metadata walks when ``.zmetadata`` is missing or incomplete.
 
     Returns
     -------
@@ -650,9 +770,9 @@ def open_dataset(
                 # For local files or HTTPS, use UPath without storage_options
                 store_path = UPath(normalized_source)
 
-                # Explicit local existence check
-                if store_path.protocol in ("", "file") and not store_path.exists():
-                    raise FileNotFoundError(f"Local path does not exist: {store_path}")
+                if store_path.protocol in ("", "file"):
+                    local_store = validate_local_zarr_store(normalized_source)
+                    store_path = UPath(str(local_store))
 
                 # Build a Zarr store (fsspec mapper) from the UPath
                 fs = store_path.fs
@@ -715,4 +835,6 @@ def open_dataset(
     if validate:
         _validate_dataset(ds)
 
-    return ds
+    from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
+
+    return strip_redundant_fits_wcs_header_attrs(ds)

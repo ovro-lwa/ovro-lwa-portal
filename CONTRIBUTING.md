@@ -255,6 +255,41 @@ To install dewarp tooling locally:
 
 3. Run `pixi lock`, then `pixi install --environment dewarp`.
 
+### Editable astrowidget (SkyWidget)
+
+Review notebooks use **SkyWidget** from
+[astrowidget](https://github.com/ovro-lwa/astrowidget). SkyWidget is an
+**anywidget**; **ipyaladin** (HiPS backgrounds) is also anywidget-based. The
+default Pixi env installs astrowidget from GitHub `main`.
+
+To use a **local sibling checkout** (`../astrowidget`) instead, add to
+`pyproject.toml` (do not commit unless your team standardizes on this layout):
+
+```toml
+[tool.pixi.feature.astrowidget-local.pypi-dependencies]
+astrowidget = { path = "../astrowidget", editable = true }
+```
+
+Extend the environment features (replace `astrowidget` with
+`astrowidget-local`):
+
+```toml
+[tool.pixi.environments]
+default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget-local"], solve-group = "default" }
+```
+
+Then:
+
+```bash
+pixi lock
+pixi install
+cd ../astrowidget && pixi run build   # or: npm ci && npm run build
+```
+
+Restart the Jupyter kernel after rebuilding astrowidget JS. See the
+[astrowidget README](https://github.com/ovro-lwa/astrowidget) for widget
+development tasks.
+
 ### BDSF Integration
 
 For macOS ARM64 users:
