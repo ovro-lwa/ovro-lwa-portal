@@ -565,39 +565,59 @@ avoid ``hold_and_push`` in the notebook UI.
 | -------- | ---------- | ---- | ----------- |
 | SkyWidget | ipywidgets | Widget comm | Trait updates; works from observers/workers |
 | Activity log | ipywidgets ``HTML`` in ``pn.pane.IPyWidget`` | Widget comm | ``_refresh_log_widget()`` on every ``_log()`` |
-| Status, spinner, controls | Panel/Bokeh | One notebook comm | ``_dispatch`` → ``JupyterPanelUISession.dispatch`` → assign + ``_push_panel_layout`` |
-| Heatmap (Bokeh figure) | Panel/Bokeh | Same comm | ``publish_bokeh_pane_to_notebook`` **after** batch push |
+| Loading spinner | ipywidgets ``HTML`` in ``pn.pane.IPyWidget`` | Widget comm | ``_refresh_loading_widget()`` (+ ``send_state`` when available) |
+| Status, controls, coord field | Panel/Bokeh | One notebook comm | ``_dispatch`` → ``JupyterPanelUISession.dispatch`` → assign + ``_push_panel_layout`` |
+| Heatmap (Bokeh figure) | Panel/Bokeh | Same comm | ``publish_bokeh_pane_to_notebook`` on a **fresh io_loop turn** after batch push |
 
 **Bottom line (``source_review``):** Production UI goes through
 :class:`~ovro_lwa_portal.viz.panel_ui_session.JupyterPanelUISession` (``SourceReview._ui``).
-Schedule worker/io-loop callbacks via ``_dispatch`` / ``_schedule_ipython_main``, mutate
-Python models, then ``_push_panel_layout`` over ``SourceReview._notebook_ui_views()``
-(layout + status + spinner + heatmap + coord field). **Do not** use ``hold_and_push`` in
-production ``SourceReview``. **Do not** copy ``jupiter_flux_review``'s Panel HTML log or
-inline-class structure when they differ — follow ``source_review_app.py`` instead.
+Schedule worker/io-loop callbacks via ``_dispatch`` / ``_schedule_ipython_main`` /
+``self._ui.schedule``, mutate Python models, then ``_push_panel_layout`` over
+``SourceReview._notebook_ui_views()`` (layout + status + heatmap + coord field — **not**
+the ipywidgets log/spinner panes). **Do not** use ``hold_and_push`` in production
+``SourceReview``. **Do not** copy ``jupiter_flux_review``'s Panel HTML log or inline-class
+structure when they differ — follow ``source_review_app.py`` instead.
+
+**Kernel / package path (live Jupyter):** The notebook kernel must import the **editable**
+repo (Pixi: ``sys.executable`` under ``.pixi/envs/default/``, or
+``pip install -e /path/to/ovro-lwa-portal`` in a custom env). A stale
+``site-packages`` build shows correct Python state (e.g.
+``review._heatmap_pane.object.title.text``) while the browser stays on the placeholder.
+After viz comm changes: restart the kernel and confirm
+``ovro_lwa_portal.__file__`` points at ``src/ovro_lwa_portal/``.
 
 **Activity log:** ``source_review`` uses ipywidgets (validated). ``jupiter_flux_review``
 still uses Panel HTML log; treat that as legacy unless you re-validate with
 ``source_review``-level tests.
 
-#### Three sync tiers (do not collapse)
+#### Four sync tiers (do not collapse)
 
-Implemented in ``viz/panel_ui_session.py``; app code calls ``self._ui.*`` only:
+Implemented in ``viz/panel_ui_session.py`` and ``source_review_app.py``; app code calls
+``self._ui.*`` / ipywidgets refresh helpers only:
 
-1. **Dispatch batch** — spinner, status markdown inside
+1. **ipywidgets-only** — activity log and loading spinner: ``_log()`` →
+   ``_refresh_log_widget()``; ``_sync_spinner()`` → ``_refresh_loading_widget()``
+   (optional ``send_state``). **No** Panel ``dispatch`` — progress logs during long
+   heatmap compute must use ``_schedule_ipython_main(lambda: self._log(...))``, not
+   ``self._dispatch(...)``, or late batches can republish the zeros heatmap after
+   ``publish_bokeh_figure``.
+2. **Dispatch batch** — status markdown and other Panel controls inside
    :meth:`~ovro_lwa_portal.viz.panel_ui_session.JupyterPanelUISession.dispatch`:
    assign on Python models, one ``_push_panel_layout`` sweep over
-   ``SourceReview._notebook_ui_views()`` (layout + status + spinner + heatmap +
-   coord field).
-2. **Direct Bokeh publish** — heatmap figures: assign ``pane.object``, then
-   ``_push_panel_layout`` via ``publish_bokeh_pane_to_notebook`` — **never** inside
-   ``doc.hold('combine')``, **never** ``discard_events``.
-3. **Deferred widget publish** — coordinate field when a dispatch batch is active:
-   queue ``publish_panel_widget_to_notebook`` with ``defer_after_notebook_hold`` and
-   flush it **after** the batch push in the same io-loop turn.
+   ``SourceReview._notebook_ui_views()`` (layout + status + heatmap + coord field).
+3. **Direct Bokeh publish** — heatmap figures on a **fresh io_loop turn** (not inside
+   the dispatch batch push): assign ``pane.object``, ``sync_pane_to_notebook``, then
+   ``_push_panel_layout(..., force_push=True)`` via ``publish_bokeh_pane_to_notebook`` —
+   **never** inside ``doc.hold('combine')``, **never** ``discard_events`` /
+   ``set_notebook_pane_object`` for heatmap publish.
+4. **Schedule-only heavy work** — overlay Zarr slice loads via
+   ``_schedule_overlay_slice_load`` → ``self._ui.schedule`` (not ``defer_dispatch``):
+   avoids two full layout pushes bracketing ``update_slice``. Spinner on before
+   schedule; clear in ``finally`` after ``update_slice`` returns.
 
-Worker threads must never mutate Panel panes directly — always ``self._dispatch(...)``
-(which schedules on the io_loop) or ``self._ui.schedule(...)``.
+Worker threads must never mutate Panel panes directly — use ``self._dispatch(...)`` for
+Panel batch updates, ``_schedule_ipython_main`` for ipywidgets log lines, or
+``self._ui.schedule(...)`` for overlay loads.
 
 #### What did **not** work (do not reintroduce)
 
@@ -609,7 +629,21 @@ These were tried repeatedly; Python state updated but the browser UI stayed froz
   field in live Jupyter even when pytest passed (see **Test coverage vs Jupyter**
   below). **Validated fix:** ``JupyterPanelUISession`` (assign + push on ``io_loop``).
 - **`discard_events` + `_push_panel_layout` for Bokeh heatmap** — suppresses Panel's
-  watcher; browser stays on the placeholder figure.
+  watcher; browser stays on the placeholder figure. Same for
+  ``set_notebook_pane_object`` on heatmap publish (see
+  ``test_discard_events_blocks_bokeh_pane_push``).
+- **`defer_dispatch` for overlay slice loads** (heatmap tap, overlay toggle) — each
+  ``dispatch`` ends with ``_push_panel_layout`` on the full layout. On large live
+  notebooks that push can take tens of seconds and makes the spinner track Panel comm
+  latency instead of the Zarr read. Use ``_schedule_overlay_slice_load`` →
+  ``self._ui.schedule`` instead.
+- **`_dispatch` for heatmap progress logs** during ``compute_source_heatmap`` — every
+  progress line runs a full dispatch batch that pushes the **zeros** heatmap pane; a
+  late batch can run **after** ``publish_bokeh_figure`` and clobber the browser figure.
+  Use ``_schedule_ipython_main(lambda: self._log(...))`` only.
+- **Panel `LoadingSpinner` for production spinner** — often frozen in live Jupyter while
+  the ipywidgets activity log still updates. Use ``_loading_widget`` (HTML spinner in
+  ``pn.pane.IPyWidget``).
 - **Assigning `pn.pane.Bokeh.object` inside any hold cycle** — mid-hold watcher push is
   lost; zeros grid persists after Generate heatmap.
 - **`defer_dispatch(_ensure_heatmap_grid)` after Zarr open** — a second io-loop dispatch
@@ -637,25 +671,32 @@ These were tried repeatedly; Python state updated but the browser UI stayed froz
    ``pn.pane.IPyWidget``; ``_refresh_log_widget()`` on every ``_log()``. Independent
    of Panel push (symptom: log updates while spinner/heatmap stay frozen → Panel path
    bug, not logging).
-2. **`JupyterPanelUISession`** — production backend for ``source_review`` (default in
+2. **ipywidgets loading spinner** — ``_loading_widget`` / ``_loading_pane`` (same comm
+   tier as the log). Spinner on for heatmap compute and overlay loads; clear when
+   ``update_slice`` returns (no artificial settle delay).
+3. **`JupyterPanelUISession`** — production backend for ``source_review`` (default in
    ``SourceReview``): ``dispatch`` on ``io_loop`` → mutate models → ``_push_panel_layout``
-   → flush deferred Bokeh/widget publishes in the same turn. This is the validated
-   comm architecture; do not replace it with ``jupiter_flux_review``'s inline direct-push
-   class when the two differ.
-3. **`configure_source_review_notebook()`** — call once before launch; captures kernel
+   → flush deferred publishes. Heatmap figure publish is scheduled on a **separate**
+   io_loop turn via ``publish_bokeh_figure`` (not inside the batch push).
+4. **`configure_source_review_notebook()`** — call once before launch; captures kernel
    ``io_loop`` via ``_capture_ipython_io_loop()``.
-4. **`schedule_when_panel_loaded(_open_dataset)`** — defer Zarr worker until
+5. **`schedule_when_panel_loaded(_open_dataset)`** — defer Zarr worker until
    ``pn.state.loaded`` so open callbacks run against a live comm.
-5. **`publish_bokeh_pane_to_notebook`** — heatmap via ``_publish_heatmap_figure`` →
-   ``self._ui.publish_bokeh_figure`` (deferred after batch push, not inside hold).
-6. **`finalize_dataset_load` builds the zeros grid synchronously** — call
+6. **`publish_bokeh_pane_to_notebook`** — assign + ``sync_pane_to_notebook`` +
+   ``force_push`` (Jupiter path; **not** ``discard_events``). Heatmap via
+   ``_publish_heatmap_figure`` → ``publish_bokeh_figure`` on the next io_loop turn after
+   the finish dispatch batch; ``after_publish`` schedules a confirm republish, status
+   update, then overlay load.
+7. **`_schedule_overlay_slice_load`** — overlay on heatmap tap / overlay toggle: spinner
+   on, ``self._ui.schedule(_update_sky)``, spinner off in ``finally``.
+8. **`finalize_dataset_load` builds the zeros grid synchronously** — call
    ``_ensure_heatmap_grid()`` from the ``build_heatmap_grid`` step in ``_finish_open``,
    not ``defer_dispatch`` afterward. ``_apply_heatmap`` sets ``_heatmap_grid_ready`` so
    late grid passes cannot clobber a computed spectrum.
-7. **`publish_panel_widget_to_notebook`** — coordinate field after sky click (deferred
+9. **`publish_panel_widget_to_notebook`** — coordinate field after sky click (deferred
    when ``notebook_ui_hold_active()`` during a dispatch batch).
-8. **Module extraction** — ``source_review_app.py`` / ``source_review_data.py`` /
-   ``panel_ui_session.py`` so threading and comm intent are headless-testable.
+10. **Module extraction** — ``source_review_app.py`` / ``source_review_data.py`` /
+    ``panel_ui_session.py`` so threading and comm intent are headless-testable.
 
 #### Low-level helpers (`viz/pipeline_qa_app.py`)
 
@@ -665,7 +706,8 @@ Used by ``JupyterPanelUISession``, ``InlinePanelUISession``, and legacy QA code:
 | -------- | ---- |
 | `_schedule_ipython_main(callback)` | Schedule on kernel ``io_loop`` (never inline from workers) |
 | `_push_panel_layout(*views)` | Push layout comm after model assign (shared primitive) |
-| `publish_bokeh_pane_to_notebook(pane, value, *root_views)` | Bokeh figure: assign + push, no hold (`source_review` heatmap path) |
+| `sync_pane_to_notebook(pane, *root_views)` | Force-sync nested ``pn.pane.Bokeh`` when only layout root is in ``state._views`` |
+| `publish_bokeh_pane_to_notebook(pane, value, *root_views)` | Bokeh figure: assign + sync + force push (`source_review` heatmap path) |
 | `publish_panel_widget_to_notebook(widget, *root_views, **params)` | Widget assign + push |
 | `defer_after_notebook_hold(callback)` | Queue publish after active dispatch batch |
 | `notebook_ui_hold_active()` | True inside ``JupyterPanelUISession.dispatch`` batch |
@@ -701,8 +743,8 @@ models** via ``harness.bokeh_model(viewable, layout)``, not only Python Param va
 
 | Test module | What it proves |
 | ----------- | -------------- |
-| ``test_panel_ui_session.py`` | ``PanelUISession`` API + harness publish/spinner/coord |
-| ``test_source_review_ui_integration.py`` | End-to-end heatmap/spinner/coord via inline **and** ``QueuedIOLoop`` + ``JupyterPanelUISession``; includes inverted-order grid race regression |
+| ``test_panel_ui_session.py`` | ``PanelUISession`` API + harness publish/spinner/coord; ``test_jupyter_dispatch_batch_publishes_heatmap_on_next_io_turn`` |
+| ``test_source_review_ui_integration.py`` | End-to-end heatmap/spinner/coord via inline **and** ``QueuedIOLoop`` + ``JupyterPanelUISession``; grid race, progress-dispatch race, overlay schedule (not ``defer_dispatch``) |
 | ``test_pipeline_qa.py`` | ``hold_and_push``, ``sync_*``, ``publish_*`` helpers on real documents |
 | ``test_source_review.py`` | Pure logic (Center, load threading) — no browser comm |
 
@@ -753,6 +795,57 @@ pass and asserts values are not reset.
 **Triage:** Log shows finite range but heatmap is zeros → check overwrite race before
 debugging ``publish_bokeh_pane_to_notebook``. Log frozen → Panel comm path. Log works,
 Panel frozen → comm path, not logging.
+
+#### Generate heatmap publish flow (do not regress)
+
+**Order on Generate finish** (``_finish_heatmap`` → ``_apply_heatmap``):
+
+1. ``_finish_heatmap`` runs inside a ``dispatch`` batch (spinner already on from
+   ``_begin_heatmap_load``).
+2. ``_publish_heatmap_figure`` defers ``publish_bokeh_figure`` to **after** the batch
+   (``defer_after_notebook_hold`` → ``_schedule_ipython_main(_publish)``).
+3. The batch ends with ``_push_panel_layout`` while ``pane.object`` may still be the
+   zeros placeholder — expected; do **not** assign the figure inside the batch.
+4. Next io_loop turn: ``publish_bokeh_pane_to_notebook`` (assign + ``sync_pane_to_notebook``
+   + ``force_push=True``).
+5. ``after_publish``: schedule confirm republish + ``_set_status`` + overlay load
+   (``_ui.schedule`` — overlay must not block step 4).
+
+**Progress during compute:** ``_heatmap_progress_callback`` must **not** call
+``self._dispatch`` — only ``_schedule_ipython_main(lambda: self._log(...))``. Regression:
+``test_heatmap_progress_logs_do_not_dispatch_panel_batches``,
+``test_late_progress_dispatch_does_not_clobber_published_heatmap``.
+
+#### Overlay slice loading (heatmap tap / overlay toggle)
+
+Use ``_schedule_overlay_slice_load`` in ``source_review_app.py``:
+
+- Spinner on immediately (ipywidgets).
+- ``self._ui.schedule`` runs ``_update_sky(..., log_loading=True)`` on the io_loop **without**
+  a ``dispatch`` batch (no extra ``_push_panel_layout`` before/after Zarr).
+- Spinner off in ``finally`` when ``update_slice`` returns.
+
+**Overlay toggle on** with a coordinate set uses the same path. Toggle off calls
+``widget.clear_image()`` + ``send_state()`` only (no spinner).
+
+Regression: ``test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch``.
+
+#### Panel push latency vs Zarr read (not the same work)
+
+Panel ``_push_panel_layout`` serializes Bokeh model diffs over the notebook comm; it does
+**not** read Zarr. They can show similar wall-clock times on a busy machine but are
+unrelated operations.
+
+**Coupling that confused timing:** the kernel ``io_loop`` is single-threaded. Wrapping
+``update_slice`` in ``defer_dispatch`` ran **two** full layout pushes around the blocking
+Zarr read, so the spinner appeared to run ~one push cycle before ``Loading overlay slice…``
+and ~one push cycle after ``Overlay slice loaded``. The middle interval is the real Zarr
+read. Fix: ``_ui.schedule`` for overlay loads; ipywidgets spinner (not Panel push).
+
+**Diagnostic:** If Python shows the correct ``review._heatmap_pane.object.title.text`` but
+the browser shows the placeholder, the assign succeeded and the Panel comm push failed or
+was overwritten — check kernel package path, ``sync_pane_to_notebook``, and late
+progress ``dispatch`` batches.
 
 ### `source_review` Panel app and notebook
 
@@ -826,10 +919,13 @@ its tests first, then the notebook call site.
   `_heatmap_pane.object = None` — rebuild a zeros grid instead.
 - **Heatmap cell click** loads that Zarr slice as the overlay and **turns the
   overlay on** (`_set_overlay_toggle_display(True)`), even if the user toggled
-  it off. It must **preserve pan/zoom**: call `update_slice(view_lock=True)`
-  with **no `center` and no `fov`** (`_update_sky(..., preserve_view=True)`).
-  Passing `fov=` on every slice change resets the user's zoom and reads as the
-  view "jumping".
+  it off. Use ``_schedule_overlay_slice_load(..., preserve_view=True)`` — **not**
+  ``defer_dispatch``. It must **preserve pan/zoom**: ``preserve_view=True`` →
+  ``update_slice(view_lock=True)`` with **no `center` and no `fov`**
+  (`_update_sky(..., preserve_view=True)`). Passing `fov=` on every slice change
+  resets the user's zoom and reads as the view "jumping".
+- **Overlay toggle on** (with a coordinate set) shows the spinner and loads the
+  current ``time_idx``/``freq_idx`` slice via ``_schedule_overlay_slice_load``.
 - **Overlay toggle off** calls `widget.clear_image()`; the JS side must clear
   the GPU texture (`clearImageTexture()` uploads a 1×1 transparent texture),
   otherwise the stale overlay keeps rendering even though Python state says it
@@ -849,15 +945,15 @@ its tests first, then the notebook call site.
   that suppresses Param events and the field stays blank while the activity log
   still updates. Use a `_suppress_coord_value_handler` flag to skip duplicate
   resolution logging on programmatic writes instead.
-- Sky-click coordinate writes: status and spinner mutate inside
-  `JupyterPanelUISession.dispatch`; the coordinate field uses
-  **`publish_panel_widget_to_notebook`** via `defer_after_notebook_hold` (flush
-  after the batch push, same io-loop turn).
-- **Bokeh heatmap figures** from io-loop callbacks (e.g. `_ensure_heatmap_grid`,
-  Generate) use **`publish_bokeh_pane_to_notebook`** via `_publish_heatmap_figure`
-  → `self._ui.publish_bokeh_figure` — deferred after batch push, **not** inside
-  `hold_and_push`. Use `publish_bokeh_pane_to_notebook` (assign `pane.object` then
-  `_push_panel_layout`) as in `source_review_app.py`.
+- Sky-click coordinate writes: status mutates inside
+  `JupyterPanelUISession.dispatch`; spinner is ipywidgets (not Panel). The coordinate
+  field uses **`publish_panel_widget_to_notebook`** via `defer_after_notebook_hold`
+  (flush after the batch push, same io-loop turn).
+- **Bokeh heatmap figures** from Generate use **`publish_bokeh_pane_to_notebook`**
+  via `_publish_heatmap_figure` → `self._ui.publish_bokeh_figure` on the **next**
+  io_loop turn after the finish dispatch batch — **not** inside `hold_and_push`, **not**
+  `set_notebook_pane_object`. Open-time zeros grid uses the same publish path via
+  `_publish_heatmap_figure`.
 
 **Testing the controller:** compare numpy-derived booleans with
 `bool(...) is True`, not `np.bool_ is True` (`assert np.True_ is True` fails).
@@ -1247,24 +1343,60 @@ grid (correct shape, no colormap).
 
 1. **Panel comm path broken** — Bokeh figure update went through `hold_and_push`,
    `discard_events`, or `set_notebook_pane_object` instead of the validated
-   `source_review` publish path. Python `pane.object` may update but the browser
-   does not.
+   `source_review` publish path (`assign` + `sync_pane_to_notebook` + `force_push`).
+   Python `pane.object` may update but the browser does not.
 2. **Deferred grid overwrote computed heatmap** — `_apply_heatmap` published real
    data, then a later `_ensure_heatmap_grid` (often from `defer_dispatch` after
-   open) republished zeros to the same pane. Activity log and `_heatmap_values`
-   can show finite stats while the browser shows zeros. See **Deferred UI
-   ordering (heatmap grid race)** above.
+   open) republished zeros to the same pane. See **Deferred UI ordering** above.
+3. **Late progress `dispatch` overwrote published heatmap** — during long
+   ``compute_source_heatmap``, progress lines used ``self._dispatch(self._log)``
+   and each batch pushed the zeros placeholder; a batch finishing **after**
+   ``publish_bokeh_figure`` can reset the browser. See **Generate heatmap publish
+   flow** above.
 
 **Solution:**
 
 - Route all heatmap figure updates through `_publish_heatmap_figure` →
-  `self._ui.publish_bokeh_figure` → `publish_bokeh_pane_to_notebook` (assign
-  `pane.object`, then `_push_panel_layout`, deferred after dispatch batch push).
+  `self._ui.publish_bokeh_figure` → `publish_bokeh_pane_to_notebook` (assign +
+  `sync_pane_to_notebook`, then `force_push` on a fresh io_loop turn).
+- Progress logs: ``_schedule_ipython_main(lambda: self._log(...))`` only — **not**
+  ``self._dispatch``.
 - Build the open-time zeros grid inside `finalize_dataset_load`, not
   `defer_dispatch(_ensure_heatmap_grid)`.
 - Ensure `_apply_heatmap` sets `_heatmap_grid_ready` and `_ensure_heatmap_grid`
   does not replace a loaded computed spectrum unless `force=True`.
-- Spinner/status sync in the same dispatch batch via direct assign + batch push.
+- Confirm editable install + kernel restart (see **Kernel / package path** above).
+
+### Issue: Python heatmap title correct but browser shows placeholder
+
+**Symptoms:** After Generate, `review._heatmap_pane.object.title.text` shows e.g.
+`FL Cnc — …` but the browser heatmap pane still shows the zeros grid title or no
+colormap. Activity log shows finite range and `Finished … in N s`.
+
+**Causes:**
+
+- **Stale kernel package** — notebook imports an old `site-packages` build, not the
+  editable repo. Comm fixes in `src/` are ignored until kernel restart + correct env.
+- **Panel comm push missed or overwritten** — see **Generate heatmap publish flow**
+  (late progress `dispatch`, wrong publish path, batch push before assign).
+
+**Solution:** Verify ``ovro_lwa_portal.__file__`` under `src/ovro_lwa_portal/`;
+restart kernel; confirm `publish_bokeh_pane_to_notebook` uses `sync_pane_to_notebook`
+(not `discard_events`). Run
+``tests/viz/test_source_review_ui_integration.py`` regressions for progress dispatch
+and layout-only comm.
+
+### Issue: Spinner runs long before/after overlay Zarr load (not during)
+
+**Symptoms:** Spinner on for ~tens of seconds before `Loading overlay slice…`, Zarr
+load runs, then spinner stays ~tens of seconds after `Overlay slice loaded`.
+
+**Cause:** Overlay load wrapped in ``defer_dispatch`` → full ``dispatch`` batch before
+and after ``update_slice``. Spinner tracked **Panel layout push** latency on the
+single io_loop thread, not Zarr I/O. See **Panel push latency vs Zarr read** above.
+
+**Solution:** Use ``_schedule_overlay_slice_load`` (``self._ui.schedule``). Spinner
+should match the interval between `Loading overlay slice…` and `Overlay slice loaded`.
 
 ### Issue: pytest passes but `source_review.ipynb` Panel UI is frozen
 
@@ -1293,9 +1425,10 @@ the same root cause as “Generate heatmap runs but plot stays zeros” — Pane
 broken while activity log still works.
 
 **Solution:** Ensure `_ensure_heatmap_grid` / Generate use `_publish_heatmap_figure`
-(`source_review` path). Log/status/spinner from io-loop paths use `_dispatch` →
-`JupyterPanelUISession`. After comm fixes, restart the kernel and confirm the
-heatmap title changes from “Heatmap loads…” before testing clicks.
+(`source_review` path). Status uses `_dispatch` → `JupyterPanelUISession`; spinner
+is ipywidgets. Overlay loads use `_schedule_overlay_slice_load`, not `defer_dispatch`.
+After comm fixes, restart the kernel and confirm the heatmap title changes from
+“Heatmap loads…” before testing clicks.
 
 ### Issue: Radio overlay flipped or rotated relative to HiPS
 

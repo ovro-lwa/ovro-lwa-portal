@@ -6,10 +6,9 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -175,23 +174,46 @@ def run_has_thermal_noise_qa(
     return thermal_noise_png_for_run(run_dir, config=config) is not None
 
 
+def _science_runs_in_day(day_dir: Path, *, config: PipelineQAConfig) -> list[Path]:
+    """List ``Run_*`` or ``Science_*`` directories under one observation day."""
+    return [
+        path
+        for path in day_dir.iterdir()
+        if path.is_dir() and path.name.startswith(config.run_dir_prefix)
+    ]
+
+
+def _thermal_noise_status_for_runs(
+    runs: Sequence[Path],
+    *,
+    config: PipelineQAConfig | None = None,
+) -> dict[Path, Path | None]:
+    """Resolve thermal-noise QA PNG paths with one glob per run directory."""
+    cfg = config or PipelineQAConfig.default()
+    return {run_dir: thermal_noise_png_for_run(run_dir, config=cfg) for run_dir in runs}
+
+
 def select_run_dir(
     day_dir: Path,
     *,
     config: PipelineQAConfig | None = None,
+    runs: Sequence[Path] | None = None,
+    thermal_pngs: Mapping[Path, Path | None] | None = None,
 ) -> Path | None:
     """Pick the newest run directory that has thermal-noise QA for this product."""
     cfg = config or PipelineQAConfig.default()
-    runs = [
-        path
-        for path in day_dir.iterdir()
-        if path.is_dir()
-        and path.name.startswith(cfg.run_dir_prefix)
-        and run_has_thermal_noise_qa(path, config=cfg)
-    ]
-    if not runs:
+    run_dirs = list(runs) if runs is not None else _science_runs_in_day(day_dir, config=cfg)
+    if not run_dirs:
         return None
-    return max(runs, key=lambda path: run_sort_key(path, config=cfg))
+    png_by_run = (
+        dict(thermal_pngs)
+        if thermal_pngs is not None
+        else _thermal_noise_status_for_runs(run_dirs, config=cfg)
+    )
+    qualified = [path for path in run_dirs if png_by_run.get(path) is not None]
+    if not qualified:
+        return None
+    return max(qualified, key=lambda path: run_sort_key(path, config=cfg))
 
 
 def list_subbands(run_dir: Path) -> list[str]:
@@ -249,22 +271,23 @@ def scan_coverage(
             if not day_dir.is_dir() or not DATE_PATTERN.match(day_dir.name):
                 continue
 
-            all_runs = [
-                p for p in day_dir.iterdir() if p.is_dir() and p.name.startswith(cfg.run_dir_prefix)
-            ]
-            selected = select_run_dir(day_dir, config=cfg)
-            thermal_png = (
-                thermal_noise_png_for_run(selected, config=cfg) if selected is not None else None
+            all_runs = _science_runs_in_day(day_dir, config=cfg)
+            thermal_by_run = _thermal_noise_status_for_runs(all_runs, config=cfg)
+            qualified_runs = [path for path in all_runs if thermal_by_run.get(path) is not None]
+            selected = select_run_dir(
+                day_dir,
+                config=cfg,
+                runs=all_runs,
+                thermal_pngs=thermal_by_run,
             )
+            thermal_png = thermal_by_run.get(selected) if selected is not None else None
 
             rows.append(
                 {
                     "lst_hour": hour,
                     "obs_date": day_dir.name,
                     "n_runs": len(all_runs),
-                    "n_wideband_runs": sum(
-                        1 for p in all_runs if run_has_thermal_noise_qa(p, config=cfg)
-                    ),
+                    "n_wideband_runs": len(qualified_runs),
                     "latest_run": selected.name if selected is not None else pd.NA,
                     # Deferred: populated by populate_subbands_for_day when a day loads.
                     "n_subbands": pd.NA if selected is not None else 0,

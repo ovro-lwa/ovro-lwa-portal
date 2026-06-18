@@ -586,3 +586,69 @@ def test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch(
     assert review.loading is False
     assert scheduled == ["schedule"]
     assert widget.update_slice.call_count == 2
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_late_progress_dispatch_does_not_clobber_published_heatmap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a progress dispatch queued before publish must not reset the figure."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_job_id = 1
+    src = review._current_source
+    assert src is not None
+    payload = HeatmapLoad(
+        values=np.full((6, 4), 55.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+
+    review._ui.dispatch(
+        lambda: review._finish_heatmap(
+            src, payload, None, job_id=1, started_at=time.perf_counter()
+        )
+    )
+    # Simulate a progress-log dispatch still queued from compute.
+    review._ui.dispatch(lambda: review._log("late progress line"))
+    _flush_jupyter_io(loop)
+
+    assert _heatmap_values_max(review) == pytest.approx(55.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+    assert harness.bokeh_model(review._heatmap_pane, review._layout).title.text.startswith(
+        "Cas A"
+    )
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_heatmap_progress_logs_do_not_dispatch_panel_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: progress logging must not run full dispatch (stale heatmap push)."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+
+    dispatch_calls: list[str] = []
+    real_dispatch = review._ui.dispatch
+
+    def _track_dispatch(callback, **_kwargs) -> None:
+        dispatch_calls.append("dispatch")
+        real_dispatch(callback)
+
+    monkeypatch.setattr(review._ui, "dispatch", _track_dispatch)
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        sra,
+        "_schedule_ipython_main",
+        lambda fn: scheduled.append("schedule") or loop.add_callback(fn),
+    )
+
+    progress = review._heatmap_progress_callback()
+    progress("extract", 1, 10, "tracking pixels")
+
+    assert dispatch_calls == []
+    assert scheduled == ["schedule"]
+    _flush_jupyter_io(loop)
+    assert "tracking pixels" in review.log_text

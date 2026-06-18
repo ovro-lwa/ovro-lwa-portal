@@ -218,6 +218,43 @@ def test_scan_coverage_defers_subband_listing(tmp_path: Path) -> None:
     assert int(table.iloc[0]["n_subbands"]) == 1
 
 
+def test_scan_coverage_globs_once_per_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    obs_date = "2024-12-28"
+    for stamp in ("120000", "130000"):
+        run_dir = tmp_path / "08h" / obs_date / f"Science_20241228_{stamp}"
+        qa_dir = run_dir / "QA"
+        qa_dir.mkdir(parents=True)
+        (qa_dir / f"20241228_{stamp}_thermal_noise_vs_freq.png").write_bytes(b"png")
+
+    calls: list[Path] = []
+    original = pq.thermal_noise_png_for_run
+
+    def _tracking(run_dir: Path, *, config: pq.PipelineQAConfig | None = None) -> Path | None:
+        calls.append(run_dir)
+        return original(run_dir, config=config)
+
+    monkeypatch.setattr(pq, "thermal_noise_png_for_run", _tracking)
+
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB_PHASE2,
+        v_fits_glob=pq.V_FITS_GLOB_PHASE2,
+        run_dir_prefix="Science_",
+        run_dir_pattern=r"Science_(\d{8})_(\d{6})",
+        qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
+        flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
+        flux_check_csv_per_run=True,
+    )
+    coverage = pq.scan_coverage(config=cfg)
+
+    assert len(coverage) == 1
+    assert len(calls) == 2
+    assert coverage.iloc[0]["n_wideband_runs"] == 2
+    assert coverage.iloc[0]["latest_run"] == "Science_20241228_130000"
+
+
 def test_populate_subbands_for_day_only_touches_selected_day(tmp_path: Path) -> None:
     for obs_date in ("2024-12-27", "2024-12-28"):
         run_dir = tmp_path / "08h" / obs_date / f"Run_{obs_date.replace('-', '')}_120000"
@@ -493,8 +530,31 @@ def test_pipeline_qa_app_activity_log_is_fixed_height(
     app = PipelineQAApp()
     monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
 
-    assert isinstance(app._log_pane, pn.pane.HTML)
+    assert isinstance(app._log_pane, pn.pane.IPyWidget)
     assert app._log_pane.height == ACTIVITY_LOG_HEIGHT_PX
+    app._log("hello")
+    assert "hello" in app._log_widget.value
+
+
+def test_push_dashboard_ui_refreshes_ipywidgets_activity_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = PipelineQAApp()
+    monkeypatch.setattr(app, "_start_initial_scan", lambda self: None)
+    app._build_layouts()
+    app._log("scan complete")
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._sync_all_notebook_views",
+        lambda *_views: None,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._push_panel_layout",
+        lambda *_views, **_kwargs: None,
+    )
+
+    app._push_dashboard_ui()
+
+    assert "scan complete" in app._log_widget.value
 
 
 def test_convert_button_label_and_disabled() -> None:
@@ -557,7 +617,7 @@ def test_initial_scan_does_not_auto_select_day(monkeypatch: pytest.MonkeyPatch) 
         "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
         lambda _coverage: ["2024-12-28"],
     )
-    monkeypatch.setattr(app, "_execute", lambda callback: callback())
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", lambda callback: callback())
 
     class _InlineThread:
         def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
@@ -578,6 +638,96 @@ def test_initial_scan_does_not_auto_select_day(monkeypatch: pytest.MonkeyPatch) 
     assert "2024-12-28" in app.param.select_day.objects
     assert load_calls == []
     assert "Select a day" in app.log_text
+    assert app.scanning is False
+
+
+def test_initial_scan_routes_completion_through_dashboard_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+
+    schedule_calls: list[str] = []
+
+    def _schedule(callback: Callable[[], None]) -> None:
+        schedule_calls.append("schedule")
+        callback()
+
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", _schedule)
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+
+    app._start_initial_scan()
+
+    assert schedule_calls == ["schedule"]
+    assert app.scanning is False
+
+
+def test_initial_scan_applies_state_when_panel_comm_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    app = PipelineQAApp()
+    app._build_layouts()
+    coverage = _sample_coverage()
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.scan_coverage",
+        lambda *args, **kwargs: coverage,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
+        lambda _coverage: ["2024-12-28"],
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.notebook_views_registered",
+        lambda *_views: False,
+    )
+    push_calls: list[str] = []
+    monkeypatch.setattr(
+        app,
+        "_push_dashboard_ui",
+        lambda *, force=True: push_calls.append("push"),
+    )
+
+    class _InlineThread:
+        def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(threading, "Thread", _InlineThread)
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app._schedule_ipython_main",
+        lambda callback: callback(),
+    )
+
+    app._start_initial_scan()
+
+    assert app.scanning is False
+    assert "2024-12-28" in app.param.select_day.objects
+    assert "Select a day" in app.log_text
+    assert push_calls == ["push"]
 
 
 def test_initial_scan_loads_day_selected_during_scan(
@@ -595,7 +745,7 @@ def test_initial_scan_loads_day_selected_during_scan(
         "ovro_lwa_portal.viz.pipeline_qa_app.qa_days",
         lambda _coverage: ["2024-12-28"],
     )
-    monkeypatch.setattr(app, "_execute", lambda callback: callback())
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", lambda callback: callback())
 
     class _InlineThread:
         def __init__(self, *, target: Callable[[], None] | None = None, **_kwargs: object) -> None:
@@ -616,6 +766,7 @@ def test_initial_scan_loads_day_selected_during_scan(
     assert app.select_day == "2024-12-28"
     assert load_calls == ["load"]
     assert "Loading QA data for 2024-12-28" in app.log_text
+    assert app.scanning is False
 
 
 def test_day_selector_triggers_load_day(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -673,7 +824,7 @@ def test_finish_zenith_load_clears_flag_for_current_seq(
     app = PipelineQAApp()
     app._load_seq = 2
     app.loading_zenith = True
-    monkeypatch.setattr(app, "_dispatch_ui", lambda callback: callback())
+    monkeypatch.setattr(app, "_schedule_dashboard_ui", lambda callback: callback())
 
     app._finish_zenith_load(load_seq=2)
 

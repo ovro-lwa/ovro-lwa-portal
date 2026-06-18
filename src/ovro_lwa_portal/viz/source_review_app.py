@@ -37,7 +37,9 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     _capture_ipython_io_loop,
     _format_activity_log_html,
     _patch_astrowidget_get_wcs,
+    _schedule_ipython_main,
     bind_sky_widget_dataset,
+    publish_bokeh_pane_to_notebook,
     schedule_when_panel_loaded,
 )
 from ovro_lwa_portal.viz.panel_ui_session import (
@@ -833,10 +835,11 @@ class SourceReview(param.Parameterized):
                 pct = int(round(100.0 * int(current) / int(total))) if total else 0
                 text = f"{label}: {message} ({current}/{total}, {pct}%)"
 
-            def _push() -> None:
-                self._log(text)
-
-            self._dispatch(_push)
+            # Activity log is ipywidgets — schedule on the io_loop without a Panel
+            # dispatch batch. Progress ``dispatch`` calls each end with
+            # ``_push_panel_layout`` and can republish the zeros heatmap after
+            # ``publish_bokeh_figure`` on long compute jobs.
+            _schedule_ipython_main(lambda msg=text: self._log(msg))
 
         return _callback
 
@@ -1100,6 +1103,20 @@ class SourceReview(param.Parameterized):
 
         figure = self._build_heatmap_figure(payload.values)
 
+        ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
+        dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
+        overlay_hint = (
+            "**Click the heatmap** to inspect a time/frequency slice."
+            if self._overlay_enabled
+            else "Overlay is **off** — toggle **Overlay** to show slices."
+        )
+        status_text = (
+            f"**{src['name']}** — l={src['l']:.2f}°, b={src['b']:.2f}°, "
+            f"RA={ra_h}, Dec={dec_s} · "
+            f"Heatmap: **{self._heatmap_method_label()}** (scale={self._patch_scale:g}) · "
+            f"{overlay_hint}"
+        )
+
         def _load_overlay_after_heatmap() -> None:
             try:
                 if (
@@ -1118,25 +1135,24 @@ class SourceReview(param.Parameterized):
                 self._clear_loading_indicator()
 
         def _after_heatmap_publish() -> None:
-            # Overlay after heatmap publish on the next io-loop turn (do not block
-            # the Bokeh comm push or run heavy Zarr work in the same callback).
-            self._ui.schedule(_load_overlay_after_heatmap)
+            def _confirm_heatmap_then_overlay() -> None:
+                # Republish on a fresh io_loop turn (no artificial delay). Live
+                # Jupyter can miss the first push when layout-root-only comm
+                # batches interleave with late progress dispatches.
+                published = self._heatmap_pane.object
+                if published is not None:
+                    publish_bokeh_pane_to_notebook(
+                        self._heatmap_pane,
+                        published,
+                        *self._notebook_ui_views(),
+                        force_push=True,
+                    )
+                self._set_status(status_text)
+                self._ui.schedule(_load_overlay_after_heatmap)
+
+            self._ui.schedule(_confirm_heatmap_then_overlay)
 
         self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
-
-        ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
-        dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
-        overlay_hint = (
-            "**Click the heatmap** to inspect a time/frequency slice."
-            if self._overlay_enabled
-            else "Overlay is **off** — toggle **Overlay** to show slices."
-        )
-        self._set_status(
-            f"**{src['name']}** — l={src['l']:.2f}°, b={src['b']:.2f}°, "
-            f"RA={ra_h}, Dec={dec_s} · "
-            f"Heatmap: **{self._heatmap_method_label()}** (scale={self._patch_scale:g}) · "
-            f"{overlay_hint}"
-        )
 
     def _default_slice(self, values: np.ndarray) -> tuple[int, int]:
         finite = np.argwhere(np.isfinite(values))

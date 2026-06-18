@@ -2315,8 +2315,16 @@ class PipelineQAApp(param.Parameterized):
         self._close_modal_button = pn.widgets.Button(name="Close", button_type="default")
         self._close_modal_button.on_click(lambda _event: self._close_modal())
         self._modal_container = pn.Column(sizing_mode="stretch_width")
-        self._log_pane = pn.pane.HTML(
-            _format_activity_log_html(""),
+        self._log_widget = widgets.HTML(
+            value=_format_activity_log_html(""),
+            layout=widgets.Layout(
+                width="100%",
+                height=f"{ACTIVITY_LOG_HEIGHT_PX}px",
+                border="1px solid #ccc",
+            ),
+        )
+        self._log_pane = pn.pane.IPyWidget(
+            self._log_widget,
             sizing_mode="stretch_width",
             height=ACTIVITY_LOG_HEIGHT_PX,
         )
@@ -2339,7 +2347,11 @@ class PipelineQAApp(param.Parameterized):
 
     @param.depends("log_text", watch=True)
     def _sync_log_pane(self) -> None:
-        self._log_pane.object = _format_activity_log_html(self.log_text)
+        self._refresh_log_widget()
+
+    def _refresh_log_widget(self) -> None:
+        """Update the ipywidgets activity log (separate comm from Panel layout)."""
+        self._log_widget.value = _format_activity_log_html(self.log_text)
 
     @param.depends("error_message")
     def _error_alert_view(self) -> pn.viewable.Viewable:
@@ -2408,6 +2420,53 @@ class PipelineQAApp(param.Parameterized):
     def _dispatch_ui(self, callback: Callable[[], None]) -> None:
         """Run a UI mutation on the kernel io_loop with batch assign + push."""
         self._ui.dispatch(callback)
+
+    def _push_dashboard_ui(self, *, force: bool = True) -> None:
+        """Sync nested Panel widgets and push the dashboard layout comm."""
+        if self._layout is None:
+            return
+        views = self._notebook_ui_views()
+        if not views:
+            return
+        _sync_all_notebook_views(*views)
+        _push_panel_layout(*views, _force=force)
+        self._refresh_log_widget()
+
+    def _schedule_dashboard_ui(self, callback: Callable[[], None]) -> None:
+        """Apply dashboard state on the io_loop and push (never drop the callback)."""
+
+        def _run() -> None:
+            callback()
+            self._push_dashboard_ui()
+
+        _schedule_ipython_main(_run)
+
+    def _apply_initial_scan_results(self, coverage: pd.DataFrame, days: list[str]) -> None:
+        """Update coverage, day selector, and log after ``scan_coverage`` finishes."""
+        pending_day = self.select_day
+        self._coverage = coverage
+        self.scanning = False
+        if not days:
+            self._log_error(
+                f"No {self._qa_config.qa_run_label} QA days found under the pipeline root."
+            )
+            self._sync_day_selector([], None)
+        else:
+            self._clear_error()
+            preferred = pending_day if pending_day in days else None
+            self._sync_day_selector(days, preferred)
+            if preferred is not None:
+                self._begin_load_day()
+                self._log(
+                    f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
+                    f"Loading QA data for {preferred}…"
+                )
+            else:
+                self._log(
+                    f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
+                    "Select a day from the dropdown to load QA data."
+                )
+        self._sync_log()
 
     def _publish_zenith_heatmaps(self) -> None:
         """Deferred Bokeh publish for each Stokes zenith heatmap (after dispatch batch)."""
@@ -2607,10 +2666,12 @@ class PipelineQAApp(param.Parameterized):
 
             def _push() -> None:
                 self.log_text = text
+                self._refresh_log_widget()
 
             self._execute(_push)
         else:
             self.log_text = text
+            self._refresh_log_widget()
 
     def _log(self, message: str, *, sync: bool = True, defer: bool = False) -> None:
         self._scroll_log.append(message)
@@ -2659,51 +2720,25 @@ class PipelineQAApp(param.Parameterized):
         self.scanning = True
         self._scroll_log.clear()
         self._sync_log()
-        self._log("Scanning pipeline tree…", sync=False)
-        self._sync_log()
+        self._log("Scanning pipeline tree…")
+        self._refresh_log_widget()
 
         def _run() -> None:
             try:
                 coverage = scan_coverage(config=self._qa_config)
                 days = qa_days(coverage)
-
-                def _apply() -> None:
-                    pending_day = self.select_day
-                    self._coverage = coverage
-                    self.scanning = False
-                    if not days:
-                        self._log_error(
-                            f"No {self._qa_config.qa_run_label} QA days found under the pipeline root."
-                        )
-                        self._sync_day_selector([], None)
-                    else:
-                        self._clear_error()
-                        preferred = (
-                            pending_day if pending_day in days else None
-                        )
-                        self._sync_day_selector(days, preferred)
-                        if preferred is not None:
-                            self._begin_load_day()
-                            self._log(
-                                f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
-                                f"Loading QA data for {preferred}…"
-                            )
-                        else:
-                            self._log(
-                                f"Found {len(days)} {self._qa_config.qa_run_label} QA day(s). "
-                                "Select a day from the dropdown to load QA data."
-                            )
-                    self._sync_log()
-
-                self._execute(_apply)
+                self._schedule_dashboard_ui(
+                    lambda: self._apply_initial_scan_results(coverage, days)
+                )
             except Exception as exc:
                 err = exc
 
                 def _fail(err: BaseException = err) -> None:
                     self.scanning = False
                     self._log_error(f"Scan failed: {err}")
+                    self._sync_log()
 
-                self._execute(_fail)
+                self._schedule_dashboard_ui(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -3084,14 +3119,11 @@ class PipelineQAApp(param.Parameterized):
 
 
 def _schedule_initial_scan(app: PipelineQAApp) -> None:
-    """Start the pipeline scan once, even if ``pn.state.onload`` never fires."""
+    """Start the pipeline scan once the embedded Panel layout comm is ready."""
     if app._scan_started:
         return
     app._scan_started = True
-    if pn.state.loaded:
-        app._start_initial_scan()
-    else:
-        pn.state.onload(app._start_initial_scan)
+    schedule_when_panel_loaded(app._start_initial_scan)
 
 
 def display_pipeline_qa_app(
@@ -3137,8 +3169,7 @@ def display_pipeline_qa_app(
     app = app or PipelineQAApp(qa_config=resolved_config)
     app._build_layouts()
 
-    _schedule_initial_scan(app)
-
     assert app._layout is not None
     display(app._layout)
+    _schedule_initial_scan(app)
     return app
