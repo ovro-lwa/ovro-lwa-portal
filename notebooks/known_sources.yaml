@@ -1,7 +1,6 @@
 # Source names for source_review.ipynb autocomplete (resolved via SkyCoord.from_name on Apply).
 # Entries below were validated with resolve_coordinate_string (SIMBAD + NED fallback).
 sources:
-
   - FL Cnc
   - Cas A
   - Hercules A

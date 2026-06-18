@@ -238,9 +238,9 @@ before collapse).
 multi-time stores: Zarr array metadata is written once per array and would
 freeze the time-0 phase center after incremental append. Before every Zarr
 write/append and on load, the library strips those attrs when `wcs_header_str`
-is present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called from
-`_write_or_append_zarr` and `open_dataset`). See **Per-Time WCS and CRVAL** in
-`AGENTS.md`.
+is present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called
+from `_write_or_append_zarr` and `open_dataset`). See **Per-Time WCS and CRVAL**
+in `AGENTS.md`.
 
 Audit per-time CRVAL drift:
 
@@ -313,8 +313,9 @@ plt.show()
 **Symptoms:** RA/Dec grid or source tracking looks correct at the first time
 step but not when stepping through a multi-time incremental store.
 
-**Cause:** Reading `SKY.attrs["fits_wcs_header"]` or `ds.attrs["fits_wcs_header"]`
-from a legacy Zarr (time-0 only), or plotting without selecting `time_idx`.
+**Cause:** Reading `SKY.attrs["fits_wcs_header"]` or
+`ds.attrs["fits_wcs_header"]` from a legacy Zarr (time-0 only), or plotting
+without selecting `time_idx`.
 
 **Solution:** Load with `ovro_lwa_portal.open_dataset`, use
 `ds.radport._get_wcs(time_idx=…)` / `_read_wcs_header_str(ds, time_idx=…)`, and
@@ -362,7 +363,8 @@ When contributing to the ingest module:
 
 ## References
 
-- [AGENTS.md — Per-Time WCS and CRVAL](../../../AGENTS.md) (canonical metadata rules)
+- [AGENTS.md — Per-Time WCS and CRVAL](../../../AGENTS.md) (canonical metadata
+  rules)
 - [OVRO-LWA Portal Documentation](https://github.com/uw-ssec/ovro-lwa-portal)
 - [xradio Documentation](https://xradio.readthedocs.io/)
 - [Zarr Documentation](https://zarr.readthedocs.io/)

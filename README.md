@@ -72,8 +72,8 @@ ovro-ingest --help
 ### For developers (Pixi)
 
 Contributors should use [Pixi](https://pixi.sh) so the environment matches CI.
-Install Pixi from the [Pixi installation guide](https://pixi.sh/latest/#installation),
-then:
+Install Pixi from the
+[Pixi installation guide](https://pixi.sh/latest/#installation), then:
 
 ```bash
 git clone https://github.com/uw-ssec/ovro-lwa-portal.git
@@ -96,28 +96,28 @@ guidelines.
 
 **Pixi environments:**
 
-| Environment | Use |
-| ----------- | --- |
-| `default` | Day-to-day development, tests, notebooks, visualization |
-| `onboard` | First-time setup with SSEC onboarding tools |
-| `ci` | CI-only dependencies (used in GitHub Actions) |
+| Environment | Use                                                     |
+| ----------- | ------------------------------------------------------- |
+| `default`   | Day-to-day development, tests, notebooks, visualization |
+| `onboard`   | First-time setup with SSEC onboarding tools             |
+| `ci`        | CI-only dependencies (used in GitHub Actions)           |
 
 ## Jupyter notebooks and kernels
 
 Interactive review notebooks (`notebooks/source_review.ipynb`,
-`notebooks/jupiter_flux_review.ipynb`) need the **`[visualization]`** extra and a
-Jupyter kernel that points at the **same environment** where the package is
+`notebooks/jupiter_flux_review.ipynb`) need the **`[visualization]`** extra and
+a Jupyter kernel that points at the **same environment** where the package is
 installed. Start JupyterLab from that environment—not from a different conda env
 or an old kernel left over from another install.
 
 Those notebooks combine three front-end stacks:
 
-| Stack | Packages | Role in review notebooks |
-| ----- | -------- | ------------------------ |
-| Panel / Bokeh | `panel`, `bokeh`, `jupyter_bokeh` | Heatmap, controls, status |
-| anywidget | `anywidget`, `ipywidgets` | Custom widget comm (SkyWidget, HiPS) |
-| SkyWidget | `astrowidget` | Radio image overlay (WebGL) |
-| HiPS background | `ipyaladin` | Aladin Lite survey tiles behind the overlay |
+| Stack           | Packages                          | Role in review notebooks                    |
+| --------------- | --------------------------------- | ------------------------------------------- |
+| Panel / Bokeh   | `panel`, `bokeh`, `jupyter_bokeh` | Heatmap, controls, status                   |
+| anywidget       | `anywidget`, `ipywidgets`         | Custom widget comm (SkyWidget, HiPS)        |
+| SkyWidget       | `astrowidget`                     | Radio image overlay (WebGL)                 |
+| HiPS background | `ipyaladin`                       | Aladin Lite survey tiles behind the overlay |
 
 `[visualization]` pulls in `astrowidget` and `ipyaladin`; both depend on
 **anywidget**. JupyterLab must load the **anywidget** and **jupyter-widgets**
@@ -144,9 +144,9 @@ jupyter lab
 ```
 
 **astrowidget source:** `pip install 'ovro-lwa-portal[visualization]'` installs
-**astrowidget from PyPI** (`>=0.1.1`). Pixi development uses **astrowidget `main`
-from GitHub**, which can be ahead of PyPI. If SkyWidget misbehaves after a
-portal upgrade, align with the Git version:
+**astrowidget from PyPI** (`>=0.1.1`). Pixi development uses **astrowidget
+`main` from GitHub**, which can be ahead of PyPI. If SkyWidget misbehaves after
+a portal upgrade, align with the Git version:
 
 ```bash
 pip install 'git+https://github.com/ovro-lwa/astrowidget.git'
@@ -200,15 +200,17 @@ print("anywidget:", anywidget.__version__)
 _ = SkyWidget()  # should construct without import errors
 ```
 
-- `ovro_lwa_portal.__file__` should be under `site-packages` for a normal install,
-  or under `src/` if you used `pip install -e .`.
-- If Panel panes do not update in the browser after **Generate heatmap**, restart
-  the kernel, confirm the kernel name above, and check Panel/Bokeh versions.
+- `ovro_lwa_portal.__file__` should be under `site-packages` for a normal
+  install, or under `src/` if you used `pip install -e .`.
+- If Panel panes do not update in the browser after **Generate heatmap**,
+  restart the kernel, confirm the kernel name above, and check Panel/Bokeh
+  versions.
 - If the sky pane is blank, frozen, or missing HiPS, confirm **anywidget** lab
   extensions, **astrowidget** version/path, and that you restarted the kernel
   after reinstalling or rebuilding astrowidget.
 
-More detail: [Interactive visualization guide](docs/user-guide/interactive-visualization.md).
+More detail:
+[Interactive visualization guide](docs/user-guide/interactive-visualization.md).
 
 ### Pixi developers
 

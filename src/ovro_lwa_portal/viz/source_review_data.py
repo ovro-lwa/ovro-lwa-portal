@@ -347,5 +347,3 @@ def _format_patch_fit_diagnostics(fit: object, time_idx: int, freq_idx: int) -> 
         f"offset=({diag['x_offset_pixels']:.2f}, {diag['y_offset_pixels']:.2f}) px, "
         f"patch_max={diag['patch_max']:.3g} Jy"
     )
-
-

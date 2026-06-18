@@ -267,8 +267,8 @@ class WCSHeader:
    This is the only celestial WCS metadata that updates on each
    `append_dim='time'` write.
 
-**In-memory only** during combine/regrid (`_load_for_combine`); **not** persisted
-to Zarr when `wcs_header_str` is present (stripped by
+**In-memory only** during combine/regrid (`_load_for_combine`); **not**
+persisted to Zarr when `wcs_header_str` is present (stripped by
 `strip_redundant_fits_wcs_header_attrs` before `_write_or_append_zarr` and on
 `open_dataset`):
 
@@ -276,12 +276,13 @@ to Zarr when `wcs_header_str` is present (stripped by
 - Per-variable attrs: `xds[var].attrs['fits_wcs_header']`
 - Coordinate attrs on `right_ascension` / `declination`
 
-**Why:** Zarr array-level attrs (e.g. on `SKY`) do not vary per time slice; writing
-`fits_wcs_header` there after the first append freezes time-0 `CRVAL` and breaks
-QA tools that read attrs instead of `wcs_header_str[time_idx]`. See **Per-Time WCS
-and CRVAL** in `AGENTS.md`.
+**Why:** Zarr array-level attrs (e.g. on `SKY`) do not vary per time slice;
+writing `fits_wcs_header` there after the first append freezes time-0 `CRVAL`
+and breaks QA tools that read attrs instead of `wcs_header_str[time_idx]`. See
+**Per-Time WCS and CRVAL** in `AGENTS.md`.
 
-**Regression tests:** `test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present`,
+**Regression tests:**
+`test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present`,
 `test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str`.
 
 **Relationships**:
