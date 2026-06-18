@@ -303,7 +303,7 @@ def test_zarr_status_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(
         pq,
         "_zarr_store_exists",
-        lambda path: path.name.endswith("20241228.zarr"),
+        lambda path: path == i_zarr,
     )
     status = pq.zarr_status("2024-12-28")
     assert status == {"I": True, "V": False}
@@ -824,7 +824,7 @@ def test_finish_zenith_load_clears_flag_for_current_seq(
     app = PipelineQAApp()
     app._load_seq = 2
     app.loading_zenith = True
-    monkeypatch.setattr(app, "_schedule_dashboard_ui", lambda callback: callback())
+    monkeypatch.setattr(app, "_dispatch_ui", lambda callback: callback())
 
     app._finish_zenith_load(load_seq=2)
 
@@ -1508,6 +1508,10 @@ def test_convert_success_schedules_refresh_after_clearing_converting(
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app.convert_missing_zarr",
         lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.pipeline_qa_app.zarr_status",
+        lambda _day, **kwargs: {"I": True, "V": False},
     )
     monkeypatch.setattr(
         "ovro_lwa_portal.viz.pipeline_qa_app._schedule_ipython_main",

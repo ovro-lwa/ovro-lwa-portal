@@ -224,7 +224,7 @@ class TestRadportPlot:
     ) -> None:
         """plot() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found in dataset"):
-            valid_ovro_dataset.radport.plot(var="BEAM")
+            valid_ovro_dataset.radport.plot(var="NONEXISTENT")
 
     def test_plot_invalid_variable_lists_available(
         self, valid_ovro_dataset: xr.Dataset
@@ -520,7 +520,7 @@ class TestRadportCutout:
         """cutout() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found"):
             valid_ovro_dataset.radport.cutout(
-                l_center=0.0, m_center=0.0, dl=0.1, dm=0.1, var="BEAM"
+                l_center=0.0, m_center=0.0, dl=0.1, dm=0.1, var="NONEXISTENT"
             )
 
     def test_cutout_out_of_bounds_raises(
@@ -679,7 +679,9 @@ class TestRadportDynamicSpectrum:
     ) -> None:
         """dynamic_spectrum() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found"):
-            valid_ovro_dataset.radport.dynamic_spectrum(l=0.0, m=0.0, var="BEAM")
+            valid_ovro_dataset.radport.dynamic_spectrum(
+                l=0.0, m=0.0, var="NONEXISTENT"
+            )
 
 
 class TestRadportPatchStatistic:
@@ -1482,7 +1484,7 @@ class TestRadportPlotGrid:
     ) -> None:
         """plot_grid() raises ValueError for non-existent variable."""
         with pytest.raises(ValueError, match="not found"):
-            valid_ovro_dataset.radport.plot_grid(var="BEAM")
+            valid_ovro_dataset.radport.plot_grid(var="NONEXISTENT")
 
     def test_plot_grid_creates_multiple_axes(
         self, valid_ovro_dataset: xr.Dataset
