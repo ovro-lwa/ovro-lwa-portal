@@ -2,126 +2,126 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/api/data-loading/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/api/fits-to-zarr-xradio/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/api/ingest/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/api/radport-accessor/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/api/viz-module/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/contributing/contributing/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/getting-started/basic-plotting/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/getting-started/coordinate-systems/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/getting-started/installation/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/getting-started/loading-data/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/guides/architecture-decisions/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/tutorials/pulsar-dedispersion/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/tutorials/spectral-mapping/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/tutorials/transient-analysis/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/animations/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/celestial-tracking/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/dispersion-measure/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/fits-to-zarr/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/interactive-visualization/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/source-detection/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/spectral-analysis/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/visualization/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/wcs-coordinates/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-benchmarking/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-cloud-storage/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-compression/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-decision-guide/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-fundamentals/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-read-optimization/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
     <url>
          <loc>https://uw-ssec.github.io/ovro-lwa-portal/user-guide/zarr-optimization/chunking-write-path/</loc>
-         <lastmod>2026-06-16</lastmod>
+         <lastmod>2026-06-18</lastmod>
     </url>
 </urlset>
