@@ -5,8 +5,12 @@ Usage::
 
     pixi run python scripts/profile_overlay_slice.py
     pixi run python scripts/profile_overlay_slice.py /path/to/store.zarr
+    pixi run python scripts/profile_overlay_slice.py --time-comm
 
 Measures the same stages as ``SourceReview._update_sky`` → ``SkyWidget.update_slice``.
+``--time-comm`` records trait-notification block timing and simulates 50 ms
+``send_state`` latency over 10 rapid ``update_slice`` calls (revision-gated vs
+always-send).
 """
 
 from __future__ import annotations
@@ -21,9 +25,13 @@ from pathlib import Path
 from typing import Iterator
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_ASTROWIDGET_SRC = _REPO_ROOT.parent / "astrowidget" / "src"
-if _ASTROWIDGET_SRC.is_dir():
-    sys.path.insert(0, str(_ASTROWIDGET_SRC))
+for _candidate in (
+    _REPO_ROOT.parent / "astrowidget-feat-overlay-push-reproject-cache" / "src",
+    _REPO_ROOT.parent / "astrowidget" / "src",
+):
+    if _candidate.is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
 
 import numpy as np
 import xarray as xr
@@ -250,6 +258,92 @@ def _profile_widget_update(
     print(f"  warm mean={statistics.mean(warm) * 1000:.1f} ms  (LRU + no WCS rebuild)")
 
 
+def _profile_trait_comm_block(
+    ds: xr.Dataset,
+    *,
+    max_size: int,
+    time_idx: int,
+    freq_idx: int,
+    repeats: int,
+) -> None:
+    """Wrap ``_push_image_frame`` to measure trait notification block + payload size."""
+    widget = SkyWidget()
+    widget.set_dataset(ds, max_size=max_size, defer_display=True)
+    widget.overlay_view_lock = True
+    widget.view_ra = 350.85
+    widget.view_dec = 58.815
+
+    trait_ms: list[float] = []
+    nbytes: list[int] = []
+    original_push = widget._push_image_frame
+
+    def _timed_push(*args, **kwargs) -> None:
+        t0 = time.perf_counter()
+        original_push(*args, **kwargs)
+        trait_ms.append((time.perf_counter() - t0) * 1000.0)
+        nbytes.append(len(widget.image_data))
+
+    widget._push_image_frame = _timed_push  # type: ignore[method-assign]
+
+    for t in range(repeats):
+        widget.update_slice(t % int(ds.sizes["time"]), freq_idx, view_lock=True)
+
+    print(f"\n=== trait comm block (_push_image_frame wall, n={repeats}) ===")
+    print(
+        f"  mean={statistics.mean(trait_ms):.2f} ms  max={max(trait_ms):.2f} ms  "
+        f"payload={statistics.mean(nbytes) / 1024:.0f} KB"
+    )
+
+
+def _benchmark_send_state_gating(
+    ds: xr.Dataset,
+    *,
+    max_size: int,
+    freq_idx: int,
+    n_rapid: int = 10,
+    comm_delay_s: float = 0.05,
+) -> None:
+    """Simulate remote Jupyter comm latency on rapid heatmap scrub."""
+    widget = SkyWidget()
+    widget.set_dataset(ds, max_size=max_size, defer_display=True)
+    widget.overlay_view_lock = True
+    widget.view_ra = 350.85
+    widget.view_dec = 58.815
+    n_time = int(ds.sizes["time"])
+
+    send_calls = {"count": 0}
+
+    def _slow_send_state(**_kwargs) -> None:
+        send_calls["count"] += 1
+        time.sleep(comm_delay_s)
+
+    widget.send_state = _slow_send_state  # type: ignore[method-assign]
+
+    t0 = time.perf_counter()
+    for t in range(n_rapid):
+        widget.update_slice(t % n_time, freq_idx, view_lock=True)
+        widget.send_state()
+    always_ms = (time.perf_counter() - t0) * 1000.0
+    always_sends = send_calls["count"]
+
+    send_calls["count"] = 0
+    last_rev: int | None = None
+    t0 = time.perf_counter()
+    for t in range(n_rapid):
+        widget.update_slice(t % n_time, freq_idx, view_lock=True)
+        rev = int(widget.image_revision)
+        if rev != last_rev:
+            widget.send_state()
+            last_rev = rev
+    gated_ms = (time.perf_counter() - t0) * 1000.0
+    gated_sends = send_calls["count"]
+
+    print(f"\n=== send_state comm simulation ({n_rapid} rapid update_slice, "
+          f"{comm_delay_s * 1000:.0f} ms/send) ===")
+    print(f"  always send_state: {always_ms:.0f} ms total, {always_sends} sends")
+    print(f"  revision-gated:    {gated_ms:.0f} ms total, {gated_sends} sends")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -261,6 +355,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--n-time", type=int, default=120)
     parser.add_argument("--n-freq", type=int, default=16)
     parser.add_argument("--n-lm", type=int, default=512)
+    parser.add_argument(
+        "--time-comm",
+        action="store_true",
+        help="Measure trait block timing and simulate send_state latency on rapid scrubs.",
+    )
     args = parser.parse_args(argv)
 
     n_l = args.n_lm
@@ -306,6 +405,21 @@ def main(argv: list[str] | None = None) -> int:
 
     t_mid = args.n_time // 2
     f_mid = args.n_freq // 2
+
+    if args.time_comm:
+        _profile_trait_comm_block(
+            ds,
+            max_size=max_size,
+            time_idx=t_mid,
+            freq_idx=f_mid,
+            repeats=args.repeats,
+        )
+        _benchmark_send_state_gating(
+            ds,
+            max_size=max_size,
+            freq_idx=f_mid,
+        )
+        return 0
 
     _profile_cube_stages(
         cube,

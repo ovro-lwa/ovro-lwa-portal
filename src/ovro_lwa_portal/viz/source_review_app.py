@@ -96,6 +96,7 @@ class SourceReviewConfig:
     hips_http_prefix: str = "/calibration/hips"
     hips_background_percentile_low: float = 2.0
     hips_background_percentile_high: float = 98.0
+    log_overlay_timing: bool = False
 
 
 LOADING_SPINNER_HTML = (
@@ -209,6 +210,8 @@ class SourceReview(param.Parameterized):
         self._default_freq_idx = 0
         self._heatmap_job_id = 0
         self._heatmap_grid_ready = False
+        self._overlay_load_generation = 0
+        self._last_sent_image_revision: int | None = None
 
         super().__init__(coordinate_string=coordinate_string.strip(), **params)
 
@@ -516,7 +519,12 @@ class SourceReview(param.Parameterized):
             self.loading = True
             self._sync_spinner(True)
 
+        self._overlay_load_generation += 1
+        generation = self._overlay_load_generation
+
         def _run() -> None:
+            if generation != self._overlay_load_generation:
+                return
             try:
                 self._update_sky(
                     int(time_idx),
@@ -525,9 +533,10 @@ class SourceReview(param.Parameterized):
                     center=center,
                     preserve_view=preserve_view,
                     log_loading=True,
+                    overlay_generation=generation,
                 )
             finally:
-                if manage_spinner:
+                if manage_spinner and generation == self._overlay_load_generation:
                     self._clear_loading_indicator()
 
         self._ui.schedule(_run)
@@ -683,9 +692,35 @@ class SourceReview(param.Parameterized):
                 "or **Generate heatmap** for the dynamic spectrum."
             )
         self._log_overlay_diagnostics(plan.goto_center, context=f"Center[{plan.reason}]")
+        self._force_send_sky_widget_state(widget)
+
+    def _maybe_send_sky_widget_state(self, widget: object, *, force: bool = False) -> float:
+        """Push widget traits to the browser; skip when ``image_revision`` is unchanged."""
         send_state = getattr(widget, "send_state", None)
-        if callable(send_state):
-            send_state()
+        if not callable(send_state):
+            return 0.0
+        rev = int(getattr(widget, "image_revision", 0))
+        if not force and self._last_sent_image_revision == rev:
+            return 0.0
+        t0 = time.perf_counter()
+        send_state()
+        comm_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_sent_image_revision = rev
+        return comm_ms
+
+    def _force_send_sky_widget_state(self, widget: object) -> None:
+        """Always push widget state (Center/goto paths also change view traits)."""
+        self._maybe_send_sky_widget_state(widget, force=True)
+
+    def _log_overlay_push_timing(self, widget: object, *, comm_ms: float) -> None:
+        profile = getattr(widget, "_profile_last_push", None) or {}
+        zarr_ms = float(profile.get("zarr_ms", 0.0))
+        reproject_ms = float(profile.get("reproject_ms", 0.0))
+        nbytes = int(profile.get("bytes", len(getattr(widget, "image_data", b"") or b"")))
+        self._log(
+            f"Overlay push: Zarr {zarr_ms:.0f} ms, reproject {reproject_ms:.0f} ms, "
+            f"comm {comm_ms:.0f} ms, {nbytes / 1024:.0f} KB"
+        )
 
     def _log_overlay_diagnostics(self, intended_center: SkyCoord, *, context: str) -> None:
         """Log realized widget view/CRVAL vs the intended center.
@@ -823,6 +858,9 @@ class SourceReview(param.Parameterized):
         last_key: dict[str, tuple[int, str]] = {}
 
         def _callback(stage: str, current: int, total: int, message: str) -> None:
+            # Pixel track is fast; log start + finish only (skip per-batch lines).
+            if stage == "track" and total > 1 and current not in (0, total):
+                return
             if stage in ("extract", "track") and total > 1:
                 key = (current, message)
                 if current not in (0, total) and last_key.get(stage) == key:
@@ -1117,22 +1155,27 @@ class SourceReview(param.Parameterized):
             f"{overlay_hint}"
         )
 
+        # Invalidate in-flight heatmap-tap overlay loads before scheduling the
+        # post-generate slice so a slow follow-up cannot overwrite a newer tap.
+        self._overlay_load_generation += 1
+        overlay_generation = self._overlay_load_generation
+
         def _load_overlay_after_heatmap() -> None:
-            try:
-                if (
-                    self._overlay_enabled
-                    and self._sky_widget is not None
-                    and self._coord is not None
-                ):
-                    self._update_sky(
-                        self._time_idx,
-                        self._freq_idx,
-                        center_on_target=True,
-                        center=self._coord,
-                        log_loading=True,
-                    )
-            finally:
-                self._clear_loading_indicator()
+            if overlay_generation != self._overlay_load_generation:
+                return
+            if (
+                self._overlay_enabled
+                and self._sky_widget is not None
+                and self._coord is not None
+            ):
+                self._update_sky(
+                    self._time_idx,
+                    self._freq_idx,
+                    center_on_target=True,
+                    center=self._coord,
+                    log_loading=True,
+                    overlay_generation=overlay_generation,
+                )
 
         def _after_heatmap_publish() -> None:
             def _confirm_heatmap_then_overlay() -> None:
@@ -1148,6 +1191,10 @@ class SourceReview(param.Parameterized):
                         force_push=True,
                     )
                 self._set_status(status_text)
+                # Clear the generate spinner once the heatmap is confirmed; do
+                # not tie spinner lifetime to the follow-up overlay Zarr read
+                # (layout pushes during overlay load can clobber the figure).
+                self._clear_loading_indicator()
                 self._ui.schedule(_load_overlay_after_heatmap)
 
             self._ui.schedule(_confirm_heatmap_then_overlay)
@@ -1207,9 +1254,12 @@ class SourceReview(param.Parameterized):
         center: SkyCoord | None = None,
         preserve_view: bool = False,
         log_loading: bool = False,
+        overlay_generation: int | None = None,
     ) -> None:
         widget = self._sky_widget
         if widget is None:
+            return
+        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
             return
         reproject_center = center if center is not None else self._coord
         if reproject_center is None:
@@ -1251,14 +1301,18 @@ class SourceReview(param.Parameterized):
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[view_lock]"
+        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
+            return
         self._log_overlay_diagnostics(diag_center, context=diag_context)
         if log_loading:
             self._log(
                 f"Overlay slice loaded (t={int(time_idx)}, f={int(freq_idx)})."
             )
-        send_state = getattr(widget, "send_state", None)
-        if callable(send_state):
-            send_state()
+        # User-visible overlay loads always push widget state; revision-gated
+        # skip is only for silent/internal paths.
+        comm_ms = self._maybe_send_sky_widget_state(widget, force=log_loading)
+        if self._config.log_overlay_timing and log_loading:
+            self._log_overlay_push_timing(widget, comm_ms=comm_ms)
 
     def _on_heatmap_tap(self, time_idx: int, freq_idx: int) -> None:
         self._time_idx = time_idx
@@ -1439,9 +1493,7 @@ class SourceReview(param.Parameterized):
             clear_image = getattr(widget, "clear_image", None)
             if callable(clear_image):
                 clear_image()
-            send_state = getattr(widget, "send_state", None)
-            if callable(send_state):
-                send_state()
+            self._force_send_sky_widget_state(widget)
             self._log("Overlay off — hidden.")
             self._set_status("Overlay **off** — HiPS background only.")
 

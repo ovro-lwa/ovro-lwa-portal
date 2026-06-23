@@ -323,6 +323,8 @@ class JupiterFluxReview(param.Parameterized):
         def _callback(stage: str, current: int, total: int, message: str) -> None:
             if job_id != self._load_job_id:
                 return
+            if stage == "track" and total > 1 and current not in (0, total):
+                return
             if stage in ("extract", "track") and total > 1:
                 key = (current, message)
                 if current not in (0, total) and last_key.get(stage) == key:

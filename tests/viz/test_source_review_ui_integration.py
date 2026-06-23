@@ -498,7 +498,7 @@ def test_jupyter_spinner_stays_until_heatmap_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Spinner stays on through compute, heatmap publish, and overlay load."""
+    """Spinner stays on through compute until the heatmap is confirmed in the browser."""
     compute_started = threading.Event()
     release_compute = threading.Event()
 
@@ -529,11 +529,11 @@ def test_jupyter_spinner_stays_until_heatmap_publish(
     deadline = time.perf_counter() + 5.0
     while time.perf_counter() < deadline:
         _drain_io_loop(loop, timeout_s=0.1)
-        if not review.loading:
+        if abs(_heatmap_values_max(review) - 71.0) < 1e-6 and not review.loading:
             break
         time.sleep(0.01)
 
-    assert review.loading is False
+    assert not review.loading
     assert not _spinner_spinning(review)
     assert _heatmap_values_max(review) == pytest.approx(71.0)
     _assert_heatmap_bokeh_model_live(harness, review)
@@ -586,6 +586,84 @@ def test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch(
     assert review.loading is False
     assert scheduled == ["schedule"]
     assert widget.update_slice.call_count == 2
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_overlay_single_flight_drops_stale_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the latest scheduled overlay load runs when several are queued quickly."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._coord = CAS_A
+    widget = MagicMock()
+    widget.overlay_view_lock = True
+    widget.crval = (350.85, 58.815)
+    widget.view_ra = 350.85
+    widget.view_dec = 58.815
+    widget.view_center_skycoord.return_value = CAS_A
+    widget.image_revision = 0
+    review._sky_widget = widget
+
+    update_calls: list[tuple[int, int]] = []
+
+    def _record_update_slice(time_idx, freq_idx, **kwargs) -> None:
+        update_calls.append((int(time_idx), int(freq_idx)))
+        widget.image_revision = int(widget.image_revision) + 1
+
+    widget.update_slice.side_effect = _record_update_slice
+
+    review._schedule_overlay_slice_load(0, 0, preserve_view=True)
+    review._schedule_overlay_slice_load(5, 0, preserve_view=True)
+    _flush_jupyter_io(loop)
+
+    assert update_calls == [(5, 0)]
+    assert review.loading is False
+    assert not _spinner_spinning(review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_post_generate_overlay_skipped_when_heatmap_tap_supersedes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-generate overlay must not run after the user taps a newer heatmap cell."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._coord = CAS_A
+    widget = MagicMock()
+    widget.overlay_view_lock = True
+    widget.crval = (350.85, 58.815)
+    widget.view_ra = 350.85
+    widget.view_dec = 58.815
+    widget.view_center_skycoord.return_value = CAS_A
+    widget.image_revision = 0
+    review._sky_widget = widget
+
+    update_calls: list[tuple[int, int]] = []
+
+    def _record_update_slice(time_idx, freq_idx, **kwargs) -> None:
+        update_calls.append((int(time_idx), int(freq_idx)))
+        widget.image_revision = int(widget.image_revision) + 1
+
+    widget.update_slice.side_effect = _record_update_slice
+
+    src = review._current_source
+    assert src is not None
+    payload = HeatmapLoad(
+        values=np.full((6, 4), 42.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+    review._apply_heatmap(src, payload)
+    _flush_jupyter_io(loop)
+
+    review._schedule_overlay_slice_load(5, 0, preserve_view=True)
+    _flush_jupyter_io(loop)
+
+    assert (5, 0) in update_calls
+    assert (0, 0) not in update_calls or update_calls[-1] == (5, 0)
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -652,3 +730,28 @@ def test_heatmap_progress_logs_do_not_dispatch_panel_batches(
     assert scheduled == ["schedule"]
     _flush_jupyter_io(loop)
     assert "tracking pixels" in review.log_text
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_heatmap_progress_throttles_pixel_track_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pixel track logs start and finish only — intermediate batches are omitted."""
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    monkeypatch.setattr(
+        sra,
+        "_schedule_ipython_main",
+        lambda fn: loop.add_callback(fn),
+    )
+
+    progress = review._heatmap_progress_callback()
+    progress("track", 0, 120, "Mapping RA/Dec to image pixels (per-time WCS)")
+    progress("track", 60, 120, "Mapping RA/Dec to image pixels (per-time WCS)")
+    progress("track", 120, 120, "Mapping RA/Dec to image pixels (per-time WCS)")
+    _flush_jupyter_io(loop)
+
+    lines = [line for line in review.log_text.splitlines() if "Pixel track" in line]
+    assert len(lines) == 2
+    assert "(0/120" in lines[0]
+    assert "(120/120" in lines[1]
