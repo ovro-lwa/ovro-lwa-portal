@@ -37,10 +37,11 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     _capture_ipython_io_loop,
     _format_activity_log_html,
     _patch_astrowidget_get_wcs,
+    _push_panel_layout,
     _schedule_ipython_main,
     bind_sky_widget_dataset,
-    publish_bokeh_pane_to_notebook,
     schedule_when_panel_loaded,
+    set_notebook_pane_object,
 )
 from ovro_lwa_portal.viz.panel_ui_session import (
     CallbackPanelUISession,
@@ -1021,7 +1022,7 @@ class SourceReview(param.Parameterized):
         cache_key = (self.coordinate_string.strip(), method)
         if cache_key in self._cache:
             cached = self._cache[cache_key]
-            self._dispatch(lambda: self._apply_heatmap(src, cached))
+            self._ui.schedule(lambda: self._apply_heatmap(src, cached))
             return
 
         self._heatmap_job_id += 1
@@ -1122,7 +1123,7 @@ class SourceReview(param.Parameterized):
         self._log(
             f"Finished {src['name']} ({self._heatmap_method_label()}) in {elapsed_s:.1f} s"
         )
-        self._apply_heatmap(src, payload)
+        self._ui.schedule(lambda: self._apply_heatmap(src, payload))
 
     def _clear_loading_indicator(self) -> None:
         self.loading = False
@@ -1178,26 +1179,21 @@ class SourceReview(param.Parameterized):
                 )
 
         def _after_heatmap_publish() -> None:
-            def _confirm_heatmap_then_overlay() -> None:
-                # Republish on a fresh io_loop turn (no artificial delay). Live
-                # Jupyter can miss the first push when layout-root-only comm
-                # batches interleave with late progress dispatches.
-                published = self._heatmap_pane.object
-                if published is not None:
-                    publish_bokeh_pane_to_notebook(
-                        self._heatmap_pane,
-                        published,
-                        *self._notebook_ui_views(),
-                        force_push=True,
-                    )
-                self._set_status(status_text)
-                # Clear the generate spinner once the heatmap is confirmed; do
-                # not tie spinner lifetime to the follow-up overlay Zarr read
-                # (layout pushes during overlay load can clobber the figure).
-                self._clear_loading_indicator()
-                self._ui.schedule(_load_overlay_after_heatmap)
-
-            self._ui.schedule(_confirm_heatmap_then_overlay)
+            self._clear_loading_indicator()
+            with param.parameterized.discard_events(self):
+                self.status = status_text
+            set_notebook_pane_object(
+                self._status_pane,
+                status_text,
+                *self._notebook_ui_views(),
+            )
+            _push_panel_layout(
+                *self._notebook_ui_views(),
+                self._heatmap_pane,
+                self._status_pane,
+                _force=True,
+            )
+            self._ui.schedule(_load_overlay_after_heatmap)
 
         self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
 
