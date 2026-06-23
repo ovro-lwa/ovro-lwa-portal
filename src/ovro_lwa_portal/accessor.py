@@ -1237,7 +1237,8 @@ def _patch_plane_center_and_max(values: np.ndarray) -> tuple[float, float]:
     """Return (center_pixel, patch_max) for a 2D spatial patch."""
     arr = np.asarray(values, dtype=np.float64)
     center = float(arr[arr.shape[0] // 2, arr.shape[1] // 2])
-    patch_max = float(np.nanmax(arr))
+    finite = arr[np.isfinite(arr)]
+    patch_max = float(np.max(finite)) if finite.size else float("nan")
     return center, patch_max
 
 
@@ -1273,16 +1274,41 @@ def _fit_patch_cube_gaussian(
     center_fluxes: list[float] = []
     patch_maxes: list[float] = []
     for fi in range(patch_arr.shape[0]):
-        center_flux, patch_max = _patch_plane_center_and_max(patch_arr[fi])
-        center_fluxes.append(center_flux)
-        patch_maxes.append(patch_max)
         if fi >= len(beam_widths_per_freq):
             msg = (
                 f"beam_widths_per_freq length {len(beam_widths_per_freq)} "
                 f"is less than number of frequency planes {patch_arr.shape[0]}"
             )
             raise ValueError(msg)
+        if not np.any(np.isfinite(patch_arr[fi])):
+            center_fluxes.append(float("nan"))
+            patch_maxes.append(float("nan"))
+            peaks.append(float("nan"))
+            x_offsets.append(float("nan"))
+            y_offsets.append(float("nan"))
+            widthxs.append(float("nan"))
+            widthys.append(float("nan"))
+            backgrounds.append(float("nan"))
+            chi2_reds.append(float("nan"))
+            continue
+        center_flux, patch_max = _patch_plane_center_and_max(patch_arr[fi])
+        center_fluxes.append(center_flux)
+        patch_maxes.append(patch_max)
         beam_wx, beam_wy = beam_widths_per_freq[fi]
+        if (
+            not np.isfinite(beam_wx)
+            or not np.isfinite(beam_wy)
+            or beam_wx <= 0
+            or beam_wy <= 0
+        ):
+            peaks.append(float("nan"))
+            x_offsets.append(float("nan"))
+            y_offsets.append(float("nan"))
+            widthxs.append(float("nan"))
+            widthys.append(float("nan"))
+            backgrounds.append(float("nan"))
+            chi2_reds.append(float("nan"))
+            continue
         peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
             patch_arr[fi],
             beam_widthx=beam_wx,
@@ -1800,6 +1826,30 @@ class RadportAccessor:
         """
         return "BEAM" in self._obj.data_vars
 
+    def _var_cell_has_finite_data(
+        self,
+        *,
+        time_idx: int,
+        frequency_idx: int,
+        pol: int = 0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> bool:
+        """Return whether a ``(time, frequency)`` cell contains any finite data."""
+        if var not in self._obj.data_vars:
+            return False
+        plane = self._obj[var].isel(
+            time=int(time_idx),
+            frequency=int(frequency_idx),
+            polarization=int(pol),
+        )
+        if "beam_param" in plane.dims:
+            vals = np.asarray(plane.values, dtype=np.float64)
+            return bool(np.any(np.isfinite(vals)))
+        if plane.ndim == 0:
+            return bool(np.isfinite(plane.values))
+        populated = plane.notnull().any(dim=list(plane.dims))
+        return bool(np.asarray(populated.values).any())
+
     def beam_fwhm_pixels(
         self,
         *,
@@ -1886,18 +1936,39 @@ class RadportAccessor:
         time_idx: int,
         pol: int = 0,
         var: Literal["SKY", "BEAM"] = "SKY",
+        skip_empty_cells: bool = True,
+        data_var: Literal["SKY", "BEAM"] | None = None,
     ) -> list[tuple[float, float]]:
-        """Synthesized beam FWHM in pixels for every frequency at one time step."""
+        """Synthesized beam FWHM in pixels for every frequency at one time step.
+
+        When *skip_empty_cells* is True (default), ``(time, frequency)`` cells
+        with no finite data in *data_var* (defaults to *var*) return
+        ``(nan, nan)`` instead of requiring beam metadata.
+        """
         n_freqs = int(self._obj.sizes["frequency"])
-        return [
-            self.beam_fwhm_pixels(
-                time_idx=int(time_idx),
-                frequency_idx=fi,
-                pol=pol,
-                var=var,
-            )
-            for fi in range(n_freqs)
-        ]
+        empty_var = data_var if data_var is not None else var
+        widths: list[tuple[float, float]] = []
+        for fi in range(n_freqs):
+            try:
+                widths.append(
+                    self.beam_fwhm_pixels(
+                        time_idx=int(time_idx),
+                        frequency_idx=fi,
+                        pol=pol,
+                        var=var,
+                    )
+                )
+            except ValueError:
+                if skip_empty_cells and not self._var_cell_has_finite_data(
+                    time_idx=int(time_idx),
+                    frequency_idx=fi,
+                    pol=pol,
+                    var=empty_var,
+                ):
+                    widths.append((float("nan"), float("nan")))
+                    continue
+                raise
+        return widths
 
     def patch_radius_pixels(
         self,
@@ -1907,14 +1978,27 @@ class RadportAccessor:
         pol: int = 0,
         var: Literal["SKY", "BEAM"] = "SKY",
     ) -> int:
-        """Patch half-width at one time step from ``scale`` and max beam FWHM over frequency."""
+        """Patch half-width at one time step from ``scale`` and max beam FWHM over frequency.
+
+        Only populated ``(time, frequency)`` cells in *var* contribute to the
+        maximum beam size. Empty grid slots are ignored.
+        """
         beam_widths = self.beam_fwhm_pixels_all_frequencies(
             time_idx=time_idx,
             pol=pol,
             var=var,
+            skip_empty_cells=True,
+            data_var=var,
         )
-        max_wx = max(wx for wx, _wy in beam_widths)
-        max_wy = max(wy for _wx, wy in beam_widths)
+        finite_widths = [
+            (wx, wy)
+            for wx, wy in beam_widths
+            if np.isfinite(wx) and np.isfinite(wy) and wx > 0 and wy > 0
+        ]
+        if not finite_widths:
+            return 0
+        max_wx = max(wx for wx, _wy in finite_widths)
+        max_wy = max(wy for _wx, wy in finite_widths)
         return patch_half_width_pixels(scale, max_wx, max_wy)
 
     # =========================================================================
@@ -3780,7 +3864,8 @@ class RadportAccessor:
             Direction-cosine coordinates for a fixed patch centre.
         scale : float, default 3.0
             Patch half-width is ``ceil(scale * max(beam FWHM))`` pixels at each
-            time step, using the largest synthesized beam over frequency channels.
+            time step, using the largest synthesized beam over populated
+            frequency channels (empty ``(time, frequency)`` slots are skipped).
         statistic : {'std', 'max', 'min', 'mean', 'mad'}, default 'std'
             Spatial reducer applied within each patch.  ``mad`` is the
             median absolute deviation from the patch median.
@@ -3985,7 +4070,8 @@ class RadportAccessor:
 
         Initial peak guesses use the patch maximum minus median background.
         Gaussian width is fixed from synthesized beam ``BMAJ``/``BMIN`` (``BEAM``
-        variable or FITS header); only peak, position, and background are fit.
+        variable or FITS header) on populated cells; empty ``(time, frequency)``
+        slots and cells without beam metadata are left as NaN in the output maps.
         When the nonlinear fit does not converge, statistical estimates are
         returned instead of NaN.
 
@@ -4006,7 +4092,8 @@ class RadportAccessor:
             Direction-cosine coordinates for a fixed patch centre.
         scale : float, default 3.0
             Patch half-width is ``ceil(scale * max(beam FWHM))`` pixels at each
-            time step, using the largest synthesized beam over frequency channels.
+            time step, using the largest synthesized beam over populated
+            frequency channels (empty ``(time, frequency)`` slots are skipped).
         max_reduced_chi_squared : float, default 3.0
             Maximum acceptable reduced chi-squared.  Cells above this threshold
             have fit parameters set to NaN.
@@ -4097,6 +4184,8 @@ class RadportAccessor:
                 time_idx=int(ti),
                 pol=pol,
                 var=var,
+                skip_empty_cells=True,
+                data_var=var,
             )
             for ti in vis_times
         }

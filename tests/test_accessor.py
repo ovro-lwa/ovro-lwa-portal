@@ -1073,6 +1073,73 @@ class TestRadportPatchFit:
         with pytest.raises(ValueError, match="Synthesized beam metadata unavailable"):
             ds.radport.patch_fit(l=0.0, m=0.0)
 
+    def test_patch_fit_skips_empty_time_frequency_cells(self) -> None:
+        """patch_fit() leaves empty SKY slots as NaN without requiring BEAM there."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        sky = np.random.default_rng(0).random((1, 3, 1, 50, 50)) * 10.0
+        sky[:, 1, ...] = np.nan
+        beam_meta = np.zeros((1, 3, 1, 3), dtype=np.float64)
+        beam_meta[0, 0, 0] = [0.02, 0.01, 0.0]
+        beam_meta[0, 1, 0] = [np.nan, np.nan, np.nan]
+        beam_meta[0, 2, 0] = [0.02, 0.01, 0.0]
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], sky),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    beam_meta,
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 50e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        result = ds.radport.patch_fit(l=0.0, m=0.0, scale=2.0)
+        assert not np.isfinite(result.peak_map.values[0, 1])
+        assert not np.isfinite(result.reduced_chi_squared_map.values[0, 1])
+        assert np.isfinite(result.center_flux_map.values[0, 0])
+        assert np.isfinite(result.patch_max_map.values[0, 2])
+        assert ds.radport.patch_radius_pixels(time_idx=0, scale=2.0) > 0
+
+    def test_patch_statistic_skips_empty_time_frequency_cells(self) -> None:
+        """patch_statistic() ignores empty SKY slots when sizing the patch."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        sky = np.random.default_rng(1).random((1, 3, 1, 50, 50)) * 10.0
+        sky[:, 1, ...] = np.nan
+        beam_meta = np.zeros((1, 3, 1, 3), dtype=np.float64)
+        beam_meta[0, 0, 0] = [0.02, 0.01, 0.0]
+        beam_meta[0, 1, 0] = [np.nan, np.nan, np.nan]
+        beam_meta[0, 2, 0] = [0.02, 0.01, 0.0]
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], sky),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    beam_meta,
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 50e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        result = ds.radport.patch_statistic(l=0.0, m=0.0, statistic="max", scale=2.0)
+        stats = result.stat_map.values[0]
+        assert np.isfinite(stats[0])
+        assert not np.isfinite(stats[1])
+        assert np.isfinite(stats[2])
+
     def test_patch_fit_masks_poor_chi2_fits(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
