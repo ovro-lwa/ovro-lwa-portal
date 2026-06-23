@@ -269,8 +269,18 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.zarr_path:
         from ovro_lwa_portal import open_dataset
+        from ovro_lwa_portal.io import summarize_lm_chunks
 
         zarr_path = Path(args.zarr_path)
+        try:
+            chunk_summary = summarize_lm_chunks(zarr_path)
+            print(
+                "  on-disk SKY l/m chunks: "
+                f"l_min={chunk_summary['l_min']} m_min={chunk_summary['m_min']} "
+                f"(l={chunk_summary['l_chunks']}, m={chunk_summary['m_chunks']})"
+            )
+        except Exception as exc:
+            print(f"  on-disk chunk summary unavailable: {exc}")
         print(f"Loading {zarr_path} (chunks auto + l/m=512)…")
         t0 = time.perf_counter()
         ds = open_dataset(zarr_path, chunks="auto").chunk({"l": 512, "m": 512})

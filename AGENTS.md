@@ -1314,6 +1314,21 @@ share the same `CRVAL2`.
 preserved) or repair WCS rows from FITS via `ovro-ingest repair --fits-dir`. Do
 **not** reintroduce filename-based zenith stamping in `_fix_headers`.
 
+### Issue: Overlay slice loads are slow (small Zarr l/m chunks)
+
+**Symptoms:** Heatmap tap or overlay toggle takes noticeably longer on some
+stores; profiling shows cold Zarr slice reads dominating when on-disk spatial
+chunks are small (e.g. 128×128).
+
+**Cause:** Incremental ingest used `--chunk-lm` below 512, or legacy stores
+written before chunk-size guidance. Single `(time, freq)` overlay reads touch
+many fragments along `l`/`m`.
+
+**Solution:** Re-ingest with `ovro-ingest convert ... --chunk-lm 512` (default
+ingest uses 1024). `open_dataset()` warns when on-disk min chunk is below 512.
+Review apps still rechunk reads to 512 via `SourceReviewConfig.zarr_lm_chunk`;
+that helps Dask but cannot fully fix fragmented on-disk layout.
+
 ### Issue: Sky click logs coordinates but Coordinate field stays empty
 
 **Symptoms:** Activity log shows `Sky click → 'RA, Dec'`; AutocompleteInput does
