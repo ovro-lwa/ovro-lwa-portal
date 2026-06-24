@@ -16,14 +16,13 @@ import xarray as xr
 import yaml
 from astropy.coordinates import SkyCoord
 
-from ovro_lwa_portal.accessor import format_radec_sexagesimal
+from ovro_lwa_portal.accessor import PatchFitCellResult, format_radec_sexagesimal
 from bokeh.models import LinearColorMapper
 from bokeh.palettes import Magma256
 
 HEATMAP_METHOD_OPTIONS = [
     "dynamic_spectrum",
     "patch_max",
-    "patch_fit",
     "mad",
     "std",
     "mean",
@@ -147,15 +146,11 @@ def compute_source_heatmap(
         )
         return HeatmapLoad(np.asarray(da.values, dtype=np.float64))
     if method == "patch_fit":
-        fit = dataset.radport.patch_fit(
-            ra=ra,
-            dec=dec,
-            scale=scale,
-            max_reduced_chi_squared=patch_fit_max_reduced_chi_squared,
-            allow_position_offset=True,
-            progress_callback=progress_callback,
+        msg = (
+            "Full-cube patch_fit is no longer a heatmap method; use the Fit overlay "
+            "button in source review or dataset.radport.patch_fit_cell() / patch_fit()."
         )
-        return HeatmapLoad(np.asarray(fit.peak_map.values, dtype=np.float64), patch_fit_result=fit)
+        raise ValueError(msg)
     if method == "patch_max":
         result = dataset.radport.patch_statistic(
             ra=ra,
@@ -176,6 +171,27 @@ def compute_source_heatmap(
         return HeatmapLoad(np.asarray(result.stat_map.values, dtype=np.float64), patch_stat_result=result)
     msg = f"Unknown heatmap method {method!r}; expected one of {HEATMAP_METHOD_OPTIONS}"
     raise ValueError(msg)
+
+
+def compute_overlay_patch_fit(
+    dataset: xr.Dataset,
+    src: dict,
+    *,
+    time_idx: int,
+    freq_idx: int,
+    scale: float,
+    patch_fit_max_reduced_chi_squared: float,
+) -> PatchFitCellResult:
+    """Fit a Gaussian patch on the overlay cell at ``(time_idx, freq_idx)``."""
+    return dataset.radport.patch_fit_cell(
+        time_idx=int(time_idx),
+        frequency_idx=int(freq_idx),
+        ra=float(src["ra"]),
+        dec=float(src["dec"]),
+        scale=float(scale),
+        max_reduced_chi_squared=float(patch_fit_max_reduced_chi_squared),
+        allow_position_offset=True,
+    )
 
 
 def diagnose_heatmap_coverage(
@@ -223,11 +239,6 @@ def diagnose_heatmap_coverage(
     elif n_finite == 0:
         lines.append("No finite heatmap cells.")
 
-    if method == "patch_fit":
-        lines.append(
-            "Patch-fit also masks cells where reduced χ² exceeds "
-            f"{patch_fit_max_reduced_chi_squared:g}."
-        )
     return " ".join(lines)
 
 
@@ -341,7 +352,7 @@ def _format_patch_fit_diagnostics(fit: object, time_idx: int, freq_idx: int) -> 
     peak = diag["peak"]
     peak_s = f"{peak:.3g}" if np.isfinite(peak) else "n/a (masked)"
     return (
-        f"**patch_fit** t={time_idx} f={freq_idx}: accepted={accepted}, "
+        f"**Fit overlay** t={time_idx} f={freq_idx}: accepted={accepted}, "
         f"χ²_red={diag['reduced_chi_squared']:.3g}, peak={peak_s} Jy, "
         f"peak RA/Dec=({diag['peak_ra']}, {diag['peak_dec']}), "
         f"offset=({diag['x_offset_pixels']:.2f}, {diag['y_offset_pixels']:.2f}) px, "

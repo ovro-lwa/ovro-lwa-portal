@@ -259,6 +259,29 @@ class TestRunDatasetLoadThreading:
 
         assert order == ["step-1", "step-2", "loaded"]
 
+    def test_progress_log_can_use_separate_scheduler(self):
+        ui_dispatch = _DeferredDispatcher()
+        log_dispatch = _DeferredDispatcher()
+        order: list[str] = []
+
+        def _open(report: Callable[[str], None]) -> DatasetLoad:
+            report("step-1")
+            return _fake_load()
+
+        run_dataset_load(
+            open_dataset=_open,
+            dispatch=ui_dispatch,
+            log_dispatch=log_dispatch,
+            on_loaded=lambda _load: order.append("loaded"),
+            on_error=lambda exc: pytest.fail(f"unexpected error {exc!r}"),
+            log=order.append,
+        )
+        assert order == []
+        log_dispatch.drain()
+        assert order == ["step-1"]
+        ui_dispatch.drain()
+        assert order == ["step-1", "loaded"]
+
 
 class TestShouldBuildHeatmapGrid:
     def test_builds_when_no_existing_grid(self):

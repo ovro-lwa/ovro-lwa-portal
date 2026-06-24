@@ -14,6 +14,7 @@ Example
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 import warnings
@@ -188,6 +189,7 @@ def _radport_progress_heartbeat(
     progress_callback: RadportProgressCallback | None,
     *,
     stage: str,
+    current: int,
     total: int,
     message: str,
     interval_s: float = _EXTRACT_PROGRESS_HEARTBEAT_S,
@@ -206,9 +208,9 @@ def _radport_progress_heartbeat(
             _emit_radport_progress(
                 progress_callback,
                 stage,
-                0,
+                int(current),
                 total,
-                f"{message} (in progress, {elapsed:.0f}s elapsed)",
+                f"{message} — still working ({elapsed:.0f}s)",
             )
 
     thread = threading.Thread(target=_pulse, daemon=True)
@@ -264,23 +266,47 @@ def _io_batch_scheduler() -> str:
     return "threads"
 
 
+def _patch_extract_scheduler() -> str | None:
+    """Scheduler for fused patch-cube Zarr reads in :meth:`patch_statistic`.
+
+    Returns ``None`` (distributed default) when a :class:`dask.distributed.Client`
+    is active so fused reads can run on cluster workers.  Honors
+    ``OVRO_RADPORT_EXTRACT_SCHEDULER`` when set.  Otherwise ``"threads"`` in the
+    notebook kernel.
+    """
+    override = os.environ.get("OVRO_RADPORT_EXTRACT_SCHEDULER")
+    if override:
+        normalized = override.strip().lower()
+        if normalized in {"distributed", "default", "none"}:
+            return None
+        return override
+    if _active_distributed_client():
+        return None
+    return "threads"
+
+
 def _compute_xarray_dataarray(
     da: xr.DataArray,
     *,
     label: str,
     progress_callback: RadportProgressCallback | None = None,
+    quiet: bool | None = None,
+    scheduler: str | None | object = ...,
 ) -> xr.DataArray:
-    """Materialize one xarray selection with threaded/local Dask scheduling."""
-    scheduler = _point_extract_scheduler()
-    quiet = progress_callback is not None
+    """Materialize one xarray selection with threaded/local/distributed scheduling."""
+    if scheduler is ...:
+        sched: str | None = _point_extract_scheduler()
+        if sched is None and _data_var_is_dask_backed(da):
+            sched = _io_batch_scheduler()
+    else:
+        sched = scheduler  # type: ignore[assignment]
+    if quiet is None:
+        quiet = progress_callback is not None
     if _data_var_is_dask_backed(da):
-        if scheduler is not None:
-            with _dask_progress(label, quiet=quiet):
-                return da.compute(scheduler=scheduler)
-        import dask
-
         with _dask_progress(label, quiet=quiet):
-            return da.compute(scheduler=_io_batch_scheduler())
+            if sched is None:
+                return da.compute()
+            return da.compute(scheduler=sched)
     return da.load()
 
 
@@ -310,6 +336,7 @@ def _vectorized_tracked_pixel_values(
     with _radport_progress_heartbeat(
         progress_callback,
         stage="extract",
+        current=0,
         total=n_vis,
         message=progress_message,
     ):
@@ -338,16 +365,36 @@ def _rows_from_tracked_pixel_plane(plane: np.ndarray) -> list[np.ndarray]:
     return [np.asarray(plane[i], dtype=np.float64) for i in range(int(plane.shape[0]))]
 
 
-def _cpu_delayed_scheduler() -> str | None:
-    """Scheduler for CPU-bound ``dask.delayed`` batch work (patch fit, statistics).
+def _patch_reduce_scheduler() -> str | None:
+    """Scheduler for per-time patch reduce and Gaussian fit ``dask.delayed`` batches.
 
-    Gaussian fitting and patch reductions hold the GIL under the threaded
-    scheduler. Use multiprocessing locally when no distributed ``Client`` is
-    registered; otherwise defer to the active distributed scheduler.
+    Returns ``None`` when a distributed :class:`dask.distributed.Client` is
+    active so ``dask.compute`` dispatches delayed tasks to cluster workers.
+    Otherwise honors ``OVRO_RADPORT_PATCH_SCHEDULER`` when set, or ``"processes"``
+    for a local multiprocessing pool in the notebook kernel.
     """
     if _active_distributed_client():
         return None
+    override = os.environ.get("OVRO_RADPORT_PATCH_SCHEDULER")
+    if override:
+        return override
     return "processes"
+
+
+def _compute_delayed_tasks(
+    tasks: tuple[Any, ...],
+    *,
+    scheduler: str | None,
+    label: str,
+    quiet: bool,
+) -> tuple[Any, ...]:
+    """Run a batch of ``dask.delayed`` tasks with an optional local scheduler."""
+    import dask
+
+    with _dask_progress(label, quiet=quiet):
+        if scheduler is None:
+            return dask.compute(*tasks)
+        return dask.compute(*tasks, scheduler=scheduler)
 
 
 _WCS_TRACK_VARYING_KEYWORDS = frozenset({"CRVAL1", "CRVAL2", "LATPOLE"})
@@ -661,6 +708,115 @@ def _compute_xarray_batch(
     return [np.asarray(arr.values) for arr in arrays]
 
 
+def _patch_slices_from_center(
+    li: int,
+    mi: int,
+    radius: int,
+    *,
+    n_l: int,
+    n_m: int,
+) -> tuple[slice, slice]:
+    """Return ``(l, m)`` slice bounds for a square patch around ``(li, mi)``."""
+    radius_i = int(radius)
+    l_sl = slice(max(0, int(li) - radius_i), min(n_l, int(li) + radius_i + 1))
+    m_sl = slice(max(0, int(mi) - radius_i), min(n_m, int(mi) + radius_i + 1))
+    return l_sl, m_sl
+
+
+def _pad_patch_dataarray(
+    patch: xr.DataArray,
+    *,
+    n_l: int,
+    n_m: int,
+) -> xr.DataArray:
+    """Pad a patch to ``(n_l, n_m)`` with NaN for fused concat."""
+    cur_l = int(patch.sizes["l"])
+    cur_m = int(patch.sizes["m"])
+    if cur_l == n_l and cur_m == n_m:
+        return patch
+    pad_l = n_l - cur_l
+    pad_m = n_m - cur_m
+    if pad_l < 0 or pad_m < 0:
+        msg = f"patch shape {(cur_l, cur_m)} exceeds pad target {(n_l, n_m)}"
+        raise ValueError(msg)
+    return _normalize_patch_coords(
+        patch.pad(l=(0, pad_l), m=(0, pad_m), constant_values=np.nan)
+    )
+
+
+def _normalize_patch_coords(patch: xr.DataArray) -> xr.DataArray:
+    """Use positional ``l``/``m`` coords so fused concat does not align sky indices."""
+    nl = int(patch.sizes["l"])
+    nm = int(patch.sizes["m"])
+    return patch.assign_coords(l=np.arange(nl, dtype=np.intp), m=np.arange(nm, dtype=np.intp))
+
+
+def _stack_tracked_patch_selections(
+    data_var: xr.DataArray,
+    vis_times: np.ndarray,
+    vis_l: np.ndarray,
+    vis_m: np.ndarray,
+    radii: list[int] | np.ndarray,
+    *,
+    n_l: int,
+    n_m: int,
+) -> tuple[xr.DataArray, list[tuple[int, int]]]:
+    """Stack per-time patch ``isel`` selections on ``_TRACKED_POINT_DIM``.
+
+    Returns the stacked lazy array and ``(l_size, m_size)`` per track for splitting.
+    """
+    patch_list: list[xr.DataArray] = []
+    patch_sizes: list[tuple[int, int]] = []
+    for t, li, mi, radius in zip(vis_times, vis_l, vis_m, radii, strict=True):
+        l_sl, m_sl = _patch_slices_from_center(
+            int(li), int(mi), int(radius), n_l=n_l, n_m=n_m
+        )
+        patch = data_var.isel(time=int(t), l=l_sl, m=m_sl)
+        patch_list.append(_normalize_patch_coords(patch))
+        patch_sizes.append((int(patch.sizes["l"]), int(patch.sizes["m"])))
+
+    if not patch_list:
+        empty = xr.DataArray(np.empty(0, dtype=np.float64), dims=[_TRACKED_POINT_DIM])
+        return empty, []
+
+    unique_shapes = set(patch_sizes)
+    if len(unique_shapes) == 1:
+        to_stack = patch_list
+    else:
+        max_l = max(size[0] for size in patch_sizes)
+        max_m = max(size[1] for size in patch_sizes)
+        to_stack = [
+            _pad_patch_dataarray(patch, n_l=max_l, n_m=max_m) for patch in patch_list
+        ]
+
+    stacked = xr.concat(
+        to_stack,
+        dim=_TRACKED_POINT_DIM,
+        coords="minimal",
+        compat="override",
+        join="outer",
+    )
+    return stacked, patch_sizes
+
+
+def _split_stacked_patch_cubes(
+    stacked: np.ndarray,
+    patch_sizes: list[tuple[int, int]],
+) -> list[np.ndarray]:
+    """Recover per-time ``(frequency, l, m)`` patches from a fused stack."""
+    n_vis = len(patch_sizes)
+    if n_vis == 0:
+        return []
+    arr = np.asarray(stacked, dtype=np.float64)
+    if arr.shape[0] != n_vis:
+        msg = (
+            f"stacked patch axis 0 ({arr.shape[0]}) must match "
+            f"visible tracks ({n_vis})"
+        )
+        raise ValueError(msg)
+    return [arr[i, ..., :nl, :nm].copy() for i, (nl, nm) in enumerate(patch_sizes)]
+
+
 def _process_patch_statistic_time(
     time_idx: int,
     patch: np.ndarray,
@@ -769,12 +925,13 @@ def _run_batched_time_step_work(
                 for ti, patch in zip(batch_times, batch_patches, strict=True)
             ]
             label = f"{progress_label} ({end}/{total})"
-            cpu_scheduler = _cpu_delayed_scheduler()
-            with _dask_progress(label, quiet=progress_callback is not None):
-                if cpu_scheduler is not None:
-                    batch_results = dask.compute(*tasks, scheduler=cpu_scheduler)
-                else:
-                    batch_results = dask.compute(*tasks)
+            reduce_scheduler = _patch_reduce_scheduler()
+            batch_results = _compute_delayed_tasks(
+                tuple(tasks),
+                scheduler=reduce_scheduler,
+                label=label,
+                quiet=progress_callback is not None,
+            )
         else:
             batch_results = [
                 process_fn(int(ti), patch, *process_args)
@@ -845,12 +1002,13 @@ def _run_batched_patch_fit_work(
                 for ti, patch in zip(batch_times, batch_patches, strict=True)
             ]
             label = f"Fitting Gaussian patches ({end}/{total})"
-            cpu_scheduler = _cpu_delayed_scheduler()
-            with _dask_progress(label, quiet=progress_callback is not None):
-                if cpu_scheduler is not None:
-                    batch_results = dask.compute(*tasks, scheduler=cpu_scheduler)
-                else:
-                    batch_results = dask.compute(*tasks)
+            reduce_scheduler = _patch_reduce_scheduler()
+            batch_results = _compute_delayed_tasks(
+                tuple(tasks),
+                scheduler=reduce_scheduler,
+                label=label,
+                quiet=progress_callback is not None,
+            )
         else:
             batch_results = [
                 _process_patch_fit_time(
@@ -1545,6 +1703,68 @@ class PatchStatisticResult:
         )
 
 
+@dataclass(frozen=True)
+class PatchFitCellResult:
+    """Gaussian patch-fit diagnostics for one ``(time, frequency)`` cell.
+
+    Returned by :meth:`RadportAccessor.patch_fit_cell`.  Implements
+    :meth:`cell_diagnostics` with the same keys as
+    :meth:`PatchFitResult.cell_diagnostics` for UI formatting.
+    """
+
+    time_idx: int
+    frequency_idx: int
+    fit_accepted: bool
+    reduced_chi_squared: float
+    peak: float
+    peak_ra_deg: float
+    peak_dec_deg: float
+    peak_ra: str
+    peak_dec: str
+    x_offset_pixels: float
+    y_offset_pixels: float
+    peak_offset_pixels: float
+    center_flux: float
+    patch_max: float
+    background: float
+    widthx: float
+    widthy: float
+    scale: float
+    max_reduced_chi_squared: float
+    allow_position_offset: bool
+    patch_radius_pixels: int
+
+    def cell_diagnostics(
+        self,
+        time_idx: int,
+        frequency_idx: int,
+    ) -> dict[str, float | bool]:
+        """Summarize patch-fit quality for this cell (duck-types :class:`PatchFitResult`)."""
+        if int(time_idx) != self.time_idx or int(frequency_idx) != self.frequency_idx:
+            msg = (
+                f"Requested cell ({time_idx}, {frequency_idx}) does not match "
+                f"({self.time_idx}, {self.frequency_idx})"
+            )
+            raise ValueError(msg)
+        return {
+            "fit_accepted": self.fit_accepted,
+            "reduced_chi_squared": self.reduced_chi_squared,
+            "peak": self.peak,
+            "peak_ra_deg": self.peak_ra_deg,
+            "peak_dec_deg": self.peak_dec_deg,
+            "peak_ra": self.peak_ra,
+            "peak_dec": self.peak_dec,
+            "x_offset_pixels": self.x_offset_pixels,
+            "y_offset_pixels": self.y_offset_pixels,
+            "peak_offset_pixels": self.peak_offset_pixels,
+            "center_flux": self.center_flux,
+            "patch_max": self.patch_max,
+            "background": self.background,
+            "widthx": self.widthx,
+            "widthy": self.widthy,
+        }
+
+
 @dataclass
 class PatchFitResult:
     """Gaussian fit parameters on a tracked patch for each time/frequency cell.
@@ -1729,6 +1949,42 @@ class PatchFitResult:
         }
 
 
+@dataclass(frozen=True)
+class _PatchMetadataCache:
+    """Eager beam planes and populated-cell mask for patch sizing."""
+
+    pol: int
+    var: Literal["SKY", "BEAM"]
+    populated: np.ndarray
+    beam_major: np.ndarray | None
+    beam_minor: np.ndarray | None
+    beam_pa: np.ndarray | None
+
+
+def _beam_param_plane(beam: xr.DataArray, *, pol: int, param: str) -> np.ndarray:
+    """Return a ``(time, frequency)`` plane for one ``beam_param`` name."""
+    sel = beam.isel(polarization=int(pol))
+    for name in np.asarray(sel.coords["beam_param"].values):
+        if str(name).lower() == param.lower():
+            plane = sel.sel(beam_param=name)
+            if _data_var_is_dask_backed(plane):
+                plane = _compute_xarray_dataarray(
+                    plane,
+                    label=f"BEAM {param}",
+                    quiet=True,
+                )
+            return np.asarray(plane.values, dtype=np.float64)
+    msg = f"BEAM variable is missing beam_param {param!r}."
+    raise KeyError(msg)
+
+
+def _materialize_populated_mask(da: xr.DataArray, *, label: str) -> np.ndarray:
+    """Eager bool ``(time, frequency)`` mask from a lazy ``notnull().any`` reduction."""
+    if _data_var_is_dask_backed(da):
+        da = _compute_xarray_dataarray(da, label=label, quiet=True)
+    return np.asarray(da.values, dtype=bool)
+
+
 @xr.register_dataset_accessor("radport")
 class RadportAccessor:
     """xarray accessor for OVRO-LWA radio astronomy datasets.
@@ -1784,6 +2040,7 @@ class RadportAccessor:
         """
         self._obj = xarray_obj
         self._lst_cache: dict[tuple, np.ndarray] = {}
+        self._patch_metadata_cache: _PatchMetadataCache | None = None
         self._validate_structure()
 
     def _validate_structure(self) -> None:
@@ -1826,6 +2083,74 @@ class RadportAccessor:
         """
         return "BEAM" in self._obj.data_vars
 
+    def _patch_metadata_cache_matches(
+        self,
+        *,
+        pol: int,
+        var: Literal["SKY", "BEAM"],
+    ) -> bool:
+        cache = self._patch_metadata_cache
+        return cache is not None and cache.pol == int(pol) and cache.var == var
+
+    def ensure_patch_metadata_cache(
+        self,
+        *,
+        pol: int = 0,
+        var: Literal["SKY", "BEAM"] = "SKY",
+    ) -> _PatchMetadataCache:
+        """Load beam metadata and a populated ``(time, frequency)`` mask into memory.
+
+        When ``BEAM`` has ``beam_param`` major/minor, the populated mask is derived
+        from finite positive beam sizes (no full SKY scan). Otherwise one
+        ``notnull().any`` reduction over ``l``/``m`` is computed for *var*.
+        """
+        if self._patch_metadata_cache_matches(pol=pol, var=var):
+            return self._patch_metadata_cache  # type: ignore[return-value]
+
+        beam_major: np.ndarray | None = None
+        beam_minor: np.ndarray | None = None
+        beam_pa: np.ndarray | None = None
+        populated: np.ndarray
+
+        if self.has_beam:
+            beam = self._obj["BEAM"]
+            if "beam_param" in beam.dims:
+                beam_major = _beam_param_plane(beam, pol=pol, param="major")
+                beam_minor = _beam_param_plane(beam, pol=pol, param="minor")
+                with contextlib.suppress(KeyError):
+                    beam_pa = _beam_param_plane(beam, pol=pol, param="pa")
+                if beam_pa is None:
+                    beam_pa = np.zeros_like(beam_major, dtype=np.float64)
+                populated = (
+                    np.isfinite(beam_major)
+                    & (beam_major > 0)
+                    & np.isfinite(beam_minor)
+                    & (beam_minor > 0)
+                )
+            else:
+                plane = beam.isel(polarization=int(pol))
+                populated = _materialize_populated_mask(
+                    plane.notnull().any(dim=list(plane.dims)),
+                    label="BEAM populated mask",
+                )
+        else:
+            plane = self._obj[var].isel(polarization=int(pol))
+            populated = _materialize_populated_mask(
+                plane.notnull().any(dim=["l", "m"]),
+                label=f"{var} populated mask",
+            )
+
+        cache = _PatchMetadataCache(
+            pol=int(pol),
+            var=var,
+            populated=populated,
+            beam_major=beam_major,
+            beam_minor=beam_minor,
+            beam_pa=beam_pa,
+        )
+        self._patch_metadata_cache = cache
+        return cache
+
     def _var_cell_has_finite_data(
         self,
         *,
@@ -1835,6 +2160,11 @@ class RadportAccessor:
         var: Literal["SKY", "BEAM"] = "SKY",
     ) -> bool:
         """Return whether a ``(time, frequency)`` cell contains any finite data."""
+        if self._patch_metadata_cache_matches(pol=pol, var=var):
+            cache = self._patch_metadata_cache
+            assert cache is not None
+            return bool(cache.populated[int(time_idx), int(frequency_idx)])
+
         if var not in self._obj.data_vars:
             return False
         plane = self._obj[var].isel(
@@ -1874,13 +2204,21 @@ class RadportAccessor:
         bmaj: float | None = None
         bmin: float | None = None
         bpa = 0.0
+        ti = int(time_idx)
+        fi = int(frequency_idx)
 
-        if self.has_beam:
+        cache = self._patch_metadata_cache
+        if cache is not None and cache.pol == int(pol) and cache.beam_major is not None:
+            bmaj = float(cache.beam_major[ti, fi])
+            bmin = float(cache.beam_minor[ti, fi])  # type: ignore[index]
+            bpa = float(cache.beam_pa[ti, fi]) if cache.beam_pa is not None else 0.0  # type: ignore[index]
+
+        if (bmaj is None or bmin is None) and self.has_beam:
             beam = self._obj["BEAM"]
             if "beam_param" in beam.dims:
                 beam_sel = beam.isel(
-                    time=int(time_idx),
-                    frequency=int(frequency_idx),
+                    time=ti,
+                    frequency=fi,
                     polarization=int(pol),
                 )
                 params = {
@@ -1947,6 +2285,10 @@ class RadportAccessor:
         """
         n_freqs = int(self._obj.sizes["frequency"])
         empty_var = data_var if data_var is not None else var
+        use_populated_cache = self._patch_metadata_cache_matches(pol=pol, var=empty_var)
+        populated_mask = (
+            self._patch_metadata_cache.populated if use_populated_cache else None
+        )
         widths: list[tuple[float, float]] = []
         for fi in range(n_freqs):
             try:
@@ -1959,14 +2301,18 @@ class RadportAccessor:
                     )
                 )
             except ValueError:
-                if skip_empty_cells and not self._var_cell_has_finite_data(
-                    time_idx=int(time_idx),
-                    frequency_idx=fi,
-                    pol=pol,
-                    var=empty_var,
-                ):
-                    widths.append((float("nan"), float("nan")))
-                    continue
+                if skip_empty_cells:
+                    if populated_mask is not None and not populated_mask[int(time_idx), fi]:
+                        widths.append((float("nan"), float("nan")))
+                        continue
+                    if not self._var_cell_has_finite_data(
+                        time_idx=int(time_idx),
+                        frequency_idx=fi,
+                        pol=pol,
+                        var=empty_var,
+                    ):
+                        widths.append((float("nan"), float("nan")))
+                        continue
                 raise
         return widths
 
@@ -3695,6 +4041,7 @@ class RadportAccessor:
             with _radport_progress_heartbeat(
                 progress_callback,
                 stage="extract",
+                current=0,
                 total=total,
                 message=extract_message,
             ):
@@ -3774,7 +4121,13 @@ class RadportAccessor:
             return vis_times, []
 
         total = int(vis_times.size)
-        extract_message = f"Extracting {total} tracked patches"
+        on_workers = _patch_extract_scheduler() is None
+        extract_where = "Dask workers" if on_workers else "notebook kernel"
+        extract_message = (
+            f"Reading {total} tracked patches from Zarr on {extract_where} "
+            f"({'distributed' if on_workers else 'threaded'} fused I/O, "
+            "then per-time statistics)"
+        )
         _emit_radport_progress(
             progress_callback,
             "extract",
@@ -3783,42 +4136,53 @@ class RadportAccessor:
             extract_message,
         )
 
-        patch_arrays: list[xr.DataArray] = []
-        for t, li, mi, radius in zip(
-            vis_times,
-            vis_l,
-            vis_m,
-            radii,
-            strict=True,
-        ):
-            radius_i = int(radius)
-            l_sl = slice(
-                max(0, int(li) - radius_i), min(n_l, int(li) + radius_i + 1)
-            )
-            m_sl = slice(
-                max(0, int(mi) - radius_i), min(n_m, int(mi) + radius_i + 1)
-            )
-            patch_arrays.append(data_var.isel(time=int(t), l=l_sl, m=m_sl))
+        batch_size = _radport_progress_batch_size(total)
+        patches_out: list[np.ndarray] = []
 
-        with _radport_progress_heartbeat(
-            progress_callback,
-            stage="extract",
-            total=total,
-            message=extract_message,
-        ):
-            loaded = _compute_xarray_batch(
-                patch_arrays,
-                label=extract_message,
-                progress_callback=progress_callback,
+        for batch_start in range(0, total, batch_size):
+            batch_end = min(batch_start + batch_size, total)
+            batch_times = vis_times[batch_start:batch_end]
+            batch_l = vis_l[batch_start:batch_end]
+            batch_m = vis_m[batch_start:batch_end]
+            batch_radii = radii[batch_start:batch_end]
+            n_batch = int(batch_end - batch_start)
+            fused_message = (
+                f"Zarr patch read steps {batch_start + 1}–{batch_end} of {total} "
+                f"({n_batch} times, one fused compute)"
             )
-        patches_out = [np.asarray(r) for r in loaded]
-        _emit_radport_progress(
-            progress_callback,
-            "extract",
-            total,
-            total,
-            extract_message,
-        )
+
+            stacked, patch_sizes = _stack_tracked_patch_selections(
+                data_var,
+                batch_times,
+                batch_l,
+                batch_m,
+                batch_radii,
+                n_l=n_l,
+                n_m=n_m,
+            )
+            with _radport_progress_heartbeat(
+                progress_callback,
+                stage="extract",
+                current=batch_start,
+                total=total,
+                message=fused_message,
+            ):
+                loaded = _compute_xarray_dataarray(
+                    stacked,
+                    label=fused_message,
+                    progress_callback=progress_callback,
+                    scheduler=_patch_extract_scheduler(),
+                )
+            patches_out.extend(
+                _split_stacked_patch_cubes(np.asarray(loaded.data), patch_sizes)
+            )
+            _emit_radport_progress(
+                progress_callback,
+                "extract",
+                batch_end,
+                total,
+                f"finished Zarr patch read steps {batch_start + 1}–{batch_end} of {total}",
+            )
 
         return vis_times, patches_out
 
@@ -3891,6 +4255,15 @@ class RadportAccessor:
             Stages are ``extract`` (patch I/O) and ``reduce`` (per-time
             statistics).  ``current`` and ``total`` count visible time steps.
 
+        Notes
+        -----
+        Patch I/O uses :func:`_patch_extract_scheduler` — distributed workers when a
+        :class:`dask.distributed.Client` is active, otherwise threaded reads in the
+        notebook kernel.  Per-time statistics use :func:`_patch_reduce_scheduler` —
+        distributed workers when a Client is active, otherwise a local process pool.
+        Set ``OVRO_RADPORT_EXTRACT_SCHEDULER`` or ``OVRO_RADPORT_PATCH_SCHEDULER`` to
+        override schedulers when no Client is active.
+
         Returns
         -------
         PatchStatisticResult
@@ -3911,6 +4284,8 @@ class RadportAccessor:
         if scale <= 0:
             msg = f"scale must be positive, got {scale}"
             raise ValueError(msg)
+
+        self.ensure_patch_metadata_cache(pol=pol, var=var)
 
         track_freq_idx = freq_idx
         if freq_mhz is not None:
@@ -4113,6 +4488,15 @@ class RadportAccessor:
             Stages are ``extract`` (patch I/O) and ``fit`` (per-time Gaussian
             fits).  ``current`` and ``total`` count visible time steps.
 
+        Notes
+        -----
+        Patch I/O uses :func:`_patch_extract_scheduler` — distributed workers when a
+        :class:`dask.distributed.Client` is active, otherwise threaded reads in the
+        notebook kernel.  Per-time Gaussian fits use :func:`_patch_reduce_scheduler`
+        — distributed workers when a Client is active, otherwise a local process pool.
+        Set ``OVRO_RADPORT_EXTRACT_SCHEDULER`` or ``OVRO_RADPORT_PATCH_SCHEDULER`` to
+        override schedulers when no Client is active.
+
         Returns
         -------
         PatchFitResult
@@ -4133,6 +4517,8 @@ class RadportAccessor:
         if max_reduced_chi_squared <= 0:
             msg = f"max_reduced_chi_squared must be positive, got {max_reduced_chi_squared}"
             raise ValueError(msg)
+
+        self.ensure_patch_metadata_cache(pol=pol, var=var)
 
         track_freq_idx = freq_idx
         if freq_mhz is not None:
@@ -4358,6 +4744,222 @@ class RadportAccessor:
             _track_freq_idx=track_freq_idx,
             _track_freq_mhz=freq_mhz,
             _observatory=observatory,
+        )
+
+    def patch_fit_cell(
+        self,
+        time_idx: int,
+        frequency_idx: int,
+        *,
+        ra: float | None = None,
+        dec: float | None = None,
+        l: float | None = None,
+        m: float | None = None,
+        scale: float = 3.0,
+        max_reduced_chi_squared: float = 3.0,
+        allow_position_offset: bool = True,
+        var: Literal["SKY", "BEAM"] = "SKY",
+        pol: int = 0,
+        observatory: Any = None,
+    ) -> PatchFitCellResult:
+        """Fit a 2D Gaussian patch on one ``(time, frequency)`` overlay cell.
+
+        Resolves the patch centre at ``time_idx``, extracts the spatial plane
+        for ``frequency_idx``, and returns diagnostics suitable for the source
+        review **Fit overlay** workflow.
+
+        Parameters
+        ----------
+        time_idx, frequency_idx : int
+            Dataset indices for the overlay slice to fit.
+        ra, dec : float, optional
+            Celestial coordinates in degrees.  Requires both.
+        l, m : float, optional
+            Fixed direction-cosine patch centre.  Requires both.
+        scale : float, default 3.0
+            Patch half-width multiplier (see :meth:`patch_radius_pixels`).
+        max_reduced_chi_squared : float, default 3.0
+            Fit parameters are masked when reduced chi-squared exceeds this value.
+        allow_position_offset : bool, default True
+            When ``False``, fix the Gaussian peak at the tracked patch centre.
+        var : {'SKY', 'BEAM'}, default 'SKY'
+            Data variable to analyse.
+        pol : int, default 0
+            Polarization index.
+        observatory : astropy.coordinates.EarthLocation, optional
+            Observatory location for RA/Dec pixel mapping.
+
+        Returns
+        -------
+        PatchFitCellResult
+            Single-cell fit diagnostics.
+
+        Raises
+        ------
+        ValueError
+            When coordinates are ambiguous, the cell has no finite data, or beam
+            metadata is unavailable for the requested cell.
+        """
+        if var not in self._obj.data_vars:
+            available = sorted(self._obj.data_vars)
+            raise ValueError(f"Variable '{var}' not found. Available: {available}")
+        if scale <= 0:
+            msg = f"scale must be positive, got {scale}"
+            raise ValueError(msg)
+        if max_reduced_chi_squared <= 0:
+            msg = f"max_reduced_chi_squared must be positive, got {max_reduced_chi_squared}"
+            raise ValueError(msg)
+
+        ti = int(time_idx)
+        fi = int(frequency_idx)
+        self.ensure_patch_metadata_cache(pol=pol, var=var)
+
+        if not self._var_cell_has_finite_data(
+            time_idx=ti,
+            frequency_idx=fi,
+            pol=pol,
+            var=var,
+        ):
+            msg = f"No finite data in {var} at time_idx={ti}, frequency_idx={fi}"
+            raise ValueError(msg)
+
+        has_radec = ra is not None or dec is not None
+        has_lm = l is not None or m is not None
+        if has_radec and has_lm:
+            raise ValueError("Provide either (ra, dec) or (l, m), not both.")
+        if not has_radec and not has_lm:
+            raise ValueError("Must provide either (ra, dec) or (l, m) coordinates.")
+        if has_radec:
+            if ra is None or dec is None:
+                raise ValueError("Both ra and dec must be provided together.")
+            l_idx, m_idx = self.coords_to_pixel(
+                float(ra),
+                float(dec),
+                time_idx=ti,
+                observatory=observatory,
+                freq_idx=fi,
+                pol=pol,
+            )
+        else:
+            assert l is not None and m is not None
+            resolved = self._resolve_coordinates(l=l, m=m, pol=pol)
+            if not isinstance(resolved, tuple) or len(resolved) != 2:
+                msg = "patch_fit_cell with (l, m) requires fixed sky coordinates"
+                raise ValueError(msg)
+            l_idx, m_idx = (int(resolved[0]), int(resolved[1]))
+
+        radius = int(self.patch_radius_pixels(time_idx=ti, scale=scale, pol=pol, var=var))
+        if radius <= 0:
+            msg = (
+                f"Patch radius is zero at time_idx={ti} "
+                "(no populated frequency channels with beam metadata)"
+            )
+            raise ValueError(msg)
+
+        n_l = int(self._obj.sizes["l"])
+        n_m = int(self._obj.sizes["m"])
+        l_sl, m_sl = _patch_slices_from_center(l_idx, m_idx, radius, n_l=n_l, n_m=n_m)
+        data_var = self._obj[var].isel(polarization=int(pol))
+        plane = data_var.isel(time=ti, frequency=fi, l=l_sl, m=m_sl)
+        if _data_var_is_dask_backed(plane):
+            plane = _compute_xarray_dataarray(plane, label="patch_fit_cell", quiet=True)
+        patch_2d = np.asarray(plane.values, dtype=np.float64)
+        if patch_2d.ndim != 2:
+            msg = f"Expected 2D spatial patch, got shape {patch_2d.shape}"
+            raise ValueError(msg)
+
+        beam_wx, beam_wy = self.beam_fwhm_pixels(
+            time_idx=ti,
+            frequency_idx=fi,
+            pol=pol,
+            var=var,
+        )
+        center_flux, patch_max = _patch_plane_center_and_max(patch_2d)
+
+        if (
+            not np.isfinite(beam_wx)
+            or not np.isfinite(beam_wy)
+            or beam_wx <= 0
+            or beam_wy <= 0
+        ):
+            msg = (
+                f"Synthesized beam metadata unavailable at time_idx={ti}, "
+                f"frequency_idx={fi}"
+            )
+            raise ValueError(msg)
+
+        peak, x_off, y_off, widthx, widthy, background, chi2_red = _fit_spatial_gaussian(
+            patch_2d,
+            beam_widthx=beam_wx,
+            beam_widthy=beam_wy,
+            allow_position_offset=allow_position_offset,
+        )
+        (
+            peak_arr,
+            widthx_arr,
+            widthy_arr,
+            background_arr,
+            x_off_arr,
+            y_off_arr,
+        ) = _mask_patch_fit_by_chi2(
+            np.array([peak], dtype=np.float64),
+            np.array([widthx], dtype=np.float64),
+            np.array([widthy], dtype=np.float64),
+            np.array([background], dtype=np.float64),
+            np.array([chi2_red], dtype=np.float64),
+            max_reduced_chi_squared=max_reduced_chi_squared,
+            x_offsets=np.array([x_off], dtype=np.float64),
+            y_offsets=np.array([y_off], dtype=np.float64),
+        )
+        peak = float(peak_arr[0])
+        x_off = float(x_off_arr[0]) if x_off_arr is not None else float("nan")
+        y_off = float(y_off_arr[0]) if y_off_arr is not None else float("nan")
+        widthx = float(widthx_arr[0])
+        widthy = float(widthy_arr[0])
+        background = float(background_arr[0])
+        fit_accepted = bool(np.isfinite(chi2_red) and chi2_red <= max_reduced_chi_squared)
+
+        if np.isfinite(x_off) and np.isfinite(y_off):
+            l_peak = int(np.clip(int(round(l_idx + y_off)), 0, n_l - 1))
+            m_peak = int(np.clip(int(round(m_idx + x_off)), 0, n_m - 1))
+            try:
+                peak_ra_deg, peak_dec_deg = self.pixel_to_coords(
+                    l_peak,
+                    m_peak,
+                    time_idx=ti,
+                    observatory=observatory,
+                )
+            except ValueError:
+                peak_ra_deg, peak_dec_deg = float("nan"), float("nan")
+        else:
+            peak_ra_deg, peak_dec_deg = float("nan"), float("nan")
+        peak_ra_str, peak_dec_str = format_radec_sexagesimal(peak_ra_deg, peak_dec_deg)
+        peak_offset = (
+            float(np.hypot(x_off, y_off)) if np.isfinite(x_off) and np.isfinite(y_off) else float("nan")
+        )
+
+        return PatchFitCellResult(
+            time_idx=ti,
+            frequency_idx=fi,
+            fit_accepted=fit_accepted,
+            reduced_chi_squared=float(chi2_red),
+            peak=peak,
+            peak_ra_deg=peak_ra_deg,
+            peak_dec_deg=peak_dec_deg,
+            peak_ra=peak_ra_str,
+            peak_dec=peak_dec_str,
+            x_offset_pixels=x_off,
+            y_offset_pixels=y_off,
+            peak_offset_pixels=peak_offset,
+            center_flux=center_flux,
+            patch_max=patch_max,
+            background=background,
+            widthx=widthx,
+            widthy=widthy,
+            scale=float(scale),
+            max_reduced_chi_squared=float(max_reduced_chi_squared),
+            allow_position_offset=bool(allow_position_offset),
+            patch_radius_pixels=radius,
         )
 
     def select_patch_statistic(

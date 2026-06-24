@@ -627,6 +627,24 @@ def _assign_bokeh_pane_for_notebook(
     pane.object = value
 
 
+def push_bokeh_pane_mutation_to_notebook(
+    pane: pn.viewable.Viewable,
+    *root_views: pn.viewable.Viewable,
+    force_push: bool = True,
+) -> None:
+    """Push in-place Bokeh model edits without swapping ``pane.object``.
+
+    Replacing a nested ``pn.pane.Bokeh`` figure often fails to reach the browser
+    on layout-root-only notebook comms; mutating the registered figure and
+    syncing through the layout root is more reliable for title/image updates.
+    """
+    if root_views:
+        _sync_all_notebook_views(*root_views)
+    else:
+        sync_pane_to_notebook(pane, *root_views)
+    _push_panel_layout(*root_views, pane, _force=force_push)
+
+
 def publish_bokeh_pane_to_notebook(
     pane: pn.viewable.Viewable,
     value: Any,
@@ -636,10 +654,17 @@ def publish_bokeh_pane_to_notebook(
     """Publish a ``pn.pane.Bokeh`` figure swap without ``hold_and_push``.
 
     Match ``jupiter_flux_review``: assign ``pane.object`` (do **not** wrap in
-    ``discard_events``), ``sync_pane_to_notebook``, then force-push the layout comm.
+    ``discard_events``), sync nested panes, then force-push the layout comm.
+
+    When ``root_views`` is set, sync the **entire** layout tree (not only
+    ``pane``) before push — layout-root-only notebook comms often register only
+    the Column root; syncing a single nested ``pn.pane.Bokeh`` is insufficient.
     """
     _assign_bokeh_pane_for_notebook(pane, value)
-    sync_pane_to_notebook(pane, *root_views)
+    if root_views:
+        _sync_all_notebook_views(*root_views)
+    else:
+        sync_pane_to_notebook(pane, *root_views)
     _push_panel_layout(*root_views, pane, _force=force_push)
 
 

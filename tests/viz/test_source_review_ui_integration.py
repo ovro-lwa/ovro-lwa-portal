@@ -109,8 +109,32 @@ def test_open_grid_replaces_placeholder_heatmap(tmp_path: Path) -> None:
 
     assert _heatmap_title(harness, review) != placeholder_title
     assert "click a cell" in _heatmap_title(harness, review).lower()
+    assert "mad" in _heatmap_title(harness, review)
     assert _heatmap_values_max(review) == 0.0
     _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_heatmap_title_updates_in_place_on_method_change(tmp_path: Path) -> None:
+    """Regression: title/method changes must mutate the registered Bokeh figure."""
+    harness, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    harness.run_ui(harness.session(review._layout), review._ensure_heatmap_grid)
+
+    plot = review._heatmap_pane.object
+    assert plot is not None
+    assert "mad" in harness.bokeh_model(review._heatmap_pane, review._layout).title.text
+
+    review.heatmap_method = "std"
+    harness.run_ui(
+        harness.session(review._layout),
+        review._on_heatmap_method_change_impl,
+    )
+
+    assert review._heatmap_pane.object is plot
+    title = harness.bokeh_model(review._heatmap_pane, review._layout).title.text
+    assert "std" in title
+    assert "mad" not in title
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -133,6 +157,7 @@ def test_finish_heatmap_inside_dispatch_updates_bokeh_model(tmp_path: Path) -> N
     )
 
     assert "Cas A" in _heatmap_title(harness, review)
+    assert "mad" in _heatmap_title(harness, review)
     assert _heatmap_values_max(review) == pytest.approx(24.0)
     _assert_heatmap_bokeh_model_live(harness, review)
 
@@ -412,6 +437,134 @@ def test_jupyter_layout_only_generate_syncs_nested_heatmap(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_generate_heatmap_mutation_push_reaches_browser(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: Generate must mutate the mounted zeros-grid figure for live Jupyter."""
+    mutation_calls: list[bool] = []
+    publish_calls: list[bool] = []
+    real_mutation = pqa.push_bokeh_pane_mutation_to_notebook
+    real_publish = pqa.publish_bokeh_pane_to_notebook
+
+    def _track_mutation(
+        pane: object,
+        *root_views: object,
+        force_push: bool = False,
+    ) -> None:
+        mutation_calls.append(bool(force_push))
+        real_mutation(pane, *root_views, force_push=force_push)
+
+    def _track_publish(
+        pane: object,
+        value: object,
+        *root_views: object,
+        force_push: bool = False,
+    ) -> None:
+        publish_calls.append(bool(force_push))
+        real_publish(pane, value, *root_views, force_push=force_push)
+
+    monkeypatch.setattr(sra, "push_bokeh_pane_mutation_to_notebook", _track_mutation)
+    monkeypatch.setattr(pqa, "push_bokeh_pane_mutation_to_notebook", _track_mutation)
+    monkeypatch.setattr(sra, "publish_bokeh_pane_to_notebook", _track_publish)
+    monkeypatch.setattr(pqa, "publish_bokeh_pane_to_notebook", _track_publish)
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.coordinate_string = "Cas A"
+    review._coord_input.value = "Cas A"
+    review._coord_input.value_input = "Cas A"
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+    mutation_calls.clear()
+    publish_calls.clear()
+
+    values = np.full((6, 4), 71.0)
+
+    def _fast_compute(*_args, **_kwargs) -> HeatmapLoad:
+        return HeatmapLoad(values=values, patch_fit_result=None, patch_stat_result=None)
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fast_compute)
+    review._on_generate_heatmap()
+    _flush_jupyter_io(loop)
+    while loop.callbacks:
+        loop.flush()
+
+    assert _heatmap_values_max(review) == pytest.approx(71.0)
+    assert mutation_calls and mutation_calls[-1] is True
+    assert publish_calls == []
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+def test_method_change_does_not_auto_compute(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    harness, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review._coord_input.value = "Cas A"
+    review._apply_coordinate_from_field()
+    harness.run_ui(harness.session(review._layout), review._ensure_heatmap_grid)
+
+    called: list[str] = []
+
+    def _fail_compute(*_args, **_kwargs) -> HeatmapLoad:
+        called.append("compute")
+        raise AssertionError("compute_source_heatmap must not run on method change")
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fail_compute)
+    review.heatmap_method = "std"
+    harness.run_ui(harness.session(review._layout), review._on_heatmap_method_change_impl)
+
+    assert called == []
+    assert "std" in harness.bokeh_model(review._heatmap_pane, review._layout).title.text
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_jupyter_method_change_mutates_heatmap_title_after_generate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Method dropdown must push in-place title edits to layout-root-only comms."""
+    from ovro_lwa_portal.viz import pipeline_qa_app as pqa
+
+    mutation_calls: list[bool] = []
+    real_mutation = pqa.push_bokeh_pane_mutation_to_notebook
+
+    def _track_mutation(pane: object, *root_views: object, force_push: bool = False) -> None:
+        mutation_calls.append(bool(force_push))
+        real_mutation(pane, *root_views, force_push=force_push)
+
+    monkeypatch.setattr(sra, "push_bokeh_pane_mutation_to_notebook", _track_mutation)
+    monkeypatch.setattr(pqa, "push_bokeh_pane_mutation_to_notebook", _track_mutation)
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.coordinate_string = "Cas A"
+    review._coord_input.value = "Cas A"
+    review._coord_input.value_input = "Cas A"
+
+    src = review._current_source
+    assert src is not None
+    review._apply_heatmap(
+        src,
+        HeatmapLoad(
+            values=np.full((6, 4), 12.0),
+            patch_fit_result=None,
+            patch_stat_result=None,
+        ),
+    )
+    _flush_jupyter_io(loop)
+    assert "mad" in harness.bokeh_model(review._heatmap_pane, review._layout).title.text
+
+    mutation_calls.clear()
+    review.heatmap_method = "patch_max"
+    review._dispatch(review._on_heatmap_method_change_impl)
+    _flush_jupyter_io(loop)
+
+    title = harness.bokeh_model(review._heatmap_pane, review._layout).title.text
+    assert "patch_max" in title
+    assert mutation_calls and mutation_calls[-1] is True
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_jupyter_session_slow_zarr_open_then_generate_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -624,6 +777,57 @@ def test_overlay_single_flight_drops_stale_load(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_center_schedules_overlay_instead_of_blocking_update_sky(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Center must not call ``_update_sky`` synchronously inside the dispatch batch."""
+    _harness, review, _loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._coord = CAS_A
+    review._heatmap_coord = CAS_A
+
+    widget = MagicMock()
+    widget.image_shape = (512, 512)
+    widget.overlay_view_lock = True
+    widget.image_revision = 0
+    review._sky_widget = widget
+
+    scheduled_overlay: list[tuple] = []
+    update_sky_calls: list[tuple] = []
+
+    monkeypatch.setattr(
+        review,
+        "_resolve_active_coordinate",
+        lambda: (CAS_A, "Cas A"),
+    )
+    monkeypatch.setattr(
+        review,
+        "_schedule_overlay_slice_load",
+        lambda *args, **kwargs: scheduled_overlay.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        review,
+        "_update_sky",
+        lambda *args, **kwargs: update_sky_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(review, "_reset_heatmap_to_zeros", lambda: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_force_send_sky_widget_state", lambda *a, **k: None)
+
+    review._on_slew_impl()
+
+    assert not update_sky_calls
+    assert len(scheduled_overlay) == 1
+    _args, kwargs = scheduled_overlay[0]
+    assert kwargs.get("center_on_target") is True
+    assert kwargs.get("center") == CAS_A
+    widget.goto.assert_called_once()
+    widget.set_crosshair.assert_called_once_with(CAS_A)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_post_generate_overlay_skipped_when_heatmap_tap_supersedes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -730,6 +934,7 @@ def test_heatmap_progress_logs_do_not_dispatch_panel_batches(
     assert scheduled == ["schedule"]
     _flush_jupyter_io(loop)
     assert "tracking pixels" in review.log_text
+    assert "(1/10, 10%)" in review.log_text
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -755,3 +960,80 @@ def test_heatmap_progress_throttles_pixel_track_steps(
     assert len(lines) == 2
     assert "(0/120" in lines[0]
     assert "(120/120" in lines[1]
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_overlay_fit_begin_logs_schedule_not_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fit overlay start logs via ipywidgets schedule, not Panel dispatch batches."""
+    import threading
+    import time
+
+    from ovro_lwa_portal.accessor import PatchFitCellResult, format_radec_sexagesimal
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._coord = CAS_A
+
+    dispatch_calls: list[str] = []
+    real_dispatch = review._ui.dispatch
+
+    def _track_dispatch(callback, **_kwargs) -> None:
+        dispatch_calls.append("dispatch")
+        real_dispatch(callback)
+
+    monkeypatch.setattr(review._ui, "dispatch", _track_dispatch)
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        sra,
+        "_schedule_ipython_main",
+        lambda fn: scheduled.append("schedule") or loop.add_callback(fn),
+    )
+
+    ra_s, dec_s = format_radec_sexagesimal(350.85, 58.815)
+    worker_done = threading.Event()
+
+    def _fake_fit(*_args, **_kwargs) -> PatchFitCellResult:
+        worker_done.wait(timeout=2.0)
+        return PatchFitCellResult(
+            time_idx=0,
+            frequency_idx=0,
+            fit_accepted=True,
+            reduced_chi_squared=1.0,
+            peak=10.0,
+            peak_ra_deg=350.85,
+            peak_dec_deg=58.815,
+            peak_ra=ra_s,
+            peak_dec=dec_s,
+            x_offset_pixels=0.0,
+            y_offset_pixels=0.0,
+            peak_offset_pixels=0.0,
+            center_flux=1.0,
+            patch_max=11.0,
+            background=0.0,
+            widthx=3.0,
+            widthy=3.0,
+            scale=5.0,
+            max_reduced_chi_squared=10.0,
+            allow_position_offset=True,
+            patch_radius_pixels=4,
+        )
+
+    monkeypatch.setattr(sra, "compute_overlay_patch_fit", _fake_fit)
+    review._fit_overlay_button.disabled = False
+    review._load_overlay_fit()
+    _flush_jupyter_io(loop)
+
+    assert scheduled
+    assert dispatch_calls == []
+    assert "Fitting overlay patch" in review.log_text
+
+    worker_done.set()
+    deadline = time.monotonic() + 2.0
+    while len(scheduled) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    _flush_jupyter_io(loop)
+    assert dispatch_calls
+    assert "Fit overlay finished" in review.log_text
