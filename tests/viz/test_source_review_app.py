@@ -183,3 +183,66 @@ def test_fit_overlay_button_sync_is_nonblocking(
     )
     review._sync_fit_overlay_button()
     assert review._fit_overlay_button.disabled is True
+
+
+def test_configure_sky_widget_display_applies_config(tmp_path: Path) -> None:
+    """SkyWidget display config should set overlay and background traits."""
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    widget = MagicMock()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "bg.hips",
+            background_cut_min=-1.0,
+            background_cut_max=42.0,
+            background_opacity=0.85,
+            overlay_colormap="viridis",
+            overlay_stretch="sqrt",
+            overlay_opacity=0.75,
+        ),
+        validate_zarr=False,
+    )
+    review._log = MagicMock()  # type: ignore[method-assign]
+    review._configure_sky_widget_display(widget)
+
+    assert widget.colormap == "viridis"
+    assert widget.stretch == "sqrt"
+    assert widget.opacity == 0.75
+    assert widget.background_opacity == 0.85
+    assert widget.background_cut_min == -1.0
+    assert widget.background_cut_max == 42.0
+
+
+def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+            overlay_percentile_low=5.0,
+            overlay_percentile_high=95.0,
+            overlay_vmin=-2.0,
+            overlay_vmax=20.0,
+        ),
+        validate_zarr=False,
+    )
+    assert review._overlay_scale_kwargs() == {
+        "percentile_low": 5.0,
+        "percentile_high": 95.0,
+    }
+    widget = MagicMock()
+    widget.vmin = 0.0
+    widget.vmax = 1.0
+    review._apply_overlay_fixed_scale(widget)
+    assert widget.vmin == -2.0
+    assert widget.vmax == 20.0

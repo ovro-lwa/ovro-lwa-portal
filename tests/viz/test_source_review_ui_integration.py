@@ -944,6 +944,117 @@ def test_center_without_overlay_resets_mismatched_heatmap(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_generate_after_center_rebinds_desynced_heatmap_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Center layout pushes can desync pane.object from handles; Generate must recover."""
+    from bokeh.plotting import figure as bokeh_figure
+
+    from ovro_lwa_portal.viz import source_review_app as sra
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    assert review._heatmap_bokeh_handles is not None
+    review._heatmap_pane.object = bokeh_figure(width=100, height=100)
+
+    clicked = SkyCoord(ra=187.2779 * u.deg, dec=2.0524 * u.deg, frame="icrs")
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    widget.overlay_view_lock = True
+    widget.image_revision = 0
+    review._sky_widget = widget
+
+    monkeypatch.setattr(
+        review,
+        "_resolve_active_coordinate",
+        lambda: (clicked, "3C 1"),
+    )
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_force_send_sky_widget_state", lambda *a, **k: None)
+
+    review._dispatch(review._on_slew_impl)
+    _flush_jupyter_io(loop)
+
+    can_mutate, rebound = review._sync_heatmap_pane_to_handles()
+    assert can_mutate is True
+    assert rebound is True
+    assert review._heatmap_pane.object is review._heatmap_bokeh_handles.plot
+
+    values = np.full((6, 4), 91.0)
+
+    def _fast_compute(*_args, **_kwargs) -> HeatmapLoad:
+        return HeatmapLoad(values=values, patch_fit_result=None, patch_stat_result=None)
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fast_compute)
+    review._on_generate_heatmap()
+    _flush_jupyter_io(loop)
+    while loop.callbacks:
+        loop.flush()
+
+    assert _heatmap_values_max(review) == pytest.approx(91.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_sky_click_center_generate_publishes_heatmap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: sky click → Center → Generate must reach the browser (worker finish path)."""
+    from ovro_lwa_portal.viz import source_review_app as sra
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    clicked = SkyCoord(ra=187.2779 * u.deg, dec=2.0524 * u.deg, frame="icrs")
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    widget.overlay_view_lock = True
+    widget.image_revision = 0
+    widget.clicked_coord = (float(clicked.ra.deg), float(clicked.dec.deg))
+    review._sky_widget = widget
+
+    review._on_sky_widget_click(None)
+    _flush_jupyter_io(loop)
+
+    monkeypatch.setattr(
+        review,
+        "_resolve_active_coordinate",
+        lambda: (clicked, "3C 1"),
+    )
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_force_send_sky_widget_state", lambda *a, **k: None)
+
+    review._dispatch(review._on_slew_impl)
+    _flush_jupyter_io(loop)
+
+    values = np.full((6, 4), 88.0)
+
+    def _fast_compute(*_args, **_kwargs) -> HeatmapLoad:
+        return HeatmapLoad(values=values, patch_fit_result=None, patch_stat_result=None)
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fast_compute)
+    review._on_generate_heatmap()
+    _flush_jupyter_io(loop)
+    while loop.callbacks:
+        loop.flush()
+
+    assert _heatmap_values_max(review) == pytest.approx(88.0)
+    _assert_heatmap_bokeh_model_live(harness, review)
+    assert "3C 1" in harness.bokeh_model(review._heatmap_pane, review._layout).title.text
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_post_generate_overlay_skipped_when_heatmap_tap_supersedes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

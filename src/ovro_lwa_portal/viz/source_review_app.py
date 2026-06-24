@@ -38,6 +38,7 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     _capture_ipython_io_loop,
     _format_activity_log_html,
     _patch_astrowidget_get_wcs,
+    _run_after_hold,
     _schedule_ipython_main,
     bind_sky_widget_dataset,
     defer_after_notebook_hold,
@@ -110,8 +111,20 @@ class SourceReviewConfig:
         "/lustre/pipeline/calibration/hips/Blue_I_deep_Taper_Robust-0.75_Jan25.hips"
     )
     hips_http_prefix: str = "/calibration/hips"
+    # HiPS background (Aladin Lite setCuts)
     hips_background_percentile_low: float = 2.0
     hips_background_percentile_high: float = 98.0
+    background_cut_min: float | None = None
+    background_cut_max: float | None = None
+    background_opacity: float = 1.0
+    # Radio overlay (WebGL SkyWidget layer)
+    overlay_colormap: str = "inferno"
+    overlay_stretch: str = "linear"
+    overlay_percentile_low: float = 2.0
+    overlay_percentile_high: float = 98.0
+    overlay_vmin: float | None = None
+    overlay_vmax: float | None = None
+    overlay_opacity: float = 1.0
     log_overlay_timing: bool = False
 
 
@@ -461,6 +474,25 @@ class SourceReview(param.Parameterized):
     def _push_heatmap_mutation_to_notebook(self) -> None:
         """Push in-place Bokeh edits (title, image data) on a fresh io_loop turn."""
         self._publish_heatmap_mutation_to_notebook()
+
+    def _sync_heatmap_pane_to_handles(self) -> tuple[bool, bool]:
+        """Rebind ``pane.object`` to canonical handles after Panel layout pushes.
+
+        Returns ``(can_mutate_in_place, pane_was_rebound)``. Center and other
+        dispatch batches can replace the nested ``pn.pane.Bokeh`` object reference
+        while the browser still shows the zeros grid; without rebinding, Generate
+        falls through to a slow object swap that often misses layout-root comms.
+        """
+        handles = self._heatmap_bokeh_handles
+        if handles is None:
+            return False, False
+        plot = handles.plot
+        if self._heatmap_pane.object is plot:
+            return True, False
+        if self._heatmap_pane.object is None:
+            return False, False
+        self._heatmap_pane.object = plot
+        return True, True
 
     def _ensure_dataset_open(self) -> None:
         if self._open_scheduled or self._dataset is not None:
@@ -1381,9 +1413,9 @@ class SourceReview(param.Parameterized):
         self._log(
             f"Finished {src['name']} ({self._heatmap_method_label()}) in {elapsed_s:.1f} s"
         )
-        self._apply_heatmap(src, payload)
 
-        def _log_coverage_hint() -> None:
+        def _apply_and_hint() -> None:
+            self._apply_heatmap(src, payload)
             if self._dataset is None:
                 return
             hint = diagnose_heatmap_coverage(
@@ -1396,7 +1428,7 @@ class SourceReview(param.Parameterized):
             if hint:
                 self._log(f"Hint: {hint}")
 
-        _schedule_ipython_main(_log_coverage_hint)
+        _run_after_hold(_apply_and_hint)
 
     def _clear_loading_indicator(self) -> None:
         self.loading = False
@@ -1413,15 +1445,7 @@ class SourceReview(param.Parameterized):
         # Grid placeholder and deferred open-time grid must not clobber this figure.
         self._heatmap_grid_ready = True
 
-        # Mutate the live zeros-grid figure in place when it is already mounted.
-        # Object-swap + confirm republish is unreliable on layout-root-only comms;
-        # mutation push matches the method-dropdown path (validated in live Jupyter).
-        had_live_figure = (
-            self._heatmap_bokeh_handles is not None
-            and self._heatmap_pane.object is self._heatmap_bokeh_handles.plot
-        )
-        if not had_live_figure:
-            self._heatmap_bokeh_handles = None
+        can_mutate, pane_rebound = self._sync_heatmap_pane_to_handles()
         figure = self._refresh_heatmap_figure(payload.values)
 
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
@@ -1460,11 +1484,18 @@ class SourceReview(param.Parameterized):
                 )
 
         def _after_heatmap_publish() -> None:
-            self._set_status(status_text)
             self._clear_loading_indicator()
-            self._ui.schedule(_load_overlay_after_heatmap)
 
-        if had_live_figure:
+            def _follow_up() -> None:
+                self._set_status(status_text)
+                self._ui.schedule(_load_overlay_after_heatmap)
+                if pane_rebound:
+                    self._log("[diag] Heatmap notebook publish (confirm)")
+                    self._republish_heatmap_figure_for_notebook()
+
+            _run_after_hold(_follow_up)
+
+        if can_mutate:
             self._publish_heatmap_mutation_to_notebook(after_publish=_after_heatmap_publish)
         else:
             self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
@@ -1477,26 +1508,57 @@ class SourceReview(param.Parameterized):
             return int(t_idx), int(f_idx)
         return self._default_time_idx, self._default_freq_idx
 
-    def _mount_sky_widget(self, ds: xr.Dataset) -> None:
-        """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""
-        widget = SkyWidget()
-        widget.colormap = "inferno"
-        widget.background_survey = self._hips_background_url
+    def _overlay_scale_kwargs(self) -> dict[str, float]:
+        """Percentile limits passed to ``SkyWidget.update_slice``."""
+        cfg = self._config
+        return {
+            "percentile_low": float(cfg.overlay_percentile_low),
+            "percentile_high": float(cfg.overlay_percentile_high),
+        }
+
+    def _apply_overlay_fixed_scale(self, widget: SkyWidget) -> None:
+        """Override auto-scaled vmin/vmax when explicit overlay cuts are configured."""
+        cfg = self._config
+        if cfg.overlay_vmin is not None and cfg.overlay_vmax is not None:
+            widget.vmin = float(cfg.overlay_vmin)
+            widget.vmax = float(cfg.overlay_vmax)
+
+    def _configure_sky_widget_display(self, widget: SkyWidget) -> None:
+        """Apply overlay and HiPS background color-scale settings from config."""
+        cfg = self._config
+        widget.colormap = cfg.overlay_colormap
+        widget.stretch = cfg.overlay_stretch
+        widget.opacity = float(cfg.overlay_opacity)
+        widget.background_opacity = float(cfg.background_opacity)
+        if cfg.background_cut_min is not None and cfg.background_cut_max is not None:
+            widget.background_cut_min = float(cfg.background_cut_min)
+            widget.background_cut_max = float(cfg.background_cut_max)
+            self._log(
+                f"HiPS cuts (fixed): {cfg.background_cut_min:.4g} .. "
+                f"{cfg.background_cut_max:.4g}"
+            )
+            return
         try:
             cut_lo, cut_hi = compute_hips_percentile_cuts(
-                self._config.hips_background,
-                percentile_low=self._config.hips_background_percentile_low,
-                percentile_high=self._config.hips_background_percentile_high,
+                cfg.hips_background,
+                percentile_low=cfg.hips_background_percentile_low,
+                percentile_high=cfg.hips_background_percentile_high,
             )
             widget.background_cut_min = cut_lo
             widget.background_cut_max = cut_hi
             self._log(
-                f"HiPS cuts ({self._config.hips_background_percentile_low:g}/"
-                f"{self._config.hips_background_percentile_high:g} pct): "
+                f"HiPS cuts ({cfg.hips_background_percentile_low:g}/"
+                f"{cfg.hips_background_percentile_high:g} pct): "
                 f"{cut_lo:.4g} .. {cut_hi:.4g}"
             )
         except (FileNotFoundError, ValueError) as exc:
             self._log(f"WARNING: HiPS display cuts not set — {exc}")
+
+    def _mount_sky_widget(self, ds: xr.Dataset) -> None:
+        """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""
+        widget = SkyWidget()
+        widget.background_survey = self._hips_background_url
+        self._configure_sky_widget_display(widget)
         widget.invert_horizontal_pan = True
         max_size = max(256, int(ds.sizes["l"]) // 2)
         bind_sky_widget_dataset(widget, ds, max_size=max_size)
@@ -1544,8 +1606,7 @@ class SourceReview(param.Parameterized):
                 time_idx=int(time_idx),
                 freq_idx=int(freq_idx),
                 view_lock=True,
-                percentile_low=2,
-                percentile_high=98,
+                **self._overlay_scale_kwargs(),
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[heatmap]"
@@ -1555,8 +1616,7 @@ class SourceReview(param.Parameterized):
                 freq_idx=int(freq_idx),
                 center=reproject_center,
                 fov=self._sky_fov_deg * u.deg,
-                percentile_low=2,
-                percentile_high=98,
+                **self._overlay_scale_kwargs(),
             )
             diag_center = reproject_center
             diag_context = "update_sky[center]"
@@ -1565,11 +1625,11 @@ class SourceReview(param.Parameterized):
                 time_idx=int(time_idx),
                 freq_idx=int(freq_idx),
                 view_lock=True,
-                percentile_low=2,
-                percentile_high=98,
+                **self._overlay_scale_kwargs(),
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[view_lock]"
+        self._apply_overlay_fixed_scale(widget)
         if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
             return
         self._log_overlay_diagnostics(diag_center, context=diag_context)
@@ -1725,11 +1785,8 @@ class SourceReview(param.Parameterized):
         self._heatmap_values = np.zeros((n_times, n_freqs), dtype=np.float64)
         figure = self._refresh_heatmap_figure(self._heatmap_values)
         self._heatmap_grid_ready = True
-        had_live_figure = (
-            self._heatmap_bokeh_handles is not None
-            and self._heatmap_pane.object is self._heatmap_bokeh_handles.plot
-        )
-        if had_live_figure:
+        can_mutate, _pane_rebound = self._sync_heatmap_pane_to_handles()
+        if can_mutate:
             self._push_heatmap_mutation_to_notebook()
         else:
             self._publish_heatmap_figure(figure)
