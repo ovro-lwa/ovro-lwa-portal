@@ -56,6 +56,7 @@ from ovro_lwa_portal.viz.source_review import (
     finalize_dataset_load,
     plan_center_action,
     run_dataset_load,
+    should_reset_heatmap_on_center,
 )
 from ovro_lwa_portal.accessor import PatchFitCellResult
 from ovro_lwa_portal.viz.source_review_data import (
@@ -891,7 +892,7 @@ class SourceReview(param.Parameterized):
         self._sync_fit_overlay_button()
 
         def _maybe_reset_heatmap() -> None:
-            if not plan.field_matches_heatmap:
+            if should_reset_heatmap_on_center(plan):
                 self._reset_heatmap_to_zeros()
             elif self._heatmap_pane.object is None:
                 self._ensure_heatmap_grid()
@@ -908,15 +909,9 @@ class SourceReview(param.Parameterized):
 
         if plan.overlay_center is not None:
             self._log(f"Centering on {label} ({pos}) — loading overlay…")
-            if plan.field_matches_heatmap:
-                self._set_status(
-                    f"**{label}** centering ({pos}) — radio overlay reprojecting…"
-                )
-            else:
-                self._set_status(
-                    f"Centering ({pos}) — radio overlay reprojecting… "
-                    "Heatmap will reset to zeros."
-                )
+            self._set_status(
+                f"**{label}** centering ({pos}) — radio overlay reprojecting…"
+            )
             self._schedule_overlay_slice_load(
                 self._time_idx,
                 self._freq_idx,

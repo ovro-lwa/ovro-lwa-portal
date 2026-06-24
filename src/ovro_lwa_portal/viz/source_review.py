@@ -262,7 +262,20 @@ def plan_center_action(
     return CenterPlan(
         goto_center=field_coord,
         overlay_center=None,
-        drop_heatmap_state=bool(not field_matches_heatmap),
+        drop_heatmap_state=bool(
+            heatmap_coord is not None and not field_matches_heatmap
+        ),
         field_matches_heatmap=field_matches_heatmap,
         reason="center_hips_only",
     )
+
+
+def should_reset_heatmap_on_center(plan: CenterPlan) -> bool:
+    """True when Center should discard a computed heatmap for a new field target.
+
+    The open-time zeros grid is not a computed spectrum — do not republish it on
+    Center when ``heatmap_coord`` is still ``None``. When a radio overlay is
+    loaded, ``plan_center_action`` keeps ``drop_heatmap_state`` false so Center
+    reprojects the overlay without clobbering the heatmap pane.
+    """
+    return plan.drop_heatmap_state

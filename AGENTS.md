@@ -1011,8 +1011,14 @@ its tests first, then the notebook call site.
   center_on_target=True, center=field_coord)`; **do not** call `_update_sky`
   synchronously inside the Center dispatch batch (blocks the io_loop on Zarr).
   Users click a source in the overlay, hit Center, and expect to see the _same
-  source_ centered; clearing reads as data loss. If the field no longer matches
-  the generated heatmap target, defer `_reset_heatmap_to_zeros` with
+  source_ centered; clearing reads as data loss. **Heatmap reset on Center** uses
+  `should_reset_heatmap_on_center(plan)` (`plan.drop_heatmap_state`): only when a
+  **computed** heatmap exists (`_heatmap_coord` set), the field differs from that
+  target, and **no** radio overlay is loaded. Sky-click → Center **before** the
+  first Generate must **not** call `_reset_heatmap_to_zeros` (open-time zeros
+  grid only; `heatmap_coord is None`). With overlay loaded, Center never resets
+  the heatmap pane even when the field differs from the computed target. When
+  reset is needed, defer `_reset_heatmap_to_zeros` with
   `defer_after_notebook_hold` (mutates the live heatmap in place when mounted —
   do not force a full `_publish_heatmap_figure` object swap). Do not hide the
   heatmap pane (`object = None`); it must stay clickable.
@@ -1735,11 +1741,28 @@ dead-ends the workflow.
 
 **Solution:** Center **always keeps and reprojects** the overlay onto the field
 coordinate (`plan_center_action` returns `overlay_center=field_coord` whenever
-`has_overlay`), and resets the heatmap to a zeros grid
-(`_reset_heatmap_to_zeros`) instead of hiding it. Note the Python
-`clear_image()` → JS `clearImageTexture()` pairing: without the GPU texture
+`has_overlay`), and resets the heatmap only when
+`should_reset_heatmap_on_center(plan)` is true (computed heatmap for a different
+field, no overlay) — not on sky-click Center before the first Generate. Note the
+Python `clear_image()` → JS `clearImageTexture()` pairing: without the GPU texture
 clear, a "cleared" overlay keeps rendering at its old position, which presented
 as "overlay shows the wrong position" after Center.
+
+### Issue: Sky click → Center → Generate shows Finished but browser heatmap stays zeros
+
+**Symptoms:** Typing a catalog name and **Generate** works; sky-click → **Center**
+→ **Generate** logs `Finished …` with a finite range but the browser heatmap
+does not update (name-only path still works).
+
+**Cause:** Center before the first Generate used `not field_matches_heatmap` to
+call `_reset_heatmap_to_zeros`, which republished the zeros grid via a full
+layout push even when `_heatmap_coord` was still `None`. That extra publish
+raced the subsequent Generate mutation push.
+
+**Solution:** Use `should_reset_heatmap_on_center(plan)` (`drop_heatmap_state`
+requires `heatmap_coord is not None`). Sky-click users can **Generate** without
+Center when only the dynamic spectrum is needed; Center is for HiPS/overlay
+alignment.
 
 ### Issue: Zoom/FOV resets when changing time/frequency via heatmap click
 

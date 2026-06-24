@@ -24,6 +24,7 @@ from ovro_lwa_portal.viz.source_review_data import HeatmapLoad, build_source_fro
 from tests.viz.panel_ui_testkit import PanelUITestHarness, QueuedIOLoop
 
 CAS_A = SkyCoord(ra=350.85 * u.deg, dec=58.815 * u.deg, frame="icrs")
+CYG_A = SkyCoord(ra=299.8682 * u.deg, dec=40.7339 * u.deg, frame="icrs")
 
 
 def _mount_review(tmp_path: Path) -> tuple[PanelUITestHarness, SourceReview]:
@@ -825,6 +826,121 @@ def test_center_schedules_overlay_instead_of_blocking_update_sky(
     assert kwargs.get("center") == CAS_A
     widget.goto.assert_called_once()
     widget.set_crosshair.assert_called_once_with(CAS_A)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_center_before_first_generate_skips_heatmap_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sky-click → Center before any Generate must not republish the zeros grid."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_coord = None
+    review._heatmap_grid_ready = True
+
+    clicked = SkyCoord(ra=180.0 * u.deg, dec=37.0 * u.deg, frame="icrs")
+
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    widget.overlay_view_lock = True
+    widget.image_revision = 0
+    review._sky_widget = widget
+
+    reset_calls: list[bool] = []
+
+    def _track_reset() -> None:
+        reset_calls.append(True)
+
+    monkeypatch.setattr(review, "_reset_heatmap_to_zeros", _track_reset)
+    monkeypatch.setattr(
+        review,
+        "_resolve_active_coordinate",
+        lambda: (clicked, "180.0000, 37.0000"),
+    )
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_force_send_sky_widget_state", lambda *a, **k: None)
+
+    review._dispatch(review._on_slew_impl)
+    _flush_jupyter_io(loop)
+
+    assert reset_calls == []
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_center_with_overlay_skips_heatmap_reset_for_mismatched_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Overlay present: Center on a new field must not wipe the computed heatmap."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_coord = CAS_A
+
+    widget = MagicMock()
+    widget.image_shape = (512, 512)
+    widget.overlay_view_lock = True
+    widget.image_revision = 0
+    review._sky_widget = widget
+
+    reset_calls: list[bool] = []
+
+    monkeypatch.setattr(
+        review,
+        "_reset_heatmap_to_zeros",
+        lambda: reset_calls.append(True),
+    )
+    monkeypatch.setattr(
+        review,
+        "_resolve_active_coordinate",
+        lambda: (CYG_A, "Cyg A"),
+    )
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_force_send_sky_widget_state", lambda *a, **k: None)
+
+    review._dispatch(review._on_slew_impl)
+    _flush_jupyter_io(loop)
+
+    assert reset_calls == []
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_center_without_overlay_resets_mismatched_heatmap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No overlay: Center on a new field discards a stale computed heatmap."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_coord = CYG_A
+
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    review._sky_widget = widget
+
+    reset_calls: list[bool] = []
+
+    monkeypatch.setattr(
+        review,
+        "_reset_heatmap_to_zeros",
+        lambda: reset_calls.append(True),
+    )
+    monkeypatch.setattr(
+        review,
+        "_resolve_active_coordinate",
+        lambda: (CAS_A, "Cas A"),
+    )
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_force_send_sky_widget_state", lambda *a, **k: None)
+
+    review._dispatch(review._on_slew_impl)
+    _flush_jupyter_io(loop)
+
+    assert reset_calls == [True]
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
