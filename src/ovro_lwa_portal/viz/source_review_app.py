@@ -45,7 +45,6 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     publish_bokeh_pane_to_notebook,
     push_bokeh_pane_mutation_to_notebook,
     schedule_when_panel_loaded,
-    set_notebook_pane_object,
 )
 from ovro_lwa_portal.viz.panel_ui_session import (
     CallbackPanelUISession,
