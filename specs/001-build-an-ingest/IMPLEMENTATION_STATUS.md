@@ -366,11 +366,13 @@ task count.
 ### High Priority (User-Impacting)
 
 1. **No Resume Capability** (NFR-002 violation)
+
    - **Impact**: Long-running conversions cannot be resumed after interruption
    - **Workaround**: Use append mode and track completed time steps manually
    - **Future Work**: Implement `PipelineState` with JSON persistence
 
 2. **Limited Grid Validation** (FR-009 partially met)
+
    - **Impact**: Grid mismatches produce less actionable error messages
    - **Workaround**: Pre-validate FITS files manually
    - **Future Work**: Add `SpatialGrid` model with checksum validation
@@ -383,11 +385,13 @@ task count.
 ### Medium Priority (Developer Experience)
 
 4. **No Modular Discovery/Validation**
+
    - **Impact**: Cannot reuse discovery logic independently
    - **Workaround**: Import from `fits_to_zarr_xradio.py`
    - **Future Work**: Extract to `discovery.py` and `validation.py`
 
 5. **Limited Test Coverage**
+
    - **Impact**: Integration tests incomplete
    - **Workaround**: Manual testing
    - **Future Work**: Complete integration test suite from tasks.md
@@ -400,6 +404,7 @@ task count.
 ### Low Priority (Nice to Have)
 
 7. **Basic Logging Configuration**
+
    - **Impact**: No structured logging or detailed metrics
    - **Workaround**: Increase log level to debug
    - **Future Work**: Implement comprehensive logging from FR-028/029
@@ -525,12 +530,14 @@ features deferred for future iterations.
 ### For Future Development
 
 1. **Phase 2 Features** (based on user demand):
+
    - Resume/rebuild capability (NFR-002)
    - Comprehensive grid validation (FR-009)
    - Detailed progress reporting (FR-029)
    - Enhanced error diagnostics
 
 2. **Refactoring Opportunities**:
+
    - Extract discovery module
    - Extract validation module
    - Add Pydantic models for public API

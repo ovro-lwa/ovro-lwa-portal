@@ -61,6 +61,7 @@ command is idempotent and safe to run multiple times.
 ### Available Environments
 
 1. **`default`** (features: `pre-commit`, `gh-cli`)
+
    - Standard development environment
    - Radio astronomy packages: astropy, xarray, dask, zarr, netcdf4, numcodecs
    - OVRO-LWA specific: xradio, python-casacore
@@ -324,12 +325,14 @@ capabilities:
 ### Core Architecture
 
 1. **Core Module** (`ingest/core.py`):
+
    - `ConversionConfig`: Configuration dataclass for conversion parameters
    - `FITSToZarrConverter`: Main orchestration class (framework-independent)
    - `FileLock`: Cross-platform file locking using portalocker
    - `ProgressCallback`: Protocol for progress reporting
 
 2. **CLI Module** (`ingest/cli.py`):
+
    - Typer-based CLI with rich progress bars
    - Logging configuration (debug, info, warning, error levels)
    - Error handling with actionable messages
@@ -437,7 +440,7 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 | `_has_per_time_wcs_header_str(ds)`          | True when `wcs_header_str` is indexed by `time` (1-D or `(time, frequency)`)                                   |
 | `_read_wcs_header_str(ds, time_idx=…)`      | FITS header string for one time index                                                                          |
 | `strip_redundant_fits_wcs_header_attrs(ds)` | Drop static `fits_wcs_header` attrs when `wcs_header_str` is canonical (used by `open_dataset` and Zarr write) |
-| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                              |
+| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                             |
 | `pixel_to_coords` / `coords_to_pixel`       | Must pass `time_idx` when per-time WCS exists                                                                  |
 
 **Strict rules (do not break these):**

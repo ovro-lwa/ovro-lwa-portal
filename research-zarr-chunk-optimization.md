@@ -366,6 +366,7 @@ ds = ovro_lwa_portal.open_dataset(
 ## Technical Decisions
 
 - **Decision:** Fixed `chunk_lm=1024` default for spatial dimensions only
+
   - **Rationale:** Balances spatial tile size with memory; 1024x1024 float32 = 4
     MB per tile
   - **Trade-offs:** Good for full-image spatial access; suboptimal for
@@ -373,11 +374,13 @@ ds = ovro_lwa_portal.open_dataset(
     pixel)
 
 - **Decision:** No explicit compression configuration
+
   - **Rationale:** Relies on xradio `write_image()` defaults
   - **Trade-offs:** Simplifies ingest code but may leave performance on the
     table; users cannot currently control compression without modifying code
 
 - **Decision:** Zarr v2 pinned (no sharding)
+
   - **Rationale:** Required by xradio compatibility (`xradio/issues/355`)
   - **Trade-offs:** Each chunk = one object; no sub-chunk access. Must balance
     chunk count vs. chunk size without sharding.
@@ -432,6 +435,7 @@ ds = ovro_lwa_portal.open_dataset(
 ## References
 
 - Files analyzed: 8 total files
+
   - `src/ovro_lwa_portal/io.py` -- open_dataset(), resolve_source(),
     DataSourceError
   - `src/ovro_lwa_portal/fits_to_zarr_xradio.py` -- FITS-to-Zarr ingest with

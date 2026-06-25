@@ -366,6 +366,7 @@ with:
 **Configuration Models** (using pydantic-settings):
 
 1. **ConversionOptions** (frozen BaseSettings):
+
    - input_dir, output_dir, zarr_name, fixed_dir, chunk_lm, rebuild, use_prefect
    - Loaded from CLI args, environment variables, or config files
    - Validators: directories exist/writable, chunk size positive
@@ -409,37 +410,44 @@ _This section describes what the /tasks command will do - DO NOT execute during
 **Approach**: **TDD Bottom-Up with Pydantic-First**
 
 1. **Layer 1: Pydantic Models** (Tests → Implementation)
+
    - Create Pydantic model factories for testing (pytest fixtures)
    - Write validation tests for each model
    - Implement Pydantic models with Field validators
    - Test serialization/deserialization
 
 2. **Layer 2: Pydantic Settings** (Tests → Implementation)
+
    - Test configuration loading from env vars
    - Test configuration validation
    - Implement BaseSettings classes
    - Test defaults and overrides
 
 3. **Layer 3: Core Utilities** (Tests → Implementation)
+
    - File locking tests
    - State management tests (Pydantic model persistence)
    - Logging configuration tests
 
 4. **Layer 4: Conversion Logic** (Tests → Implementation → Refactor)
+
    - Extract and test each function from existing fits_to_zarr_xradio.py
    - Update signatures to use Pydantic models
    - Maintain backward compatibility wrapper
 
 5. **Layer 5: Discovery & Orchestration** (Tests → Implementation)
+
    - Discovery functions with Pydantic model returns
    - High-level orchestration with validated inputs
 
 6. **Layer 6: CLI Interface** (Tests → Implementation)
+
    - Typer CLI with Pydantic integration (typer.Option with Pydantic types)
    - Interactive prompts
    - Error formatting with Pydantic messages
 
 7. **Layer 7: Optional Prefect Layer** (Tests → Implementation)
+
    - Prefect flows with Pydantic model passing
 
 8. **Layer 8: Integration & Acceptance** (End-to-End)

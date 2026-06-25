@@ -178,12 +178,14 @@ reproducible results:
 1. **Define 3–5 representative access patterns** matching real user workflows.
    Use the recipes from [Read-Time Optimization](chunking-read-optimization.md)
    as templates:
+
    - Recipe A: Full spatial images (snapshot analysis)
    - Recipe B: Time series at a point
    - Recipe C: Spectral analysis
    - Recipe D: Full dataset batch processing
 
 2. **Create a controlled environment** to minimize external variability:
+
    - Consistent network: Use the same network connection for all runs
    - No background jobs: Close applications that may compete for bandwidth or
      CPU
@@ -191,6 +193,7 @@ reproducible results:
      rather than shared/spot instances
 
 3. **Distinguish warm cache vs. cold cache measurements:**
+
    - **Warm cache:** Data is already in OS page cache or fsspec cache. Measures
      compute and memory performance without I/O latency. To warm cache: run the
      operation once, then measure subsequent runs.
