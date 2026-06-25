@@ -52,6 +52,7 @@ def run_dataset_load(
     on_loaded: Callable[[_LoadT], None],
     on_error: Callable[[BaseException], None],
     log: Callable[[str], None] | None = None,
+    log_dispatch: Callable[[Callable[[], None]], None] | None = None,
 ) -> None:
     """Run the slow Zarr open and marshal every UI update onto the main thread.
 
@@ -84,13 +85,18 @@ def run_dataset_load(
     on_error
         Called (via ``dispatch``) with the exception on failure.
     log
-        Optional progress-message sink, invoked (via ``dispatch``) for each
-        ``report`` call made by ``open_dataset``.
+        Optional progress-message sink for each ``report`` call from
+        ``open_dataset``.
+    log_dispatch
+        Optional scheduler for progress log lines (defaults to ``dispatch``).
+        In Jupyter, pass ``_schedule_ipython_main`` so open progress reaches the
+        ipywidgets activity log even when Panel layout comm registration lags.
     """
+    schedule_log = log_dispatch if log_dispatch is not None else dispatch
 
     def _report(message: str) -> None:
         if log is not None:
-            dispatch(lambda: log(message))
+            schedule_log(lambda: log(message))
 
     try:
         load = open_dataset(_report)
@@ -256,7 +262,20 @@ def plan_center_action(
     return CenterPlan(
         goto_center=field_coord,
         overlay_center=None,
-        drop_heatmap_state=bool(not field_matches_heatmap),
+        drop_heatmap_state=bool(
+            heatmap_coord is not None and not field_matches_heatmap
+        ),
         field_matches_heatmap=field_matches_heatmap,
         reason="center_hips_only",
     )
+
+
+def should_reset_heatmap_on_center(plan: CenterPlan) -> bool:
+    """True when Center should discard a computed heatmap for a new field target.
+
+    The open-time zeros grid is not a computed spectrum — do not republish it on
+    Center when ``heatmap_coord`` is still ``None``. When a radio overlay is
+    loaded, ``plan_center_action`` keeps ``drop_heatmap_state`` false so Center
+    reprojects the overlay without clobbering the heatmap pane.
+    """
+    return plan.drop_heatmap_state

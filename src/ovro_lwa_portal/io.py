@@ -7,19 +7,23 @@ multiple sources including local paths, remote URLs, and DOI identifiers.
 from __future__ import annotations
 
 import difflib
+import json
 import re
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 import xarray as xr
 
 __all__ = [
     "DataSourceError",
+    "LmChunkSummary",
     "open_dataset",
     "resolve_source",
+    "summarize_lm_chunks",
     "validate_local_zarr_store",
+    "warn_if_suboptimal_lm_chunks",
 ]
 
 # DOI pattern: matches both "doi:10.xxxx/xxxxx" and "10.xxxx/xxxxx"
@@ -34,6 +38,18 @@ class DataSourceError(Exception):
     """Exception raised for errors in data source handling."""
 
     pass
+
+
+class LmChunkSummary(TypedDict):
+    """On-disk ``l``/``m`` chunk layout for a Zarr data variable."""
+
+    l_min: int
+    m_min: int
+    l_chunks: tuple[int, ...]
+    m_chunks: tuple[int, ...]
+
+
+_MIN_RECOMMENDED_LM_CHUNK = 512
 
 
 def _is_doi(source: str) -> bool:
@@ -359,6 +375,108 @@ def validate_local_zarr_store(source: str | Path) -> Path:
         raise DataSourceError("\n".join(lines))
 
     return resolved
+
+
+def _chunk_sizes_on_axis(chunk_size: int, axis_length: int) -> tuple[int, ...]:
+    """Expand a uniform Zarr chunk length into per-chunk sizes along one axis."""
+    size = int(chunk_size)
+    if size <= 0:
+        msg = f"chunk size must be positive, got {size}"
+        raise ValueError(msg)
+    n_full, remainder = divmod(int(axis_length), size)
+    if remainder:
+        return (size,) * n_full + (remainder,)
+    return (size,) * max(n_full, 1)
+
+
+def summarize_lm_chunks(
+    zarr_path: str | Path,
+    *,
+    var: str = "SKY",
+) -> LmChunkSummary:
+    """Summarize on-disk ``l`` and ``m`` chunk sizes for a Zarr array.
+
+    Reads ``{var}/.zarray`` and ``{var}/.zattrs`` from a local Zarr v2 store.
+    """
+    root = validate_local_zarr_store(zarr_path)
+    zarray_path = root / var / ".zarray"
+    zattrs_path = root / var / ".zattrs"
+    if not zarray_path.is_file():
+        msg = f"Variable {var!r} not found in Zarr store:\n  {root}"
+        raise DataSourceError(msg)
+
+    meta = json.loads(zarray_path.read_text(encoding="utf-8"))
+    shape = tuple(int(x) for x in meta.get("shape", ()))
+    chunks = meta.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        msg = f"Zarr array {var!r} is missing chunk metadata in {zarray_path}"
+        raise DataSourceError(msg)
+
+    dims: list[str] = []
+    if zattrs_path.is_file():
+        attrs = json.loads(zattrs_path.read_text(encoding="utf-8"))
+        raw_dims = attrs.get("_ARRAY_DIMENSIONS")
+        if isinstance(raw_dims, list):
+            dims = [str(d) for d in raw_dims]
+
+    if len(dims) != len(shape):
+        msg = (
+            f"Cannot map chunk layout for {var!r}: "
+            f"shape rank {len(shape)} != _ARRAY_DIMENSIONS {dims!r}"
+        )
+        raise DataSourceError(msg)
+
+    try:
+        l_idx = dims.index("l")
+        m_idx = dims.index("m")
+    except ValueError as exc:
+        msg = f"Variable {var!r} lacks l/m dimensions; found {dims!r}"
+        raise DataSourceError(msg) from exc
+
+    l_chunks = _chunk_sizes_on_axis(int(chunks[l_idx]), shape[l_idx])
+    m_chunks = _chunk_sizes_on_axis(int(chunks[m_idx]), shape[m_idx])
+    return {
+        "l_min": min(l_chunks),
+        "m_min": min(m_chunks),
+        "l_chunks": l_chunks,
+        "m_chunks": m_chunks,
+    }
+
+
+def warn_if_suboptimal_lm_chunks(
+    zarr_path: str | Path,
+    *,
+    min_chunk: int = _MIN_RECOMMENDED_LM_CHUNK,
+    var: str = "SKY",
+) -> LmChunkSummary | None:
+    """Warn when on-disk spatial chunks are smaller than recommended for overlay I/O."""
+    try:
+        summary = summarize_lm_chunks(zarr_path, var=var)
+    except (DataSourceError, OSError, json.JSONDecodeError):
+        return None
+
+    l_extent = sum(summary["l_chunks"])
+    m_extent = sum(summary["m_chunks"])
+    smallest = min(summary["l_min"], summary["m_min"])
+    max_achievable = min(l_extent, m_extent)
+
+    if smallest >= int(min_chunk):
+        return summary
+
+    # Already chunked as large as this store geometry allows (e.g. 4×4 or 10×10 tests).
+    if smallest >= max_achievable:
+        return summary
+
+    warnings.warn(
+        "Zarr store "
+        f"{Path(zarr_path).expanduser()} has small on-disk l/m chunks "
+        f"(minimum={smallest}, recommended>={min_chunk}). "
+        "Single-slice overlay reads may be slow. Re-ingest with "
+        f"`ovro-ingest convert ... --chunk-lm {min_chunk}` or higher.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return summary
 
 
 def _validate_dataset(ds: xr.Dataset) -> None:
@@ -708,6 +826,7 @@ def open_dataset(
     original_source = str(source)
     source_type, normalized_source = _detect_source_type(source)
     resolved_url: str | None = None  # Track DOI-resolved URL for error messages
+    local_zarr_path: Path | None = None
 
     # Resolve DOI to actual data URL
     if source_type == "doi":
@@ -772,6 +891,7 @@ def open_dataset(
 
                 if store_path.protocol in ("", "file"):
                     local_store = validate_local_zarr_store(normalized_source)
+                    local_zarr_path = local_store
                     store_path = UPath(str(local_store))
 
                 # Build a Zarr store (fsspec mapper) from the UPath
@@ -834,6 +954,9 @@ def open_dataset(
     # Validate dataset structure if requested
     if validate:
         _validate_dataset(ds)
+
+    if local_zarr_path is not None:
+        warn_if_suboptimal_lm_chunks(local_zarr_path)
 
     from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
 

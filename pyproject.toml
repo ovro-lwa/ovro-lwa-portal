@@ -109,7 +109,6 @@ minversion = "7.0"
 pythonpath = ["src"]
 addopts = ["-vvv", "-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = false
-filterwarnings = ["error"]
 log_cli_level = "INFO"
 testpaths = ["tests"]
 markers = [

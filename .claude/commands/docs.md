@@ -6,6 +6,7 @@ broadly)
 ## Instructions
 
 1. **Gather context** — Run these in parallel to understand what changed:
+
    - `git log --oneline -20` (recent commits)
    - `git diff main...HEAD --stat` (if on a feature branch)
    - `git log --oneline --since="8 hours ago"` (today's work)
@@ -14,6 +15,7 @@ broadly)
 
 2. **Determine scope** — Based on the argument and recent changes, decide which
    docs need writing or updating:
+
    - If argument is a specific topic (e.g., "queues", "auth", "notifications"),
      focus there
    - If argument is a section (e.g., "architecture", "database", "guides"),
@@ -24,18 +26,21 @@ broadly)
 3. **Write documentation** covering these categories as relevant:
 
    ### Technical Details
+
    - What was built, changed, or fixed
    - API contracts, database schema changes, new RPC functions
    - Configuration changes, environment variables, dependencies added
    - Code patterns introduced or modified
 
    ### Technical Architecture
+
    - System design and component relationships
    - Data flow diagrams (use Mermaid syntax)
    - Integration points between services (workers, platform, database)
    - Infrastructure decisions (Cloudflare, Neon, WorkOS, Stripe, etc.)
 
    ### Session Learnings
+
    - Decisions made and their rationale (ADR-style: Decision / Why / Result)
    - Technical issues encountered and how they were resolved
    - Trade-offs considered and which path was chosen
@@ -43,6 +48,7 @@ broadly)
    - Things that didn't work and why
 
 4. **Place documentation correctly:**
+
    - New architecture docs → `docs/architecture/`
    - Database changes → `docs/database/`
    - Frontend changes → `docs/frontend/`

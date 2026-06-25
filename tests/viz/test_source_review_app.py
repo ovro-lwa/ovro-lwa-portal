@@ -10,6 +10,9 @@ import pytest
 pn = pytest.importorskip("panel")
 pytest.importorskip("astrowidget")
 
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+
 from ovro_lwa_portal.viz.source_review_app import SourceReview, SourceReviewConfig
 
 
@@ -95,3 +98,151 @@ def test_ui_action_handlers_schedule_through_dispatch(tmp_path: Path) -> None:
     scheduled.clear()
     review._on_overlay_toggle(MagicMock(new=True))
     assert scheduled and scheduled[-1] == "_run"
+
+
+def test_fit_overlay_button_exists(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    assert review._fit_overlay_button.name == "Fit overlay"
+    assert review._fit_overlay_button.disabled is True
+
+
+def test_fit_overlay_click_schedules_impl(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    scheduled: list[str] = []
+
+    def _recording_dispatch(callback) -> None:
+        scheduled.append(callback.__name__ if hasattr(callback, "__name__") else "lambda")
+        callback()
+
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        dispatch_override=_recording_dispatch,
+    )
+
+    started: list[bool] = []
+    review._load_overlay_fit = lambda: started.append(True)  # type: ignore[method-assign]
+    review._fit_overlay_button.disabled = False
+
+    review._on_fit_overlay(None)
+    assert scheduled and scheduled[-1] == "_on_fit_overlay_impl"
+    assert started == [True]
+
+
+def test_fit_overlay_button_sync_is_nonblocking(
+    tmp_path: Path,
+    valid_ovro_dataset,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fit overlay gating must not scan the full cube on the UI thread."""
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    review._dataset = valid_ovro_dataset
+    review._coord = SkyCoord(ra=350.85 * u.deg, dec=58.815 * u.deg, frame="icrs")
+    review._time_idx = 0
+    review._freq_idx = 0
+
+    def _fail_full_cache(self, **_kwargs) -> None:
+        msg = "ensure_patch_metadata_cache must not run for Fit overlay button gating"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.accessor.RadportAccessor.ensure_patch_metadata_cache",
+        _fail_full_cache,
+    )
+    review._sync_fit_overlay_button()
+    assert review._fit_overlay_button.disabled is True
+
+
+def test_configure_sky_widget_display_applies_config(tmp_path: Path) -> None:
+    """SkyWidget display config should set overlay and background traits."""
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    widget = MagicMock()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "bg.hips",
+            background_cut_min=-1.0,
+            background_cut_max=42.0,
+            background_opacity=0.85,
+            overlay_colormap="viridis",
+            overlay_stretch="sqrt",
+            overlay_opacity=0.75,
+        ),
+        validate_zarr=False,
+    )
+    review._log = MagicMock()  # type: ignore[method-assign]
+    review._configure_sky_widget_display(widget)
+
+    assert widget.colormap == "viridis"
+    assert widget.stretch == "sqrt"
+    assert widget.opacity == 0.75
+    assert widget.background_opacity == 0.85
+    assert widget.background_cut_min == -1.0
+    assert widget.background_cut_max == 42.0
+
+
+def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+            overlay_percentile_low=5.0,
+            overlay_percentile_high=95.0,
+            overlay_vmin=-2.0,
+            overlay_vmax=20.0,
+        ),
+        validate_zarr=False,
+    )
+    assert review._overlay_scale_kwargs() == {
+        "percentile_low": 5.0,
+        "percentile_high": 95.0,
+    }
+    widget = MagicMock()
+    widget.vmin = 0.0
+    widget.vmax = 1.0
+    review._apply_overlay_fixed_scale(widget)
+    assert widget.vmin == -2.0
+    assert widget.vmax == 20.0

@@ -21,6 +21,7 @@ from ovro_lwa_portal.viz.source_review import (
     plan_center_action,
     run_dataset_load,
     should_build_heatmap_grid,
+    should_reset_heatmap_on_center,
 )
 
 # Cas A and a clearly different target (Cyg A) for "different source" cases.
@@ -43,7 +44,15 @@ class TestCenterUsesFieldCoordinate:
         plan = plan_center_action(CAS_A, heatmap_coord=None, has_overlay=False)
         assert plan.goto_center is CAS_A
         assert plan.overlay_center is None  # nothing loaded to reproject yet
+        assert plan.drop_heatmap_state is False
         assert plan.reason == "center_hips_only"
+
+    def test_sky_click_center_before_first_generate_skips_heatmap_reset(self):
+        # Sky-click RA/Dec then Center before any Generate — zeros grid only.
+        clicked = SkyCoord(ra=180.0 * u.deg, dec=37.0 * u.deg, frame="icrs")
+        plan = plan_center_action(clicked, heatmap_coord=None, has_overlay=False)
+        assert plan.drop_heatmap_state is False
+        assert plan.field_matches_heatmap is False
 
     def test_center_on_loaded_matching_target_centers_field(self):
         # Cas A heatmap loaded, user panned away, Center -> back to Cas A overlay.
@@ -112,6 +121,20 @@ class TestCenterNoOverlay:
         plan = plan_center_action(CAS_A, heatmap_coord=CAS_A, has_overlay=False)
         assert plan.drop_heatmap_state is False
         assert plan.field_matches_heatmap is True
+
+
+class TestShouldResetHeatmapOnCenter:
+    def test_no_generated_heatmap_never_resets(self):
+        plan = plan_center_action(CAS_A, heatmap_coord=None, has_overlay=False)
+        assert should_reset_heatmap_on_center(plan) is False
+
+    def test_mismatched_generated_heatmap_resets_without_overlay(self):
+        plan = plan_center_action(CAS_A, heatmap_coord=CYG_A, has_overlay=False)
+        assert should_reset_heatmap_on_center(plan) is True
+
+    def test_overlay_present_never_resets_even_when_field_differs(self):
+        plan = plan_center_action(CAS_A, heatmap_coord=CYG_A, has_overlay=True)
+        assert should_reset_heatmap_on_center(plan) is False
 
 
 @pytest.mark.parametrize("has_overlay", [True, False])
@@ -258,6 +281,29 @@ class TestRunDatasetLoadThreading:
         dispatcher.drain()
 
         assert order == ["step-1", "step-2", "loaded"]
+
+    def test_progress_log_can_use_separate_scheduler(self):
+        ui_dispatch = _DeferredDispatcher()
+        log_dispatch = _DeferredDispatcher()
+        order: list[str] = []
+
+        def _open(report: Callable[[str], None]) -> DatasetLoad:
+            report("step-1")
+            return _fake_load()
+
+        run_dataset_load(
+            open_dataset=_open,
+            dispatch=ui_dispatch,
+            log_dispatch=log_dispatch,
+            on_loaded=lambda _load: order.append("loaded"),
+            on_error=lambda exc: pytest.fail(f"unexpected error {exc!r}"),
+            log=order.append,
+        )
+        assert order == []
+        log_dispatch.drain()
+        assert order == ["step-1"]
+        ui_dispatch.drain()
+        assert order == ["step-1", "loaded"]
 
 
 class TestShouldBuildHeatmapGrid:

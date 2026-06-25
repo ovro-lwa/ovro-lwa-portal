@@ -799,6 +799,37 @@ def test_discover_groups_filename_time_merges_same_image_id(tmp_path: Path) -> N
     assert {p.name for p in by_name["20241221_102109"]} == {a.name, b.name}
 
 
+def test_harmonize_subband_time_coords_collapses_mjd_spread() -> None:
+    """Mismatched per-subband ``time`` coords must collapse before frequency stacking."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    mjd_a = 60662.13476852
+    mjd_b = mjd_a + 30.0 / 86400.0
+
+    def _slice(mjd: float) -> xr.Dataset:
+        return xr.Dataset(
+            {
+                "SKY": (
+                    ("time", "frequency", "polarization", "l", "m"),
+                    np.zeros((1, 1, 1, 2, 2), dtype=np.float32),
+                )
+            },
+            coords={
+                "time": ("time", [mjd]),
+                "frequency": ("frequency", [41e6]),
+                "polarization": ("polarization", [1]),
+                "l": ("l", [0, 1]),
+                "m": ("m", [0, 1]),
+            },
+        )
+
+    harmonized = mod._harmonize_subband_time_coords_for_stack([_slice(mjd_a), _slice(mjd_b)])
+    assert float(harmonized[0]["time"].values[0]) == pytest.approx(mjd_a)
+    assert float(harmonized[1]["time"].values[0]) == pytest.approx(mjd_a)
+
+
 def test_discover_groups_filename_only_skips_getheader(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

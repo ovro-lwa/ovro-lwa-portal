@@ -30,6 +30,7 @@ The script requires the following environment variables to be set:
 You can provide these environment variables in several ways:
 
 1. **Using a .env file** (recommended for local development):
+
    - Copy `.env.example` to `.env` and fill in your credentials
    - The script will automatically load variables from `.env` in the current
      directory

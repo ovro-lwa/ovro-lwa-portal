@@ -675,16 +675,19 @@ required** for the initial PR but could be added later.
 
 1. **`spectral_index(l, m, ...)`** - Compute spectral index (power-law slope) at
    a location
+
    - Returns α where S ∝ ν^α, computed as log(S₂/S₁) / log(ν₂/ν₁)
    - Supports frequency selection via MHz or index
 
 2. **`spectral_index_map(...)`** - Compute spectral index map across the full
    image
+
    - Returns DataArray with dims (l, m)
    - Includes frequency metadata in attrs
 
 3. **`integrated_flux(l, m, ...)`** - Compute integrated flux density over
    frequency band
+
    - Uses trapezoidal integration (numpy.trapezoid)
    - Returns flux in Jy·Hz
 

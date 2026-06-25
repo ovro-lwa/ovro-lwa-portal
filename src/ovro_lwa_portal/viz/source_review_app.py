@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import ipywidgets as widgets
 import numpy as np
@@ -37,9 +38,12 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     _capture_ipython_io_loop,
     _format_activity_log_html,
     _patch_astrowidget_get_wcs,
+    _run_after_hold,
     _schedule_ipython_main,
     bind_sky_widget_dataset,
+    defer_after_notebook_hold,
     publish_bokeh_pane_to_notebook,
+    push_bokeh_pane_mutation_to_notebook,
     schedule_when_panel_loaded,
 )
 from ovro_lwa_portal.viz.panel_ui_session import (
@@ -47,12 +51,15 @@ from ovro_lwa_portal.viz.panel_ui_session import (
     JupyterPanelUISession,
     PanelUISession,
 )
+from ovro_lwa_portal.viz.panel_compat import button_appearance_kwargs, set_button_appearance
 from ovro_lwa_portal.viz.source_review import (
     DatasetLoad,
     finalize_dataset_load,
     plan_center_action,
     run_dataset_load,
+    should_reset_heatmap_on_center,
 )
+from ovro_lwa_portal.accessor import PatchFitCellResult
 from ovro_lwa_portal.viz.source_review_data import (
     HEATMAP_METHOD_OPTIONS,
     HeatmapLoad,
@@ -60,10 +67,10 @@ from ovro_lwa_portal.viz.source_review_data import (
     _color_mapper,
     _format_patch_fit_diagnostics,
     _heatmap_index_from_coord,
-    _patch_fit_hover_columns,
     _row_hover,
     build_source_from_coordinate,
     calendar_mmdd_labels_for_time_coord,
+    compute_overlay_patch_fit,
     compute_source_heatmap,
     diagnose_heatmap_coverage,
     filter_known_source_names,
@@ -81,6 +88,16 @@ __all__ = [
 ]
 
 
+@dataclass
+class _HeatmapBokehHandles:
+    """Live Bokeh models for the heatmap pane (mutate in place after first publish)."""
+
+    plot: figure
+    image_renderer: Any
+    hover_source: ColumnDataSource
+    hover_tool: HoverTool
+
+
 @dataclass(frozen=True)
 class SourceReviewConfig:
     """Runtime paths and tuning knobs normally set in the notebook config cell."""
@@ -94,8 +111,21 @@ class SourceReviewConfig:
         "/lustre/pipeline/calibration/hips/Blue_I_deep_Taper_Robust-0.75_Jan25.hips"
     )
     hips_http_prefix: str = "/calibration/hips"
+    # HiPS background (Aladin Lite setCuts)
     hips_background_percentile_low: float = 2.0
     hips_background_percentile_high: float = 98.0
+    background_cut_min: float | None = None
+    background_cut_max: float | None = None
+    background_opacity: float = 1.0
+    # Radio overlay (WebGL SkyWidget layer)
+    overlay_colormap: str = "inferno"
+    overlay_stretch: str = "linear"
+    overlay_percentile_low: float = 2.0
+    overlay_percentile_high: float = 98.0
+    overlay_vmin: float | None = None
+    overlay_vmax: float | None = None
+    overlay_opacity: float = 1.0
+    log_overlay_timing: bool = False
 
 
 LOADING_SPINNER_HTML = (
@@ -184,7 +214,7 @@ class SourceReview(param.Parameterized):
         self._dataset: xr.Dataset | None = None
         self._cache: dict[tuple[str, str], HeatmapLoad] = {}
         self._heatmap_values: np.ndarray | None = None
-        self._patch_fit_result: object | None = None
+        self._overlay_patch_fit_result: PatchFitCellResult | None = None
         self._patch_stat_result: object | None = None
         self._current_source: dict | None = None
         self._coord: SkyCoord | None = None
@@ -209,6 +239,12 @@ class SourceReview(param.Parameterized):
         self._default_freq_idx = 0
         self._heatmap_job_id = 0
         self._heatmap_grid_ready = False
+        self._heatmap_bokeh_handles: _HeatmapBokehHandles | None = None
+        self._last_heatmap_figure: object | None = None
+        self._overlay_load_generation = 0
+        self._overlay_fit_job_id = 0
+        self._fit_overlay_sync_token = 0
+        self._last_sent_image_revision: int | None = None
 
         super().__init__(coordinate_string=coordinate_string.strip(), **params)
 
@@ -268,29 +304,36 @@ class SourceReview(param.Parameterized):
         self._suppress_coord_value_handler = False
         self._coord_slew = pn.widgets.Button(
             name="Center",
-            button_type="primary",
             width=80,
+            **button_appearance_kwargs("primary"),
         )
         self._coord_slew.on_click(self._on_slew)
         self._coord_generate = pn.widgets.Button(
             name="Generate heatmap",
-            button_type="primary",
             width=150,
+            **button_appearance_kwargs("primary"),
         )
         self._coord_generate.on_click(self._on_generate_heatmap)
         self._overlay_toggle = pn.widgets.Toggle(
             name="Overlay: on",
             value=True,
-            button_type="success",
             width=110,
+            **button_appearance_kwargs("success", widget_class=pn.widgets.Toggle),
         )
         self._overlay_toggle.param.watch(self._on_overlay_toggle, "value")
+        self._fit_overlay_button = pn.widgets.Button(
+            name="Fit overlay",
+            width=110,
+            disabled=True,
+        )
+        self._fit_overlay_button.on_click(self._on_fit_overlay)
         self._layout = pn.Column(
             pn.Row(
                 self._coord_input,
                 self._coord_slew,
                 self._coord_generate,
                 self._overlay_toggle,
+                self._fit_overlay_button,
                 self._method_selector,
                 self._loading_pane,
                 sizing_mode="stretch_width",
@@ -380,10 +423,76 @@ class SourceReview(param.Parameterized):
         return self._ui_session
 
     def _publish_heatmap_figure(
-        self, figure: object, *, after_publish: Callable[[], None] | None = None
+        self,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
     ) -> None:
         """Push a Bokeh heatmap figure on the next io-loop turn (Jupiter push path)."""
-        self._ui.publish_bokeh_figure(self._heatmap_pane, figure, after_publish=after_publish)
+        self._last_heatmap_figure = figure
+        self._ui.publish_bokeh_figure(
+            self._heatmap_pane,
+            figure,
+            after_publish=after_publish,
+        )
+
+    def _republish_heatmap_figure_for_notebook(self) -> None:
+        """Confirm push on a fresh io_loop turn (layout-root-only notebook comms)."""
+        published = self._heatmap_pane.object
+        if published is None and self._heatmap_values is not None:
+            self._heatmap_bokeh_handles = None
+            published = self._refresh_heatmap_figure(self._heatmap_values)
+        if published is None:
+            return
+        # Force a nested-pane swap when confirm re-assigns the same figure object.
+        self._heatmap_pane.object = None
+        publish_bokeh_pane_to_notebook(
+            self._heatmap_pane,
+            published,
+            *self._notebook_ui_views(),
+            force_push=True,
+        )
+
+    def _publish_heatmap_mutation_to_notebook(
+        self,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
+        """Push in-place heatmap edits after the active hold cycle (or on io_loop)."""
+
+        def _push() -> None:
+            push_bokeh_pane_mutation_to_notebook(
+                self._heatmap_pane,
+                *self._notebook_ui_views(),
+                force_push=True,
+            )
+            if after_publish is not None:
+                after_publish()
+
+        defer_after_notebook_hold(_push)
+
+    def _push_heatmap_mutation_to_notebook(self) -> None:
+        """Push in-place Bokeh edits (title, image data) on a fresh io_loop turn."""
+        self._publish_heatmap_mutation_to_notebook()
+
+    def _sync_heatmap_pane_to_handles(self) -> tuple[bool, bool]:
+        """Rebind ``pane.object`` to canonical handles after Panel layout pushes.
+
+        Returns ``(can_mutate_in_place, pane_was_rebound)``. Center and other
+        dispatch batches can replace the nested ``pn.pane.Bokeh`` object reference
+        while the browser still shows the zeros grid; without rebinding, Generate
+        falls through to a slow object swap that often misses layout-root comms.
+        """
+        handles = self._heatmap_bokeh_handles
+        if handles is None:
+            return False, False
+        plot = handles.plot
+        if self._heatmap_pane.object is plot:
+            return True, False
+        if self._heatmap_pane.object is None:
+            return False, False
+        self._heatmap_pane.object = plot
+        return True, True
 
     def _ensure_dataset_open(self) -> None:
         if self._open_scheduled or self._dataset is not None:
@@ -491,6 +600,161 @@ class SourceReview(param.Parameterized):
     def _sync_spinner(self, value: bool) -> None:
         self._refresh_loading_widget(value)
 
+    def _overlay_fit_source(self) -> dict | None:
+        """RA/Dec dict for overlay patch fit (field position, not heatmap target)."""
+        if self._coord is not None:
+            label = self.coordinate_string.strip() or "overlay"
+            return build_source_from_coordinate(label, self._coord)
+        return self._current_source
+
+    def _sync_fit_overlay_button(self) -> None:
+        """Update Fit overlay disabled state without blocking UI actions on Zarr I/O."""
+        if self._dataset is None or self._coord is None:
+            self._fit_overlay_button.disabled = True
+            return
+        self._fit_overlay_sync_token += 1
+        token = self._fit_overlay_sync_token
+        dataset = self._dataset
+        time_idx = int(self._time_idx)
+        freq_idx = int(self._freq_idx)
+
+        def _work() -> None:
+            try:
+                populated = dataset.radport._var_cell_has_finite_data(
+                    time_idx=time_idx,
+                    frequency_idx=freq_idx,
+                )
+            except (ValueError, KeyError, AttributeError):
+                populated = False
+
+            def _apply() -> None:
+                if token != self._fit_overlay_sync_token:
+                    return
+                self._fit_overlay_button.disabled = not populated
+
+            _schedule_ipython_main(_apply)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _invalidate_overlay_patch_fit(self) -> None:
+        self._overlay_fit_job_id += 1
+        self._overlay_patch_fit_result = None
+        self._sync_fit_overlay_button()
+
+    def _on_fit_overlay(self, _event: object | None = None) -> None:
+        self._schedule_ui_action(self._on_fit_overlay_impl)
+
+    def _on_fit_overlay_impl(self) -> None:
+        if self._fit_overlay_button.disabled:
+            return
+        self._load_overlay_fit()
+
+    def _load_overlay_fit(self) -> None:
+        if self._dataset is None or self._coord is None:
+            return
+        src = self._overlay_fit_source()
+        if src is None:
+            return
+        self._overlay_fit_job_id += 1
+        job_id = self._overlay_fit_job_id
+        time_idx = int(self._time_idx)
+        freq_idx = int(self._freq_idx)
+        dataset = self._dataset
+
+        def _begin() -> None:
+            self.loading = True
+            self._sync_spinner(True)
+            self._log(
+                f"Fitting overlay patch for {src['name']} "
+                f"(t={time_idx}, f={freq_idx})…"
+            )
+
+        _schedule_ipython_main(_begin)
+
+        def _work() -> None:
+            try:
+                result = compute_overlay_patch_fit(
+                    dataset,
+                    src,
+                    time_idx=time_idx,
+                    freq_idx=freq_idx,
+                    scale=self._patch_scale,
+                    patch_fit_max_reduced_chi_squared=self._patch_fit_max_chi2,
+                )
+            except Exception as exc:
+                captured_error = exc
+                _schedule_ipython_main(
+                    lambda err=captured_error: self._finish_overlay_fit(
+                        None, err, job_id
+                    )
+                )
+                return
+            captured_result = result
+            _schedule_ipython_main(
+                lambda fit=captured_result: self._finish_overlay_fit(
+                    fit, None, job_id
+                )
+            )
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _finish_overlay_fit(
+        self,
+        result: PatchFitCellResult | None,
+        error: BaseException | None,
+        job_id: int,
+    ) -> None:
+        if job_id != self._overlay_fit_job_id:
+            return
+        self.loading = False
+        self._sync_spinner(False)
+        if error is not None:
+            self._log(f"ERROR (fit overlay): {error}")
+            self._dispatch(
+                lambda: self._set_status(f"**Fit overlay failed:** {error}")
+            )
+            return
+        assert result is not None
+        self._overlay_patch_fit_result = result
+        diag = result.cell_diagnostics(result.time_idx, result.frequency_idx)
+        peak_s = (
+            f"{diag['peak']:.3g}"
+            if np.isfinite(float(diag["peak"]))
+            else "n/a (masked)"
+        )
+        self._log(
+            f"Fit overlay finished t={result.time_idx} f={result.frequency_idx}: "
+            f"χ²_red={diag['reduced_chi_squared']:.3g}, peak={peak_s} Jy"
+        )
+
+        def _update_status() -> None:
+            if self._lst_hours is None or self._freq_mhz is None:
+                status = _format_patch_fit_diagnostics(
+                    result, result.time_idx, result.frequency_idx
+                )
+            else:
+                lst = format_heatmap_time_axis_label(
+                    np.asarray(self._dataset.coords["time"].values),
+                    result.time_idx,
+                    self._lst_hours,
+                    day_labels=self._time_day_labels,
+                )
+                freq = float(self._freq_mhz[result.frequency_idx])
+                name = (
+                    self._current_source["name"]
+                    if self._current_source is not None
+                    else "field"
+                )
+                status = (
+                    f"**{name}** · LST {lst}, {freq:.1f} MHz "
+                    f"(t={result.time_idx}, f={result.frequency_idx})\n\n"
+                    f"{_format_patch_fit_diagnostics(result, result.time_idx, result.frequency_idx)}"
+                )
+            self._set_status(status)
+
+        self._dispatch(_update_status)
+        self._sync_fit_overlay_button()
+
     def _schedule_overlay_slice_load(
         self,
         time_idx: int,
@@ -516,7 +780,12 @@ class SourceReview(param.Parameterized):
             self.loading = True
             self._sync_spinner(True)
 
+        self._overlay_load_generation += 1
+        generation = self._overlay_load_generation
+
         def _run() -> None:
+            if generation != self._overlay_load_generation:
+                return
             try:
                 self._update_sky(
                     int(time_idx),
@@ -525,9 +794,10 @@ class SourceReview(param.Parameterized):
                     center=center,
                     preserve_view=preserve_view,
                     log_loading=True,
+                    overlay_generation=generation,
                 )
             finally:
-                if manage_spinner:
+                if manage_spinner and generation == self._overlay_load_generation:
                     self._clear_loading_indicator()
 
         self._ui.schedule(_run)
@@ -614,6 +884,22 @@ class SourceReview(param.Parameterized):
             return False
         return bool(self._coord.separation(coord) < 1 * u.arcsec)
 
+    def _set_sky_crosshair(self, widget: object, coord: SkyCoord | None) -> None:
+        """Pin the sky crosshair to a catalog position (requires astrowidget >= crosshair traits)."""
+        setter = getattr(widget, "set_crosshair", None)
+        if callable(setter):
+            setter(coord)
+            return
+        if not hasattr(widget, "crosshair_ra"):
+            return
+        if coord is None:
+            widget.crosshair_ra = -999.0
+            widget.crosshair_dec = -999.0
+        else:
+            icrs = coord.icrs
+            widget.crosshair_ra = float(icrs.ra.deg)
+            widget.crosshair_dec = float(icrs.dec.deg)
+
     def _on_slew(self, _event: object | None = None) -> None:
         self._schedule_ui_action(self._on_slew_impl)
 
@@ -635,57 +921,77 @@ class SourceReview(param.Parameterized):
         )
         # Center establishes the current overlay center for later heatmap clicks.
         self._coord = field_coord
+        self._sync_fit_overlay_button()
 
-        if not plan.field_matches_heatmap:
-            self._reset_heatmap_to_zeros()
-        elif self._heatmap_pane.object is None:
-            self._ensure_heatmap_grid()
+        def _maybe_reset_heatmap() -> None:
+            if should_reset_heatmap_on_center(plan):
+                self._reset_heatmap_to_zeros()
+            elif self._heatmap_pane.object is None:
+                self._ensure_heatmap_grid()
+
+        defer_after_notebook_hold(_maybe_reset_heatmap)
 
         widget.goto(plan.goto_center, fov=self._sky_fov_deg * u.deg)
+        self._set_sky_crosshair(widget, plan.goto_center)
+
+        pos = (
+            f"RA={plan.goto_center.ra.deg:.4f}°, "
+            f"Dec={plan.goto_center.dec.deg:.4f}°"
+        )
 
         if plan.overlay_center is not None:
-            self._update_sky(
+            self._log(f"Centering on {label} ({pos}) — loading overlay…")
+            self._set_status(
+                f"**{label}** centering ({pos}) — radio overlay reprojecting…"
+            )
+            self._schedule_overlay_slice_load(
                 self._time_idx,
                 self._freq_idx,
                 center_on_target=True,
                 center=plan.overlay_center,
-                log_loading=True,
+                manage_spinner=True,
             )
-            pos = (
-                f"RA={plan.goto_center.ra.deg:.4f}°, "
-                f"Dec={plan.goto_center.dec.deg:.4f}°"
-            )
-            if plan.field_matches_heatmap:
-                self._log(f"Centered HiPS and overlay on {label} ({pos}).")
-                self._set_status(
-                    f"**{label}** centered ({pos}) — radio overlay reprojected here."
-                )
-            else:
-                self._log(
-                    f"Centered HiPS and overlay at field position ({pos}). "
-                    "Heatmap reset to zeros — click a cell or Generate heatmap."
-                )
-                self._set_status(
-                    f"Centered ({pos}) — radio overlay reprojected here. "
-                    "Heatmap reset to zeros — **click a cell** to load a slice or "
-                    "**Generate heatmap** for the dynamic spectrum."
-                )
         else:
             self._log(
-                f"Centered HiPS on {label} "
-                f"(RA={plan.goto_center.ra.deg:.4f}°, Dec={plan.goto_center.dec.deg:.4f}°). "
+                f"Centered HiPS on {label} ({pos}). "
                 "Click a heatmap cell to load a slice, or Generate heatmap for the dynamic spectrum."
             )
             self._set_status(
-                f"**{label}** centered on the HiPS sky "
-                f"(RA={plan.goto_center.ra.deg:.4f}°, Dec={plan.goto_center.dec.deg:.4f}°). "
+                f"**{label}** centered on the HiPS sky ({pos}). "
                 "**Click a heatmap cell** to load that time/frequency as an overlay, "
                 "or **Generate heatmap** for the dynamic spectrum."
             )
+
         self._log_overlay_diagnostics(plan.goto_center, context=f"Center[{plan.reason}]")
+        self._force_send_sky_widget_state(widget)
+
+    def _maybe_send_sky_widget_state(self, widget: object, *, force: bool = False) -> float:
+        """Push widget traits to the browser; skip when ``image_revision`` is unchanged."""
         send_state = getattr(widget, "send_state", None)
-        if callable(send_state):
-            send_state()
+        if not callable(send_state):
+            return 0.0
+        rev = int(getattr(widget, "image_revision", 0))
+        if not force and self._last_sent_image_revision == rev:
+            return 0.0
+        t0 = time.perf_counter()
+        send_state()
+        comm_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_sent_image_revision = rev
+        return comm_ms
+
+    def _force_send_sky_widget_state(self, widget: object) -> None:
+        """Always push widget state (Center/goto paths also change view traits)."""
+        self._maybe_send_sky_widget_state(widget, force=True)
+
+    def _log_overlay_push_timing(self, widget: object, *, comm_ms: float) -> None:
+        profile = getattr(widget, "_profile_last_push", None) or {}
+        zarr_ms = float(profile.get("zarr_ms", 0.0))
+        reproject_ms = float(profile.get("reproject_ms", 0.0))
+        nbytes = int(profile.get("bytes", len(getattr(widget, "image_data", b"") or b"")))
+        self._log(
+            f"Overlay push: Zarr {zarr_ms:.0f} ms, reproject {reproject_ms:.0f} ms, "
+            f"comm {comm_ms:.0f} ms, {nbytes / 1024:.0f} KB"
+        )
 
     def _log_overlay_diagnostics(self, intended_center: SkyCoord, *, context: str) -> None:
         """Log realized widget view/CRVAL vs the intended center.
@@ -779,11 +1085,20 @@ class SourceReview(param.Parameterized):
             return
         self._load_heatmap()
 
+    def _heatmap_figure_title(self, *, subject: str | None = None) -> str:
+        """Bokeh title: target name + heatmap method (matches the method selector)."""
+        if subject is None:
+            src = self._current_source
+            subject = src["name"] if src is not None else "Time × frequency"
+        return (
+            f"{subject} — {self.heatmap_method} "
+            f"({self._heatmap_method_label()}; click a cell for sky view)"
+        )
+
     def _heatmap_method_label(self) -> str:
         labels = {
             "dynamic_spectrum": "tracked centre pixel",
             "patch_max": "patch maximum",
-            "patch_fit": "Gaussian patch fit (peak)",
             "mad": "patch MAD",
             "std": "patch std",
             "mean": "patch mean",
@@ -823,17 +1138,20 @@ class SourceReview(param.Parameterized):
         last_key: dict[str, tuple[int, str]] = {}
 
         def _callback(stage: str, current: int, total: int, message: str) -> None:
-            if stage in ("extract", "track") and total > 1:
+            # Pixel track is fast; log start + finish only (skip per-batch lines).
+            if stage == "track" and total > 1 and current not in (0, total):
+                return
+            if stage in ("extract", "reduce", "fit") and total > 1:
                 key = (current, message)
                 if current not in (0, total) and last_key.get(stage) == key:
                     return
                 last_key[stage] = key
             label = _PROGRESS_STAGE_LABELS.get(stage, stage)
-            if "in progress" in message or (stage == "extract" and current < total):
-                text = f"{label}: {message}"
-            else:
-                pct = int(round(100.0 * int(current) / int(total))) if total else 0
+            if total > 0:
+                pct = int(round(100.0 * int(current) / int(total)))
                 text = f"{label}: {message} ({current}/{total}, {pct}%)"
+            else:
+                text = f"{label}: {message}"
 
             # Activity log is ipywidgets — schedule on the io_loop without a Panel
             # dispatch batch. Progress ``dispatch`` calls each end with
@@ -896,6 +1214,7 @@ class SourceReview(param.Parameterized):
             run_dataset_load(
                 open_dataset=_open,
                 dispatch=self._dispatch,
+                log_dispatch=_schedule_ipython_main,
                 on_loaded=lambda load: self._finish_open(
                     load.dataset,
                     load.default_time_idx,
@@ -942,6 +1261,9 @@ class SourceReview(param.Parameterized):
         self._default_freq_idx = int(default_freq_idx)
         self._time_idx = self._default_time_idx
         self._freq_idx = self._default_freq_idx
+        self._heatmap_bokeh_handles = None
+        self._heatmap_grid_ready = False
+        self._heatmap_values = None
 
         self._log(
             f"Opened — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs, "
@@ -966,14 +1288,25 @@ class SourceReview(param.Parameterized):
             "Enter a coordinate, then **click a heatmap cell** to load a slice or "
             "**Generate heatmap** for the dynamic spectrum."
         )
+        self._sync_fit_overlay_button()
 
     def _on_heatmap_method_change(self, *_events) -> None:
         self._schedule_ui_action(self._on_heatmap_method_change_impl)
 
     def _on_heatmap_method_change_impl(self) -> None:
-        if self._current_source is None or self._dataset is None or self.loading:
+        """Update the heatmap title for the new method; do not recompute until Generate."""
+        self._sync_heatmap_method_display()
+
+    def _sync_heatmap_method_display(self) -> None:
+        """Refresh heatmap chrome for ``heatmap_method`` without loading Zarr data."""
+        if self._dataset is None or self.loading:
             return
-        self._load_heatmap()
+        if self._heatmap_values is not None:
+            self._refresh_heatmap_figure(self._heatmap_values)
+            self._push_heatmap_mutation_to_notebook()
+            return
+        if self._heatmap_grid_ready:
+            self._ensure_heatmap_grid(force=True, announce=False)
 
     def _load_heatmap(self) -> None:
         if self._dataset is None or self._current_source is None:
@@ -988,6 +1321,7 @@ class SourceReview(param.Parameterized):
 
         self._heatmap_job_id += 1
         job_id = self._heatmap_job_id
+        self._invalidate_overlay_patch_fit()
         self._begin_heatmap_load(src)
 
         def _work() -> None:
@@ -1003,14 +1337,14 @@ class SourceReview(param.Parameterized):
                 )
             except Exception as exc:
                 captured_error = exc
-                self._dispatch(
+                _schedule_ipython_main(
                     lambda err=captured_error: self._finish_heatmap(
                         src, None, err, job_id, t0
                     )
                 )
                 return
             captured_payload = payload
-            self._dispatch(
+            _schedule_ipython_main(
                 lambda result=captured_payload: self._finish_heatmap(
                     src, result, None, job_id, t0
                 )
@@ -1034,11 +1368,16 @@ class SourceReview(param.Parameterized):
                 f"({n_times} times × {n_freqs} freqs, "
                 f"RA={src['ra']:.4f}°, Dec={src['dec']:.4f}°)…"
             )
-            self._set_status(
+            status_text = (
                 f"Computing **{self._heatmap_method_label()}** for **{label}**…"
             )
+            with param.parameterized.discard_events(self):
+                self.status = status_text
+            self._ui.sync_status_pane(self._status_pane, status_text)
 
-        self._dispatch(_begin)
+        # Avoid a dispatch batch ``_push_panel_layout`` on the zeros heatmap while
+        # compute runs — that full layout push can race the post-finish publish.
+        _schedule_ipython_main(_begin)
 
     def _finish_heatmap(
         self,
@@ -1071,7 +1410,14 @@ class SourceReview(param.Parameterized):
             )
         else:
             self._log(f"{src['name']} ({self._heatmap_method_label()}): no finite values")
-        if self._dataset is not None:
+        self._log(
+            f"Finished {src['name']} ({self._heatmap_method_label()}) in {elapsed_s:.1f} s"
+        )
+
+        def _apply_and_hint() -> None:
+            self._apply_heatmap(src, payload)
+            if self._dataset is None:
+                return
             hint = diagnose_heatmap_coverage(
                 self._dataset,
                 src,
@@ -1081,10 +1427,8 @@ class SourceReview(param.Parameterized):
             )
             if hint:
                 self._log(f"Hint: {hint}")
-        self._log(
-            f"Finished {src['name']} ({self._heatmap_method_label()}) in {elapsed_s:.1f} s"
-        )
-        self._apply_heatmap(src, payload)
+
+        _run_after_hold(_apply_and_hint)
 
     def _clear_loading_indicator(self) -> None:
         self.loading = False
@@ -1093,15 +1437,16 @@ class SourceReview(param.Parameterized):
     def _apply_heatmap(self, src: dict, payload: HeatmapLoad) -> None:
         self._current_source = src
         self._heatmap_values = payload.values
-        self._patch_fit_result = payload.patch_fit_result
         self._patch_stat_result = payload.patch_stat_result
+        self._invalidate_overlay_patch_fit()
         self._coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg, frame="icrs")
         self._heatmap_coord = self._coord
         self._time_idx, self._freq_idx = self._default_slice(payload.values)
         # Grid placeholder and deferred open-time grid must not clobber this figure.
         self._heatmap_grid_ready = True
 
-        figure = self._build_heatmap_figure(payload.values)
+        can_mutate, pane_rebound = self._sync_heatmap_pane_to_handles()
+        figure = self._refresh_heatmap_figure(payload.values)
 
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
         dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
@@ -1117,42 +1462,44 @@ class SourceReview(param.Parameterized):
             f"{overlay_hint}"
         )
 
+        # Invalidate in-flight heatmap-tap overlay loads before scheduling the
+        # post-generate slice so a slow follow-up cannot overwrite a newer tap.
+        self._overlay_load_generation += 1
+        overlay_generation = self._overlay_load_generation
+
         def _load_overlay_after_heatmap() -> None:
-            try:
-                if (
-                    self._overlay_enabled
-                    and self._sky_widget is not None
-                    and self._coord is not None
-                ):
-                    self._update_sky(
-                        self._time_idx,
-                        self._freq_idx,
-                        center_on_target=True,
-                        center=self._coord,
-                        log_loading=True,
-                    )
-            finally:
-                self._clear_loading_indicator()
+            if overlay_generation != self._overlay_load_generation:
+                return
+            if (
+                self._overlay_enabled
+                and self._sky_widget is not None
+                and self._coord is not None
+            ):
+                self._schedule_overlay_slice_load(
+                    self._time_idx,
+                    self._freq_idx,
+                    center_on_target=True,
+                    center=self._coord,
+                    manage_spinner=True,
+                )
 
         def _after_heatmap_publish() -> None:
-            def _confirm_heatmap_then_overlay() -> None:
-                # Republish on a fresh io_loop turn (no artificial delay). Live
-                # Jupyter can miss the first push when layout-root-only comm
-                # batches interleave with late progress dispatches.
-                published = self._heatmap_pane.object
-                if published is not None:
-                    publish_bokeh_pane_to_notebook(
-                        self._heatmap_pane,
-                        published,
-                        *self._notebook_ui_views(),
-                        force_push=True,
-                    )
+            self._clear_loading_indicator()
+
+            def _follow_up() -> None:
                 self._set_status(status_text)
                 self._ui.schedule(_load_overlay_after_heatmap)
+                if pane_rebound:
+                    self._log("[diag] Heatmap notebook publish (confirm)")
+                    self._republish_heatmap_figure_for_notebook()
 
-            self._ui.schedule(_confirm_heatmap_then_overlay)
+            _run_after_hold(_follow_up)
 
-        self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
+        if can_mutate:
+            self._publish_heatmap_mutation_to_notebook(after_publish=_after_heatmap_publish)
+        else:
+            self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
+        self._sync_fit_overlay_button()
 
     def _default_slice(self, values: np.ndarray) -> tuple[int, int]:
         finite = np.argwhere(np.isfinite(values))
@@ -1161,26 +1508,57 @@ class SourceReview(param.Parameterized):
             return int(t_idx), int(f_idx)
         return self._default_time_idx, self._default_freq_idx
 
-    def _mount_sky_widget(self, ds: xr.Dataset) -> None:
-        """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""
-        widget = SkyWidget()
-        widget.colormap = "inferno"
-        widget.background_survey = self._hips_background_url
+    def _overlay_scale_kwargs(self) -> dict[str, float]:
+        """Percentile limits passed to ``SkyWidget.update_slice``."""
+        cfg = self._config
+        return {
+            "percentile_low": float(cfg.overlay_percentile_low),
+            "percentile_high": float(cfg.overlay_percentile_high),
+        }
+
+    def _apply_overlay_fixed_scale(self, widget: SkyWidget) -> None:
+        """Override auto-scaled vmin/vmax when explicit overlay cuts are configured."""
+        cfg = self._config
+        if cfg.overlay_vmin is not None and cfg.overlay_vmax is not None:
+            widget.vmin = float(cfg.overlay_vmin)
+            widget.vmax = float(cfg.overlay_vmax)
+
+    def _configure_sky_widget_display(self, widget: SkyWidget) -> None:
+        """Apply overlay and HiPS background color-scale settings from config."""
+        cfg = self._config
+        widget.colormap = cfg.overlay_colormap
+        widget.stretch = cfg.overlay_stretch
+        widget.opacity = float(cfg.overlay_opacity)
+        widget.background_opacity = float(cfg.background_opacity)
+        if cfg.background_cut_min is not None and cfg.background_cut_max is not None:
+            widget.background_cut_min = float(cfg.background_cut_min)
+            widget.background_cut_max = float(cfg.background_cut_max)
+            self._log(
+                f"HiPS cuts (fixed): {cfg.background_cut_min:.4g} .. "
+                f"{cfg.background_cut_max:.4g}"
+            )
+            return
         try:
             cut_lo, cut_hi = compute_hips_percentile_cuts(
-                self._config.hips_background,
-                percentile_low=self._config.hips_background_percentile_low,
-                percentile_high=self._config.hips_background_percentile_high,
+                cfg.hips_background,
+                percentile_low=cfg.hips_background_percentile_low,
+                percentile_high=cfg.hips_background_percentile_high,
             )
             widget.background_cut_min = cut_lo
             widget.background_cut_max = cut_hi
             self._log(
-                f"HiPS cuts ({self._config.hips_background_percentile_low:g}/"
-                f"{self._config.hips_background_percentile_high:g} pct): "
+                f"HiPS cuts ({cfg.hips_background_percentile_low:g}/"
+                f"{cfg.hips_background_percentile_high:g} pct): "
                 f"{cut_lo:.4g} .. {cut_hi:.4g}"
             )
         except (FileNotFoundError, ValueError) as exc:
             self._log(f"WARNING: HiPS display cuts not set — {exc}")
+
+    def _mount_sky_widget(self, ds: xr.Dataset) -> None:
+        """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""
+        widget = SkyWidget()
+        widget.background_survey = self._hips_background_url
+        self._configure_sky_widget_display(widget)
         widget.invert_horizontal_pan = True
         max_size = max(256, int(ds.sizes["l"]) // 2)
         bind_sky_widget_dataset(widget, ds, max_size=max_size)
@@ -1207,9 +1585,12 @@ class SourceReview(param.Parameterized):
         center: SkyCoord | None = None,
         preserve_view: bool = False,
         log_loading: bool = False,
+        overlay_generation: int | None = None,
     ) -> None:
         widget = self._sky_widget
         if widget is None:
+            return
+        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
             return
         reproject_center = center if center is not None else self._coord
         if reproject_center is None:
@@ -1225,8 +1606,7 @@ class SourceReview(param.Parameterized):
                 time_idx=int(time_idx),
                 freq_idx=int(freq_idx),
                 view_lock=True,
-                percentile_low=2,
-                percentile_high=98,
+                **self._overlay_scale_kwargs(),
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[heatmap]"
@@ -1236,8 +1616,7 @@ class SourceReview(param.Parameterized):
                 freq_idx=int(freq_idx),
                 center=reproject_center,
                 fov=self._sky_fov_deg * u.deg,
-                percentile_low=2,
-                percentile_high=98,
+                **self._overlay_scale_kwargs(),
             )
             diag_center = reproject_center
             diag_context = "update_sky[center]"
@@ -1246,23 +1625,28 @@ class SourceReview(param.Parameterized):
                 time_idx=int(time_idx),
                 freq_idx=int(freq_idx),
                 view_lock=True,
-                percentile_low=2,
-                percentile_high=98,
+                **self._overlay_scale_kwargs(),
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[view_lock]"
+        self._apply_overlay_fixed_scale(widget)
+        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
+            return
         self._log_overlay_diagnostics(diag_center, context=diag_context)
         if log_loading:
             self._log(
                 f"Overlay slice loaded (t={int(time_idx)}, f={int(freq_idx)})."
             )
-        send_state = getattr(widget, "send_state", None)
-        if callable(send_state):
-            send_state()
+        # User-visible overlay loads always push widget state; revision-gated
+        # skip is only for silent/internal paths.
+        comm_ms = self._maybe_send_sky_widget_state(widget, force=log_loading)
+        if self._config.log_overlay_timing and log_loading:
+            self._log_overlay_push_timing(widget, comm_ms=comm_ms)
 
     def _on_heatmap_tap(self, time_idx: int, freq_idx: int) -> None:
         self._time_idx = time_idx
         self._freq_idx = freq_idx
+        self._invalidate_overlay_patch_fit()
         if self._lst_hours is None or self._freq_mhz is None:
             return
 
@@ -1323,8 +1707,15 @@ class SourceReview(param.Parameterized):
             f"{self._heatmap_method_label()}={val_s} · target RA={ra_h}, Dec={dec_s}"
             f"{track_note}"
         )
-        if self.heatmap_method == "patch_fit" and self._patch_fit_result is not None:
-            status = f"{status}\n\n{_format_patch_fit_diagnostics(self._patch_fit_result, time_idx, freq_idx)}"
+        if (
+            self._overlay_patch_fit_result is not None
+            and self._overlay_patch_fit_result.time_idx == time_idx
+            and self._overlay_patch_fit_result.frequency_idx == freq_idx
+        ):
+            status = (
+                f"{status}\n\n"
+                f"{_format_patch_fit_diagnostics(self._overlay_patch_fit_result, time_idx, freq_idx)}"
+            )
         self._set_status(status)
         self._log(
             f"Heatmap cell — {name}, t={time_idx}, f={freq_idx} ({freq:.1f} MHz); "
@@ -1338,7 +1729,7 @@ class SourceReview(param.Parameterized):
 
     def _reset_heatmap_to_zeros(self) -> None:
         """Replace the heatmap with a zeros grid when centering on a new position."""
-        self._patch_fit_result = None
+        self._invalidate_overlay_patch_fit()
         self._patch_stat_result = None
         self._heatmap_coord = None
         self._ensure_heatmap_grid(force=True, announce=False)
@@ -1349,8 +1740,9 @@ class SourceReview(param.Parameterized):
         self._overlay_toggle.name = (
             "Overlay: on" if self._overlay_enabled else "Overlay: off"
         )
-        self._overlay_toggle.button_type = (
-            "success" if self._overlay_enabled else "default"
+        set_button_appearance(
+            self._overlay_toggle,
+            "success" if self._overlay_enabled else "default",
         )
         if self._overlay_toggle.value != self._overlay_enabled:
             self._suppress_overlay_toggle = True
@@ -1392,9 +1784,13 @@ class SourceReview(param.Parameterized):
         n_times = int(self._dataset.sizes["time"])
         n_freqs = int(self._dataset.sizes["frequency"])
         self._heatmap_values = np.zeros((n_times, n_freqs), dtype=np.float64)
-        figure = self._build_heatmap_figure(self._heatmap_values)
+        figure = self._refresh_heatmap_figure(self._heatmap_values)
         self._heatmap_grid_ready = True
-        self._publish_heatmap_figure(figure)
+        can_mutate, _pane_rebound = self._sync_heatmap_pane_to_handles()
+        if can_mutate:
+            self._push_heatmap_mutation_to_notebook()
+        else:
+            self._publish_heatmap_figure(figure)
         if announce:
             self._log(
                 f"Heatmap grid ready ({n_times} times × {n_freqs} freqs) — enter a "
@@ -1439,37 +1835,26 @@ class SourceReview(param.Parameterized):
             clear_image = getattr(widget, "clear_image", None)
             if callable(clear_image):
                 clear_image()
-            send_state = getattr(widget, "send_state", None)
-            if callable(send_state):
-                send_state()
+            self._force_send_sky_widget_state(widget)
             self._log("Overlay off — hidden.")
             self._set_status("Overlay **off** — HiPS background only.")
 
-    def _build_heatmap_figure(self, values: np.ndarray):
-        n_times, n_freqs = values.shape
-        mapper = _color_mapper(values.astype(np.float64, copy=False))
-        src = self._current_source
-        title_name = src["name"] if src is not None else "source"
-        method_label = self._heatmap_method_label()
-        plot = figure(
-            width=1000,
-            height=400,
-            title=f"{title_name} — {method_label} (click a cell for sky view)",
-            x_range=(0, n_times),
-            y_range=(0, n_freqs),
-            tools="pan,wheel_zoom,reset,tap",
-            active_drag="pan",
-            active_tap="tap",
-        )
-        plot.image(
-            image=[values.T.astype(np.float64, copy=False)],
-            x=0,
-            y=0,
-            dw=n_times,
-            dh=n_freqs,
-            color_mapper=mapper,
-        )
+    def _refresh_heatmap_figure(self, values: np.ndarray) -> figure:
+        """Return the live heatmap figure, creating it once then mutating in place."""
+        if self._heatmap_bokeh_handles is None:
+            handles = self._create_heatmap_figure_shell(values)
+            self._heatmap_bokeh_handles = handles
+            return handles.plot
+        self._update_heatmap_figure_shell(self._heatmap_bokeh_handles, values)
+        return self._heatmap_bokeh_handles.plot
 
+    def _heatmap_hover_payload(
+        self,
+        values: np.ndarray,
+        *,
+        n_times: int,
+        n_freqs: int,
+    ) -> tuple[dict[str, object], list[tuple[str, str]]]:
         time_idx, freq_idx = np.meshgrid(
             np.arange(n_times, dtype=int),
             np.arange(n_freqs, dtype=int),
@@ -1502,19 +1887,46 @@ class SourceReview(param.Parameterized):
             ("Freq idx", "@freq_idx"),
             ("Value", "@value_display"),
         ]
-        if self.heatmap_method == "patch_fit" and self._patch_fit_result is not None:
-            hover_data.update(_patch_fit_hover_columns(self._patch_fit_result))
-            tooltips.extend(
-                [
-                    ("Patch max (Jy)", "@patch_max_display"),
-                    ("χ²_red", "@chi2_display"),
-                    ("Fit accepted", "@fit_accepted_display"),
-                    ("Peak RA", "@peak_ra_display"),
-                    ("Peak Dec", "@peak_dec_display"),
-                    ("Offset (l,m px)", "@offset_display"),
-                ]
-            )
+        return hover_data, tooltips
 
+    def _heatmap_axis_ticks(
+        self,
+        n: int,
+        axis_values: np.ndarray,
+        fmt: Callable[[float], str],
+    ) -> tuple[list[float], dict[float, str]]:
+        step = 1 if n <= 24 else int(np.ceil(n / 24))
+        indices = range(0, n, step)
+        ticks = [i + 0.5 for i in indices]
+        labels = {tick: fmt(float(axis_values[i])) for tick, i in zip(ticks, indices, strict=True)}
+        return ticks, labels
+
+    def _create_heatmap_figure_shell(self, values: np.ndarray) -> _HeatmapBokehHandles:
+        n_times, n_freqs = values.shape
+        mapper = _color_mapper(values.astype(np.float64, copy=False))
+        src = self._current_source
+        title_name = src["name"] if src is not None else None
+        plot = figure(
+            width=1000,
+            height=400,
+            title=self._heatmap_figure_title(subject=title_name),
+            x_range=(0, n_times),
+            y_range=(0, n_freqs),
+            tools="pan,wheel_zoom,reset,tap",
+            active_drag="pan",
+            active_tap="tap",
+        )
+        image_renderer = plot.image(
+            image=[values.T.astype(np.float64, copy=False)],
+            x=0,
+            y=0,
+            dw=n_times,
+            dh=n_freqs,
+            color_mapper=mapper,
+        )
+        hover_data, tooltips = self._heatmap_hover_payload(
+            values, n_times=n_times, n_freqs=n_freqs
+        )
         hover_src = ColumnDataSource(data=hover_data)
         hover_renderer = plot.rect(
             x="x",
@@ -1525,18 +1937,11 @@ class SourceReview(param.Parameterized):
             fill_alpha=0,
             line_alpha=0,
         )
-        plot.add_tools(HoverTool(renderers=[hover_renderer], tooltips=tooltips))
+        hover_tool = HoverTool(renderers=[hover_renderer], tooltips=tooltips)
+        plot.add_tools(hover_tool)
 
-        def _axis_ticks(
-            n: int, axis_values: np.ndarray, fmt: Callable[[float], str]
-        ) -> tuple[list[float], dict[float, str]]:
-            step = 1 if n <= 24 else int(np.ceil(n / 24))
-            indices = range(0, n, step)
-            ticks = [i + 0.5 for i in indices]
-            labels = {tick: fmt(float(axis_values[i])) for tick, i in zip(ticks, indices, strict=True)}
-            return ticks, labels
-
-        x_ticks, x_labels = _axis_ticks(
+        time_values = np.asarray(self._dataset.coords["time"].values)
+        x_ticks, x_labels = self._heatmap_axis_ticks(
             n_times,
             np.arange(n_times, dtype=float),
             lambda i: format_heatmap_time_axis_label(
@@ -1546,7 +1951,7 @@ class SourceReview(param.Parameterized):
                 day_labels=self._time_day_labels,
             ),
         )
-        y_ticks, y_labels = _axis_ticks(
+        y_ticks, y_labels = self._heatmap_axis_ticks(
             n_freqs, self._freq_mhz, lambda v: f"{float(v):.1f}"  # type: ignore[arg-type]
         )
         plot.xaxis.ticker = FixedTicker(ticks=x_ticks)
@@ -1558,11 +1963,65 @@ class SourceReview(param.Parameterized):
         plot.xaxis.major_label_orientation = math.pi / 4
 
         def _on_tap(event: Tap) -> None:
-            if event.x is None or event.y is None:
+            if event.x is None or event.y is None or self._heatmap_values is None:
                 return
-            t_idx = _heatmap_index_from_coord(event.x, n_times)
-            f_idx = _heatmap_index_from_coord(event.y, n_freqs)
+            n_t, n_f = self._heatmap_values.shape
+            t_idx = _heatmap_index_from_coord(event.x, n_t)
+            f_idx = _heatmap_index_from_coord(event.y, n_f)
             self._schedule_ui_action(lambda: self._on_heatmap_tap(t_idx, f_idx))
 
         plot.on_event(Tap, _on_tap)
-        return plot
+        return _HeatmapBokehHandles(
+            plot=plot,
+            image_renderer=image_renderer,
+            hover_source=hover_src,
+            hover_tool=hover_tool,
+        )
+
+    def _update_heatmap_figure_shell(
+        self,
+        handles: _HeatmapBokehHandles,
+        values: np.ndarray,
+    ) -> None:
+        n_times, n_freqs = values.shape
+        plot = handles.plot
+        src = self._current_source
+        title_name = src["name"] if src is not None else None
+        plot.title.text = self._heatmap_figure_title(subject=title_name)
+        plot.x_range.start = 0
+        plot.x_range.end = n_times
+        plot.y_range.start = 0
+        plot.y_range.end = n_freqs
+
+        glyph = handles.image_renderer.glyph
+        handles.image_renderer.data_source.data = {
+            "image": [values.T.astype(np.float64, copy=False)],
+        }
+        glyph.dw = n_times
+        glyph.dh = n_freqs
+        glyph.color_mapper = _color_mapper(values.astype(np.float64, copy=False))
+
+        hover_data, tooltips = self._heatmap_hover_payload(
+            values, n_times=n_times, n_freqs=n_freqs
+        )
+        handles.hover_source.data = hover_data
+        handles.hover_tool.tooltips = tooltips
+
+        time_values = np.asarray(self._dataset.coords["time"].values)
+        x_ticks, x_labels = self._heatmap_axis_ticks(
+            n_times,
+            np.arange(n_times, dtype=float),
+            lambda i: format_heatmap_time_axis_label(
+                time_values,
+                int(i),
+                self._lst_hours,  # type: ignore[arg-type]
+                day_labels=self._time_day_labels,
+            ),
+        )
+        y_ticks, y_labels = self._heatmap_axis_ticks(
+            n_freqs, self._freq_mhz, lambda v: f"{float(v):.1f}"  # type: ignore[arg-type]
+        )
+        plot.xaxis.ticker = FixedTicker(ticks=x_ticks)
+        plot.yaxis.ticker = FixedTicker(ticks=y_ticks)
+        plot.xaxis.major_label_overrides = x_labels
+        plot.yaxis.major_label_overrides = y_labels

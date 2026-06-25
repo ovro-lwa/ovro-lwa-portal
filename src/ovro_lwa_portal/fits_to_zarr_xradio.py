@@ -202,6 +202,7 @@ _LM_REF_SCAN_TIME_GROUPS: int = 5
 # more than this on-sky separation (sampled on the LM grid). Used after ``combine`` so
 # per-channel WCS drift across a wideband time step is visible before collapsing coords.
 _CELESTIAL_FRAME_WARN_MAX_SKY_SEP_ARCSEC: float = 60.0
+_SUBBAND_TIME_WARN_MAX_SPREAD_S: float = 1.0
 _CELESTIAL_DRIFT_SAMPLE_MAX_POINTS: int = 65536
 _CELESTIAL_DRIFT_SAMPLE_SEED: int = 0
 
@@ -2462,6 +2463,56 @@ def _assert_nonempty_wcs_header_str_before_zarr_write(xds: xr.Dataset) -> None:
         raise RuntimeError(msg)
 
 
+def _harmonize_subband_time_coords_for_stack(
+    xds_list: List[xr.Dataset],
+    *,
+    ref_idx: int = 0,
+    warn_max_spread_s: float = _SUBBAND_TIME_WARN_MAX_SPREAD_S,
+) -> List[xr.Dataset]:
+    """Assign one shared ``time`` coordinate to every subband before frequency stacking.
+
+    Discovery groups subbands by the basename ``-image-YYYYMMDD_HHMMSS`` stamp, but
+    ``xradio`` sets each slice's ``time`` from FITS ``DATE-OBS``. OVRO-LWA dewarped
+    products often differ by tens of seconds across subbands in the same group; without
+    harmonization, :func:`xr.combine_by_coords` stacks along ``time`` instead of
+    ``frequency`` and :func:`_write_or_append_zarr` rejects the multi-index append.
+    """
+    if len(xds_list) <= 1:
+        return xds_list
+
+    mjds: list[float] = []
+    for xds in xds_list:
+        if "time" not in xds.coords:
+            return xds_list
+        tvals = np.atleast_1d(np.asarray(xds["time"].values, dtype=np.float64))
+        if tvals.size == 0 or not np.isfinite(tvals[0]):
+            return xds_list
+        mjds.append(float(tvals[0]))
+
+    ri = int(np.clip(ref_idx, 0, len(mjds) - 1))
+    ref_mjd = mjds[ri]
+    spread_s = (max(mjds) - min(mjds)) * 86400.0
+    if spread_s <= 0.0 or len({round(m, 12) for m in mjds}) == 1:
+        return xds_list
+
+    if spread_s > warn_max_spread_s:
+        logger.warning(
+            "Subband FITS DATE-OBS times differ by up to %.1f s within one filename "
+            "time group; using reference MJD %.8f from slice index %d so stacked "
+            "subbands produce a single Zarr time index.",
+            spread_s,
+            ref_mjd,
+            ri,
+        )
+
+    ref_time = xr.DataArray(
+        np.asarray([ref_mjd], dtype=np.float64),
+        dims=("time",),
+        attrs=dict(xds_list[ri]["time"].attrs),
+    )
+    return [xds.assign_coords(time=ref_time) for xds in xds_list]
+
+
 def _harmonize_celestial_coords_independent_of_frequency(
     xds: xr.Dataset,
     *,
@@ -3345,6 +3396,8 @@ def _combine_time_step(
             fvals = np.atleast_1d(xds.frequency.values)
             freqs_seen.extend([float(f) for f in fvals])
             xds_list.append(xds)
+
+        xds_list = _harmonize_subband_time_coords_for_stack(xds_list)
 
         lm_shapes = [_lm_shape(xds) for xds in xds_list]
         reference_idx = _select_reference_shape_index(lm_shapes)

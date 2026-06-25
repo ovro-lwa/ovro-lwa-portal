@@ -166,6 +166,7 @@ region = ds.sel(ra=slice(10, 20), dec=slice(-5, 5))
 ## Best Practices
 
 1. **Chunk Size**: Choose chunk sizes that match your access patterns
+
    - For time series analysis: larger time chunks
    - For spatial analysis: larger l/m chunks
 

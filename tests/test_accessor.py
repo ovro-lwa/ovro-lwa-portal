@@ -112,6 +112,142 @@ class TestRadportHasBeam:
         assert valid_ovro_dataset_with_beam.radport.has_beam
 
 
+class TestPatchMetadataCache:
+    """Tests for eager patch metadata cache (beam + populated mask)."""
+
+    @staticmethod
+    def _dataset_with_empty_channel() -> xr.Dataset:
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        sky = np.random.default_rng(4).random((1, 3, 1, 50, 50)) * 10.0
+        sky[:, 1, ...] = np.nan
+        beam_meta = np.zeros((1, 3, 1, 3), dtype=np.float64)
+        beam_meta[0, 0, 0] = [0.02, 0.01, 0.0]
+        beam_meta[0, 1, 0] = [np.nan, np.nan, np.nan]
+        beam_meta[0, 2, 0] = [0.02, 0.01, 0.0]
+        return xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], sky),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    beam_meta,
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 50e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+
+    def test_patch_metadata_cache_uses_beam_without_sky_scan(self) -> None:
+        """ensure_patch_metadata_cache builds populated mask from BEAM only."""
+        import dask.array as da
+
+        ds = self._dataset_with_empty_channel()
+        sky_lazy = xr.DataArray(
+            da.from_array(ds["SKY"].values, chunks=(1, 1, 1, 50, 50)),
+            dims=["time", "frequency", "polarization", "l", "m"],
+            name="SKY",
+        )
+        ds = ds.drop_vars("SKY").assign(SKY=sky_lazy)
+        cache = ds.radport.ensure_patch_metadata_cache()
+        assert cache.beam_major is not None
+        assert cache.populated.shape == (1, 3)
+        assert bool(cache.populated[0, 0]) is True
+        assert bool(cache.populated[0, 1]) is False
+        assert bool(cache.populated[0, 2]) is True
+        assert isinstance(ds["SKY"].data, da.Array)
+
+    def test_var_cell_has_finite_data_reads_populated_cache(self) -> None:
+        """Cached populated mask answers cell probes without SKY isel."""
+        ds = self._dataset_with_empty_channel()
+        ds.radport.ensure_patch_metadata_cache()
+        assert ds.radport._var_cell_has_finite_data(time_idx=0, frequency_idx=1) is False
+        assert ds.radport._var_cell_has_finite_data(time_idx=0, frequency_idx=0) is True
+
+    def test_beam_fwhm_all_frequencies_uses_populated_cache_not_sky_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """beam_fwhm_pixels_all_frequencies skips empty cells via cache only."""
+        ds = self._dataset_with_empty_channel()
+        ds.radport.ensure_patch_metadata_cache()
+
+        def _fail_probe(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("_var_cell_has_finite_data should not run when cache is warm")
+
+        monkeypatch.setattr(ds.radport, "_var_cell_has_finite_data", _fail_probe)
+        widths = ds.radport.beam_fwhm_pixels_all_frequencies(time_idx=0)
+        assert np.isfinite(widths[0][0])
+        assert not np.isfinite(widths[1][0])
+        assert np.isfinite(widths[2][0])
+
+
+class TestPatchReduceScheduler:
+    """Tests for per-time patch reduce scheduler selection."""
+
+    def test_patch_reduce_scheduler_distributed_when_client_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ovro_lwa_portal import accessor as acc
+
+        monkeypatch.setattr(acc, "_active_distributed_client", lambda: True)
+        monkeypatch.setenv("OVRO_RADPORT_PATCH_SCHEDULER", "processes")
+        assert acc._patch_reduce_scheduler() is None
+
+    def test_patch_reduce_scheduler_processes_without_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ovro_lwa_portal import accessor as acc
+
+        monkeypatch.setattr(acc, "_active_distributed_client", lambda: False)
+        monkeypatch.delenv("OVRO_RADPORT_PATCH_SCHEDULER", raising=False)
+        assert acc._patch_reduce_scheduler() == "processes"
+
+    def test_patch_reduce_scheduler_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ovro_lwa_portal import accessor as acc
+
+        monkeypatch.setattr(acc, "_active_distributed_client", lambda: False)
+        monkeypatch.setenv("OVRO_RADPORT_PATCH_SCHEDULER", "single-threaded")
+        assert acc._patch_reduce_scheduler() == "single-threaded"
+
+
+class TestPatchExtractScheduler:
+    """Tests for fused patch Zarr read scheduler selection."""
+
+    def test_patch_extract_scheduler_distributed_when_client_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ovro_lwa_portal import accessor as acc
+
+        monkeypatch.setattr(acc, "_active_distributed_client", lambda: True)
+        monkeypatch.delenv("OVRO_RADPORT_EXTRACT_SCHEDULER", raising=False)
+        assert acc._patch_extract_scheduler() is None
+
+    def test_patch_extract_scheduler_threads_without_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ovro_lwa_portal import accessor as acc
+
+        monkeypatch.setattr(acc, "_active_distributed_client", lambda: False)
+        monkeypatch.delenv("OVRO_RADPORT_EXTRACT_SCHEDULER", raising=False)
+        assert acc._patch_extract_scheduler() == "threads"
+
+    def test_patch_extract_scheduler_env_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ovro_lwa_portal import accessor as acc
+
+        monkeypatch.setattr(acc, "_active_distributed_client", lambda: True)
+        monkeypatch.setenv("OVRO_RADPORT_EXTRACT_SCHEDULER", "threads")
+        assert acc._patch_extract_scheduler() == "threads"
+
+
 class TestRadportPlot:
     """Tests for plot() method."""
 
@@ -663,15 +799,18 @@ class TestRadportDynamicSpectrum:
         with _radport_progress_heartbeat(
             _callback,
             stage="extract",
+            current=3,
             total=10,
-            message="Extracting 10 tracked pixels",
+            message="Zarr patch read steps 4–10 of 10",
             interval_s=0.05,
         ):
             time.sleep(0.16)
 
         assert events
-        assert all(stage == "extract" and current == 0 and total == 10 for stage, current, total, _ in events)
-        assert all("in progress" in message for _stage, _current, _total, message in events)
+        assert all(
+            stage == "extract" and current == 3 and total == 10 for stage, current, total, _ in events
+        )
+        assert all("still working" in message for _stage, _current, _total, message in events)
         assert len(events) >= 2
 
     def test_dynamic_spectrum_invalid_var_raises(
@@ -828,6 +967,99 @@ class TestRadportPatchStatistic:
         assert "extract" in stages
         assert "reduce" in stages
         assert any(current == total and total > 0 for _s, current, total, _m in events)
+        assert any("Zarr patch read" in message for *_rest, message in events)
+        assert any(
+            stage == "extract" and current > 0 and current < total
+            for stage, current, total, _m in events
+        )
+
+    def test_extract_tracked_patch_cubes_fused_matches_loop(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """Fused patch I/O returns the same cubes as independent isel computes."""
+        from ovro_lwa_portal.accessor import (
+            _compute_xarray_batch,
+            _patch_slices_from_center,
+            _split_stacked_patch_cubes,
+            _stack_tracked_patch_selections,
+        )
+
+        ds = valid_ovro_dataset
+        rad = ds.radport
+        visible = np.array([True, True], dtype=bool)
+        l_indices = np.array([25, 2], dtype=int)
+        m_indices = np.array([25, 48], dtype=int)
+        radii = [3, 5]
+
+        vis_times, fused_patches = rad._extract_tracked_patch_cubes(
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+            var="SKY",
+            pol=0,
+            radii=radii,
+        )
+
+        data_var = ds["SKY"].isel(polarization=0)
+        n_l = int(ds.sizes["l"])
+        n_m = int(ds.sizes["m"])
+        vis_l = l_indices[visible]
+        vis_m = m_indices[visible]
+
+        patch_arrays: list[xr.DataArray] = []
+        for t, li, mi, radius in zip(vis_times, vis_l, vis_m, radii, strict=True):
+            l_sl, m_sl = _patch_slices_from_center(
+                int(li), int(mi), int(radius), n_l=n_l, n_m=n_m
+            )
+            patch_arrays.append(data_var.isel(time=int(t), l=l_sl, m=m_sl))
+        loop_loaded = _compute_xarray_batch(patch_arrays, label="loop reference")
+        loop_patches = [np.asarray(item) for item in loop_loaded]
+
+        stacked, patch_sizes = _stack_tracked_patch_selections(
+            data_var,
+            vis_times,
+            vis_l,
+            vis_m,
+            radii,
+            n_l=n_l,
+            n_m=n_m,
+        )
+        split_patches = _split_stacked_patch_cubes(
+            np.asarray(stacked.compute().data), patch_sizes
+        )
+
+        assert len(fused_patches) == len(loop_patches) == len(split_patches)
+        for fused, loop, split in zip(fused_patches, loop_patches, split_patches, strict=True):
+            np.testing.assert_allclose(fused, loop, equal_nan=True)
+            np.testing.assert_allclose(split, loop, equal_nan=True)
+
+    def test_pad_patch_dataarray_renormalizes_coords_after_nan_pad(self) -> None:
+        """Padding with NaN must not leave duplicate l/m index labels for concat."""
+        from ovro_lwa_portal.accessor import (
+            _TRACKED_POINT_DIM,
+            _normalize_patch_coords,
+            _pad_patch_dataarray,
+        )
+
+        patch = _normalize_patch_coords(
+            xr.DataArray(
+                np.zeros((2, 5, 5)),
+                dims=["frequency", "l", "m"],
+                coords={"frequency": [0, 1]},
+            )
+        )
+        padded = _pad_patch_dataarray(patch, n_l=8, n_m=8)
+        assert padded.sizes["l"] == 8
+        assert padded.sizes["m"] == 8
+        assert len(padded.coords["l"]) == len(np.unique(padded.coords["l"].values))
+        stacked = xr.concat(
+            [patch, padded],
+            dim=_TRACKED_POINT_DIM,
+            coords="minimal",
+            compat="override",
+            join="outer",
+        )
+        stacked.compute()
 
     def test_patch_statistic_radec_tracking(
         self, valid_ovro_dataset_with_tracking_wcs: xr.Dataset
@@ -1073,6 +1305,73 @@ class TestRadportPatchFit:
         with pytest.raises(ValueError, match="Synthesized beam metadata unavailable"):
             ds.radport.patch_fit(l=0.0, m=0.0)
 
+    def test_patch_fit_skips_empty_time_frequency_cells(self) -> None:
+        """patch_fit() leaves empty SKY slots as NaN without requiring BEAM there."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        sky = np.random.default_rng(0).random((1, 3, 1, 50, 50)) * 10.0
+        sky[:, 1, ...] = np.nan
+        beam_meta = np.zeros((1, 3, 1, 3), dtype=np.float64)
+        beam_meta[0, 0, 0] = [0.02, 0.01, 0.0]
+        beam_meta[0, 1, 0] = [np.nan, np.nan, np.nan]
+        beam_meta[0, 2, 0] = [0.02, 0.01, 0.0]
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], sky),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    beam_meta,
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 50e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        result = ds.radport.patch_fit(l=0.0, m=0.0, scale=2.0)
+        assert not np.isfinite(result.peak_map.values[0, 1])
+        assert not np.isfinite(result.reduced_chi_squared_map.values[0, 1])
+        assert np.isfinite(result.center_flux_map.values[0, 0])
+        assert np.isfinite(result.patch_max_map.values[0, 2])
+        assert ds.radport.patch_radius_pixels(time_idx=0, scale=2.0) > 0
+
+    def test_patch_statistic_skips_empty_time_frequency_cells(self) -> None:
+        """patch_statistic() ignores empty SKY slots when sizing the patch."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        sky = np.random.default_rng(1).random((1, 3, 1, 50, 50)) * 10.0
+        sky[:, 1, ...] = np.nan
+        beam_meta = np.zeros((1, 3, 1, 3), dtype=np.float64)
+        beam_meta[0, 0, 0] = [0.02, 0.01, 0.0]
+        beam_meta[0, 1, 0] = [np.nan, np.nan, np.nan]
+        beam_meta[0, 2, 0] = [0.02, 0.01, 0.0]
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], sky),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    beam_meta,
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 50e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        result = ds.radport.patch_statistic(l=0.0, m=0.0, statistic="max", scale=2.0)
+        stats = result.stat_map.values[0]
+        assert np.isfinite(stats[0])
+        assert not np.isfinite(stats[1])
+        assert np.isfinite(stats[2])
+
     def test_patch_fit_masks_poor_chi2_fits(
         self, valid_ovro_dataset: xr.Dataset
     ) -> None:
@@ -1187,6 +1486,84 @@ class TestRadportPatchFit:
         assert "peak_dec_deg" in diag
         assert "peak_ra" in diag
         assert "peak_dec" in diag
+
+    def test_patch_fit_cell_returns_diagnostics(
+        self, valid_ovro_dataset: xr.Dataset
+    ) -> None:
+        """patch_fit_cell() matches full-cube patch_fit diagnostics on one cell."""
+        ds = valid_ovro_dataset.copy(deep=True)
+        l_idx, m_idx = ds.radport._resolve_coordinates(l=0.0, m=0.0)
+        scale = 25.0
+        radius = ds.radport.patch_radius_pixels(time_idx=0, scale=scale)
+        sky = np.zeros(ds["SKY"].shape, dtype=float)
+        ny = nx = 2 * radius + 1
+        cy, cx = (ny - 1) / 2.0, (nx - 1) / 2.0
+        yy, xx = np.indices((ny, nx))
+        sigma = 3.0 / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+        bump = 100.0 * np.exp(
+            -0.5 * (((yy - cy) / sigma) ** 2 + ((xx - cx) / sigma) ** 2)
+        )
+        sky[0, :, 0, l_idx - radius : l_idx + radius + 1, m_idx - radius : m_idx + radius + 1] = (
+            bump[np.newaxis, :, :]
+        )
+        ds["SKY"].values[:] = sky
+
+        full = ds.radport.patch_fit(l=0.0, m=0.0, scale=scale)
+        cell = ds.radport.patch_fit_cell(0, 0, l=0.0, m=0.0, scale=scale)
+        full_diag = full.cell_diagnostics(0, 0)
+        cell_diag = cell.cell_diagnostics(0, 0)
+
+        assert cell.patch_radius_pixels == radius
+        assert cell.fit_accepted is True
+        assert cell.reduced_chi_squared <= cell.max_reduced_chi_squared
+        assert np.isfinite(cell.peak) and cell.peak > 50.0
+        for key in (
+            "fit_accepted",
+            "reduced_chi_squared",
+            "peak",
+            "center_flux",
+            "patch_max",
+            "background",
+            "widthx",
+            "widthy",
+        ):
+            np.testing.assert_allclose(
+                cell_diag[key],
+                full_diag[key],
+                rtol=1e-5,
+                atol=1e-5,
+                err_msg=key,
+            )
+
+    def test_patch_fit_cell_empty_cell_raises(self) -> None:
+        """patch_fit_cell() rejects empty SKY cells before fitting."""
+        l = np.linspace(-0.01, 0.01, 50)
+        m = np.linspace(-0.01, 0.01, 50)
+        sky = np.random.default_rng(0).random((1, 3, 1, 50, 50)) * 10.0
+        sky[:, 1, ...] = np.nan
+        beam_meta = np.zeros((1, 3, 1, 3), dtype=np.float64)
+        beam_meta[0, 0, 0] = [0.02, 0.01, 0.0]
+        beam_meta[0, 1, 0] = [np.nan, np.nan, np.nan]
+        beam_meta[0, 2, 0] = [0.02, 0.01, 0.0]
+        ds = xr.Dataset(
+            data_vars={
+                "SKY": (["time", "frequency", "polarization", "l", "m"], sky),
+                "BEAM": (
+                    ["time", "frequency", "polarization", "beam_param"],
+                    beam_meta,
+                ),
+            },
+            coords={
+                "time": [60000.0],
+                "frequency": [46e6, 50e6, 54e6],
+                "polarization": [0],
+                "beam_param": ["major", "minor", "pa"],
+                "l": l,
+                "m": m,
+            },
+        )
+        with pytest.raises(ValueError, match="No finite data"):
+            ds.radport.patch_fit_cell(0, 1, l=0.0, m=0.0, scale=2.0)
 
 
 class TestRadportPlotDynamicSpectrum:

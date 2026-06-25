@@ -277,3 +277,44 @@ class TestCLI:
 
         assert result.exit_code == 0, result.stdout + result.stderr
         assert seen == [2048]
+
+    def test_convert_rejects_small_chunk_lm_without_flag(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        result = runner.invoke(
+            app,
+            ["convert", str(inp), str(out), "--chunk-lm", "128"],
+            color=False,
+            env=_CI_PLAIN_ENV,
+        )
+        assert result.exit_code != 0
+        combined = click.unstyle(result.stdout + result.stderr).lower()
+        assert "allow-small-lm-chunks" in combined
+
+    def test_convert_allows_small_chunk_lm_with_flag(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        with patch(
+            "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+            return_value=out / "dummy.zarr",
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "convert",
+                    str(inp),
+                    str(out),
+                    "--chunk-lm",
+                    "128",
+                    "--allow-small-lm-chunks",
+                ],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        combined = click.unstyle(result.stdout + result.stderr).lower()
+        assert "below the recommended minimum" not in combined

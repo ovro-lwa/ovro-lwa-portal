@@ -10,8 +10,11 @@ import pytest
 from astropy.coordinates import SkyCoord
 
 from ovro_lwa_portal.viz.source_review_data import (
+    HEATMAP_METHOD_OPTIONS,
     build_source_from_coordinate,
     calendar_mmdd_labels_for_time_coord,
+    compute_overlay_patch_fit,
+    compute_source_heatmap,
     filter_known_source_names,
     format_heatmap_time_axis_label,
     load_known_sources,
@@ -68,3 +71,45 @@ def test_calendar_mmdd_labels_from_mjd_not_datetime64_epoch() -> None:
     expected = np.array([Time(v, format="mjd", scale="utc").isot[5:10] for v in mjd])
     assert labels.tolist() == expected.tolist()
     assert labels[0] != "01-01" or expected[0] == "01-01"
+
+
+def test_heatmap_method_options_exclude_patch_fit() -> None:
+    assert "patch_fit" not in HEATMAP_METHOD_OPTIONS
+
+
+def test_compute_source_heatmap_rejects_patch_fit(valid_ovro_dataset) -> None:
+    """Full-cube patch_fit is no longer a heatmap method."""
+    src = build_source_from_coordinate(
+        "Test",
+        SkyCoord(ra=180.0 * u.deg, dec=37.0 * u.deg, frame="icrs"),
+    )
+    with pytest.raises(ValueError, match="Fit overlay"):
+        compute_source_heatmap(
+            valid_ovro_dataset,
+            src,
+            method="patch_fit",
+            scale=3.0,
+            patch_fit_max_reduced_chi_squared=3.0,
+        )
+
+
+def test_compute_overlay_patch_fit(
+    valid_ovro_dataset_with_tracking_wcs: xr.Dataset,
+) -> None:
+    """compute_overlay_patch_fit wraps patch_fit_cell for overlay coordinates."""
+    src = build_source_from_coordinate(
+        "Test",
+        SkyCoord(ra=180.0 * u.deg, dec=37.0 * u.deg, frame="icrs"),
+    )
+    result = compute_overlay_patch_fit(
+        valid_ovro_dataset_with_tracking_wcs,
+        src,
+        time_idx=6,
+        freq_idx=0,
+        scale=3.0,
+        patch_fit_max_reduced_chi_squared=3.0,
+    )
+    assert result.time_idx == 6
+    assert result.frequency_idx == 0
+    diag = result.cell_diagnostics(6, 0)
+    assert "reduced_chi_squared" in diag

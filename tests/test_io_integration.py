@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ import pytest
 import xarray as xr
 
 from ovro_lwa_portal import open_dataset, resolve_source
-from ovro_lwa_portal.io import DataSourceError
+from ovro_lwa_portal.io import DataSourceError, summarize_lm_chunks, warn_if_suboptimal_lm_chunks
 
 
 @pytest.fixture
@@ -65,10 +66,72 @@ def sample_zarr_store(tmp_path: Path) -> Path:
     wcs_header = "WCSAXES = 2\nCTYPE1  = 'RA---SIN'\nCTYPE2  = 'DEC--SIN'\n"
     ds.attrs["fits_wcs_header"] = wcs_header
 
-    # Save to zarr
-    ds.to_zarr(zarr_path, mode="w")
+    # Match production ingest defaults (512 l/m chunks) so open_dataset does not warn.
+    ds.chunk({"time": 10, "frequency": 20, "polarization": 1, "l": 512, "m": 512}).to_zarr(
+        zarr_path, mode="w"
+    )
 
     return zarr_path
+
+
+@pytest.fixture
+def small_chunk_zarr_store(tmp_path: Path) -> Path:
+    """Zarr store with 128×128 on-disk l/m chunks for overlay I/O tests."""
+    zarr_path = tmp_path / "small_chunk_observation.zarr"
+    time = np.arange(2)
+    frequency = np.linspace(50e6, 55e6, 4)
+    l = np.arange(256)
+    m = np.arange(256)
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.random.rand(2, 4, 1, 256, 256).astype(np.float32),
+            ),
+        },
+        coords={
+            "time": time,
+            "frequency": frequency,
+            "polarization": [0],
+            "l": l,
+            "m": m,
+        },
+    )
+    ds.chunk({"time": 1, "frequency": 1, "polarization": 1, "l": 128, "m": 128}).to_zarr(
+        zarr_path, mode="w"
+    )
+    return zarr_path
+
+
+class TestLmChunkSummary:
+    def test_summarize_lm_chunks(self, small_chunk_zarr_store: Path) -> None:
+        summary = summarize_lm_chunks(small_chunk_zarr_store)
+        assert summary["l_min"] == 128
+        assert summary["m_min"] == 128
+        assert summary["l_chunks"] == (128, 128)
+        assert summary["m_chunks"] == (128, 128)
+
+    def test_warn_if_suboptimal_lm_chunks(self, small_chunk_zarr_store: Path) -> None:
+        with pytest.warns(UserWarning, match="small on-disk l/m chunks"):
+            warn_if_suboptimal_lm_chunks(small_chunk_zarr_store)
+
+    def test_warn_if_suboptimal_lm_chunks_skips_tiny_store(self, tmp_path: Path) -> None:
+        """Sub-512 images cannot use the recommended chunk size on every axis."""
+        zarr_path = tmp_path / "tiny.zarr"
+        ds = xr.Dataset(
+            {"SKY": (["time", "l", "m"], np.zeros((1, 4, 4), dtype=np.float32))},
+            coords={"time": [0], "l": np.arange(4), "m": np.arange(4)},
+        )
+        ds.to_zarr(zarr_path, mode="w")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            warn_if_suboptimal_lm_chunks(zarr_path)
+
+    def test_open_dataset_warns_on_small_lm_chunks(
+        self, small_chunk_zarr_store: Path
+    ) -> None:
+        with pytest.warns(UserWarning, match="small on-disk l/m chunks"):
+            open_dataset(small_chunk_zarr_store)
 
 
 class TestOpenDatasetIntegration:

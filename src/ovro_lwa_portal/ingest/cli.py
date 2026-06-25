@@ -133,6 +133,23 @@ def _configure_logging(level: LogLevel) -> None:
     )
 
 
+_MIN_RECOMMENDED_LM_CHUNK = 512
+
+
+def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> None:
+    """Reject ingest chunk sizes that hurt interactive overlay slice reads."""
+    if chunk_lm == 0 or chunk_lm >= _MIN_RECOMMENDED_LM_CHUNK:
+        return
+    if allow_small_lm_chunks:
+        return
+    raise typer.BadParameter(
+        f"--chunk-lm {chunk_lm} is below the recommended minimum "
+        f"{_MIN_RECOMMENDED_LM_CHUNK} for interactive overlay reads. "
+        "Pass --allow-small-lm-chunks to override, or use 512 or higher.",
+        param_hint="--chunk-lm",
+    )
+
+
 def _execute_fits_to_zarr_conversion(
     config: ConversionConfig,
     *,
@@ -267,8 +284,19 @@ def convert(
         1024,
         "--chunk-lm",
         "-c",
-        help="Chunk size for l and m spatial dimensions (0 to disable)",
+        help=(
+            "Chunk size for l and m spatial dimensions (0 for one chunk per axis; "
+            "minimum 512 recommended for interactive overlay reads)"
+        ),
         min=0,
+    ),
+    allow_small_lm_chunks: bool = typer.Option(
+        False,
+        "--allow-small-lm-chunks",
+        help=(
+            "Allow --chunk-lm values below 512 (not recommended for source_review "
+            "overlay performance)"
+        ),
     ),
     rebuild: bool = typer.Option(
         False,
@@ -386,6 +414,7 @@ def convert(
             --discovery-filename-convention lst-color
     """
     _configure_logging(log_level)
+    _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
 
     verbose = log_level == LogLevel.DEBUG
 
@@ -476,8 +505,19 @@ def dewarp_convert(
         1024,
         "--chunk-lm",
         "-c",
-        help="Chunk size for l and m spatial dimensions (0 to disable)",
+        help=(
+            "Chunk size for l and m spatial dimensions (0 for one chunk per axis; "
+            "minimum 512 recommended for interactive overlay reads)"
+        ),
         min=0,
+    ),
+    allow_small_lm_chunks: bool = typer.Option(
+        False,
+        "--allow-small-lm-chunks",
+        help=(
+            "Allow --chunk-lm values below 512 (not recommended for source_review "
+            "overlay performance)"
+        ),
     ),
     rebuild: bool = typer.Option(
         False,
@@ -636,6 +676,7 @@ def dewarp_convert(
             --cleanup-fixed-fits
     """
     _configure_logging(log_level)
+    _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
     verbose = log_level == LogLevel.DEBUG
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
     time_key_source = _cli_time_key_source(discovery_time_key_source)
