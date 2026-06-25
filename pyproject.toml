@@ -109,13 +109,6 @@ minversion = "7.0"
 pythonpath = ["src"]
 addopts = ["-vvv", "-ra", "--showlocals", "--strict-markers", "--strict-config"]
 xfail_strict = false
-filterwarnings = [
-    "error",
-    # Panel 1.9+ deprecates button_type/name ahead of 2.0; pixi still pins 1.8.x.
-    "ignore:Widget.name is deprecated:PendingDeprecationWarning",
-    "ignore:button_type is deprecated:PendingDeprecationWarning",
-    "ignore:Both 'name' and 'label' were provided:PendingDeprecationWarning",
-]
 log_cli_level = "INFO"
 testpaths = ["tests"]
 markers = [
