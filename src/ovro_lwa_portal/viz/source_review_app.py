@@ -46,13 +46,16 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     push_bokeh_pane_mutation_to_notebook,
     schedule_when_panel_loaded,
     set_notebook_pane_object,
+    set_notebook_widget_params,
 )
 from ovro_lwa_portal.viz.panel_ui_session import (
     CallbackPanelUISession,
     JupyterPanelUISession,
     PanelUISession,
+    ServedPanelUISession,
 )
 from ovro_lwa_portal.viz.source_review import (
+    CenterPlan,
     DatasetLoad,
     finalize_dataset_load,
     plan_center_action,
@@ -85,8 +88,8 @@ __all__ = [
     "SourceReview",
     "SourceReviewConfig",
     "configure_source_review_notebook",
+    "configure_source_review_serve",
 ]
-
 
 @dataclass
 class _HeatmapBokehHandles:
@@ -166,6 +169,40 @@ def configure_source_review_notebook() -> None:
     _capture_ipython_io_loop()
 
 
+def configure_source_review_serve() -> None:
+    """One-time ``panel serve`` setup: astrowidget patch + ipywidgets bridge.
+
+    Do **not** call ``pn.extension('ipywidgets')`` in JupyterLab — only for
+    standalone Bokeh server apps (``scripts/serve_source_review.py``).
+    """
+    _patch_astrowidget_get_wcs()
+    # Bokeh is already active under ``panel serve``; loading the bokeh extension
+    # here triggers "extension not recognized" on Panel 1.8 + Bokeh 3.9.
+    pn.extension("ipywidgets", sizing_mode="stretch_width")
+
+
+class ServeSkyWidget(SkyWidget):
+    """SkyWidget for ``panel serve`` with JSON-null-safe float traits.
+
+    ipywidgets_bokeh embeds ``float('nan')`` as JSON ``null``. When the browser
+    echoes that state back, traitlets rejects ``None`` on ``Float`` traits
+    (``background_cut_*`` default to NaN). Coerce ``null`` → ``nan`` so bundle
+    remounts do not raise :class:`traitlets.TraitError`.
+    """
+
+    _NULLABLE_FLOAT_TRAITS = frozenset({"background_cut_min", "background_cut_max"})
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._NULLABLE_FLOAT_TRAITS and value is None:
+            value = float("nan")
+        super().__setattr__(name, value)
+
+    def set_trait(self, name: str, value: Any, *args: Any, **kwargs: Any) -> None:
+        if name in self._NULLABLE_FLOAT_TRAITS and value is None:
+            value = float("nan")
+        super().set_trait(name, value, *args, **kwargs)
+
+
 class SourceReview(param.Parameterized):
     """Sky-position heatmap + SkyWidget review (Jupiter-style Panel UI)."""
 
@@ -209,6 +246,7 @@ class SourceReview(param.Parameterized):
         self._config = config or SourceReviewConfig()
         self._dispatch_override = dispatch_override
         self._ui_session_override = ui_session
+        self._panel_serve_mode = isinstance(ui_session, ServedPanelUISession)
         self._ui_session: PanelUISession | None = None
         self._scroll_log = ScrollLog()
         self._dataset: xr.Dataset | None = None
@@ -242,6 +280,7 @@ class SourceReview(param.Parameterized):
         self._heatmap_bokeh_handles: _HeatmapBokehHandles | None = None
         self._last_heatmap_figure: object | None = None
         self._overlay_load_generation = 0
+        self._sky_push_generation = 0
         self._overlay_fit_job_id = 0
         self._fit_overlay_sync_token = 0
         self._last_sent_image_revision: int | None = None
@@ -253,39 +292,75 @@ class SourceReview(param.Parameterized):
             height=420,
             sizing_mode="stretch_width",
         )
-        self._sky_container = widgets.VBox(
-            children=[widgets.HTML("<i>Sky view loads after the Zarr store opens.</i>")],
-            layout=widgets.Layout(width="100%", min_height="620px"),
-        )
-        self._sky_pane = pn.pane.IPyWidget(self._sky_container, height=620, sizing_mode="stretch_width")
+        if self._panel_serve_mode:
+            # HTML placeholder until Zarr open; avoid an early IPyWidget(VBox) whose comm
+            # is replaced when SkyWidget mounts (incremental send_state then never reaches JS).
+            self._sky_container = None
+            self._sky_pane = pn.pane.HTML(
+                "<i>Sky view loads after the Zarr store opens.</i>",
+                height=620,
+                sizing_mode="stretch_width",
+            )
+        else:
+            self._sky_container = widgets.VBox(
+                children=[
+                    widgets.HTML("<i>Sky view loads after the Zarr store opens.</i>")
+                ],
+                layout=widgets.Layout(width="100%", min_height="620px"),
+            )
+            self._sky_pane = pn.pane.IPyWidget(
+                self._sky_container,
+                height=620,
+                sizing_mode="stretch_width",
+            )
         self._status_pane = pn.pane.Markdown("")
-        self._log_widget = widgets.HTML(
-            value=_format_activity_log_html(""),
-            layout=widgets.Layout(
-                width="100%",
-                height=f"{ACTIVITY_LOG_HEIGHT_PX}px",
-                border="1px solid #ccc",
-            ),
-        )
-        self._log_pane = pn.pane.IPyWidget(
-            self._log_widget,
-            sizing_mode="stretch_width",
-            height=ACTIVITY_LOG_HEIGHT_PX,
-        )
+        # ipywidgets log in Jupyter (separate comm tier); Panel HTML under ``panel serve``
+        # so worker-thread Zarr open never touches ipywidgets comm (Bokeh doc teardown).
+        if self._panel_serve_mode:
+            self._log_widget = None
+            self._log_pane = pn.pane.HTML(
+                _format_activity_log_html(""),
+                sizing_mode="stretch_width",
+                height=ACTIVITY_LOG_HEIGHT_PX,
+            )
+        else:
+            self._log_widget = widgets.HTML(
+                value=_format_activity_log_html(""),
+                layout=widgets.Layout(
+                    width="100%",
+                    height=f"{ACTIVITY_LOG_HEIGHT_PX}px",
+                    border="1px solid #ccc",
+                ),
+            )
+            self._log_pane = pn.pane.IPyWidget(
+                self._log_widget,
+                sizing_mode="stretch_width",
+                height=ACTIVITY_LOG_HEIGHT_PX,
+            )
         self._method_selector = pn.widgets.Select.from_param(
             self.param.heatmap_method,
             name="Heatmap method",
             width=220,
         )
-        # ipywidgets spinner: same comm path as the activity log (Panel LoadingSpinner
-        # often never spins or clears at the wrong time in live Jupyter).
-        self._loading_widget = widgets.HTML(value="", layout=widgets.Layout(width="28px"))
-        self._loading_pane = pn.pane.IPyWidget(
-            self._loading_widget,
-            width=32,
-            height=32,
-            sizing_mode="fixed",
-        )
+        # ipywidgets spinner in Jupyter; Panel spinner under ``panel serve`` (native comm).
+        if self._panel_serve_mode:
+            self._loading_widget = None
+            self._loading_pane = pn.indicators.LoadingSpinner(
+                value=False,
+                width=32,
+                height=32,
+                sizing_mode="fixed",
+            )
+        else:
+            self._loading_widget = widgets.HTML(
+                value="", layout=widgets.Layout(width="28px")
+            )
+            self._loading_pane = pn.pane.IPyWidget(
+                self._loading_widget,
+                width=32,
+                height=32,
+                sizing_mode="fixed",
+            )
         initial_coord = coordinate_string.strip()
         self._coord_input = pn.widgets.AutocompleteInput(
             name="Coordinate",
@@ -444,6 +519,10 @@ class SourceReview(param.Parameterized):
             published = self._refresh_heatmap_figure(self._heatmap_values)
         if published is None:
             return
+        if isinstance(self._ui, ServedPanelUISession):
+            self._heatmap_pane.object = None
+            self._heatmap_pane.object = published
+            return
         # Force a nested-pane swap when confirm re-assigns the same figure object.
         self._heatmap_pane.object = None
         publish_bokeh_pane_to_notebook(
@@ -461,11 +540,16 @@ class SourceReview(param.Parameterized):
         """Push in-place heatmap edits after the active hold cycle (or on io_loop)."""
 
         def _push() -> None:
-            push_bokeh_pane_mutation_to_notebook(
-                self._heatmap_pane,
-                *self._notebook_ui_views(),
-                force_push=True,
-            )
+            if isinstance(self._ui, ServedPanelUISession):
+                handles = self._heatmap_bokeh_handles
+                if handles is not None and self._heatmap_pane.object is not handles.plot:
+                    self._heatmap_pane.object = handles.plot
+            else:
+                push_bokeh_pane_mutation_to_notebook(
+                    self._heatmap_pane,
+                    *self._notebook_ui_views(),
+                    force_push=True,
+                )
             if after_publish is not None:
                 after_publish()
 
@@ -494,15 +578,85 @@ class SourceReview(param.Parameterized):
         self._heatmap_pane.object = plot
         return True, True
 
+    def _install_sky_ipywidget_pane(self, widget: SkyWidget) -> None:
+        """Mount ``SkyWidget`` in the layout (``panel serve`` only).
+
+        Replaces the HTML placeholder with a fresh ``IPyWidget`` pane so the
+        ipywidgets_bokeh bundle and live comm share one model id.
+        """
+        new_pane = pn.pane.IPyWidget(
+            widget,
+            height=620,
+            sizing_mode="stretch_width",
+        )
+        objects = list(self._layout.objects)
+        for index, pane in enumerate(objects):
+            if pane is self._sky_pane:
+                objects[index] = new_pane
+                break
+        else:
+            return
+        self._layout.objects = objects
+        self._sky_pane = new_pane
+        doc = pn.state.curdoc
+        if doc is not None:
+            new_pane.get_root(doc)
+
+    def _remount_sky_ipywidget_model(self, widget: SkyWidget) -> None:
+        """Re-embed SkyWidget state for ``panel serve`` (bundle replace, not comm_msg).
+
+        Incremental ``send_state()`` through Panel's ipywidgets bridge does not
+        reliably update the browser model after the initial embed; replacing the
+        Bokeh ``IPyWidget`` child model pushes a fresh manager state bundle.
+        """
+        from ipywidgets_bokeh.widget import IPyWidget as BkIPyWidget
+
+        if not isinstance(self._sky_pane, pn.pane.IPyWidget):
+            self._install_sky_ipywidget_pane(widget)
+            return
+        if not self._sky_pane._models:
+            self._install_sky_ipywidget_pane(widget)
+            return
+        ref = next(iter(self._sky_pane._models))
+        old_model, parent = self._sky_pane._models[ref]
+        if parent is None:
+            return
+        style: dict[str, Any] = {}
+        for attr in ("height", "width", "sizing_mode", "margin"):
+            if hasattr(old_model, attr):
+                style[attr] = getattr(old_model, attr)
+        new_model = BkIPyWidget(widget=widget, **style)
+        children = list(parent.children)
+        try:
+            index = children.index(old_model)
+        except ValueError:
+            return
+        children[index] = new_model
+        parent.children = children
+        self._sky_pane._models[ref] = (new_model, parent)
+
     def _ensure_dataset_open(self) -> None:
         if self._open_scheduled or self._dataset is not None:
             return
         self._open_scheduled = True
         _capture_ipython_io_loop()
-        schedule_when_panel_loaded(self._open_dataset)
+
+        def _on_load() -> None:
+            if isinstance(self._ui, ServedPanelUISession):
+                self._ui.bind_document(pn.state.curdoc)
+            self._open_dataset()
+
+        schedule_when_panel_loaded(_on_load)
 
     def _dispatch(self, callback: Callable[[], None]) -> None:
         self._ui.dispatch(callback)
+
+    def _schedule_main(self, callback: Callable[[], None]) -> None:
+        """Schedule UI/log work on the kernel or Bokeh server main thread."""
+        if self._panel_serve_mode:
+            self._ui.schedule(callback)
+        else:
+            _schedule_ipython_main(callback)
 
     def _schedule_ui_action(self, callback: Callable[[], None]) -> None:
         """Run a Panel button/param handler on the kernel io_loop (``JupyterPanelUISession``)."""
@@ -592,6 +746,18 @@ class SourceReview(param.Parameterized):
             self._log(f"{log_prefix} {text!r}")
 
     def _refresh_loading_widget(self, active: bool) -> None:
+        if self._panel_serve_mode:
+            active_bool = bool(active)
+            # BooleanIndicator skips CSS ``spin`` without synthetic Param events
+            # (see pipeline_qa_app.sync_widget_to_notebook).
+            set_notebook_widget_params(
+                self._loading_pane,
+                *self._notebook_ui_views(),
+                value=active_bool,
+                visible=active_bool,
+            )
+            return
+        assert self._loading_widget is not None
         self._loading_widget.value = LOADING_SPINNER_HTML if active else ""
         send_state = getattr(self._loading_widget, "send_state", None)
         if callable(send_state):
@@ -632,7 +798,7 @@ class SourceReview(param.Parameterized):
                     return
                 self._fit_overlay_button.disabled = not populated
 
-            _schedule_ipython_main(_apply)
+            self._schedule_main(_apply)
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -669,7 +835,7 @@ class SourceReview(param.Parameterized):
                 f"(t={time_idx}, f={freq_idx})…"
             )
 
-        _schedule_ipython_main(_begin)
+        self._schedule_main(_begin)
 
         def _work() -> None:
             try:
@@ -683,14 +849,14 @@ class SourceReview(param.Parameterized):
                 )
             except Exception as exc:
                 captured_error = exc
-                _schedule_ipython_main(
+                self._schedule_main(
                     lambda err=captured_error: self._finish_overlay_fit(
                         None, err, job_id
                     )
                 )
                 return
             captured_result = result
-            _schedule_ipython_main(
+            self._schedule_main(
                 lambda fit=captured_result: self._finish_overlay_fit(
                     fit, None, job_id
                 )
@@ -796,6 +962,8 @@ class SourceReview(param.Parameterized):
                     log_loading=True,
                     overlay_generation=generation,
                 )
+            except Exception as exc:
+                self._log(f"ERROR (overlay slice): {exc}")
             finally:
                 if manage_spinner and generation == self._overlay_load_generation:
                     self._clear_loading_indicator()
@@ -824,11 +992,16 @@ class SourceReview(param.Parameterized):
                 self._log(f"WARNING: {exc}")
                 return
             self._log_click_projection_diagnostics(ra_deg, dec_deg)
+            click_coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+            if widget is not None:
+                self._set_sky_crosshair(widget, click_coord)
             self._set_coordinate_field_from_text(text, log_prefix="Sky click →")
             self._set_status(
                 f"Sky click — RA={ra_deg:.4f}°, Dec={dec_deg:.4f}° · "
                 "**Center** reprojects the overlay here; **Generate heatmap** tracks this position."
             )
+            if self._panel_serve_mode and widget is not None:
+                self._schedule_sky_widget_push(widget, force=True)
 
         self._schedule_ui_action(_apply)
 
@@ -921,6 +1094,7 @@ class SourceReview(param.Parameterized):
         )
         # Center establishes the current overlay center for later heatmap clicks.
         self._coord = field_coord
+        self._current_source = build_source_from_coordinate(label, field_coord)
         self._sync_fit_overlay_button()
 
         def _maybe_reset_heatmap() -> None:
@@ -939,6 +1113,23 @@ class SourceReview(param.Parameterized):
             f"Dec={plan.goto_center.dec.deg:.4f}°"
         )
 
+        def _finish_center() -> None:
+            self._complete_center_action(widget, plan, label, pos)
+
+        if self._panel_serve_mode:
+            # One bundle remount after overlay load (or below for HiPS-only Center).
+            self._ui.schedule(_finish_center)
+            return
+
+        _finish_center()
+
+    def _complete_center_action(
+        self,
+        widget: SkyWidget,
+        plan: CenterPlan,
+        label: str,
+        pos: str,
+    ) -> None:
         if plan.overlay_center is not None:
             self._log(f"Centering on {label} ({pos}) — loading overlay…")
             self._set_status(
@@ -963,25 +1154,64 @@ class SourceReview(param.Parameterized):
             )
 
         self._log_overlay_diagnostics(plan.goto_center, context=f"Center[{plan.reason}]")
-        self._force_send_sky_widget_state(widget)
+        if plan.overlay_center is None:
+            self._schedule_sky_widget_push(widget, force=True)
 
     def _maybe_send_sky_widget_state(self, widget: object, *, force: bool = False) -> float:
         """Push widget traits to the browser; skip when ``image_revision`` is unchanged."""
-        send_state = getattr(widget, "send_state", None)
-        if not callable(send_state):
-            return 0.0
         rev = int(getattr(widget, "image_revision", 0))
         if not force and self._last_sent_image_revision == rev:
             return 0.0
         t0 = time.perf_counter()
-        send_state()
+        if self._panel_serve_mode:
+            self._remount_sky_ipywidget_model(widget)  # type: ignore[arg-type]
+        else:
+            send_state = getattr(widget, "send_state", None)
+            if not callable(send_state):
+                return 0.0
+            send_state()
         comm_ms = (time.perf_counter() - t0) * 1000.0
         self._last_sent_image_revision = rev
+        if self._panel_serve_mode and force:
+            nbytes = len(getattr(widget, "image_data", b"") or b"")
+            self._log(
+                f"[diag] SkyWidget bundle remount: revision={rev}, "
+                f"image_bytes={nbytes // 1024} KB, {comm_ms:.0f} ms"
+            )
         return comm_ms
 
     def _force_send_sky_widget_state(self, widget: object) -> None:
         """Always push widget state (Center/goto paths also change view traits)."""
         self._maybe_send_sky_widget_state(widget, force=True)
+
+    def _schedule_sky_widget_push(
+        self,
+        widget: object,
+        *,
+        force: bool = True,
+        after_push: Callable[[float], None] | None = None,
+    ) -> None:
+        """Push SkyWidget comm on the next Bokeh tick under ``panel serve``.
+
+        Coalesces rapid requests (Center goto + overlay remount, repeated clicks)
+        so only the latest state is embedded once per user action.
+        """
+        if self._panel_serve_mode:
+            self._sky_push_generation += 1
+            generation = self._sky_push_generation
+
+            def _push() -> None:
+                if generation != self._sky_push_generation:
+                    return
+                comm_ms = self._maybe_send_sky_widget_state(widget, force=force)
+                if after_push is not None:
+                    after_push(comm_ms)
+
+            self._ui.schedule(_push)
+        else:
+            comm_ms = self._maybe_send_sky_widget_state(widget, force=force)
+            if after_push is not None:
+                after_push(comm_ms)
 
     def _log_overlay_push_timing(self, widget: object, *, comm_ms: float) -> None:
         profile = getattr(widget, "_profile_last_push", None) or {}
@@ -1114,8 +1344,13 @@ class SourceReview(param.Parameterized):
         self._ui.sync_status_pane(self._status_pane, self.status)
 
     def _refresh_log_widget(self) -> None:
-        """Update the ipywidgets activity log (separate comm from Panel layout)."""
-        self._log_widget.value = _format_activity_log_html(self.log_text)
+        """Update the activity log (ipywidgets in Jupyter, Panel HTML when served)."""
+        html = _format_activity_log_html(self.log_text)
+        if self._panel_serve_mode:
+            self._log_pane.object = html
+        else:
+            assert self._log_widget is not None
+            self._log_widget.value = html
 
     def _sync_log(self) -> None:
         self.log_text = self._scroll_log.text
@@ -1157,7 +1392,7 @@ class SourceReview(param.Parameterized):
             # dispatch batch. Progress ``dispatch`` calls each end with
             # ``_push_panel_layout`` and can republish the zeros heatmap after
             # ``publish_bokeh_figure`` on long compute jobs.
-            _schedule_ipython_main(lambda msg=text: self._log(msg))
+            self._schedule_main(lambda msg=text: self._log(msg))
 
         return _callback
 
@@ -1214,7 +1449,7 @@ class SourceReview(param.Parameterized):
             run_dataset_load(
                 open_dataset=_open,
                 dispatch=self._dispatch,
-                log_dispatch=_schedule_ipython_main,
+                log_dispatch=self._schedule_main,
                 on_loaded=lambda load: self._finish_open(
                     load.dataset,
                     load.default_time_idx,
@@ -1337,14 +1572,14 @@ class SourceReview(param.Parameterized):
                 )
             except Exception as exc:
                 captured_error = exc
-                _schedule_ipython_main(
+                self._schedule_main(
                     lambda err=captured_error: self._finish_heatmap(
                         src, None, err, job_id, t0
                     )
                 )
                 return
             captured_payload = payload
-            _schedule_ipython_main(
+            self._schedule_main(
                 lambda result=captured_payload: self._finish_heatmap(
                     src, result, None, job_id, t0
                 )
@@ -1377,7 +1612,7 @@ class SourceReview(param.Parameterized):
 
         # Avoid a dispatch batch ``_push_panel_layout`` on the zeros heatmap while
         # compute runs — that full layout push can race the post-finish publish.
-        _schedule_ipython_main(_begin)
+        self._schedule_main(_begin)
 
     def _finish_heatmap(
         self,
@@ -1556,8 +1791,18 @@ class SourceReview(param.Parameterized):
 
     def _mount_sky_widget(self, ds: xr.Dataset) -> None:
         """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""
-        widget = SkyWidget()
-        widget.background_survey = self._hips_background_url
+        from panel.io.state import set_curdoc
+
+        doc = pn.state.curdoc
+        if self._panel_serve_mode:
+            if doc is None:
+                return
+            with set_curdoc(doc):
+                widget = ServeSkyWidget()
+                widget.background_survey = self._hips_background_url
+        else:
+            widget = SkyWidget()
+            widget.background_survey = self._hips_background_url
         self._configure_sky_widget_display(widget)
         widget.invert_horizontal_pan = True
         max_size = max(256, int(ds.sizes["l"]) // 2)
@@ -1567,7 +1812,10 @@ class SourceReview(param.Parameterized):
             widget.observe(self._on_view_gesture_revision, names="view_gesture_revision")
         widget.observe(self._on_sky_widget_click, names="click_tick")
         self._sky_widget = widget
-        self._sky_container.children = [widget]
+        if self._panel_serve_mode:
+            self._install_sky_ipywidget_pane(widget)
+        else:
+            self._sky_container.children = [widget]
 
     def _on_view_gesture_revision(self, change) -> None:
         """Activity-log hook when pan/zoom triggers debounced overlay reproject."""
@@ -1601,12 +1849,13 @@ class SourceReview(param.Parameterized):
                 f"Loading overlay slice t={int(time_idx)}, f={int(freq_idx)} "
                 f"({freq:.1f} MHz)…"
             )
+        scale = self._overlay_scale_kwargs()
         if preserve_view:
             widget.update_slice(
                 time_idx=int(time_idx),
                 freq_idx=int(freq_idx),
                 view_lock=True,
-                **self._overlay_scale_kwargs(),
+                **scale,
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[heatmap]"
@@ -1616,7 +1865,7 @@ class SourceReview(param.Parameterized):
                 freq_idx=int(freq_idx),
                 center=reproject_center,
                 fov=self._sky_fov_deg * u.deg,
-                **self._overlay_scale_kwargs(),
+                **scale,
             )
             diag_center = reproject_center
             diag_context = "update_sky[center]"
@@ -1625,7 +1874,7 @@ class SourceReview(param.Parameterized):
                 time_idx=int(time_idx),
                 freq_idx=int(freq_idx),
                 view_lock=True,
-                **self._overlay_scale_kwargs(),
+                **scale,
             )
             diag_center = widget.view_center_skycoord()
             diag_context = "update_sky[view_lock]"
@@ -1634,14 +1883,28 @@ class SourceReview(param.Parameterized):
             return
         self._log_overlay_diagnostics(diag_center, context=diag_context)
         if log_loading:
+            nbytes = len(getattr(widget, "image_data", b"") or b"")
             self._log(
-                f"Overlay slice loaded (t={int(time_idx)}, f={int(freq_idx)})."
+                f"Overlay slice loaded (t={int(time_idx)}, f={int(freq_idx)}, "
+                f"{nbytes // 1024} KB)."
             )
         # User-visible overlay loads always push widget state; revision-gated
         # skip is only for silent/internal paths.
-        comm_ms = self._maybe_send_sky_widget_state(widget, force=log_loading)
-        if self._config.log_overlay_timing and log_loading:
-            self._log_overlay_push_timing(widget, comm_ms=comm_ms)
+        if self._panel_serve_mode and log_loading:
+
+            def _after_overlay_push(comm_ms: float) -> None:
+                if self._config.log_overlay_timing:
+                    self._log_overlay_push_timing(widget, comm_ms=comm_ms)
+
+            self._schedule_sky_widget_push(
+                widget,
+                force=True,
+                after_push=_after_overlay_push,
+            )
+        else:
+            comm_ms = self._maybe_send_sky_widget_state(widget, force=log_loading)
+            if self._config.log_overlay_timing and log_loading:
+                self._log_overlay_push_timing(widget, comm_ms=comm_ms)
 
     def _on_heatmap_tap(self, time_idx: int, freq_idx: int) -> None:
         self._time_idx = time_idx
@@ -1834,7 +2097,7 @@ class SourceReview(param.Parameterized):
             clear_image = getattr(widget, "clear_image", None)
             if callable(clear_image):
                 clear_image()
-            self._force_send_sky_widget_state(widget)
+            self._schedule_sky_widget_push(widget, force=True)
             self._log("Overlay off — hidden.")
             self._set_status("Overlay **off** — HiPS background only.")
 

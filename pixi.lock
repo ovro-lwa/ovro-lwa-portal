@@ -506,7 +506,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/32/53/bac4724684064bfee95ece0bb6caf3887e509006845e25388a12cac26d0c/astroid-4.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/c3/1c/f06ad85180e7dd9855aa5ede901bfc2be858d7bee17d4e978a14c0ecec14/astropy-7.2.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/0f/c6/cdfe89a694f41d435687dea90b14b567b2e8daf18afc2b3168c7f1260124/astropy_iers_data-0.2026.2.23.0.48.33-py3-none-any.whl
-      - pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
       - pypi: https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/13/5c/af990f019b8dd11c5492a6371fe74a5b0276357370030b67254a87329944/async_lru-2.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3a/2a/7cc015f5b9f5db42b7d48157e23356022889fc354a2813c15934b7cb5c0e/attrs-25.4.0-py3-none-any.whl
@@ -667,6 +666,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/c9/cd8538dc2e7727095e0c1d867bad1e40c98f37763e6d995c1939f5fdc7b1/yarl-1.22.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5e/d8/9ffd8c237b3559945bb52103cf0eed64ea098f7b7f573f8d2962ef27b4b2/zarr-2.18.7-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/80/ab/11a76c1e2126084fde2639514f24e6111b789b0bfa4fc6264a8975c7e1f1/zict-3.0.0-py2.py3-none-any.whl
+      - pypi: ../astrowidget
       - pypi: ./
   onboard:
     channels:
@@ -853,7 +853,6 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/32/53/bac4724684064bfee95ece0bb6caf3887e509006845e25388a12cac26d0c/astroid-4.1.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/c3/1c/f06ad85180e7dd9855aa5ede901bfc2be858d7bee17d4e978a14c0ecec14/astropy-7.2.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/0f/c6/cdfe89a694f41d435687dea90b14b567b2e8daf18afc2b3168c7f1260124/astropy_iers_data-0.2026.2.23.0.48.33-py3-none-any.whl
-      - pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
       - pypi: https://files.pythonhosted.org/packages/d2/39/e7eaf1799466a4aef85b6a4fe7bd175ad2b1c6345066aa33f1f58d4b18d0/asttokens-3.0.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/13/5c/af990f019b8dd11c5492a6371fe74a5b0276357370030b67254a87329944/async_lru-2.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/3a/2a/7cc015f5b9f5db42b7d48157e23356022889fc354a2813c15934b7cb5c0e/attrs-25.4.0-py3-none-any.whl
@@ -1015,6 +1014,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/11/c9/cd8538dc2e7727095e0c1d867bad1e40c98f37763e6d995c1939f5fdc7b1/yarl-1.22.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/5e/d8/9ffd8c237b3559945bb52103cf0eed64ea098f7b7f573f8d2962ef27b4b2/zarr-2.18.7-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/80/ab/11a76c1e2126084fde2639514f24e6111b789b0bfa4fc6264a8975c7e1f1/zict-3.0.0-py2.py3-none-any.whl
+      - pypi: ../astrowidget
       - pypi: ./
 packages:
 - conda: https://prefix.dev/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -1245,14 +1245,16 @@ packages:
   - pytest ; extra == 'test'
   - pytest-remotedata ; extra == 'test'
   requires_python: '>=3.8'
-- pypi: git+https://github.com/ovro-lwa/astrowidget.git?branch=main#90d94286bcb155406a6e5c50c9c807e59c2b2742
+- pypi: ../astrowidget
   name: astrowidget
   version: 0.2.0
+  sha256: 915fb688ebc55713c5ecb03696536f55dfed13611fb270b03fca492f9d26ed4c
   requires_dist:
   - anywidget>=0.9
   - traitlets>=5.0
   - astropy>=6.0
   - numpy>=1.24
+  - scipy>=1.10
   - xarray>=2024.1
   - zarr>=2.16,<3
   - dask[array]>=2024.1
@@ -4130,8 +4132,8 @@ packages:
   timestamp: 1769555830639
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev93
-  sha256: 3590cfb35d9436f7df21e2541614d6dd3ee8a00477014f7449063a1c883bdf5e
+  version: 0.1.1.dev15
+  sha256: 1242ae34bf04b06b1a91ada0bf9ec3bdabccf9ef5e7185e6c12f38c3ef463c53
   requires_dist:
   - astropy>=7.1.0,<8
   - dask>=2025.9.1,<2026

@@ -7,6 +7,8 @@ helpers exercise the same code paths as Jupyter without monkeypatching ``push``.
 
 from __future__ import annotations
 
+import threading
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -16,6 +18,32 @@ import pytest
 from bokeh.document import Document
 
 from ovro_lwa_portal.viz.panel_ui_session import InlinePanelUISession, PanelUISession
+
+
+class _FakeSessionContext:
+    """Minimal stand-in so :meth:`Document.add_next_tick_callback` is enabled."""
+
+
+class BokehTickHarness:
+    """Drain Bokeh ``add_next_tick_callback`` queues in headless serve-mode tests."""
+
+    def __init__(self, doc: Document) -> None:
+        self.doc = doc
+        self._session_context = _FakeSessionContext()
+        doc._session_context = weakref.ref(self._session_context)
+
+    def flush_ticks(self, *, max_rounds: int = 50) -> None:
+        """Run pending next-tick callbacks until the queue is empty."""
+        for _ in range(max_rounds):
+            pending = [
+                cb
+                for cb in list(self.doc.callbacks._session_callbacks)
+                if cb._callback is not None
+            ]
+            if not pending:
+                return
+            for session_cb in pending:
+                session_cb._callback()
 
 
 class FakeNotebookComm:
@@ -110,6 +138,10 @@ class PanelUITestHarness:
     ) -> None:
         """Execute a UI mutation through the session dispatch path."""
         session.dispatch(callback)
+
+    def served_ticks(self) -> BokehTickHarness:
+        """Return a tick flusher for the harness document (``panel serve`` tests)."""
+        return BokehTickHarness(self.doc)
 
     @contextmanager
     def capture_notebook_pushes(

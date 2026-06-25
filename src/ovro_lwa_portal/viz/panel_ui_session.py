@@ -17,6 +17,7 @@ Three sync tiers (do not collapse into one code path):
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
@@ -371,6 +372,104 @@ class InlinePanelUISession:
                 after_publish()
 
         defer_after_notebook_hold(_publish)
+
+
+class ServedPanelUISession:
+    """``panel serve`` backend: Bokeh server document updates, not Jupyter comm.
+
+    Use from :mod:`scripts.serve_source_review` only. Mutating Panel models on the
+    server event loop is enough; :func:`notebook_views_registered` is always false
+    for embedded Bokeh server roots.
+    """
+
+    def __init__(self, root_views: RootViewsFn) -> None:
+        self._root_views = root_views
+        self._doc: Any | None = None
+        self._pending: list[Callable[[], None]] = []
+
+    def bind_document(self, doc: Any | None) -> None:
+        """Capture the live Bokeh ``Document`` once ``panel.state.onload`` fires."""
+        self._doc = doc
+        if doc is None or doc.session_context is None:
+            return
+        pending = self._pending
+        self._pending = []
+        for callback in pending:
+            self._schedule(callback)
+
+    def _views(self) -> tuple[pn.viewable.Viewable, ...]:
+        return tuple(self._root_views())
+
+    def _schedule(self, callback: Callable[[], None]) -> None:
+        if notebook_ui_hold_active():
+            callback()
+            return
+        doc = self._doc or pn.state.curdoc
+        if doc is not None and doc.session_context is not None:
+
+            def _run() -> None:
+                callback()
+
+            doc.add_next_tick_callback(_run)
+            return
+        if threading.current_thread() is threading.main_thread():
+            callback()
+            return
+        self._pending.append(callback)
+
+    def dispatch(self, callback: Callable[[], None]) -> None:
+        self._schedule(callback)
+
+    def defer_dispatch(self, callback: Callable[[], None]) -> None:
+        self._schedule(callback)
+
+    def schedule(self, callback: Callable[[], None]) -> None:
+        self._schedule(callback)
+
+    def hold_active(self) -> bool:
+        return notebook_ui_hold_active()
+
+    def sync_spinner(
+        self,
+        widget: pn.viewable.Viewable,
+        *,
+        value: bool,
+        visible: bool,
+    ) -> None:
+        set_notebook_widget_params(
+            widget,
+            *self._views(),
+            value=value,
+            visible=visible,
+        )
+
+    def sync_coordinate_field(
+        self,
+        widget: pn.viewable.Viewable,
+        *,
+        value: str,
+        value_input: str,
+    ) -> None:
+        widget.value = value
+        widget.value_input = value_input
+        widget.options = []
+
+    def sync_status_pane(self, pane: pn.viewable.Viewable, text: str) -> None:
+        pane.object = text
+
+    def publish_bokeh_figure(
+        self,
+        pane: pn.viewable.Viewable,
+        figure: object,
+        *,
+        after_publish: Callable[[], None] | None = None,
+    ) -> None:
+        def _publish() -> None:
+            pane.object = figure
+            if after_publish is not None:
+                after_publish()
+
+        self._schedule(_publish)
 
 
 class CallbackPanelUISession:

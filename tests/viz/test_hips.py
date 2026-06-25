@@ -115,3 +115,32 @@ def test_compute_hips_percentile_cuts(tmp_path: Path) -> None:
 def test_compute_hips_percentile_cuts_missing_tiles(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="No FITS tiles"):
         compute_hips_percentile_cuts(tmp_path / "empty.hips")
+
+
+def test_register_hips_panel_serve_adds_toplevel_pattern(tmp_path: Path) -> None:
+    from bokeh.server.urls import toplevel_patterns
+
+    from ovro_lwa_portal.viz import hips_server as hs
+
+    hips_root = tmp_path / "hips"
+    hips_root.mkdir()
+    hs._HIPS_PANEL_PATTERN = None  # noqa: SLF001
+    prefix = f"/test-hips-{tmp_path.name}"
+
+    before = len(toplevel_patterns)
+    hs.register_hips_panel_serve(hips_root, prefix)
+
+    assert len(toplevel_patterns) == before + 1
+    entry = toplevel_patterns[-1]
+    pattern = entry[0]
+    handler = entry[1]
+    kwargs = entry[2] if len(entry) > 2 else {}
+    assert "test-hips" in pattern.replace("\\", "")
+    assert kwargs["path"] == str(hips_root.resolve())
+    from tornado.web import StaticFileHandler
+
+    assert handler is StaticFileHandler
+
+    # Idempotent second call.
+    hs.register_hips_panel_serve(hips_root, prefix)
+    assert len(toplevel_patterns) == before + 1
