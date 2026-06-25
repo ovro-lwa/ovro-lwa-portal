@@ -2560,10 +2560,14 @@ limits parallelism; more than 10,000 creates excessive scheduling overhead.</p>
 <p>Follow this systematic approach to isolate performance factors and ensure
 reproducible results:</p>
 <ol>
-<li><strong>Define 3–5 representative access patterns</strong> matching real user workflows.
+<li>
+<p><strong>Define 3–5 representative access patterns</strong> matching real user workflows.
    Use the recipes from <a href="../chunking-read-optimization/">Read-Time Optimization</a>
-   as templates:</li>
-<li>Recipe A: Full spatial images (snapshot analysis)</li>
+   as templates:</p>
+</li>
+<li>
+<p>Recipe A: Full spatial images (snapshot analysis)</p>
+</li>
 <li>Recipe B: Time series at a point</li>
 <li>Recipe C: Spectral analysis</li>
 <li>
@@ -2572,7 +2576,9 @@ reproducible results:</p>
 <li>
 <p><strong>Create a controlled environment</strong> to minimize external variability:</p>
 </li>
-<li>Consistent network: Use the same network connection for all runs</li>
+<li>
+<p>Consistent network: Use the same network connection for all runs</p>
+</li>
 <li>No background jobs: Close applications that may compete for bandwidth or
      CPU</li>
 <li>
@@ -2582,9 +2588,11 @@ reproducible results:</p>
 <li>
 <p><strong>Distinguish warm cache vs. cold cache measurements:</strong></p>
 </li>
-<li><strong>Warm cache:</strong> Data is already in OS page cache or fsspec cache. Measures
+<li>
+<p><strong>Warm cache:</strong> Data is already in OS page cache or fsspec cache. Measures
      compute and memory performance without I/O latency. To warm cache: run the
-     operation once, then measure subsequent runs.</li>
+     operation once, then measure subsequent runs.</p>
+</li>
 <li><strong>Cold cache:</strong> Data must be fetched from storage. Measures full I/O +
      compute performance. To clear cache:<ul>
 <li><strong>macOS:</strong> <code>sudo purge</code></li>
