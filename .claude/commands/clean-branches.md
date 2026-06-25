@@ -8,6 +8,7 @@ omitted, prompt the user.
 ## Instructions
 
 1. Run these commands in parallel to gather branch information:
+
    - `git branch` (local branches)
    - `git branch -r` (remote branches, exclude HEAD)
    - `git branch --merged main` (branches merged into main)
@@ -25,16 +26,19 @@ omitted, prompt the user.
    | **Active**          | Has recent commits and is not merged                              |
 
 3. If `$ARGUMENTS` is empty or unclear:
+
    - Display a summary table of all branches grouped by category with branch
      name, last commit age, and local/remote status
    - Ask the user which categories to clean: merged, stale, orphaned, or all
    - Wait for the user's response before proceeding
 
 4. If `$ARGUMENTS` specifies a category or "all":
+
    - Show the list of branches that will be deleted
    - Ask for confirmation before proceeding
 
 5. Delete branches:
+
    - Local branches: `git branch -d <name>` (safe delete, merged only) or
      `git branch -D <name>` (if user confirms force delete for unmerged)
    - Remote branches: `git push origin --delete <name>`

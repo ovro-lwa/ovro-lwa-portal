@@ -862,6 +862,7 @@ NoSuchBucket: The specified bucket does not exist
    ```
 
 2. **Wrong endpoint** — Bucket exists on different OSN pod or AWS region:
+
    - OSN buckets are pod-specific (uma1 vs caltech1)
    - AWS buckets are region-specific (us-east-1 vs us-west-2)
 

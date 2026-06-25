@@ -1,0 +1,3 @@
+# Shared with the pre-commit prettier hook (.pre-commit-config.yaml).
+# Install the Prettier VS Code/Cursor extension for format-on-save in editors.
+proseWrap: always
