@@ -17,6 +17,7 @@ np = pytest.importorskip("numpy")
 widgets = pytest.importorskip("ipywidgets")
 
 from ovro_lwa_portal.viz import pipeline_qa as pq
+from ovro_lwa_portal.viz.panel_compat import button_appearance
 from ovro_lwa_portal.viz.pipeline_qa_app import PipelineQAApp
 
 
@@ -580,7 +581,7 @@ def test_refresh_convert_button_uses_primary_when_zarr_missing(
 
     app._sync_action_controls()
 
-    assert app._convert_button.button_type == "primary"
+    assert button_appearance(app._convert_button) == "primary"
     assert app._convert_button.disabled is False
 
 
@@ -600,7 +601,7 @@ def test_refresh_convert_button_uses_default_when_zarr_complete(
 
     app._sync_action_controls()
 
-    assert app._convert_button.button_type == "default"
+    assert button_appearance(app._convert_button) == "default"
     assert app._convert_button.disabled is True
 
 

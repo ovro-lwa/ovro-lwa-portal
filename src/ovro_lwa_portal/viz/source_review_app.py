@@ -51,6 +51,7 @@ from ovro_lwa_portal.viz.panel_ui_session import (
     JupyterPanelUISession,
     PanelUISession,
 )
+from ovro_lwa_portal.viz.panel_compat import button_appearance_kwargs, set_button_appearance
 from ovro_lwa_portal.viz.source_review import (
     DatasetLoad,
     finalize_dataset_load,
@@ -303,21 +304,21 @@ class SourceReview(param.Parameterized):
         self._suppress_coord_value_handler = False
         self._coord_slew = pn.widgets.Button(
             name="Center",
-            button_type="primary",
             width=80,
+            **button_appearance_kwargs("primary"),
         )
         self._coord_slew.on_click(self._on_slew)
         self._coord_generate = pn.widgets.Button(
             name="Generate heatmap",
-            button_type="primary",
             width=150,
+            **button_appearance_kwargs("primary"),
         )
         self._coord_generate.on_click(self._on_generate_heatmap)
         self._overlay_toggle = pn.widgets.Toggle(
             name="Overlay: on",
             value=True,
-            button_type="success",
             width=110,
+            **button_appearance_kwargs("success", widget_class=pn.widgets.Toggle),
         )
         self._overlay_toggle.param.watch(self._on_overlay_toggle, "value")
         self._fit_overlay_button = pn.widgets.Button(
@@ -1739,8 +1740,9 @@ class SourceReview(param.Parameterized):
         self._overlay_toggle.name = (
             "Overlay: on" if self._overlay_enabled else "Overlay: off"
         )
-        self._overlay_toggle.button_type = (
-            "success" if self._overlay_enabled else "default"
+        set_button_appearance(
+            self._overlay_toggle,
+            "success" if self._overlay_enabled else "default",
         )
         if self._overlay_toggle.value != self._overlay_enabled:
             self._suppress_overlay_toggle = True
