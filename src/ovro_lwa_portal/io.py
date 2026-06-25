@@ -455,8 +455,16 @@ def warn_if_suboptimal_lm_chunks(
     except (DataSourceError, OSError, json.JSONDecodeError):
         return None
 
+    l_extent = sum(summary["l_chunks"])
+    m_extent = sum(summary["m_chunks"])
     smallest = min(summary["l_min"], summary["m_min"])
+    max_achievable = min(l_extent, m_extent)
+
     if smallest >= int(min_chunk):
+        return summary
+
+    # Already chunked as large as this store geometry allows (e.g. 4×4 or 10×10 tests).
+    if smallest >= max_achievable:
         return summary
 
     warnings.warn(
