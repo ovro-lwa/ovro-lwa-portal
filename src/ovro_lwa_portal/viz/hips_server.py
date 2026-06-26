@@ -57,8 +57,10 @@ def register_hips_panel_serve(hips_root: Path, url_prefix: str) -> None:
     from bokeh.server.urls import toplevel_patterns
 
     rel_prefix = prefix.lstrip("/")
+    if not rel_prefix:
+        logger.warning("HiPS URL prefix is empty; refusing to register Panel serve static handler")
+        return
     pattern = rf"/{re.escape(rel_prefix)}/(.*)"
-    if _HIPS_PANEL_PATTERN == pattern:
         return
     for entry in toplevel_patterns:
         existing_pattern = entry[0]
