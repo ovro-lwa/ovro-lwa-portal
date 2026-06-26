@@ -449,10 +449,9 @@ def warn_if_suboptimal_lm_chunks(
     min_chunk: int = _MIN_RECOMMENDED_LM_CHUNK,
     var: str = "SKY",
 ) -> LmChunkSummary | None:
-    """Warn when on-disk spatial chunks are smaller than recommended for overlay I/O."""
     try:
         summary = summarize_lm_chunks(zarr_path, var=var)
-    except (DataSourceError, OSError, json.JSONDecodeError):
+    except (DataSourceError, OSError, ValueError, json.JSONDecodeError):
         return None
 
     smallest = min(summary["l_min"], summary["m_min"])
