@@ -13,7 +13,137 @@ pytest.importorskip("astrowidget")
 import astropy.units as u
 from astropy.coordinates import SkyCoord
 
+from astrowidget import SkyWidget
+
+from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
 from ovro_lwa_portal.viz.source_review_app import SourceReview, SourceReviewConfig
+
+
+def test_astrowidget_update_slice_supports_view_lock() -> None:
+    """Editable ``../astrowidget`` is required for source review overlay view-lock."""
+    import inspect
+
+    assert "view_lock" in inspect.signature(SkyWidget.update_slice).parameters
+    assert "overlay_view_lock" in SkyWidget.class_trait_names()
+
+
+def test_serve_sky_widget_coerces_null_background_cuts() -> None:
+    """JSON null from ipywidgets_bokeh must not raise on Float HiPS cut traits."""
+    import math
+
+    from ovro_lwa_portal.viz.source_review_app import ServeSkyWidget
+
+    widget = ServeSkyWidget()
+    widget.background_cut_max = None
+    assert math.isnan(widget.background_cut_max)
+    widget.background_cut_min = None
+    assert math.isnan(widget.background_cut_min)
+
+
+def test_serve_sky_push_coalesces_rapid_schedules(tmp_path: Path) -> None:
+    """Only the latest scheduled serve bundle remount should run."""
+    holder: dict[str, SourceReview] = {}
+    review = SourceReview(
+        tmp_path / "store.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        ui_session=_served_session(holder),
+    )
+    holder["review"] = review
+
+    remounts = 0
+    widget = MagicMock()
+    widget.image_revision = 1
+
+    def _count_remount(_widget: object) -> None:
+        nonlocal remounts
+        remounts += 1
+
+    review._remount_sky_ipywidget_model = _count_remount  # type: ignore[method-assign]
+    scheduled: list[Callable[[], None]] = []
+    review._ui.schedule = lambda callback: scheduled.append(callback)  # type: ignore[method-assign]
+
+    review._schedule_sky_widget_push(widget, force=True)
+    review._schedule_sky_widget_push(widget, force=True)
+    for callback in scheduled:
+        callback()
+
+    assert remounts == 1
+
+
+def test_serve_mode_remounts_ipywidget_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``panel serve`` re-embeds SkyWidget via a fresh ipywidgets_bokeh bundle."""
+    holder: dict[str, SourceReview] = {}
+    review = SourceReview(
+        tmp_path / "store.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        ui_session=_served_session(holder),
+    )
+    holder["review"] = review
+
+    remounted: list[object] = []
+    monkeypatch.setattr(
+        review,
+        "_remount_sky_ipywidget_model",
+        lambda widget: remounted.append(widget),
+    )
+    widget = MagicMock()
+    widget.image_revision = 1
+    review._maybe_send_sky_widget_state(widget, force=True)
+
+    assert remounted == [widget]
+
+
+def _served_session(review_holder: dict[str, SourceReview]) -> ServedPanelUISession:
+    def _root_views() -> tuple:
+        review = review_holder["review"]
+        return (
+            review._layout,
+            review._status_pane,
+            review._heatmap_pane,
+            review._coord_input,
+        )
+
+    return ServedPanelUISession(_root_views)
+
+
+def test_panel_serve_mode_defers_sky_widget_until_session(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    holder: dict[str, SourceReview] = {}
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        ui_session=_served_session(holder),
+    )
+    holder["review"] = review
+
+    assert review._sky_widget is None
+    assert review._loading_widget is None
+    assert review._log_widget is None
+    assert isinstance(review._log_pane, pn.pane.HTML)
+    assert isinstance(review._sky_pane, pn.pane.HTML)
+    assert review._loading_pane.value is False
 
 
 def test_source_review_builds_layout_without_zarr_validation(tmp_path: Path) -> None:

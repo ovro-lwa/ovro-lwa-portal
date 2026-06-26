@@ -261,10 +261,22 @@ To install dewarp tooling locally:
 Review notebooks use **SkyWidget** from
 [astrowidget](https://github.com/ovro-lwa/astrowidget). SkyWidget is an
 **anywidget**; **ipyaladin** (HiPS backgrounds) is also anywidget-based. The
-default Pixi env installs astrowidget from GitHub `main`.
+default Pixi env installs editable **astrowidget** from a sibling checkout at
+`../astrowidget` (`astrowidget-local` feature).
 
-To use a **local sibling checkout** (`../astrowidget`) instead, add to
-`pyproject.toml` (do not commit unless your team standardizes on this layout):
+If you do not have that checkout, clone it next to this repository::
+
+```bash
+git clone https://github.com/ovro-lwa/astrowidget.git ../astrowidget
+pixi lock && pixi install
+cd ../astrowidget && pixi run build   # or: npm ci && npm run build
+```
+
+To use GitHub `main` instead of the sibling (not recommended for source review),
+replace `astrowidget-local` with `astrowidget` in `[tool.pixi.environments]` and
+run `pixi lock && pixi install`.
+
+Legacy manual override (same as `astrowidget-local`):
 
 ```toml
 [tool.pixi.feature.astrowidget-local.pypi-dependencies]
