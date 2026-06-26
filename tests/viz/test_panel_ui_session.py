@@ -214,3 +214,57 @@ def test_jupyter_dispatch_batch_publishes_heatmap_on_next_io_turn(
         loop.flush()
 
     assert harness.bokeh_model(pane, layout).title.text == "FL Cnc — tracked centre pixel"
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_served_session_schedules_worker_callbacks_on_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker-thread ``schedule`` must defer via Bokeh next-tick, not run inline."""
+    import threading
+
+    from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
+    from tests.viz.panel_ui_testkit import BokehTickHarness, PanelUITestHarness
+
+    harness = PanelUITestHarness()
+    layout = pn.Column(pn.pane.Markdown("idle"))
+    harness.mount(layout)
+    ticks = harness.served_ticks()
+    session = ServedPanelUISession(lambda: (layout,))
+    session.bind_document(harness.doc)
+
+    ran_on: list[threading.Thread] = []
+    worker = threading.Thread(target=lambda: session.schedule(lambda: ran_on.append(threading.current_thread())))
+
+    worker.start()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert ran_on == []
+
+    ticks.flush_ticks()
+    assert len(ran_on) == 1
+    assert ran_on[0] is threading.main_thread()
+
+
+def test_served_session_pending_flushed_on_bind_document() -> None:
+    """Callbacks scheduled before ``bind_document`` run after the document is bound."""
+    import threading
+
+    from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
+
+    session = ServedPanelUISession(lambda: ())
+    ran: list[str] = []
+
+    worker = threading.Thread(target=lambda: session.schedule(lambda: ran.append("ok")))
+    worker.start()
+    worker.join(timeout=2.0)
+    assert ran == []
+
+    harness = PanelUITestHarness()
+    layout = pn.Column(pn.pane.Markdown("idle"))
+    harness.mount(layout)
+    ticks = harness.served_ticks()
+    session.bind_document(harness.doc)
+    ticks.flush_ticks()
+
+    assert ran == ["ok"]

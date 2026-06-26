@@ -452,7 +452,7 @@ def warn_if_suboptimal_lm_chunks(
     """Warn when on-disk spatial chunks are smaller than recommended for overlay I/O."""
     try:
         summary = summarize_lm_chunks(zarr_path, var=var)
-    except (DataSourceError, OSError, json.JSONDecodeError):
+    except (DataSourceError, OSError, ValueError, json.JSONDecodeError):
         return None
 
     l_extent = sum(summary["l_chunks"])

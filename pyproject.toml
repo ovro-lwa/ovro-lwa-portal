@@ -196,17 +196,15 @@ docs-serve = { cmd = "mkdocs serve", description = "Serve the documentation site
 rtd-publish = { cmd = "python -m mkdocs build --clean --site-dir $READTHEDOCS_OUTPUT/html --config-file mkdocs.yml", description = "Build docs for Read the Docs" }
 
 [tool.pixi.environments]
-default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget"], solve-group = "default" }
-onboard = { features = ["pre-commit", "gh-cli", "onboard", "visualization", "astrowidget"], solve-group = "default" }
+default = { features = ["pre-commit", "gh-cli", "visualization", "astrowidget-local"], solve-group = "default" }
+onboard = { features = ["pre-commit", "gh-cli", "onboard", "visualization", "astrowidget-local"], solve-group = "default" }
 ci = ["ci"]
 # Optional dewarp env (requires ../image-plane-correction sibling). Do not commit;
 # see CONTRIBUTING.md. Example:
-# dewarp = { features = ["dewarp", "astrowidget"], solve-group = "dewarp" }
+# dewarp = { features = ["dewarp", "astrowidget-local"], solve-group = "dewarp" }
 
-# Optional: editable sibling checkout — add manually (see CONTRIBUTING.md), e.g.:
-# [tool.pixi.feature.astrowidget-local.pypi-dependencies]
-# astrowidget = { path = "../astrowidget", editable = true }
-# then extend an environment's features with "astrowidget-local".
+[tool.pixi.feature.astrowidget-local.pypi-dependencies]
+astrowidget = { path = "../astrowidget", editable = true }
 
 # GitHub CLI feature for interacting with GitHub from the command line
 [tool.pixi.feature.gh-cli.dependencies]
@@ -238,8 +236,8 @@ python-dotenv = ">=1.2.1,<2"
 jupyterlab = ">=4.0"
 s3fs = ">=2024.6.0"
 
-# GitHub astrowidget (SkyWidget). On `default`, `onboard`, and `dewarp`; for editable
-# sibling checkout use the snippet under [tool.pixi.environments].
+# GitHub astrowidget fallback when ``../astrowidget`` is not checked out. Swap
+# ``astrowidget-local`` for ``astrowidget`` in ``[tool.pixi.environments]``.
 [tool.pixi.feature.astrowidget.pypi-dependencies]
 astrowidget = { git = "https://github.com/ovro-lwa/astrowidget.git", branch = "main" }
 

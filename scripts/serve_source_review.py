@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Serve :class:`~ovro_lwa_portal.viz.source_review_app.SourceReview` with Panel.
 
-Thin wrapper around the notebook launch cell — same ``SourceReview`` backend
-(``JupyterPanelUISession``), no app refactor.
+Uses :class:`ServedPanelUISession` (Bokeh server comm) and
+:func:`configure_source_review_serve` (includes the ipywidgets bridge). The
+notebook path keeps :class:`JupyterPanelUISession` and must not load
+``pn.extension('ipywidgets')`` in JupyterLab.
 
 Usage::
 
     export OVRO_SOURCE_REVIEW_ZARR=/path/to/store.zarr
     pixi run panel serve scripts/serve_source_review.py --show --autoreload
 
-Or pass the store on the command line (``--`` separates Panel flags from script args)::
+Or pass the store with Panel's ``--args`` (not ``--``; Panel does not forward bare
+``--zarr`` after the script path)::
 
-    pixi run panel serve scripts/serve_source_review.py --show --autoreload -- \\
-        --zarr /path/to/store.zarr
+    pixi run panel serve scripts/serve_source_review.py --show --autoreload \\
+        --args /path/to/store.zarr
+
+    pixi run panel serve scripts/serve_source_review.py --show --autoreload \\
+        --args --zarr /path/to/store.zarr
 
 Optional environment variables (same as ``notebooks/source_review.ipynb``)::
 
@@ -20,10 +26,10 @@ Optional environment variables (same as ``notebooks/source_review.ipynb``)::
     OVRO_HIPS_HTTP_BASE       HiPS URL prefix (default ``/calibration/hips``)
     OVRO_HIPS_ROOT            HiPS files on disk
 
-HiPS note: ``panel serve`` does not install the Jupyter HiPS extension. For a
-standalone server, serve tiles with ``python -m http.server`` from the HiPS root
-and point ``OVRO_HIPS_HTTP_BASE`` at that URL, or run behind a reverse proxy that
-maps ``/calibration/hips``.
+HiPS note: this script registers a static route on the Panel server at
+``OVRO_HIPS_HTTP_BASE`` (default ``/calibration/hips``) when ``--hips-root`` exists
+on disk. Alternatively serve tiles with ``python -m http.server`` and set
+``OVRO_HIPS_HTTP_BASE`` to the full URL (e.g. ``http://localhost:3005``).
 """
 
 from __future__ import annotations
@@ -34,12 +40,13 @@ import sys
 from pathlib import Path
 
 import ovro_lwa_portal as ovro
-import panel as pn
 
+from ovro_lwa_portal.viz.hips_server import register_hips_panel_serve
+from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
 from ovro_lwa_portal.viz.source_review_app import (
     SourceReview,
     SourceReviewConfig,
-    configure_source_review_notebook,
+    configure_source_review_serve,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -48,12 +55,28 @@ _DEFAULT_HIPS_ROOT = Path("/lustre/pipeline/calibration/hips")
 _DEFAULT_HIPS_BACKGROUND = _DEFAULT_HIPS_ROOT / "Blue_I_deep_Taper_Robust-0.75_Jan25.hips"
 
 
+def _resolve_zarr_path(args: argparse.Namespace) -> Path | None:
+    if args.zarr is not None:
+        return Path(args.zarr)
+    if args.zarr_path is not None:
+        return Path(args.zarr_path)
+    env = os.environ.get("OVRO_SOURCE_REVIEW_ZARR")
+    return Path(env) if env else None
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SourceReview Panel app")
     parser.add_argument(
+        "zarr_path",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="OVRO-LWA Zarr store (positional; use with panel serve --args)",
+    )
+    parser.add_argument(
         "--zarr",
         type=Path,
-        default=os.environ.get("OVRO_SOURCE_REVIEW_ZARR"),
+        default=None,
         help="OVRO-LWA Zarr store (or set OVRO_SOURCE_REVIEW_ZARR)",
     )
     parser.add_argument(
@@ -91,13 +114,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _build_review(args: argparse.Namespace) -> SourceReview:
-    if args.zarr is None:
+    zarr_raw = _resolve_zarr_path(args)
+    if zarr_raw is None:
         raise SystemExit(
-            "Zarr path required: pass --zarr or set OVRO_SOURCE_REVIEW_ZARR",
+            "Zarr path required: panel serve ... --args /path/to/store.zarr, "
+            "or --args --zarr /path, or set OVRO_SOURCE_REVIEW_ZARR",
         )
-    zarr_path = Path(args.zarr).expanduser()
+    zarr_path = zarr_raw.expanduser()
     ovro.validate_local_zarr_store(zarr_path)
-    return SourceReview(
+    review_holder: dict[str, SourceReview] = {}
+
+    def _root_views() -> tuple:
+        review = review_holder["review"]
+        return (
+            review._layout,
+            review._status_pane,
+            review._heatmap_pane,
+            review._coord_input,
+        )
+
+    ui_session = ServedPanelUISession(_root_views)
+    review = SourceReview(
         zarr_path,
         coordinate_string=args.coordinate,
         known_sources_path=args.known_sources,
@@ -112,26 +149,31 @@ def _build_review(args: argparse.Namespace) -> SourceReview:
             hips_http_prefix=args.hips_http_prefix,
         ),
         validate_zarr=False,
+        ui_session=ui_session,
     )
+    review_holder["review"] = review
+    return review
 
 
 _args = _parse_args()
-if _args.zarr is None:
+if _resolve_zarr_path(_args) is None:
     raise SystemExit(
-        "Zarr path required: pass --zarr or set OVRO_SOURCE_REVIEW_ZARR",
+        "Zarr path required: panel serve ... --args /path/to/store.zarr, "
+        "or --args --zarr /path, or set OVRO_SOURCE_REVIEW_ZARR",
     )
 
-configure_source_review_notebook()
-try:
-    pn.extension("ipywidgets")
-except Exception:  # noqa: BLE001
-    pass
+configure_source_review_serve()
+
+register_hips_panel_serve(_args.hips_root, _args.hips_http_prefix)
 
 _review = _build_review(_args)
 _review.panel.servable(title="Source review")
 
 if __name__ == "__main__":
     print(
-        "Launch with: panel serve scripts/serve_source_review.py --show --autoreload",
+        "Launch with:\n"
+        "  panel serve scripts/serve_source_review.py --show --autoreload "
+        "--args /path/to/store.zarr\n"
+        "Or set OVRO_SOURCE_REVIEW_ZARR (no --args needed).",
         file=sys.stderr,
     )
