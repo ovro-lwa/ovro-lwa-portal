@@ -50,6 +50,10 @@ from ovro_lwa_portal.viz.flux_check_plots import (
     build_flux_ratio_figures,
     build_flux_ratio_panel_grid,
 )
+from ovro_lwa_portal.viz.panel_compat import (
+    button_appearance_kwargs,
+    set_button_appearance,
+)
 
 check_viz_deps()
 
@@ -1526,8 +1530,8 @@ class _StokesReviewHolder(param.Parameterized):
             self.param.sky_stokes,
             name="Sky view",
             options={"Stokes I": "I", "Stokes V": "V"},
-            button_type="default",
             width=200,
+            **button_appearance_kwargs("default", widget_class=pn.widgets.RadioButtonGroup),
         )
         self._controls_row = pn.Row(
             self._time_slider,
@@ -2307,8 +2311,8 @@ class PipelineQAApp(param.Parameterized):
         )
         self._zenith_load_button = pn.widgets.Button(
             name="Reload zenith panels",
-            button_type="default",
             disabled=True,
+            **button_appearance_kwargs("default"),
         )
         self._zenith_load_button.on_click(self._on_zenith_load_click)
         self._qa_grid = pn.Column(
@@ -2333,11 +2337,14 @@ class PipelineQAApp(param.Parameterized):
         self._programmatic_day_sync = False
         self._convert_button = pn.widgets.Button(
             name="Convert FITS → Zarr",
-            button_type="primary",
             disabled=True,
+            **button_appearance_kwargs("primary"),
         )
         self._convert_button.on_click(self._on_convert_click)
-        self._close_modal_button = pn.widgets.Button(name="Close", button_type="default")
+        self._close_modal_button = pn.widgets.Button(
+            name="Close",
+            **button_appearance_kwargs("default"),
+        )
         self._close_modal_button.on_click(lambda _event: self._close_modal())
         self._modal_container = pn.Column(sizing_mode="stretch_width")
         self._log_widget = widgets.HTML(
@@ -2730,7 +2737,7 @@ class PipelineQAApp(param.Parameterized):
         """Sync convert button label, color, and disabled state with the selected day."""
         if self.select_day is None:
             self._convert_button.disabled = True
-            self._convert_button.button_type = "default"
+            set_button_appearance(self._convert_button, "default")
             return
         status = zarr_status(self.select_day, config=self._qa_config)
         zarr_complete = status["I"] and status["V"]
@@ -2739,7 +2746,10 @@ class PipelineQAApp(param.Parameterized):
             status,
             converting=self.converting,
         ) or self.busy
-        self._convert_button.button_type = "default" if zarr_complete or self.busy else "primary"
+        set_button_appearance(
+            self._convert_button,
+            "default" if zarr_complete or self.busy else "primary",
+        )
 
     def _start_initial_scan(self) -> None:
         self.scanning = True

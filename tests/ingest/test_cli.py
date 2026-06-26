@@ -283,9 +283,14 @@ class TestCLI:
         out = tmp_path / "out"
         inp.mkdir()
         out.mkdir()
-        result = runner.invoke(app, ["convert", str(inp), str(out), "--chunk-lm", "128"])
+        result = runner.invoke(
+            app,
+            ["convert", str(inp), str(out), "--chunk-lm", "128"],
+            color=False,
+            env=_CI_PLAIN_ENV,
+        )
         assert result.exit_code != 0
-        combined = (result.stdout + result.stderr).lower()
+        combined = click.unstyle(result.stdout + result.stderr).lower()
         assert "allow-small-lm-chunks" in combined
 
     def test_convert_allows_small_chunk_lm_with_flag(self, tmp_path: Path) -> None:
@@ -307,6 +312,9 @@ class TestCLI:
                     "128",
                     "--allow-small-lm-chunks",
                 ],
+                color=False,
+                env=_CI_PLAIN_ENV,
             )
         assert result.exit_code == 0, result.stdout + result.stderr
-        assert "below the recommended minimum" not in (result.stdout + result.stderr).lower()
+        combined = click.unstyle(result.stdout + result.stderr).lower()
+        assert "below the recommended minimum" not in combined

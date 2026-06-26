@@ -3,6 +3,7 @@ Create a pull request for the current branch.
 ## Instructions
 
 1. Run these commands in parallel to understand the current state:
+
    - `git status` (never use `-uall`)
    - `git diff --stat` (check for uncommitted changes)
    - `git branch --show-current` (current branch)
@@ -14,6 +15,7 @@ Create a pull request for the current branch.
 3. If the branch hasn't been pushed, push with `git push -u origin <branch>`.
 
 4. Analyze ALL commits in the branch (not just the latest) to draft:
+
    - **Title**: Use conventional commit format: `type(scope): short description`
      (under 70 chars)
    - **Body**: Structured summary with test plan

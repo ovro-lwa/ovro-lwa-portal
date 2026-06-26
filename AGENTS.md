@@ -61,6 +61,7 @@ command is idempotent and safe to run multiple times.
 ### Available Environments
 
 1. **`default`** (features: `pre-commit`, `gh-cli`)
+
    - Standard development environment
    - Radio astronomy packages: astropy, xarray, dask, zarr, netcdf4, numcodecs
    - OVRO-LWA specific: xradio, python-casacore
@@ -324,12 +325,14 @@ capabilities:
 ### Core Architecture
 
 1. **Core Module** (`ingest/core.py`):
+
    - `ConversionConfig`: Configuration dataclass for conversion parameters
    - `FITSToZarrConverter`: Main orchestration class (framework-independent)
    - `FileLock`: Cross-platform file locking using portalocker
    - `ProgressCallback`: Protocol for progress reporting
 
 2. **CLI Module** (`ingest/cli.py`):
+
    - Typer-based CLI with rich progress bars
    - Logging configuration (debug, info, warning, error levels)
    - Error handling with actionable messages
@@ -437,7 +440,7 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 | `_has_per_time_wcs_header_str(ds)`          | True when `wcs_header_str` is indexed by `time` (1-D or `(time, frequency)`)                                   |
 | `_read_wcs_header_str(ds, time_idx=…)`      | FITS header string for one time index                                                                          |
 | `strip_redundant_fits_wcs_header_attrs(ds)` | Drop static `fits_wcs_header` attrs when `wcs_header_str` is canonical (used by `open_dataset` and Zarr write) |
-| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                              |
+| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                             |
 | `pixel_to_coords` / `coords_to_pixel`       | Must pass `time_idx` when per-time WCS exists                                                                  |
 
 **Strict rules (do not break these):**
@@ -496,10 +499,10 @@ are empty slots (all-NaN beam and SKY). `patch_fit` / `patch_statistic` need a
 **populated-cell mask** so empty slots are skipped instead of failing the whole
 time step.
 
-| API | Role |
-| --- | --- |
+| API                                                             | Role                                                          |
+| --------------------------------------------------------------- | ------------------------------------------------------------- |
 | `RadportAccessor.ensure_patch_metadata_cache(pol=0, var='SKY')` | Build/cache BEAM-based mask (or SKY `notnull().any` fallback) |
-| `_var_cell_has_finite_data`, `beam_fwhm_pixels`, … | Read from cache after `ensure_patch_metadata_cache` |
+| `_var_cell_has_finite_data`, `beam_fwhm_pixels`, …              | Read from cache after `ensure_patch_metadata_cache`           |
 
 **Lazy cache (do not regress):**
 
@@ -672,10 +675,10 @@ frozen (activity log often still worked via ipywidgets):
   heatmap pane; a late batch can run **after** `publish_bokeh_figure` and
   clobber the browser figure. Use
   `_schedule_ipython_main(lambda: self._log(...))` only.
-- **`_dispatch` for `_finish_heatmap`** from the compute worker — if Panel
-  views are not registered the batch can be skipped while ipywidgets progress
-  lines still run. Schedule finish on the io_loop with
-  `_schedule_ipython_main`; apply via `_ui.schedule(_apply_heatmap)`.
+- **`_dispatch` for `_finish_heatmap`** from the compute worker — if Panel views
+  are not registered the batch can be skipped while ipywidgets progress lines
+  still run. Schedule finish on the io_loop with `_schedule_ipython_main`; apply
+  via `_ui.schedule(_apply_heatmap)`.
 - **Confirm republish with `publish_bokeh_pane_to_notebook(pane, pane.object)`**
   — when the first publish already assigned the figure, passing the same object
   reference does not re-trigger Panel/Bokeh watchers; the browser keeps the
@@ -730,9 +733,9 @@ frozen (activity log often still worked via ipywidgets):
 6. **Heatmap publish** — **mutation-first** when `_heatmap_bokeh_handles` is
    mounted (`_publish_heatmap_mutation_to_notebook` →
    `push_bokeh_pane_mutation_to_notebook`). **Object swap**
-   (`_publish_heatmap_figure` → `publish_bokeh_pane_to_notebook`) only on **first
-   mount** (Zarr open zeros grid). Full layout push is **very slow** on large
-   notebooks (tens of seconds) and must not run on Generate finish, Center
+   (`_publish_heatmap_figure` → `publish_bokeh_pane_to_notebook`) only on
+   **first mount** (Zarr open zeros grid). Full layout push is **very slow** on
+   large notebooks (tens of seconds) and must not run on Generate finish, Center
    reset, or method-title refresh when a live figure exists. Fallback confirm:
    `_republish_heatmap_figure_for_notebook` only when mutation did not reach the
    browser. Overlay load follows via `_ui.schedule`.
@@ -751,23 +754,23 @@ frozen (activity log often still worked via ipywidgets):
 
 Used by `JupyterPanelUISession`, `InlinePanelUISession`, and legacy QA code:
 
-| Function                                                          | Role                                                                         |
-| ----------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `_schedule_ipython_main(callback)`                                | Schedule on kernel `io_loop` (never inline from workers)                     |
-| `_push_panel_layout(*views)`                                      | Push layout comm after model assign (shared primitive)                       |
-| `sync_pane_to_notebook(pane, *root_views)`                        | Force-sync nested `pn.pane.Bokeh` when only layout root is in `state._views` |
+| Function                                                          | Role                                                                           |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `_schedule_ipython_main(callback)`                                | Schedule on kernel `io_loop` (never inline from workers)                       |
+| `_push_panel_layout(*views)`                                      | Push layout comm after model assign (shared primitive)                         |
+| `sync_pane_to_notebook(pane, *root_views)`                        | Force-sync nested `pn.pane.Bokeh` when only layout root is in `state._views`   |
 | `publish_bokeh_pane_to_notebook(pane, value, *root_views)`        | **First mount only:** assign new figure + sync + full layout push              |
 | `push_bokeh_pane_mutation_to_notebook(pane, *root_views)`         | **Preferred:** in-place title/image edits + push (fast; no object swap)        |
 | `SourceReview._publish_heatmap_mutation_to_notebook`              | Generate finish, Center reset, method-title refresh when live figure mounted   |
 | `SourceReview._republish_heatmap_figure_for_notebook`             | **Fallback:** `pane.object = None` then assign (slow; comm miss recovery only) |
-| `publish_panel_widget_to_notebook(widget, *root_views, **params)` | Widget assign + push                                                         |
-| `defer_after_notebook_hold(callback)`                             | Queue publish after active dispatch batch                                    |
-| `notebook_ui_hold_active()`                                       | True inside `JupyterPanelUISession.dispatch` batch                           |
-| `hold_and_push(*views)`                                           | **Headless / `InlinePanelUISession` only** — not production Jupyter          |
-| `dispatch_notebook_ui(callback, *views)`                          | Legacy hold/push entry; prefer `JupyterPanelUISession`                       |
-| `set_notebook_widget_params` / `sync_pane_to_notebook`            | Used inside `InlinePanelUISession` + unit tests                              |
-| `schedule_when_panel_loaded(callback)`                            | Run after Panel notebook comm is ready                                       |
-| `notebook_views_registered(*views)`                               | Comm retry gate; not sufficient alone                                        |
+| `publish_panel_widget_to_notebook(widget, *root_views, **params)` | Widget assign + push                                                           |
+| `defer_after_notebook_hold(callback)`                             | Queue publish after active dispatch batch                                      |
+| `notebook_ui_hold_active()`                                       | True inside `JupyterPanelUISession.dispatch` batch                             |
+| `hold_and_push(*views)`                                           | **Headless / `InlinePanelUISession` only** — not production Jupyter            |
+| `dispatch_notebook_ui(callback, *views)`                          | Legacy hold/push entry; prefer `JupyterPanelUISession`                         |
+| `set_notebook_widget_params` / `sync_pane_to_notebook`            | Used inside `InlinePanelUISession` + unit tests                                |
+| `schedule_when_panel_loaded(callback)`                            | Run after Panel notebook comm is ready                                         |
+| `notebook_views_registered(*views)`                               | Comm retry gate; not sufficient alone                                          |
 
 Tests: `tests/viz/test_pipeline_qa.py` (low-level hold/sync/publish helpers),
 `tests/viz/test_panel_ui_session.py`,
@@ -795,12 +798,12 @@ values.
 
 **What pytest covers:**
 
-| Test module                            | What it proves                                                                                                                                                           |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `test_panel_ui_session.py`             | `PanelUISession` API + harness publish/spinner/coord; `test_jupyter_dispatch_batch_publishes_heatmap_on_next_io_turn`                                                    |
+| Test module                            | What it proves                                                                                                                                                                                                                                              |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `test_panel_ui_session.py`             | `PanelUISession` API + harness publish/spinner/coord; `test_jupyter_dispatch_batch_publishes_heatmap_on_next_io_turn`                                                                                                                                       |
 | `test_source_review_ui_integration.py` | End-to-end heatmap/spinner/coord via inline **and** `QueuedIOLoop` + `JupyterPanelUISession`; grid race, progress-dispatch race, confirm republish (`test_generate_heatmap_confirm_republish_calls_publish_twice`), overlay schedule (not `defer_dispatch`) |
-| `test_pipeline_qa.py`                  | `hold_and_push`, `sync_*`, `publish_*` helpers on real documents                                                                                                         |
-| `test_source_review.py`                | Pure logic (Center, load threading) — no browser comm                                                                                                                    |
+| `test_pipeline_qa.py`                  | `hold_and_push`, `sync_*`, `publish_*` helpers on real documents                                                                                                                                                                                            |
+| `test_source_review.py`                | Pure logic (Center, load threading) — no browser comm                                                                                                                                                                                                       |
 
 **Test coverage vs Jupyter (critical):**
 
@@ -851,13 +854,13 @@ grid pass and asserts values are not reset.
 
 **Triage:**
 
-| Symptom | Likely cause |
-| ------- | ------------ |
-| Log frozen | Panel comm path (tier 2), not logging |
-| Log works; spinner/status/heatmap frozen | Panel comm path (tier 2–3), not logging |
+| Symptom                                                                           | Likely cause                                                                                                        |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Log frozen                                                                        | Panel comm path (tier 2), not logging                                                                               |
+| Log works; spinner/status/heatmap frozen                                          | Panel comm path (tier 2–3), not logging                                                                             |
 | Log shows `Finished …`, finite range, `Overlay slice loaded`, heatmap still zeros | Nested Bokeh comm miss — **not** compute failure. Overlay (ipywidgets) and heatmap (Panel) are independent channels |
-| Above + no `[diag] Heatmap notebook publish (confirm)` | Stale kernel package or pre-fix confirm path |
-| Finite range in log but zeros heatmap, no overlay | Overwrite race (`_ensure_heatmap_grid`) or late progress `dispatch` before checking comm |
+| Above + no `[diag] Heatmap notebook publish (confirm)`                            | Stale kernel package or pre-fix confirm path                                                                        |
+| Finite range in log but zeros heatmap, no overlay                                 | Overwrite race (`_ensure_heatmap_grid`) or late progress `dispatch` before checking comm                            |
 
 #### Generate heatmap publish flow (do not regress)
 
@@ -867,7 +870,8 @@ grid pass and asserts values are not reset.
    `_schedule_ipython_main(lambda: self._log(...))` only — **not** `_dispatch`.
 2. Worker schedules `_finish_heatmap` on the io_loop via
    `_schedule_ipython_main` (not `_dispatch`).
-3. `_finish_heatmap` logs range/finish (ipywidgets), then calls `_apply_heatmap`.
+3. `_finish_heatmap` logs range/finish (ipywidgets), then calls
+   `_apply_heatmap`.
 4. `_apply_heatmap` mutates the live figure when `had_live_figure` (zeros grid
    or prior spectrum already mounted); otherwise `_publish_heatmap_figure`
    (object swap).
@@ -875,10 +879,11 @@ grid pass and asserts values are not reset.
    `_ui.schedule(_load_overlay_after_heatmap)` when overlay is on (must not
    block the heatmap publish or wrap `update_slice` in `defer_dispatch`).
 
-**In-memory cache:** `_load_heatmap` keys `(coordinate_string, method)`. Generate
-calls `_apply_coordinate_from_field`, which currently clears `_cache` — so each
-**Generate** on a new coordinate always recomputes (expected). Re-generating the
-same coordinate without changing the field can still hit the cache.
+**In-memory cache:** `_load_heatmap` keys `(coordinate_string, method)`.
+Generate calls `_apply_coordinate_from_field`, which currently clears `_cache` —
+so each **Generate** on a new coordinate always recomputes (expected).
+Re-generating the same coordinate without changing the field can still hit the
+cache.
 
 **Progress during compute:** `_heatmap_progress_callback` must **not** call
 `self._dispatch` — only `_schedule_ipython_main(lambda: self._log(...))`.
@@ -919,13 +924,13 @@ mount — mutate the existing Bokeh figure in place instead.
 Once the open-time zeros grid is mounted, **all** heatmap updates must use the
 **mutation** path unless the pane is genuinely unmounted.
 
-| Situation | Path | Speed |
-| --------- | ---- | ----- |
-| Zarr open — first zeros grid | `_publish_heatmap_figure` (object swap) | Slow once (unavoidable first mount) |
-| **Generate** finish | `_publish_heatmap_mutation_to_notebook` when `had_live_figure` | Fast |
-| **Center** reset to zeros (`_ensure_heatmap_grid(force=True)`) | Mutation when live figure mounted | Fast |
-| Method dropdown (title only) | `_push_heatmap_mutation_to_notebook` | Fast |
-| Browser missed first publish (comm miss) | `_republish_heatmap_figure_for_notebook` fallback | Slow — recovery only |
+| Situation                                                      | Path                                                           | Speed                               |
+| -------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------- |
+| Zarr open — first zeros grid                                   | `_publish_heatmap_figure` (object swap)                        | Slow once (unavoidable first mount) |
+| **Generate** finish                                            | `_publish_heatmap_mutation_to_notebook` when `had_live_figure` | Fast                                |
+| **Center** reset to zeros (`_ensure_heatmap_grid(force=True)`) | Mutation when live figure mounted                              | Fast                                |
+| Method dropdown (title only)                                   | `_push_heatmap_mutation_to_notebook`                           | Fast                                |
+| Browser missed first publish (comm miss)                       | `_republish_heatmap_figure_for_notebook` fallback              | Slow — recovery only                |
 
 **Enforcement (do not regress):**
 
@@ -1007,21 +1012,22 @@ its tests first, then the notebook call site.
   `widget.set_crosshair(field_coord)` (astrowidget `crosshair_ra` /
   `crosshair_dec` traits — requires editable `../astrowidget` with
   `set_crosshair`). **Never clear an existing overlay on Center** — schedule
-  overlay reprojection via `_schedule_overlay_slice_load(...,
-  center_on_target=True, center=field_coord)`; **do not** call `_update_sky`
-  synchronously inside the Center dispatch batch (blocks the io_loop on Zarr).
-  Users click a source in the overlay, hit Center, and expect to see the _same
-  source_ centered; clearing reads as data loss. **Heatmap reset on Center** uses
-  `should_reset_heatmap_on_center(plan)` (`plan.drop_heatmap_state`): only when a
-  **computed** heatmap exists (`_heatmap_coord` set), the field differs from that
-  target, and **no** radio overlay is loaded. Sky-click → Center **before** the
-  first Generate must **not** call `_reset_heatmap_to_zeros` (open-time zeros
-  grid only; `heatmap_coord is None`). With overlay loaded, Center never resets
-  the heatmap pane even when the field differs from the computed target. When
-  reset is needed, defer `_reset_heatmap_to_zeros` with
-  `defer_after_notebook_hold` (mutates the live heatmap in place when mounted —
-  do not force a full `_publish_heatmap_figure` object swap). Do not hide the
-  heatmap pane (`object = None`); it must stay clickable.
+  overlay reprojection via
+  `_schedule_overlay_slice_load(..., center_on_target=True, center=field_coord)`;
+  **do not** call `_update_sky` synchronously inside the Center dispatch batch
+  (blocks the io*loop on Zarr). Users click a source in the overlay, hit Center,
+  and expect to see the \_same source* centered; clearing reads as data loss.
+  **Heatmap reset on Center** uses `should_reset_heatmap_on_center(plan)`
+  (`plan.drop_heatmap_state`): only when a **computed** heatmap exists
+  (`_heatmap_coord` set), the field differs from that target, and **no** radio
+  overlay is loaded. Sky-click → Center **before** the first Generate must
+  **not** call `_reset_heatmap_to_zeros` (open-time zeros grid only;
+  `heatmap_coord is None`). With overlay loaded, Center never resets the heatmap
+  pane even when the field differs from the computed target. When reset is
+  needed, defer `_reset_heatmap_to_zeros` with `defer_after_notebook_hold`
+  (mutates the live heatmap in place when mounted — do not force a full
+  `_publish_heatmap_figure` object swap). Do not hide the heatmap pane
+  (`object = None`); it must stay clickable.
 - **Generate heatmap** — resolves the field, then `_load_heatmap()`; sets
   `_heatmap_coord` (the target the _computed_ spectrum belongs to, distinct from
   `_coord`, the current overlay center). **Method dropdown** only updates the
@@ -1029,8 +1035,8 @@ its tests first, then the notebook call site.
   until **Generate heatmap** is pressed.
 - **Fit overlay** — per-cell Gaussian patch fit at the selected heatmap
   `(time_idx, freq_idx)` via `compute_overlay_patch_fit()` /
-  `dataset.radport.patch_fit_cell()`. Full-cube `patch_fit` is **not** a
-  heatmap method.
+  `dataset.radport.patch_fit_cell()`. Full-cube `patch_fit` is **not** a heatmap
+  method.
 - **Sky click** — observe `SkyWidget.click_tick`; read `clicked_coord`, format
   with `format_icrs_degree_pair` (`ovro_lwa_portal.name_resolution`), fill the
   field via `_set_coordinate_field_from_text`. Schedule with `_dispatch(...)` →
@@ -1077,16 +1083,18 @@ its tests first, then the notebook call site.
   coordinate field uses **`publish_panel_widget_to_notebook`** via
   `defer_after_notebook_hold` (flush after the batch push, same io-loop turn).
 - **Bokeh heatmap figures** — two publish tiers (do not collapse):
-  - **First mount** (Zarr open zeros grid, or no live figure): `_publish_heatmap_figure`
-    → `publish_bokeh_pane_to_notebook` (full object assign + layout push).
+  - **First mount** (Zarr open zeros grid, or no live figure):
+    `_publish_heatmap_figure` → `publish_bokeh_pane_to_notebook` (full object
+    assign + layout push).
   - **Subsequent updates** when `_heatmap_bokeh_handles` is mounted and
     `pane.object` is the same figure: mutate title/image in place, then
-    `push_bokeh_pane_mutation_to_notebook` via `_publish_heatmap_mutation_to_notebook`
-    (validated for Generate finish and method-title refresh). **Center** heatmap
-    reset (`_reset_heatmap_to_zeros` → `_ensure_heatmap_grid(force=True)`) must
-    use the mutation path when a live figure exists — a full object swap on a
-    new target can take tens of seconds on large notebooks and reads as “second
-    Generate is slow” when the delay is really the Center reset publish.
+    `push_bokeh_pane_mutation_to_notebook` via
+    `_publish_heatmap_mutation_to_notebook` (validated for Generate finish and
+    method-title refresh). **Center** heatmap reset (`_reset_heatmap_to_zeros` →
+    `_ensure_heatmap_grid(force=True)`) must use the mutation path when a live
+    figure exists — a full object swap on a new target can take tens of seconds
+    on large notebooks and reads as “second Generate is slow” when the delay is
+    really the Center reset publish.
   - Generate finish uses mutation when `had_live_figure`; falls back to object
     swap only when the pane is not yet mounted.
 
@@ -1108,10 +1116,11 @@ celestial view.
 **Python-driven view** (`goto`, `update_slice(..., center=, fov=)`):
 
 1. Traits `view_ra` / `view_dec` / `view_fov` update in Python.
-2. **`set_crosshair(coord)`** (or `crosshair_ra` / `crosshair_dec` traits) moves the
-   celestial crosshair to a catalog position after **Center**; sky clicks still
-   set the crosshair in JS from the click pixel. Without `set_crosshair`, Center
-   moves the view but leaves the crosshair at the last sky-click position.
+2. **`set_crosshair(coord)`** (or `crosshair_ra` / `crosshair_dec` traits) moves
+   the celestial crosshair to a catalog position after **Center**; sky clicks
+   still set the crosshair in JS from the click pixel. Without `set_crosshair`,
+   Center moves the view but leaves the crosshair at the last sky-click
+   position.
 3. JS `onPythonViewChange` (only when `userInteracting` is false):
    `applyViewFromModel()` → `syncAladin()` → `scheduleDraw()` (deferred
    `requestAnimationFrame`, not synchronous `draw()`). `change:image_revision`
@@ -1120,7 +1129,7 @@ celestial view.
    `update_slice(..., center=)` cannot paint the new view center before
    `image_data`/`crval` sync — that mismatch projected zenith data onto the
    wrong sky (e.g. southern hemisphere).
-3. **Do not** call `syncViewFromAladin()` inside `updateViewPlaneScales()`
+4. **Do not** call `syncViewFromAladin()` inside `updateViewPlaneScales()`
    before `syncAladin()` runs. That reads the **stale** HiPS center and reverts
    the overlay before Python’s target is applied (breaks **Slew** and makes the
    field appear not to move).
@@ -1537,7 +1546,8 @@ only the nested Bokeh heatmap comm failed.
   `defer_dispatch(_ensure_heatmap_grid)`.
 - Ensure `_apply_heatmap` sets `_heatmap_grid_ready` and `_ensure_heatmap_grid`
   does not replace a loaded computed spectrum unless `force=True`.
-- Do **not** call `ensure_patch_metadata_cache()` from Zarr open (blocks io_loop).
+- Do **not** call `ensure_patch_metadata_cache()` from Zarr open (blocks
+  io_loop).
 - Confirm editable install + kernel restart (see **Kernel / package path**
   above).
 
@@ -1547,8 +1557,8 @@ the browser is zeros, it is comm-only (not accessor compute).
 
 ### Issue: Center is slow or crosshair wrong after Center
 
-**Symptoms:** **Center** blocks for a long time; crosshair stays at the pre-Center
-sky-click position after the view moves.
+**Symptoms:** **Center** blocks for a long time; crosshair stays at the
+pre-Center sky-click position after the view moves.
 
 **Causes:**
 
@@ -1558,9 +1568,10 @@ sky-click position after the view moves.
   not move it unless Python sets `crosshair_ra` / `crosshair_dec` via
   `set_crosshair`.
 
-**Solution:** Center uses `_schedule_overlay_slice_load(..., center_on_target=True)`
-and `widget.set_crosshair(field_coord)` + `_force_send_sky_widget_state` for
-`goto`. Requires astrowidget with `set_crosshair` (editable `../astrowidget` or
+**Solution:** Center uses
+`_schedule_overlay_slice_load(..., center_on_target=True)` and
+`widget.set_crosshair(field_coord)` + `_force_send_sky_widget_state` for `goto`.
+Requires astrowidget with `set_crosshair` (editable `../astrowidget` or
 `astrowidget-local` Pixi feature). Regression:
 `test_center_schedules_overlay_instead_of_blocking_update_sky`.
 
@@ -1570,18 +1581,19 @@ and `widget.set_crosshair(field_coord)` + `_force_send_sky_widget_state` for
 pan/zoom did not change.
 
 **Cause:** `change:image_revision` reset `measuredViewScales` on every
-view-locked slice swap, reprojecting the crosshair with remeasured Aladin scales.
+view-locked slice swap, reprojecting the crosshair with remeasured Aladin
+scales.
 
 **Solution:** In `../astrowidget/js/inline_widget.js`, skip
-`measuredViewScales = null` on `image_revision` when `overlay_view_lock` is true.
-Rebuild astrowidget JS and restart the kernel.
+`measuredViewScales = null` on `image_revision` when `overlay_view_lock` is
+true. Rebuild astrowidget JS and restart the kernel.
 
 ### Issue: Second Generate on a new target feels much slower than the first
 
-**Symptoms:** First **Generate heatmap** (`dynamic_spectrum`) updates the browser
-almost immediately after `Finished … in N s`; Center on a new coordinate then
-**Generate** again — long wait before the heatmap shows the new spectrum (even
-when the activity-log compute time is similar).
+**Symptoms:** First **Generate heatmap** (`dynamic_spectrum`) updates the
+browser almost immediately after `Finished … in N s`; Center on a new coordinate
+then **Generate** again — long wait before the heatmap shows the new spectrum
+(even when the activity-log compute time is similar).
 
 **Causes (often combined):**
 
@@ -1598,10 +1610,10 @@ when the activity-log compute time is similar).
    another overlay slice load at the default finite cell (Zarr read after the
    heatmap publish).
 
-**Triage:** Compare activity log `Finished … in N s` to when the browser
-heatmap changes. Similar `N` but slow browser → Panel publish tier (mutation vs
-object swap). Much larger `N` on the second target → compute/I/O (different
-pixels, cold chunks).
+**Triage:** Compare activity log `Finished … in N s` to when the browser heatmap
+changes. Similar `N` but slow browser → Panel publish tier (mutation vs object
+swap). Much larger `N` on the second target → compute/I/O (different pixels,
+cold chunks).
 
 **Solution:** Use mutation push for `_ensure_heatmap_grid(force=True)` when a
 live figure is mounted; keep Center overlay on `_schedule_overlay_slice_load`.
@@ -1620,7 +1632,8 @@ or no colormap. Activity log shows finite range and `Finished … in N s`.
   correct env.
 - **Confirm republish / mutation miss** — first publish assigned the figure in
   Python but the browser missed it; use mutation push when `had_live_figure`, or
-  `_republish_heatmap_figure_for_notebook` only when falling back to object swap.
+  `_republish_heatmap_figure_for_notebook` only when falling back to object
+  swap.
 - **Panel comm push missed or overwritten** — see **Generate heatmap publish
   flow** (late progress `dispatch`, wrong publish path, batch push before
   assign).
@@ -1634,10 +1647,11 @@ regressions for progress dispatch, confirm republish, and layout-only comm.
 
 ### Issue: Center blocks the UI (historical)
 
-**Symptoms:** Center appeared hung; spinner tracked Panel pushes bracketing Zarr.
+**Symptoms:** Center appeared hung; spinner tracked Panel pushes bracketing
+Zarr.
 
-**Cause:** Synchronous `_update_sky` inside Center dispatch (fixed — see **Center
-is slow or crosshair wrong** above).
+**Cause:** Synchronous `_update_sky` inside Center dispatch (fixed — see
+**Center is slow or crosshair wrong** above).
 
 ### Issue: Spinner runs long before/after overlay Zarr load (not during)
 
@@ -1744,15 +1758,15 @@ coordinate (`plan_center_action` returns `overlay_center=field_coord` whenever
 `has_overlay`), and resets the heatmap only when
 `should_reset_heatmap_on_center(plan)` is true (computed heatmap for a different
 field, no overlay) — not on sky-click Center before the first Generate. Note the
-Python `clear_image()` → JS `clearImageTexture()` pairing: without the GPU texture
-clear, a "cleared" overlay keeps rendering at its old position, which presented
-as "overlay shows the wrong position" after Center.
+Python `clear_image()` → JS `clearImageTexture()` pairing: without the GPU
+texture clear, a "cleared" overlay keeps rendering at its old position, which
+presented as "overlay shows the wrong position" after Center.
 
 ### Issue: Sky click → Center → Generate shows Finished but browser heatmap stays zeros
 
-**Symptoms:** Typing a catalog name and **Generate** works; sky-click → **Center**
-→ **Generate** logs `Finished …` with a finite range but the browser heatmap
-does not update (name-only path still works).
+**Symptoms:** Typing a catalog name and **Generate** works; sky-click →
+**Center** → **Generate** logs `Finished …` with a finite range but the browser
+heatmap does not update (name-only path still works).
 
 **Cause:** Center before the first Generate used `not field_matches_heatmap` to
 call `_reset_heatmap_to_zeros`, which republished the zeros grid via a full

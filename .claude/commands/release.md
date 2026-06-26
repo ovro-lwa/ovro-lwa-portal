@@ -9,6 +9,7 @@ to analyzing changes)
 ## Instructions
 
 1. Determine the version bump:
+
    - If `$ARGUMENTS` specifies `patch`, `minor`, or `major`, use that
    - If not specified, analyze commits since the last tag to determine:
      - `major`: breaking changes (commits with `!` or `BREAKING CHANGE`)
@@ -16,12 +17,14 @@ to analyzing changes)
      - `patch`: fixes, refactors, docs, chores only
 
 2. Get the current version:
+
    - Check `git tag --sort=-v:refname | head -1` for the latest tag
    - If no tags exist, start at `v0.1.0`
 
 3. Calculate the new version following semver.
 
 4. Verify readiness:
+
    - `git status` — must be on `main` with no uncommitted changes
    - `git pull origin main` — must be up to date
    - Warn and stop if not on `main` or if there are uncommitted changes
@@ -29,6 +32,7 @@ to analyzing changes)
 5. Read `CHANGELOG.md` and check that the `[Unreleased]` section has content.
 
 6. Update `CHANGELOG.md`:
+
    - Rename `[Unreleased]` to `[X.Y.Z] -- YYYY-MM-DD` (today's date)
    - Add a new empty `[Unreleased]` section above it
 
@@ -57,6 +61,7 @@ to analyzing changes)
    ```
 
 10. Build plugin zip assets:
+
     - For each directory in `plugins/`, create a zip archive
     - **Zip naming convention:**
       - Default: `plugin_name_MM_DD_YYYY.zip` (snake_case plugin name + date)
