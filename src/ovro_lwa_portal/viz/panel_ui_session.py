@@ -400,6 +400,7 @@ class ServedPanelUISession:
     def _views(self) -> tuple[pn.viewable.Viewable, ...]:
         return tuple(self._root_views())
 
+    def _schedule(self, callback: Callable[[], None]) -> None:
         if notebook_ui_hold_active() and threading.current_thread() is threading.main_thread():
             callback()
             return
