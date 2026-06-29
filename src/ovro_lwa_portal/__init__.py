@@ -13,17 +13,23 @@ except ImportError:
     __version__ = "0.0.0+unknown"
 
 from . import accessor  # Register xarray accessor on import
+from . import export_fits
 from . import fits_to_zarr_xradio
+from .export_fits import build_fits_hdulist, build_fits_hdu, write_fits_slice
 from .io import open_dataset, resolve_source, validate_local_zarr_store
 from .name_resolution import CoordinateResolution, resolve_coordinate_string
 
 __all__ = [
     "__version__",
     "accessor",
+    "build_fits_hdu",
+    "build_fits_hdulist",
     "CoordinateResolution",
+    "export_fits",
     "fits_to_zarr_xradio",
     "open_dataset",
     "resolve_coordinate_string",
     "resolve_source",
     "validate_local_zarr_store",
+    "write_fits_slice",
 ]

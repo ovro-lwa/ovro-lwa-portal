@@ -45,8 +45,10 @@ Notes
   (from FITS headers when ``group_metadata_source`` is ``"fits"``, or from basename
   ``_NNNMHz_`` when ``group_metadata_source`` is ``"filename"``), so Hz-level jitter does
   not create extra ``frequency`` planes for one subband. Multiple files in the same
-  (time, bin) without a duplicate resolver keep the first and skip the rest (with a warning).
-  With ``"fits"``, filename parsing is a fallback when header metadata is missing.
+  (time, frequency bin, Stokes) without a duplicate resolver keep the first and skip the
+  rest (with a warning). Separate Stokes I and V at the same time and subband are **not**
+  duplicates — both are kept for polarization stacking. With ``"fits"``, filename parsing
+  is a fallback when header metadata is missing.
 * LM grids must match across time steps after global and per-step mixed-resolution normalization;
   a mismatch raises a RuntimeError.
 * Within a single time step, mixed LM shapes are regridded onto the reference grid before combine.
@@ -75,6 +77,7 @@ import re
 import shutil
 import tempfile
 import time
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
@@ -1435,7 +1438,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 data = np.expand_dims(data, axis=0)
                 hdr["NAXIS"] = 4
                 hdr["CTYPE4"] = "STOKES"
-                hdr["CRVAL4"] = 1.0
+                hdr["CRVAL4"] = float(hdr.get("CRVAL4", 1.0))
                 hdr["CRPIX4"] = 1.0
                 hdr["CDELT4"] = 1.0
                 if "CUNIT4" not in hdr:
@@ -1457,7 +1460,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 hdr["CUNIT3"] = "Hz"
                 hdr["NAXIS4"] = 1
                 hdr["CTYPE4"] = "STOKES"
-                hdr["CRVAL4"] = 1.0
+                hdr["CRVAL4"] = float(hdr.get("CRVAL4", 1.0))
                 hdr["CRPIX4"] = 1.0
                 hdr["CDELT4"] = 1.0
                 if "CUNIT4" not in hdr:
@@ -1728,8 +1731,12 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
 
     # 2) Open FITS header and extract 2D celestial WCS matching the image plane
     with fits.open(str(fp), memmap=True) as hdul:
-        H = hdul[0].header
-    w2d = WCS(H).celestial  # 2D (RA/Dec) WCS
+        H = hdul[0].header.copy()
+    from astropy.wcs import FITSFixedWarning
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FITSFixedWarning)
+        w2d = WCS(H).celestial  # 2D (RA/Dec) WCS
 
     # 3) Compute RA/Dec at pixel centers (origin=0); FITS (NAXIS2, NAXIS1) = (m, l) sizes
     ny = int(xds.sizes["m"])
@@ -1750,6 +1757,7 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
 
     # 5) Persist the exact celestial WCS header so we can re-create WCSAxes later without FITS
     xds.attrs["fits_wcs_header"] = hdr_str
+    xds.attrs[_FITS_PRIMARY_HEADER_ATTR] = H.tostring(sep="\n")
 
     # 6) Hygiene + optional LM chunking
     xds.attrs.pop("history", None)  # keep attrs minimal
@@ -1760,16 +1768,18 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
         xds = xds.chunk({"l": chunk_lm, "m": chunk_lm})
 
     # ---- persist celestial WCS for combine/regrid (in-memory only) ----
-    # Zarr export uses wcs_header_str(time) only; strip_redundant_fits_wcs_header_attrs
-    # removes fits_wcs_header attrs before write (see AGENTS.md Per-Time WCS).
-    # 2) 0-D variable that always survives (NumPy ≥ 2.0: use np.bytes_)
+    # Zarr export uses fits_header_str(time, frequency, polarization) only;
+    # strip_redundant_fits_wcs_header_attrs removes fits_wcs_header attrs before write.
     xds = xds.assign(wcs_header_str=((), np.bytes_(hdr_str.encode("utf-8"))))
+    xds = _assign_pixel_faithful_fits_header_str(xds, post_regrid_wcs_hdr=hdr_str)
 
-    # 3) per-variable attrs (in-memory merges; not written to multi-time Zarr)
+    # per-variable attrs (in-memory merges; not written to multi-time Zarr)
     for dv in xds.data_vars:
+        if dv in {"wcs_header_str", "fits_header_str"}:
+            continue
         xds[dv].attrs["fits_wcs_header"] = hdr_str
 
-    # 4) also stash on coords for convenience (in-memory only)
+    # also stash on coords for convenience (in-memory only)
     xds["right_ascension"].attrs["fits_wcs_header"] = hdr_str
     xds["declination"].attrs["fits_wcs_header"] = hdr_str
 
@@ -1885,6 +1895,321 @@ def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:
             del header[key]
         except KeyError:
             pass
+
+
+_FITS_PRIMARY_HEADER_ATTR = "_fits_primary_header_str"
+
+
+def _promote_singleton_freq_stokes_cards(
+    hdr: fits.Header,
+    *,
+    freq_hz: float,
+    stokes: float,
+) -> None:
+    """Set OVRO 4D singleton FREQ and Stokes axis cards on ``hdr`` (in-place)."""
+    freq = float(freq_hz)
+    stokes_val = float(stokes)
+    hdr["NAXIS"] = 4
+    hdr["NAXIS3"] = 1
+    hdr["CTYPE3"] = "FREQ"
+    hdr["CRVAL3"] = freq
+    hdr["CRPIX3"] = 1.0
+    hdr["CDELT3"] = 1.0
+    hdr.setdefault("CUNIT3", "Hz")
+    hdr["NAXIS4"] = 1
+    hdr["CTYPE4"] = "STOKES"
+    hdr["CRVAL4"] = stokes_val
+    hdr["CRPIX4"] = 1.0
+    hdr["CDELT4"] = 1.0
+    hdr.setdefault("CUNIT4", "")
+    hdr["RESTFREQ"] = freq
+    hdr["RESTFRQ"] = (freq, "Rest frequency in Hz")
+
+
+def _freq_hz_for_fits_header_slice(
+    xds: xr.Dataset,
+    primary: fits.Header,
+) -> float:
+    """Resolve reference frequency (Hz) for a stored ``fits_header_str`` slice."""
+    if "frequency" in xds.coords and int(xds.sizes.get("frequency", 0)) >= 1:
+        return float(np.asarray(xds.frequency.values).ravel()[0])
+    hz = _frequency_hz_from_header(primary)
+    if hz is not None and hz > 0:
+        return float(hz)
+    return 6e7
+
+
+def _fits_stokes_from_polarization_coord(raw: object) -> float | None:
+    """Map Zarr ``polarization`` coord values to FITS Stokes codes when possible."""
+    if isinstance(raw, (str, np.str_)):
+        label = str(raw).strip().upper()
+        table = {"I": 1.0, "Q": 2.0, "U": 3.0, "V": 4.0, "RR": -1.0, "LL": -2.0}
+        if label in table:
+            return table[label]
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stokes_for_fits_header_slice(
+    xds: xr.Dataset,
+    primary: fits.Header,
+) -> float:
+    """Resolve FITS Stokes code for a stored ``fits_header_str`` slice."""
+    if "polarization" in xds.coords and int(xds.sizes.get("polarization", 0)) >= 1:
+        mapped = _fits_stokes_from_polarization_coord(
+            np.asarray(xds.polarization.values).ravel()[0]
+        )
+        if mapped is not None:
+            return mapped
+    return _stokes_value_from_header(primary)
+
+
+def _fits_header_bytes_for_slice(
+    hdr: fits.Header,
+    *,
+    post_regrid_wcs_hdr: str,
+    nl: int,
+    nm: int,
+    freq_hz: float | None = None,
+    stokes: float | None = None,
+) -> bytes:
+    """Build a pixel-faithful 4D singleton-axis primary-header string for one ``SKY`` slice.
+
+    The output describes stored pixels after ingest transforms: celestial cards come
+    from the post-regrid WCS; provenance and beam keywords are retained from the
+    post-``_fix_headers`` primary header; axes 3–4 are singleton FREQ and Stokes
+    (``NAXIS3=NAXIS4=1``) for xradio-compatible export.
+    """
+    out = hdr.copy()
+    preserved: dict[str, object] = {}
+    for key in (
+        "RESTFREQ",
+        "RESTFRQ",
+        "SPECSYS",
+        "TIMESYS",
+        "DATE-OBS",
+        "MJD-OBS",
+        "TELESCOP",
+        "OBSERVER",
+        "ORIGIN",
+        "BMAJ",
+        "BMIN",
+        "BPA",
+        "BUNIT",
+    ):
+        if key in hdr:
+            preserved[key] = hdr[key]
+    resolved_freq = float(freq_hz) if freq_hz is not None else _frequency_hz_from_header(hdr)
+    if resolved_freq is None or resolved_freq <= 0:
+        resolved_freq = 6e7
+    resolved_stokes = float(stokes) if stokes is not None else _stokes_value_from_header(hdr)
+    cel = WCS(fits.Header.fromstring(post_regrid_wcs_hdr, sep="\n")).celestial
+    for key, value in cel.to_header(relax=True).items():
+        out[key] = value
+    _strip_axis_cards_above(out, max_axis=2)
+    for key, value in preserved.items():
+        out[key] = value
+    out["NAXIS1"] = int(nl)
+    out["NAXIS2"] = int(nm)
+    _promote_singleton_freq_stokes_cards(
+        out, freq_hz=resolved_freq, stokes=resolved_stokes
+    )
+    out["BITPIX"] = -32
+    for key in ("BSCALE", "BZERO"):
+        if key in out:
+            del out[key]
+    return out.tostring(sep="\n").encode("utf-8")
+
+
+def _stokes_value_from_header(hdr: fits.Header) -> float:
+    """Return the FITS Stokes parameter encoded on a header's ``STOKES`` axis."""
+    naxis = int(hdr.get("NAXIS", 0))
+    for axis in range(1, naxis + 1):
+        if str(hdr.get(f"CTYPE{axis}", "")).strip().upper() == "STOKES":
+            return float(hdr.get(f"CRVAL{axis}", 1.0))
+    if "CRVAL4" in hdr:
+        return float(hdr["CRVAL4"])
+    return 1.0
+
+
+def _stokes_key_from_fits_path(fp: Path) -> int:
+    """Integer Stokes code for discovery duplicate bins (``1`` = I, ``4`` = V, …)."""
+    try:
+        hdr = _getheader_for_ingest(fp)
+        return int(round(_stokes_value_from_header(hdr)))
+    except Exception as exc:
+        logger.debug("Could not read Stokes from %s (%s); defaulting to I.", fp.name, exc)
+        return 1
+
+
+def _stokes_key_from_filename(fp: Path) -> int:
+    """Best-effort Stokes code from basename when discovery skips FITS I/O."""
+    stem = fp.stem.upper()
+    if stem.endswith("-V") or "-STOKES-V" in stem or "STOKESV" in stem:
+        return 4
+    if stem.endswith("-I") or "-STOKES-I" in stem or "STOKESI" in stem:
+        return 1
+    return 1
+
+
+def _stokes_key_for_discovery(
+    fp: Path,
+    *,
+    group_metadata_source: Literal["fits", "filename"],
+) -> int:
+    if group_metadata_source == "filename":
+        return _stokes_key_from_filename(fp)
+    return _stokes_key_from_fits_path(fp)
+
+
+def _stokes_sort_key_from_dataset(xds: xr.Dataset) -> float:
+    """Stokes value used to order polarization slices before ``xr.concat``."""
+    primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
+    if primary_str is not None:
+        hdr = fits.Header.fromstring(str(primary_str), sep="\n")
+        return _stokes_value_from_header(hdr)
+    if "fits_header_str" in xds.data_vars:
+        fh = xds["fits_header_str"]
+        sel = fh
+        if "frequency" in sel.dims:
+            sel = sel.isel(frequency=0)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=0)
+        hdr = fits.Header.fromstring(_decode_wcs_header_payload(sel.values), sep="\n")
+        return _stokes_value_from_header(hdr)
+    return 1.0
+
+
+def _stack_polarization_slices_per_frequency(xds_list: List[xr.Dataset]) -> List[xr.Dataset]:
+    """Merge datasets that share a frequency but differ in Stokes along ``polarization``."""
+    if len(xds_list) <= 1:
+        return xds_list
+
+    from collections import defaultdict
+
+    groups: dict[float, list[int]] = defaultdict(list)
+    for idx, xds in enumerate(xds_list):
+        if "frequency" not in xds.coords:
+            return xds_list
+        fvals = np.atleast_1d(np.asarray(xds["frequency"].values, dtype=np.float64))
+        if fvals.size == 0 or not np.isfinite(fvals[0]):
+            return xds_list
+        groups[float(fvals[0])].append(idx)
+
+    if all(len(indices) == 1 for indices in groups.values()):
+        return xds_list
+
+    merged: list[xr.Dataset] = []
+    for freq_hz in sorted(groups.keys()):
+        indices = groups[freq_hz]
+        if len(indices) == 1:
+            merged.append(xds_list[indices[0]])
+            continue
+        pol_slices = [xds_list[i] for i in indices]
+        pol_slices.sort(key=_stokes_sort_key_from_dataset)
+        expanded: list[xr.Dataset] = []
+        for xds in pol_slices:
+            stokes = _stokes_sort_key_from_dataset(xds)
+            if "polarization" in xds.dims:
+                xds = xds.assign_coords(polarization=[stokes])
+            else:
+                xds = xds.expand_dims(polarization=[stokes])
+            if (
+                "fits_header_str" in xds.data_vars
+                and "polarization" not in xds["fits_header_str"].dims
+            ):
+                xds = xds.assign(
+                    fits_header_str=xds["fits_header_str"].expand_dims(
+                        polarization=[stokes]
+                    )
+                )
+            expanded.append(xds)
+        merged.append(
+            xr.concat(
+                expanded,
+                dim="polarization",
+                data_vars="minimal",
+                compat="no_conflicts",
+            )
+        )
+    return merged
+
+
+def _assign_pixel_faithful_fits_header_str(
+    xds: xr.Dataset,
+    *,
+    post_regrid_wcs_hdr: str,
+) -> xr.Dataset:
+    """Attach scalar ``fits_header_str`` from the in-memory primary header + post-regrid WCS."""
+    primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
+    if primary_str is None:
+        msg = (
+            "Dataset is missing the in-memory primary FITS header required to build "
+            "fits_header_str during ingest."
+        )
+        raise RuntimeError(msg)
+    nl, nm = _lm_shape(xds)
+    primary = fits.Header.fromstring(str(primary_str), sep="\n")
+    payload = _fits_header_bytes_for_slice(
+        primary,
+        post_regrid_wcs_hdr=post_regrid_wcs_hdr,
+        nl=nl,
+        nm=nm,
+        freq_hz=_freq_hz_for_fits_header_slice(xds, primary),
+        stokes=_stokes_for_fits_header_slice(xds, primary),
+    )
+    return xds.assign(fits_header_str=((), np.bytes_(payload)))
+
+
+def _set_polarization_coord_from_fits_headers(xds: xr.Dataset) -> xr.Dataset:
+    """Set ``polarization`` coordinate values from FITS ``CRVAL`` Stokes codes."""
+    if "fits_header_str" not in xds.data_vars:
+        return xds
+    fh = xds["fits_header_str"]
+    n_pol = int(xds.sizes.get("polarization", 1))
+    stokes_vals: list[float] = []
+    for pol_idx in range(n_pol):
+        sel = fh
+        if "frequency" in sel.dims:
+            sel = sel.isel(frequency=0)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=pol_idx)
+        hdr = fits.Header.fromstring(_decode_wcs_header_payload(sel.values), sep="\n")
+        stokes_vals.append(_stokes_value_from_header(hdr))
+    if "polarization" in xds.dims:
+        return xds.assign_coords(polarization=("polarization", np.asarray(stokes_vals)))
+    return xds.assign_coords(polarization=np.asarray(stokes_vals, dtype=np.float64))
+
+
+def _expand_fits_header_str_to_data_dims(xds: xr.Dataset) -> xr.Dataset:
+    """Broadcast ``fits_header_str`` to ``(time, frequency, polarization)`` when needed."""
+    if "fits_header_str" not in xds.data_vars:
+        return xds
+    fh = xds["fits_header_str"]
+    target_dims: list[str] = []
+    for dim in ("time", "frequency", "polarization"):
+        if dim in xds.dims:
+            target_dims.append(dim)
+    missing = [dim for dim in target_dims if dim not in fh.dims]
+    if not missing:
+        return xds
+    expanded = fh
+    for dim in missing:
+        expanded = expanded.expand_dims({dim: xds.coords[dim]})
+    return xds.assign(fits_header_str=expanded)
+
+
+def _drop_ingest_only_metadata_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
+    """Remove in-memory-only metadata before persisting a Zarr store."""
+    out = xds
+    if "wcs_header_str" in out.data_vars:
+        out = out.drop_vars("wcs_header_str")
+    out = out.copy(deep=False)
+    out.attrs.pop(_FITS_PRIMARY_HEADER_ATTR, None)
+    return out
 
 
 def _make_target_wcs_scaled(seed_wcs: WCS, seed_n: int, target_size: int) -> WCS:
@@ -2196,23 +2521,13 @@ def _lm_index_coords_match(
 def _read_wcs_header_str(ds: xr.Dataset) -> Optional[str]:
     """Return the persisted 2D celestial WCS header string from *ds*, if any.
 
-    Looks first at ``ds.attrs['fits_wcs_header']`` (set by :func:`_load_for_combine`
-    and :func:`_resample_lm_reference_to_target_size`), then falls back to the 0-D
-    ``wcs_header_str`` data variable so the lookup also works after merges that may
-    strip non-essential attrs.
+  Delegates to :func:`ovro_lwa_portal.accessor._read_wcs_header_str` so ingest
+  resume/LM-reference paths understand ``fits_header_str`` on new Zarr stores as
+  well as legacy ``wcs_header_str``.
     """
-    s = ds.attrs.get("fits_wcs_header")
-    if s is None and "wcs_header_str" in ds:
-        raw_arr = np.asarray(ds["wcs_header_str"].values)
-        if raw_arr.size == 0:
-            return None
-        # After incremental Zarr appends, ``wcs_header_str`` is promoted to ``(time,)``
-        # (or ``(time, frequency)``); use any representative row for the LM grid WCS.
-        raw = np.ravel(raw_arr)[0]
-        s = raw.decode("utf-8") if isinstance(raw, (bytes, np.bytes_)) else str(raw)
-    if s is None:
-        return None
-    return str(s)
+    from ovro_lwa_portal.accessor import _read_wcs_header_str as _accessor_read_wcs
+
+    return _accessor_read_wcs(ds, time_idx=0, freq_idx=0)
 
 
 def _wcs_header_from_ref_grid_and_source_crval(
@@ -2294,25 +2609,25 @@ def _regrid_to_reference_lm(
         If interpolation fails (e.g. incompatible coordinates) or the per-time
         celestial WCS cannot be derived (missing ``fits_wcs_header``).
     """
-    if _lm_shape(xds) == _lm_shape(ref) and _lm_index_coords_match(ref, xds):
-        return xds
-
     if "l" not in xds.coords or "m" not in xds.coords:
         who = f"{source_label}: " if source_label else ""
         msg = f"{who}cannot regrid: dataset is missing ``l`` and/or ``m`` coordinates."
         raise RuntimeError(msg)
 
-    # Materialize for scipy-backed interp; reference coords may be lazy.
-    xds = xds.load()
-    target_l = ref["l"].load() if hasattr(ref["l"].data, "compute") else ref["l"]
-    target_m = ref["m"].load() if hasattr(ref["m"].data, "compute") else ref["m"]
+    if _lm_shape(xds) == _lm_shape(ref) and _lm_index_coords_match(ref, xds):
+        regridded = xds
+    else:
+        # Materialize for scipy-backed interp; reference coords may be lazy.
+        xds = xds.load()
+        target_l = ref["l"].load() if hasattr(ref["l"].data, "compute") else ref["l"]
+        target_m = ref["m"].load() if hasattr(ref["m"].data, "compute") else ref["m"]
 
-    try:
-        regridded = xds.interp(l=target_l, m=target_m, method="linear")
-    except Exception as exc:
-        who = f"{source_label}: " if source_label else ""
-        msg = f"{who}LM regridding onto reference grid failed: {exc}"
-        raise RuntimeError(msg) from exc
+        try:
+            regridded = xds.interp(l=target_l, m=target_m, method="linear")
+        except Exception as exc:
+            who = f"{source_label}: " if source_label else ""
+            msg = f"{who}LM regridding onto reference grid failed: {exc}"
+            raise RuntimeError(msg) from exc
 
     # Recompute sky coords on ref's pixel grid using the source's per-time CRVAL so
     # every subband at one time step shares identical RA/Dec regardless of which path
@@ -2341,15 +2656,20 @@ def _regrid_to_reference_lm(
 
     regridded.attrs.pop("history", None)
     regridded.attrs["fits_wcs_header"] = hdr_str
+    if _FITS_PRIMARY_HEADER_ATTR not in regridded.attrs:
+        regridded.attrs[_FITS_PRIMARY_HEADER_ATTR] = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
     regridded["right_ascension"].attrs["fits_wcs_header"] = hdr_str
     regridded["declination"].attrs["fits_wcs_header"] = hdr_str
     for dv in regridded.data_vars:
-        if dv == "wcs_header_str":
+        if dv in {"wcs_header_str", "fits_header_str"}:
             continue
         regridded[dv].attrs["fits_wcs_header"] = hdr_str
 
     regridded["wcs_header_str"] = xr.DataArray(
         np.bytes_(hdr_str.encode("utf-8")), dims=()
+    )
+    regridded = _assign_pixel_faithful_fits_header_str(
+        regridded, post_regrid_wcs_hdr=hdr_str
     )
 
     for v in regridded.data_vars:
@@ -2429,6 +2749,54 @@ def _collapse_wcs_header_str_variable(
     nf = int(xds.sizes.get("frequency", 1))
     ri = int(np.clip(ref_freq_idx, 0, max(0, nf - 1)))
     return xds.assign(wcs_header_str=wh.isel(frequency=ri, drop=True))
+
+
+def _assert_nonempty_fits_header_str_before_zarr_write(xds: xr.Dataset) -> None:
+    """Fail fast when a time step would be written without usable ``fits_header_str``."""
+    if "fits_header_str" not in xds.data_vars:
+        msg = (
+            "Dataset is missing fits_header_str before Zarr write; each "
+            "(time, frequency, polarization) slice must persist a FITS header."
+        )
+        raise RuntimeError(msg)
+
+    fh = xds["fits_header_str"]
+    if "time" in fh.dims:
+        for ti in range(int(fh.sizes["time"])):
+            sel = fh.isel(time=ti)
+            if "frequency" in sel.dims:
+                for fi in range(int(sel.sizes["frequency"])):
+                    freq_sel = sel.isel(frequency=fi)
+                    if "polarization" in freq_sel.dims:
+                        for pi in range(int(freq_sel.sizes["polarization"])):
+                            hdr = _decode_wcs_header_payload(
+                                freq_sel.isel(polarization=pi).values
+                            )
+                            if not hdr:
+                                msg = (
+                                    f"fits_header_str is empty for time={ti}, "
+                                    f"frequency={fi}, polarization={pi} before Zarr write."
+                                )
+                                raise RuntimeError(msg)
+                    else:
+                        hdr = _decode_wcs_header_payload(freq_sel.values)
+                        if not hdr:
+                            msg = (
+                                f"fits_header_str is empty for time={ti}, "
+                                f"frequency={fi} before Zarr write."
+                            )
+                            raise RuntimeError(msg)
+            else:
+                hdr = _decode_wcs_header_payload(sel.values)
+                if not hdr:
+                    msg = f"fits_header_str is empty for time index {ti} before Zarr write."
+                    raise RuntimeError(msg)
+        return
+
+    hdr = _decode_wcs_header_payload(fh.values)
+    if not hdr:
+        msg = "fits_header_str is empty before Zarr write."
+        raise RuntimeError(msg)
 
 
 def _assert_nonempty_wcs_header_str_before_zarr_write(xds: xr.Dataset) -> None:
@@ -3209,7 +3577,7 @@ def _discover_groups(
         raise ValueError(msg)
 
     by_time: Dict[str, List[Path]] = {}
-    by_time_freq: Dict[str, Dict[int, List[Path]]] = {}
+    by_time_freq_stokes: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
     for f in sorted(in_dir.glob("*.fits")):
         time_key, frequency_hz, notes = _extract_group_metadata_for_discovery(
             f,
@@ -3236,28 +3604,31 @@ def _discover_groups(
             continue
 
         freq_key = int(round(frequency_hz / freq_bin_hz))
-        time_freq_map = by_time_freq.setdefault(time_key, {})
-        candidates = time_freq_map.setdefault(freq_key, [])
+        stokes_key = _stokes_key_for_discovery(f, group_metadata_source=group_metadata_source)
+        time_freq_map = by_time_freq_stokes.setdefault(time_key, {})
+        bucket_key = (freq_key, stokes_key)
+        candidates = time_freq_map.setdefault(bucket_key, [])
         candidates.append(f)
 
         if len(candidates) > 1:
             duplicate_names = [p.name for p in candidates]
             if duplicate_resolver is None:
-                # Same time + same binned subband: stacking would be wrong; keep the first
-                # file and drop the rest (typical: symlink pairs or header jitter in Hz).
+                # Same time + same binned subband + same Stokes: stacking would be wrong;
+                # keep the first file and drop the rest (typical: symlink pairs or header jitter).
                 kept = candidates[0]
                 logger.warning(
-                    "Multiple FITS share time=%s and the same %g Hz frequency bin "
-                    "(binned key=%s, ~%.3f MHz): %s. Using only %s. "
+                    "Multiple FITS share time=%s, frequency bin %g Hz (key=%s, ~%.3f MHz), "
+                    "and Stokes %s: %s. Using only %s. "
                     "Remove extras or pass duplicate_resolver to select a file.",
                     time_key,
                     freq_bin_hz,
                     freq_key,
                     frequency_hz / 1e6,
+                    stokes_key,
                     duplicate_names,
                     kept.name,
                 )
-                time_freq_map[freq_key] = [kept]
+                time_freq_map[bucket_key] = [kept]
                 continue
 
             if group_metadata_source == "filename":
@@ -3285,11 +3656,13 @@ def _discover_groups(
             # starts from the chosen file only. Otherwise `candidates` never shrinks and
             # grows as [f1, f2, f3, ...], re-invoking the resolver with stale paths and
             # widening the filter that strips `by_time[time_key]`.
-            time_freq_map[freq_key] = [selected]
+            time_freq_map[bucket_key] = [selected]
             logger.warning(
-                "Duplicate FITS files for time=%s, frequency_hz=%.1f. Selected: %s. Candidates: %s",
+                "Duplicate FITS files for time=%s, frequency_hz=%.1f, Stokes=%s. "
+                "Selected: %s. Candidates: %s",
                 time_key,
                 resolver_hz,
+                stokes_key,
                 selected.name,
                 duplicate_names,
             )
@@ -3430,6 +3803,8 @@ def _combine_time_step(
                 )
             xds_list[i] = _regrid_to_reference_lm(xds, ref_ds, source_label=str(fixed_paths[i]))
 
+        xds_list = _stack_polarization_slices_per_frequency(xds_list)
+
         try:
             xds_t = xr.combine_by_coords(
                 xds_list,
@@ -3466,7 +3841,8 @@ def _combine_time_step(
             xds_t[v].encoding = {}
 
         xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
-        xds_t = _collapse_wcs_header_str_variable(xds_t)
+        xds_t = _expand_fits_header_str_to_data_dims(xds_t)
+        xds_t = _set_polarization_coord_from_fits_headers(xds_t)
 
         xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
 
@@ -3696,7 +4072,16 @@ def _align_time_dimension_for_zarr_write(
             if "frequency" in da.dims and "time" not in da.dims:
                 target_dims_by_name[name] = ("time", *tuple(da.dims))
             elif da.dims == ():
-                target_dims_by_name[name] = ("time",)
+                if name == "fits_header_str":
+                    freq_dims = ("frequency", "polarization")
+                    if all(d in ds.dims for d in freq_dims):
+                        target_dims_by_name[name] = ("time", *freq_dims)
+                    elif "frequency" in ds.dims:
+                        target_dims_by_name[name] = ("time", "frequency")
+                    else:
+                        target_dims_by_name[name] = ("time",)
+                else:
+                    target_dims_by_name[name] = ("time",)
 
     out = ds
     for name, target_dims in target_dims_by_name.items():
@@ -3710,7 +4095,7 @@ def _align_time_dimension_for_zarr_write(
             and "frequency" in out.coords
         ):
             da = da.expand_dims(frequency=out.coords["frequency"])
-        if target_dims == ("time",) and "frequency" in da.dims:
+        if target_dims == ("time",) and "frequency" in da.dims and name == "wcs_header_str":
             da = da.isel(frequency=0, drop=True)
         expanded = _expand_leading_time_dim(
             da, time_coord=time_coord, target_dims=target_dims
@@ -3724,7 +4109,7 @@ def _align_time_dimension_for_zarr_write(
 
 
 def _prepare_time_only_vars_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
-    """Rechunk time-only metadata (e.g. ``wcs_header_str``) for safe Zarr append.
+    """Rechunk metadata variables with a leading ``time`` axis for safe Zarr append.
 
     After many ``append_dim='time'`` writes, a store can carry
     ``encoding['chunks']=(n_time,)`` while each new slice only spans one index.
@@ -3733,13 +4118,19 @@ def _prepare_time_only_vars_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
     out = xds
     for name in list(out.data_vars):
         da = out[name]
-        if da.dims != ("time",):
+        if da.dims == ("time",):
+            prepared = da.load()
+            if hasattr(prepared.data, "rechunk"):
+                prepared = prepared.chunk({"time": 1})
+            prepared.encoding = {}
+            out = out.assign({name: prepared})
             continue
-        prepared = da.load()
-        if hasattr(prepared.data, "rechunk"):
-            prepared = prepared.chunk({"time": 1})
-        prepared.encoding = {}
-        out = out.assign({name: prepared})
+        if da.dims and da.dims[0] == "time" and len(da.dims) > 1:
+            prepared = da.load()
+            if hasattr(prepared.data, "rechunk"):
+                prepared = prepared.chunk({"time": 1})
+            prepared.encoding = {}
+            out = out.assign({name: prepared})
     return out
 
 
@@ -3760,14 +4151,23 @@ def _write_or_append_zarr(
     """
     from shutil import rmtree
 
-    xds_t = _collapse_wcs_header_str_variable(xds_t)
     if first_write or not out_zarr.exists():
         to_write = _align_time_dimension_for_zarr_write(xds_t)
     else:
         with xr.open_zarr(str(out_zarr), consolidated=False) as existing:
             to_write = _align_time_dimension_for_zarr_write(xds_t, schema=existing)
+            if "polarization" in existing.dims or "polarization" in to_write.dims:
+                existing_npol = int(existing.sizes.get("polarization", 1))
+                incoming_npol = int(to_write.sizes.get("polarization", 1))
+                if existing_npol != incoming_npol:
+                    msg = (
+                        f"Cannot append to {out_zarr}: polarization size mismatch "
+                        f"(store has {existing_npol}, new time step has {incoming_npol}). "
+                        "Re-ingest with a consistent I+V (or single-Stokes) layout."
+                    )
+                    raise RuntimeError(msg)
 
-    _assert_nonempty_wcs_header_str_before_zarr_write(to_write)
+    _assert_nonempty_fits_header_str_before_zarr_write(to_write)
     to_write = _rechunk_lm_for_zarr(to_write, chunk_lm)
     to_write = _ensure_append_friendly_time_chunks(to_write)
     to_write = _prepare_time_only_vars_for_zarr_write(to_write)
@@ -3779,6 +4179,7 @@ def _write_or_append_zarr(
     from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
 
     to_write = strip_redundant_fits_wcs_header_attrs(to_write)
+    to_write = _drop_ingest_only_metadata_for_zarr_write(to_write)
 
     if first_write or not out_zarr.exists():
         if out_zarr.exists():

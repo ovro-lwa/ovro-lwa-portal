@@ -193,26 +193,27 @@ class TestOpenDatasetIntegration:
         assert ds.attrs["instrument"] == "OVRO-LWA"
         assert "fits_wcs_header" in ds.attrs
 
-    def test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str(
+    def test_open_dataset_strips_stale_fits_wcs_header_with_fits_header_str(
         self, tmp_path: Path
     ) -> None:
         """Legacy Zarr rows must not keep time-0 ``fits_wcs_header`` on SKY in memory."""
-        import numpy as np
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
 
-        zarr_path = tmp_path / "per_time_wcs.zarr"
-        hdr = np.bytes_(b"SIMPLE  = T\nCRVAL1  = 61.0\n")
+        zarr_path = tmp_path / "per_time_fits_hdr.zarr"
+        hdr_str = _make_sin_wcs_header_str(nx=4, ny=4, crval1=61.0, crval2=45.0)
+        hdr = _encoded_fits_header_bytes(hdr_str, nl=4, nm=4)
         ds = xr.Dataset(
             {
                 "SKY": (
                     ["time", "frequency", "polarization", "l", "m"],
                     np.zeros((2, 1, 1, 4, 4), dtype=np.float32),
                 ),
-                "wcs_header_str": (("time",), np.array([hdr, hdr])),
+                "fits_header_str": (("time",), np.array([hdr, hdr], dtype=object)),
             },
             coords={
                 "time": [60000.0, 60001.0],
                 "frequency": [55e6],
-                "polarization": [0],
+                "polarization": [1.0],
                 "l": np.arange(4),
                 "m": np.arange(4),
             },
@@ -221,10 +222,14 @@ class TestOpenDatasetIntegration:
         ds["SKY"].attrs["fits_wcs_header"] = "stale-sky"
         ds.to_zarr(zarr_path, mode="w")
 
-        loaded = open_dataset(zarr_path, validate=False)
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            loaded = open_dataset(zarr_path, validate=False)
         assert "fits_wcs_header" not in loaded.attrs
         assert "fits_wcs_header" not in loaded["SKY"].attrs
-        assert "wcs_header_str" in loaded
+        assert "fits_header_str" in loaded
 
     def test_coordinates_preserved(self, sample_zarr_store: Path) -> None:
         """Test that coordinates are preserved."""

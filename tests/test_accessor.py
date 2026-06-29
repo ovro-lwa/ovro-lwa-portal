@@ -2376,33 +2376,34 @@ class TestRadportHasWcs:
 
 
 class TestRadportGetWcsTimePromotedHeader:
-    """``_get_wcs`` must read ``wcs_header_str`` when stored per time step."""
+    """``_get_wcs`` must read per-time headers from ``fits_header_str``."""
 
-    def test_get_wcs_uses_time_index_for_wcs_header_str(self) -> None:
-        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+    def test_get_wcs_uses_time_index_for_fits_header_str(self) -> None:
+        from astropy.io import fits as afits
+        from astropy.wcs import WCS
+
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
 
         from ovro_lwa_portal.accessor import _read_wcs_header_str
 
         hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
         hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=181.0, crval2=46.0)
-        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
+        enc0 = _encoded_fits_header_bytes(hdr0, nl=8, nm=8)
+        enc1 = _encoded_fits_header_bytes(hdr1, nl=8, nm=8)
         n_time = 2
-        wcs_per_time = np.array(
-            [np.bytes_(enc0), np.bytes_(enc1)],
-            dtype=f"S{max(len(enc0), len(enc1))}",
-        )
+        fits_per_time = np.array([enc0, enc1], dtype=object)
         ds = xr.Dataset(
             {
                 "SKY": (
                     ("time", "frequency", "polarization", "m", "l"),
                     np.zeros((n_time, 1, 1, 8, 8), dtype=np.float32),
                 ),
-                "wcs_header_str": (("time",), wcs_per_time),
+                "fits_header_str": (("time",), fits_per_time),
             },
             coords={
                 "time": ("time", np.arange(n_time, dtype=float)),
                 "frequency": ("frequency", np.array([55e6])),
-                "polarization": ("polarization", np.array([0])),
+                "polarization": ("polarization", np.array([1.0])),
                 "l": ("l", np.linspace(-0.1, 0.1, 8)),
                 "m": ("m", np.linspace(-0.1, 0.1, 8)),
             },
@@ -2412,64 +2413,67 @@ class TestRadportGetWcsTimePromotedHeader:
         w1 = ds.radport._get_wcs(time_idx=1)
         assert w0.wcs.crval[0] == pytest.approx(180.0)
         assert w1.wcs.crval[0] == pytest.approx(181.0)
-        assert _read_wcs_header_str(ds, time_idx=1) == hdr1
+        wcs1 = _read_wcs_header_str(ds, time_idx=1)
+        assert wcs1 is not None
+        assert WCS(afits.Header.fromstring(wcs1, sep="\n")).wcs.crval[0] == pytest.approx(181.0)
 
     def test_read_wcs_header_str_time_frequency_dim(self) -> None:
-        """Per-time WCS may be stored as (time, frequency) before frequency collapse."""
-        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+        """Per-time WCS may be stored as ``fits_header_str(time, frequency)``."""
+        from astropy.io import fits as afits
+        from astropy.wcs import WCS
+
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
 
         from ovro_lwa_portal.accessor import _read_wcs_header_str
 
         hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
         hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=190.0, crval2=50.0)
-        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
-        wcs_arr = np.array(
-            [[np.bytes_(enc0)], [np.bytes_(enc1)]],
-            dtype=f"S{max(len(enc0), len(enc1))}",
-        )
+        enc0 = _encoded_fits_header_bytes(hdr0, nl=8, nm=8)
+        enc1 = _encoded_fits_header_bytes(hdr1, nl=8, nm=8)
+        fits_arr = np.array([[enc0], [enc1]], dtype=object)
         ds = xr.Dataset(
             {
                 "SKY": (
                     ("time", "frequency", "polarization", "m", "l"),
                     np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
                 ),
-                "wcs_header_str": (("time", "frequency"), wcs_arr),
+                "fits_header_str": (("time", "frequency"), fits_arr),
             },
             coords={
                 "time": ("time", np.arange(2, dtype=float)),
                 "frequency": ("frequency", np.array([55e6])),
-                "polarization": ("polarization", np.array([0])),
+                "polarization": ("polarization", np.array([1.0])),
                 "l": ("l", np.linspace(-0.1, 0.1, 8)),
                 "m": ("m", np.linspace(-0.1, 0.1, 8)),
             },
         )
-        assert _read_wcs_header_str(ds, time_idx=1) == hdr1
+        wcs1 = _read_wcs_header_str(ds, time_idx=1)
+        assert wcs1 is not None
+        assert WCS(afits.Header.fromstring(wcs1, sep="\n")).wcs.crval[0] == pytest.approx(190.0)
         assert ds.radport._use_persisted_wcs_for_pixel_mapping() is True
 
     def test_get_wcs_prefers_per_time_header_over_static_attrs(self) -> None:
-        """Static ``fits_wcs_header`` must not mask per-time ``wcs_header_str``."""
-        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+        """Static ``fits_wcs_header`` must not mask per-time ``fits_header_str``."""
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
 
         hdr_static = _make_sin_wcs_header_str(nx=8, ny=8, crval1=10.0, crval2=20.0)
         hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
         hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=181.0, crval2=46.0)
-        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
-        wcs_per_time = np.array(
-            [np.bytes_(enc0), np.bytes_(enc1)],
-            dtype=f"S{max(len(enc0), len(enc1))}",
-        )
+        enc0 = _encoded_fits_header_bytes(hdr0, nl=8, nm=8)
+        enc1 = _encoded_fits_header_bytes(hdr1, nl=8, nm=8)
+        fits_per_time = np.array([enc0, enc1], dtype=object)
         ds = xr.Dataset(
             {
                 "SKY": (
                     ("time", "frequency", "polarization", "m", "l"),
                     np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
                 ),
-                "wcs_header_str": (("time",), wcs_per_time),
+                "fits_header_str": (("time",), fits_per_time),
             },
             coords={
                 "time": ("time", np.arange(2, dtype=float)),
                 "frequency": ("frequency", np.array([55e6])),
-                "polarization": ("polarization", np.array([0])),
+                "polarization": ("polarization", np.array([1.0])),
                 "l": ("l", np.linspace(-0.1, 0.1, 8)),
                 "m": ("m", np.linspace(-0.1, 0.1, 8)),
             },
@@ -2482,27 +2486,27 @@ class TestRadportGetWcsTimePromotedHeader:
     def test_read_wcs_header_str_empty_per_time_does_not_use_static_attrs(
         self,
     ) -> None:
-        """Late time steps with empty wcs_header_str must not fall back to time-0 attrs."""
-        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+        """Late time steps with empty fits_header_str must not fall back to time-0 attrs."""
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
 
         from ovro_lwa_portal.accessor import _read_wcs_header_str
 
         hdr_static = _make_sin_wcs_header_str(nx=8, ny=8, crval1=10.0, crval2=20.0)
         hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
-        enc0 = hdr0.encode("utf-8")
-        wcs_per_time = np.array([np.bytes_(enc0), np.bytes_(b"")], dtype=f"S{len(enc0)}")
+        enc0 = _encoded_fits_header_bytes(hdr0, nl=8, nm=8)
+        fits_per_time = np.array([enc0, np.bytes_(b"")], dtype=object)
         ds = xr.Dataset(
             {
                 "SKY": (
                     ("time", "frequency", "polarization", "m", "l"),
                     np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
                 ),
-                "wcs_header_str": (("time",), wcs_per_time),
+                "fits_header_str": (("time",), fits_per_time),
             },
             coords={
                 "time": ("time", np.arange(2, dtype=float)),
                 "frequency": ("frequency", np.array([55e6])),
-                "polarization": ("polarization", np.array([0])),
+                "polarization": ("polarization", np.array([1.0])),
                 "l": ("l", np.linspace(-0.1, 0.1, 8)),
                 "m": ("m", np.linspace(-0.1, 0.1, 8)),
             },
@@ -2510,36 +2514,60 @@ class TestRadportGetWcsTimePromotedHeader:
         )
         ds["SKY"].attrs["fits_wcs_header"] = hdr_static
 
-        assert _read_wcs_header_str(ds, time_idx=0) == hdr0
-        assert _read_wcs_header_str(ds, time_idx=1) is None
-        with pytest.raises(ValueError, match="No WCS header found"):
-            ds.radport._get_wcs(time_idx=1)
+        wcs0 = _read_wcs_header_str(ds, time_idx=0)
+        assert wcs0 is not None
+        from astropy.io import fits as afits
+        from astropy.wcs import WCS
 
-    def test_coords_to_pixel_uses_per_time_wcs_header_str(self) -> None:
-        """coords_to_pixel must follow wcs_header_str(time), not analytical SIN."""
+        assert WCS(afits.Header.fromstring(wcs0, sep="\n")).wcs.crval[0] == pytest.approx(180.0)
+        assert _read_wcs_header_str(ds, time_idx=1) is None
+
+    def test_read_wcs_header_str_lm_reference_attrs_only(self) -> None:
+        """Stokes V regrid reads WCS from LM ref coords + ``fits_wcs_header`` attr only."""
+        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _read_wcs_header_str
+
+        hdr_str = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        ref = xr.Dataset(
+            coords={
+                "l": ("l", np.linspace(-0.1, 0.1, 8)),
+                "m": ("m", np.linspace(-0.1, 0.1, 8)),
+            },
+            attrs={"fits_wcs_header": hdr_str},
+        )
+        wcs_hdr = _read_wcs_header_str(ref)
+        assert wcs_hdr is not None
+        from astropy.io import fits as afits
+        from astropy.wcs import WCS
+
+        assert WCS(afits.Header.fromstring(wcs_hdr, sep="\n")).wcs.crval[0] == pytest.approx(
+            180.0
+        )
+
+    def test_coords_to_pixel_uses_per_time_fits_header_str(self) -> None:
+        """coords_to_pixel must follow fits_header_str(time), not analytical SIN."""
         from astropy.io.fits import Header
         from astropy.wcs import WCS
-        from tests.test_fits_to_zarr import _make_sin_wcs_header_str
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
 
         hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
         hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=200.0, crval2=50.0)
-        enc0, enc1 = hdr0.encode("utf-8"), hdr1.encode("utf-8")
-        wcs_per_time = np.array(
-            [np.bytes_(enc0), np.bytes_(enc1)],
-            dtype=f"S{max(len(enc0), len(enc1))}",
-        )
+        enc0 = _encoded_fits_header_bytes(hdr0, nl=8, nm=8)
+        enc1 = _encoded_fits_header_bytes(hdr1, nl=8, nm=8)
+        fits_per_time = np.array([enc0, enc1], dtype=object)
         ds = xr.Dataset(
             {
                 "SKY": (
                     ("time", "frequency", "polarization", "m", "l"),
                     np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
                 ),
-                "wcs_header_str": (("time",), wcs_per_time),
+                "fits_header_str": (("time",), fits_per_time),
             },
             coords={
                 "time": ("time", [60000.0, 60000.01]),
                 "frequency": ("frequency", np.array([55e6])),
-                "polarization": ("polarization", np.array([0])),
+                "polarization": ("polarization", np.array([1.0])),
                 "l": ("l", np.linspace(-0.1, 0.1, 8)),
                 "m": ("m", np.linspace(-0.1, 0.1, 8)),
             },
