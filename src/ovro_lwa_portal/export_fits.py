@@ -1,11 +1,69 @@
 """Export OVRO-LWA Zarr ``SKY`` slices to standalone 4D singleton-axis FITS files.
 
-Each export call writes one ``PrimaryHDU`` with ``NAXIS=4``, ``NAXIS3=NAXIS4=1``
-(FREQ and Stokes singleton axes), using ``fits_header_str`` as the metadata source
-and live ``frequency`` / ``polarization`` coordinates for ``CRVAL3`` / ``CRVAL4``.
+Archival model
+--------------
 
-Legacy stores without ``fits_header_str`` raise :class:`ValueError` — re-ingest
-from original FITS is required.
+OVRO-LWA delivers **separate FITS files** per ``(time, frequency, Stokes)`` cell.
+Ingest combines them into one Zarr store; this module recovers any slice as a
+**pixel-faithful** standalone FITS file for external tools (pybdsf, CASA, DS9,
+``ovro-ingest convert``, xradio) without portal-specific knowledge.
+
+Zarr is the consolidated archive; export is the round-trip path back to per-slice
+FITS. Metadata comes from ``fits_header_str(time, frequency, polarization)``
+(the sole on-disk header array on new ingests). Portal WCS helpers derive a
+celestial subset in memory — export reads the **full** stored header.
+
+Export layout
+-------------
+
+Each call selects exactly one ``(time_idx, freq_idx, pol_idx)`` and writes one
+``PrimaryHDU`` with the OVRO/xradio 4D singleton-axis layout:
+
+- ``NAXIS=4``, ``NAXIS3=NAXIS4=1`` (singleton FREQ and Stokes axes)
+- Data shape ``(1, 1, n_m, n_l)`` — FITS axis order 4→3→2→1
+- ``CTYPE3='FREQ'``, ``CRVAL3`` from ``ds.frequency[freq_idx]``
+- ``CTYPE4='STOKES'``, ``CRVAL4`` from ``ds.polarization[pol_idx]`` (FITS Stokes
+  code, e.g. ``1`` = I, ``4`` = V)
+- Spatial WCS from stored ``fits_header_str`` (post-regrid, pixel-faithful)
+
+**Not supported:** multi-frequency, multi-Stokes, or time cubes in one FITS file
+(``NAXIS3>1`` or ``NAXIS4>1``). Combined I+V Zarr stores export **two** files
+(one per ``pol_idx``).
+
+Legacy stores
+-------------
+
+Stores with only ``wcs_header_str`` (no ``fits_header_str``) **hard-fail** on
+export with :class:`ValueError` and re-ingest guidance. Re-ingest from original
+FITS to populate ``fits_header_str``.
+
+Examples
+--------
+
+Single-slice export::
+
+    from ovro_lwa_portal import open_dataset, write_fits_slice
+
+    ds = open_dataset("/path/to/store.zarr")
+    write_fits_slice(ds, "image.fits", time_idx=0, freq_idx=0, pol_idx=0)
+
+Batch export via accessor::
+
+    paths = ds.radport.export_fits("/out/dir", time_indices=[0, 1], freq_indices=[0])
+
+Build an HDU for pybdsf or xradio::
+
+    from ovro_lwa_portal import build_fits_hdu
+
+    hdu = build_fits_hdu(ds, time_idx=0, freq_idx=0, pol_idx=0)
+    hdu.writeto("image.fits", overwrite=True)
+
+    import bdsf
+
+    bdsf.process_image("image.fits")  # expects NAXIS=4 singleton FREQ/Stokes
+
+``BEAM`` data variables are **not** exported — beam keywords remain in the FITS
+header when present in ``fits_header_str``.
 """
 
 from __future__ import annotations
@@ -155,7 +213,21 @@ def build_fits_hdu(
     pol_idx: int = 0,
     var: str = _EXPORT_VAR,
 ) -> PrimaryHDU:
-    """Build a ``PrimaryHDU`` for one exported ``SKY`` slice."""
+    """Build a ``PrimaryHDU`` for one exported ``SKY`` slice.
+
+    The returned HDU has ``NAXIS=4`` with singleton FREQ/Stokes axes
+    (``NAXIS3=NAXIS4=1``), ``data.shape == (1, 1, n_m, n_l)``, and a header
+    rebuilt from ``fits_header_str`` plus live ``frequency`` / ``polarization``
+    coordinates. Readable by Astropy, xradio, pybdsf, and ``ovro-ingest convert``.
+
+    Raises
+    ------
+    ValueError
+        If ``fits_header_str`` is missing (legacy store — re-ingest required) or
+        required coordinates/variables are absent.
+    IndexError
+        If any slice index is out of range.
+    """
     header = build_fits_header(
         ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=pol_idx, var=var
     )
