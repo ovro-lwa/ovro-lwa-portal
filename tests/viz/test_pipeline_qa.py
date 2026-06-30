@@ -14,6 +14,7 @@ import pytest
 
 pn = pytest.importorskip("panel")
 np = pytest.importorskip("numpy")
+xr = pytest.importorskip("xarray")
 widgets = pytest.importorskip("ipywidgets")
 
 from ovro_lwa_portal.viz import pipeline_qa as pq
@@ -178,6 +179,8 @@ def test_resolve_pipeline_qa_config_preserves_phase2_fields() -> None:
     assert cfg.qa_thermal_noise_glob == base.qa_thermal_noise_glob
     assert cfg.flux_check_csv_glob == base.flux_check_csv_glob
     assert cfg.flux_check_csv_per_run is base.flux_check_csv_per_run
+    assert cfg.combined_qa_zarr is base.combined_qa_zarr
+    assert cfg.qa_zarr_stem == base.qa_zarr_stem
     assert cfg.i_qa_zarr_stem == base.i_qa_zarr_stem
     assert cfg.v_qa_zarr_stem == base.v_qa_zarr_stem
     assert cfg.thermal_noise_grid_cols == base.thermal_noise_grid_cols
@@ -196,6 +199,22 @@ def test_qa_zarr_path_uses_config_zarr_root(tmp_path: Path) -> None:
     path = pq.qa_zarr_path("I", "2024-12-28", config=cfg)
     assert path.parent == tmp_path / "zarr"
     assert path.name == "pipelineQA-I-Deep-Taper-Robust-0.75-20241228.zarr"
+
+
+def test_qa_zarr_path_combined_uses_single_stem(tmp_path: Path) -> None:
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB_PHASE2,
+        v_fits_glob=pq.V_FITS_GLOB_PHASE2,
+        combined_qa_zarr=True,
+        qa_zarr_stem=pq.QA_ZARR_STEM_PHASE2_COMBINED,
+    )
+    i_path = pq.qa_zarr_path("I", "2024-12-28", config=cfg)
+    v_path = pq.qa_zarr_path("V", "2024-12-28", config=cfg)
+    assert i_path == v_path
+    assert i_path.name == f"{pq.QA_ZARR_STEM_PHASE2_COMBINED}-20241228.zarr"
 
 
 def test_scan_coverage_finds_wideband_runs(tmp_path: Path) -> None:
@@ -432,6 +451,168 @@ def test_convert_missing_zarr_skips_existing(
     assert paths["I"] == i_zarr
     assert paths["V"] == v_zarr
     assert any("Using existing Zarr" in line for line in calls)
+
+
+def test_convert_missing_combined_zarr_stages_i_and_v_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_root = tmp_path / "stage"
+    zarr_root = tmp_path / "zarr"
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=stage_root,
+        zarr_root=zarr_root,
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+        combined_qa_zarr=True,
+        qa_zarr_stem="pipelineQA-phase2-combined-test",
+    )
+    _write_qa_tree(tmp_path)
+    v_subband = (
+        tmp_path
+        / "08h"
+        / "2024-12-28"
+        / "Run_20241228_120000"
+        / "82MHz"
+        / "V"
+        / "deep"
+    )
+    v_subband.mkdir(parents=True)
+    v_name = "82MHz-V-Taper-Deep-image-20241228_120000.pbcorr.fits"
+    (v_subband / v_name).write_bytes(b"fits")
+
+    day_tag = "20241228"
+    staging = stage_root / f"{cfg.qa_zarr_stem}-{day_tag}-fits"
+    fixed = stage_root / f"{cfg.qa_zarr_stem}-{day_tag}-fixed"
+    staged_file_count: list[int] = []
+
+    def _fake_convert(*, input_dir: Path, out_dir: Path, zarr_name: str, **kwargs: object) -> Path:
+        staged_file_count.append(len(list(input_dir.iterdir())))
+        out = out_dir / zarr_name
+        out.mkdir(parents=True, exist_ok=True)
+        (out / ".zgroup").write_text("{}")
+        fixed_dir = kwargs.get("fixed_dir")
+        if isinstance(fixed_dir, Path):
+            fixed_dir.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _fake_stage_symlinks(fits_paths: list[Path], staging_dir: Path) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in fits_paths:
+            (staging_dir / src.name).write_bytes(b"fits-i")
+        return staging_dir
+
+    def _fake_stage_v(
+        v_paths: list[Path],
+        _i_paths: list[Path],
+        staging_dir: Path,
+    ) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in v_paths:
+            (staging_dir / src.name).write_bytes(b"fits-v")
+        return staging_dir
+
+    monkeypatch.setattr(pq, "infer_target_size_from_82mhz", lambda *_args, **_kwargs: 64)
+    monkeypatch.setattr(pq, "convert_fits_dir_to_zarr", _fake_convert)
+    monkeypatch.setattr(pq, "stage_symlinks", _fake_stage_symlinks)
+    monkeypatch.setattr(pq, "stage_v_fits_with_beam_from_i", _fake_stage_v)
+
+    calls: list[str] = []
+    coverage = pq.scan_coverage(config=cfg)
+    paths = pq.convert_missing_zarr("2024-12-28", coverage, calls.append, config=cfg)
+
+    assert paths["I"] == paths["V"]
+    assert staged_file_count == [2]
+    assert not staging.exists()
+    assert not fixed.exists()
+    assert any("combined QA Zarr" in line for line in calls)
+
+
+def test_convert_missing_combined_zarr_skips_existing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+        combined_qa_zarr=True,
+        qa_zarr_stem="pipelineQA-phase2-combined-test",
+    )
+    zarr_path = pq.qa_zarr_path("I", "2024-12-28", config=cfg)
+    zarr_path.mkdir(parents=True)
+    (zarr_path / ".zgroup").write_text("{}")
+
+    monkeypatch.setattr(
+        pq,
+        "zarr_status",
+        lambda *_args, **_kwargs: {"I": True, "V": True},
+    )
+
+    def _fail_convert(*_args, **_kwargs):
+        raise AssertionError("convert_fits_dir_to_zarr should not be called")
+
+    monkeypatch.setattr(pq, "convert_fits_dir_to_zarr", _fail_convert)
+    calls: list[str] = []
+    paths = pq.convert_missing_zarr("2024-12-28", _sample_coverage(), calls.append, config=cfg)
+    assert paths["I"] == zarr_path
+    assert paths["V"] == zarr_path
+    assert any("combined Zarr" in line for line in calls)
+
+
+def test_load_qa_datasets_combined_splits_by_pol_idx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=tmp_path / "stage",
+        zarr_root=tmp_path / "zarr",
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+        combined_qa_zarr=True,
+        qa_zarr_stem="pipelineQA-phase2-combined-test",
+    )
+    zarr_path = pq.qa_zarr_path("I", "2024-12-28", config=cfg)
+    zarr_path.mkdir(parents=True)
+    (zarr_path / ".zgroup").write_text("{}")
+
+    monkeypatch.setattr(
+        pq,
+        "zarr_status",
+        lambda *_args, **_kwargs: {"I": True, "V": True},
+    )
+
+    base = xr.Dataset(
+        coords={
+            "time": [0],
+            "frequency": [18e6],
+            "polarization": [1, 4],
+            "l": [0],
+            "m": [0],
+        },
+        data_vars={"SKY": (("time", "frequency", "polarization", "l", "m"), np.zeros((1, 1, 2, 1, 1)))},
+    )
+
+    def _fake_open_dataset(path: Path, *, chunks: object) -> xr.Dataset:
+        assert path == zarr_path
+        return base
+
+    monkeypatch.setattr(pq.ovro_lwa_portal, "open_dataset", _fake_open_dataset)
+
+    calls: list[str] = []
+    datasets = pq.load_qa_datasets("2024-12-28", calls.append, config=cfg)
+    assert set(datasets) == {"I", "V"}
+    for pol_label, stokes in (("I", 1), ("V", 4)):
+        view = datasets[pol_label]
+        assert view.sizes["polarization"] == 1
+        assert int(view.coords["polarization"].values[0]) == stokes
+        _ = view.radport  # noqa: SLF001 — length-1 pol dim must satisfy accessor validation
+    assert any("pol_idx=0" in line for line in calls)
+    assert any("pol_idx=1" in line for line in calls)
 
 
 def test_pipeline_qa_app_panel_builds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2353,6 +2534,8 @@ def test_scan_coverage_phase2_science_runs(tmp_path: Path) -> None:
         qa_thermal_noise_glob=cfg.qa_thermal_noise_glob,
         flux_check_csv_glob=cfg.flux_check_csv_glob,
         flux_check_csv_per_run=cfg.flux_check_csv_per_run,
+        combined_qa_zarr=cfg.combined_qa_zarr,
+        qa_zarr_stem=cfg.qa_zarr_stem,
         i_qa_zarr_stem=cfg.i_qa_zarr_stem,
         v_qa_zarr_stem=cfg.v_qa_zarr_stem,
         thermal_noise_grid_cols=cfg.thermal_noise_grid_cols,

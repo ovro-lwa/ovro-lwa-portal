@@ -39,14 +39,17 @@ V_FITS_GLOB = "*V-Taper-Deep-image*.pbcorr.fits"
 I_FITS_GLOB_PHASE2 = "*I-NoTaper-*-Robust-0-*-image.pbcorr_dewarped.fits"
 V_FITS_GLOB_PHASE2 = "*V-Taper-*-Robust-0-*-image.pbcorr_dewarped.fits"
 REF_SUBBAND = "82MHz"
-I_QA_ZARR_STEM = "pipelineQA-I-Deep-Taper-Robust-0.75"
-V_QA_ZARR_STEM = "pipelineQA-V-Taper-Deep"
-I_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-I-NoTaper-Robust-0"
+I_QA_ZARR_STEM = "pipelineQA-I-Taper-Robust-0"
+V_QA_ZARR_STEM = "pipelineQA-V-Taper-Robust-0"
+I_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-I-Taper-Robust-0"
 V_QA_ZARR_STEM_PHASE2 = "pipelineQA-phase2-V-Taper-Robust-0"
+QA_ZARR_STEM_PHASE2_COMBINED = "pipelineQA-phase2-Taper-Robust-0"
 DEWARP_FREQ_COLUMN = "freq_mhz"
 DEWARP_SHIFT_COLUMN = "median_shift_arcmin"
 
 FITS_KEY_PATTERN = re.compile(r"^(?P<subband>\d+MHz)-.*?(?P<stamp>\d{8}_\d{6})")
+
+_STOKES_FITS_VALUE: dict[str, int] = {"I": 1, "V": 4}
 
 LogFn = Callable[[str], None]
 
@@ -69,6 +72,8 @@ class PipelineQAConfig:
     ref_subband: str = REF_SUBBAND
     i_qa_zarr_stem: str = I_QA_ZARR_STEM
     v_qa_zarr_stem: str = V_QA_ZARR_STEM
+    combined_qa_zarr: bool = False
+    qa_zarr_stem: str = QA_ZARR_STEM_PHASE2_COMBINED
     thermal_noise_grid_cols: int = 4
     thermal_noise_plot_name: str = "thermal_noise_vs_subband"
     qa_run_label: str = "Wideband"
@@ -103,6 +108,8 @@ class PipelineQAConfig:
             qa_thermal_noise_glob="QA/*_thermal_noise_vs_freq.png",
             flux_check_csv_glob="QA/*_flux_check_hybrid.csv",
             flux_check_csv_per_run=True,
+            combined_qa_zarr=True,
+            qa_zarr_stem=QA_ZARR_STEM_PHASE2_COMBINED,
             i_qa_zarr_stem=I_QA_ZARR_STEM_PHASE2,
             v_qa_zarr_stem=V_QA_ZARR_STEM_PHASE2,
             thermal_noise_grid_cols=4,
@@ -330,8 +337,16 @@ def qa_zarr_path(
     """Output Zarr path for pipeline QA products on one observation day."""
     cfg = config or PipelineQAConfig.default()
     day_tag = select_day.replace("-", "")
+    if cfg.combined_qa_zarr:
+        return cfg.zarr_root / f"{cfg.qa_zarr_stem}-{day_tag}.zarr"
     stem = cfg.i_qa_zarr_stem if pol == "I" else cfg.v_qa_zarr_stem
     return cfg.zarr_root / f"{stem}-{day_tag}.zarr"
+
+
+def _polarization_stokes_in_zarr(zarr_path: Path) -> set[int]:
+    """Return FITS Stokes values present in a QA Zarr ``polarization`` coordinate."""
+    pol = xr.open_dataset(zarr_path, engine="zarr", chunks={}).coords["polarization"].values
+    return {int(value) for value in np.asarray(pol).ravel()}
 
 
 def zarr_status(
@@ -340,6 +355,16 @@ def zarr_status(
     config: PipelineQAConfig | None = None,
 ) -> dict[str, bool]:
     """Return whether Stokes I/V QA Zarr stores exist for one day."""
+    cfg = config or PipelineQAConfig.default()
+    if cfg.combined_qa_zarr:
+        path = qa_zarr_path("I", select_day, config=cfg)
+        if not _zarr_store_exists(path):
+            return {"I": False, "V": False}
+        pols = _polarization_stokes_in_zarr(path)
+        return {
+            "I": _STOKES_FITS_VALUE["I"] in pols,
+            "V": _STOKES_FITS_VALUE["V"] in pols,
+        }
     return {
         "I": _zarr_store_exists(qa_zarr_path("I", select_day, config=config)),
         "V": _zarr_store_exists(qa_zarr_path("V", select_day, config=config)),
@@ -686,6 +711,8 @@ def convert_missing_zarr(
         raise RuntimeError(msg)
 
     cfg = config or PipelineQAConfig.default()
+    if cfg.combined_qa_zarr:
+        return _convert_missing_combined_zarr(select_day, coverage, log, config=cfg)
 
     zarr_paths: dict[str, Path] = {
         "I": qa_zarr_path("I", select_day, config=cfg),
@@ -777,6 +804,58 @@ def convert_missing_zarr(
     return zarr_paths
 
 
+def _convert_missing_combined_zarr(
+    select_day: str,
+    coverage: pd.DataFrame,
+    log: LogFn,
+    *,
+    config: PipelineQAConfig,
+) -> dict[str, Path]:
+    """Convert Stokes I and V FITS into one combined QA Zarr store."""
+    cfg = config
+    zarr_path = qa_zarr_path("I", select_day, config=cfg)
+    status = zarr_status(select_day, config=cfg)
+    if status["I"] and status["V"]:
+        log(f"Using existing combined Zarr for {select_day}: {zarr_path}")
+        return {"I": zarr_path, "V": zarr_path}
+
+    target_size = infer_target_size_from_82mhz(select_day, coverage, config=cfg)
+    log(f"LM reference target size from {cfg.ref_subband}: {target_size} px")
+    i_paths = collect_pol_fits(select_day, "I", coverage, config=cfg)
+    v_paths = collect_pol_fits(select_day, "V", coverage, config=cfg)
+    log(f"Stokes I: {len(i_paths)} FITS files")
+    log(f"Stokes V: {len(v_paths)} FITS files")
+    if not i_paths:
+        msg = f"No Stokes I FITS found for {select_day}"
+        raise FileNotFoundError(msg)
+    if not v_paths:
+        msg = f"No Stokes V FITS found for {select_day}"
+        raise FileNotFoundError(msg)
+
+    day_tag = select_day.replace("-", "")
+    staging = cfg.symlink_root / f"{cfg.qa_zarr_stem}-{day_tag}-fits"
+    fixed = cfg.symlink_root / f"{cfg.qa_zarr_stem}-{day_tag}-fixed"
+    stage_symlinks(i_paths, staging)
+    stage_v_fits_with_beam_from_i(v_paths, i_paths, staging)
+    log(f"Staged {len(i_paths)} I + {len(v_paths)} V files -> {staging}")
+    log(f"Converting Stokes I+V -> {zarr_path.name} …")
+    progress = _convert_progress_callback(log)
+    zarr_path = convert_fits_dir_to_zarr(
+        input_dir=staging,
+        out_dir=cfg.zarr_root,
+        zarr_name=zarr_path.name,
+        fixed_dir=fixed,
+        chunk_lm=1024,
+        rebuild=True,
+        lm_reference_target_size=target_size,
+        progress_callback=progress,
+    )
+    log(f"Wrote combined QA Zarr: {zarr_path}")
+    _remove_staging_dir(staging, log)
+    _remove_staging_dir(fixed, log)
+    return {"I": zarr_path, "V": zarr_path}
+
+
 def load_qa_datasets(
     select_day: str,
     log: LogFn,
@@ -785,7 +864,17 @@ def load_qa_datasets(
     config: PipelineQAConfig | None = None,
 ) -> dict[str, xr.Dataset]:
     """Load available Stokes I/V datasets for one day."""
-    status = zarr_status(select_day, config=config)
+    cfg = config or PipelineQAConfig.default()
+    status = zarr_status(select_day, config=cfg)
+    if cfg.combined_qa_zarr:
+        return _load_combined_qa_datasets(
+            select_day,
+            status,
+            log,
+            flush=flush,
+            config=cfg,
+        )
+
     datasets: dict[str, xr.Dataset] = {}
     for pol, available in status.items():
         if not available:
@@ -803,6 +892,55 @@ def load_qa_datasets(
             f"(time={ds.sizes.get('time', '?')}, freq={ds.sizes.get('frequency', '?')}, "
             f"l={ds.sizes.get('l', '?')}, m={ds.sizes.get('m', '?')})"
         )
+        if flush is not None:
+            flush()
+    return datasets
+
+
+def _load_combined_qa_datasets(
+    select_day: str,
+    status: dict[str, bool],
+    log: LogFn,
+    *,
+    flush: Callable[[], None] | None = None,
+    config: PipelineQAConfig,
+) -> dict[str, xr.Dataset]:
+    """Open one combined QA Zarr and return per-Stokes ``isel(polarization=…)`` views."""
+    if not (status["I"] or status["V"]):
+        return {}
+
+    zarr_path = qa_zarr_path("I", select_day, config=config)
+    log(f"Opening combined QA Zarr at {zarr_path}…")
+    if flush is not None:
+        flush()
+    started = time.perf_counter()
+    ds = ovro_lwa_portal.open_dataset(zarr_path, chunks={"l": 512, "m": 512})
+    elapsed = time.perf_counter() - started
+    pol_values = np.asarray(ds.coords["polarization"].values).ravel()
+    log(
+        f"Opened combined QA Zarr in {elapsed:.1f}s "
+        f"(time={ds.sizes.get('time', '?')}, freq={ds.sizes.get('frequency', '?')}, "
+        f"pol={list(pol_values)}, l={ds.sizes.get('l', '?')}, m={ds.sizes.get('m', '?')})"
+    )
+    if flush is not None:
+        flush()
+
+    datasets: dict[str, xr.Dataset] = {}
+    for pol_label, available in status.items():
+        if not available:
+            continue
+        stokes_val = _STOKES_FITS_VALUE[pol_label]
+        matches = np.flatnonzero(pol_values == stokes_val)
+        if matches.size == 0:
+            msg = (
+                f"Combined QA Zarr {zarr_path} is missing polarization={stokes_val} "
+                f"(Stokes {pol_label}); found {list(pol_values)}."
+            )
+            raise ValueError(msg)
+        pol_idx = int(matches[0])
+        # List index keeps ``polarization`` as a length-1 dim (required by ``.radport``).
+        datasets[pol_label] = ds.isel(polarization=[pol_idx])
+        log(f"  Stokes {pol_label}: pol_idx={pol_idx} (FITS Stokes {stokes_val})")
         if flush is not None:
             flush()
     return datasets
