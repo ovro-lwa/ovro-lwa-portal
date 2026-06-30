@@ -198,7 +198,7 @@ def test_qa_zarr_path_uses_config_zarr_root(tmp_path: Path) -> None:
     )
     path = pq.qa_zarr_path("I", "2024-12-28", config=cfg)
     assert path.parent == tmp_path / "zarr"
-    assert path.name == "pipelineQA-I-Deep-Taper-Robust-0.75-20241228.zarr"
+    assert path.name == "pipelineQA-I-Taper-Robust-0-20241228.zarr"
 
 
 def test_qa_zarr_path_combined_uses_single_stem(tmp_path: Path) -> None:
@@ -561,6 +561,72 @@ def test_convert_missing_combined_zarr_skips_existing(
     assert paths["I"] == zarr_path
     assert paths["V"] == zarr_path
     assert any("combined Zarr" in line for line in calls)
+
+
+def test_convert_missing_combined_zarr_removes_staging_on_convert_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage_root = tmp_path / "stage"
+    zarr_root = tmp_path / "zarr"
+    cfg = pq.PipelineQAConfig(
+        pipeline_root=tmp_path,
+        symlink_root=stage_root,
+        zarr_root=zarr_root,
+        i_fits_glob=pq.I_FITS_GLOB,
+        v_fits_glob=pq.V_FITS_GLOB,
+        combined_qa_zarr=True,
+        qa_zarr_stem="pipelineQA-phase2-combined-test",
+    )
+    _write_qa_tree(tmp_path)
+    v_subband = (
+        tmp_path
+        / "08h"
+        / "2024-12-28"
+        / "Run_20241228_120000"
+        / "82MHz"
+        / "V"
+        / "deep"
+    )
+    v_subband.mkdir(parents=True)
+    (v_subband / "82MHz-V-Taper-Deep-image-20241228_120000.pbcorr.fits").write_bytes(b"fits")
+
+    day_tag = "20241228"
+    staging = stage_root / f"{cfg.qa_zarr_stem}-{day_tag}-fits"
+    fixed = stage_root / f"{cfg.qa_zarr_stem}-{day_tag}-fixed"
+
+    def _fail_convert(*_args, **_kwargs):
+        raise RuntimeError("simulated convert failure")
+
+    def _fake_stage_symlinks(fits_paths: list[Path], staging_dir: Path) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in fits_paths:
+            (staging_dir / src.name).write_bytes(b"fits-i")
+        return staging_dir
+
+    def _fake_stage_v(
+        v_paths: list[Path],
+        _i_paths: list[Path],
+        staging_dir: Path,
+    ) -> Path:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        for src in v_paths:
+            (staging_dir / src.name).write_bytes(b"fits-v")
+        return staging_dir
+
+    monkeypatch.setattr(pq, "stage_symlinks", _fake_stage_symlinks)
+    monkeypatch.setattr(pq, "stage_v_fits_with_beam_from_i", _fake_stage_v)
+    monkeypatch.setattr(pq, "infer_target_size_from_82mhz", lambda *_args, **_kwargs: 64)
+    monkeypatch.setattr(pq, "convert_fits_dir_to_zarr", _fail_convert)
+
+    calls: list[str] = []
+    coverage = pq.scan_coverage(config=cfg)
+    with pytest.raises(RuntimeError, match="simulated convert failure"):
+        pq.convert_missing_zarr("2024-12-28", coverage, calls.append, config=cfg)
+
+    assert not staging.exists()
+    assert not fixed.exists()
+    assert any("Removed staging directory" in line for line in calls)
 
 
 def test_load_qa_datasets_combined_splits_by_pol_idx(

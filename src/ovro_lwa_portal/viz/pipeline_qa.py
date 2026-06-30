@@ -748,24 +748,26 @@ def convert_missing_zarr(
 
         staging_i = cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fits"
         fixed_i = cfg.symlink_root / f"{cfg.i_qa_zarr_stem}-{day_tag}-fixed"
-        stage_symlinks(i_paths, staging_i)
-        log(f"Staged {len(i_paths)} Stokes I files -> {staging_i}")
-        log(f"Converting Stokes I -> {zarr_paths['I'].name} …")
-        progress = _convert_progress_callback(log)
+        try:
+            stage_symlinks(i_paths, staging_i)
+            log(f"Staged {len(i_paths)} Stokes I files -> {staging_i}")
+            log(f"Converting Stokes I -> {zarr_paths['I'].name} …")
+            progress = _convert_progress_callback(log)
 
-        zarr_paths["I"] = convert_fits_dir_to_zarr(
-            input_dir=staging_i,
-            out_dir=cfg.zarr_root,
-            zarr_name=zarr_paths["I"].name,
-            fixed_dir=fixed_i,
-            chunk_lm=1024,
-            rebuild=True,
-            lm_reference_target_size=target_size,
-            progress_callback=progress,
-        )
-        log(f"Wrote {zarr_paths['I']}")
-        _remove_staging_dir(staging_i, log)
-        _remove_staging_dir(fixed_i, log)
+            zarr_paths["I"] = convert_fits_dir_to_zarr(
+                input_dir=staging_i,
+                out_dir=cfg.zarr_root,
+                zarr_name=zarr_paths["I"].name,
+                fixed_dir=fixed_i,
+                chunk_lm=1024,
+                rebuild=True,
+                lm_reference_target_size=target_size,
+                progress_callback=progress,
+            )
+            log(f"Wrote {zarr_paths['I']}")
+        finally:
+            _remove_staging_dir(staging_i, log)
+            _remove_staging_dir(fixed_i, log)
     else:
         log(f"Using existing Stokes I Zarr: {zarr_paths['I']}")
 
@@ -780,24 +782,26 @@ def convert_missing_zarr(
 
         staging_v = cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fits"
         fixed_v = cfg.symlink_root / f"{cfg.v_qa_zarr_stem}-{day_tag}-fixed"
-        stage_v_fits_with_beam_from_i(v_paths, fits_by_pol["I"], staging_v)
-        log(f"Staged {len(v_paths)} Stokes V files -> {staging_v}")
-        log(f"Converting Stokes V -> {zarr_paths['V'].name} …")
-        progress = _convert_progress_callback(log)
+        try:
+            stage_v_fits_with_beam_from_i(v_paths, fits_by_pol["I"], staging_v)
+            log(f"Staged {len(v_paths)} Stokes V files -> {staging_v}")
+            log(f"Converting Stokes V -> {zarr_paths['V'].name} …")
+            progress = _convert_progress_callback(log)
 
-        zarr_paths["V"] = convert_fits_dir_to_zarr(
-            input_dir=staging_v,
-            out_dir=cfg.zarr_root,
-            zarr_name=zarr_paths["V"].name,
-            fixed_dir=fixed_v,
-            chunk_lm=1024,
-            rebuild=True,
-            lm_reference_ds=lm_ref_ds,
-            progress_callback=progress,
-        )
-        log(f"Wrote {zarr_paths['V']}")
-        _remove_staging_dir(staging_v, log)
-        _remove_staging_dir(fixed_v, log)
+            zarr_paths["V"] = convert_fits_dir_to_zarr(
+                input_dir=staging_v,
+                out_dir=cfg.zarr_root,
+                zarr_name=zarr_paths["V"].name,
+                fixed_dir=fixed_v,
+                chunk_lm=1024,
+                rebuild=True,
+                lm_reference_ds=lm_ref_ds,
+                progress_callback=progress,
+            )
+            log(f"Wrote {zarr_paths['V']}")
+        finally:
+            _remove_staging_dir(staging_v, log)
+            _remove_staging_dir(fixed_v, log)
     else:
         log(f"Using existing Stokes V Zarr: {zarr_paths['V']}")
 
@@ -835,25 +839,27 @@ def _convert_missing_combined_zarr(
     day_tag = select_day.replace("-", "")
     staging = cfg.symlink_root / f"{cfg.qa_zarr_stem}-{day_tag}-fits"
     fixed = cfg.symlink_root / f"{cfg.qa_zarr_stem}-{day_tag}-fixed"
-    stage_symlinks(i_paths, staging)
-    stage_v_fits_with_beam_from_i(v_paths, i_paths, staging)
-    log(f"Staged {len(i_paths)} I + {len(v_paths)} V files -> {staging}")
-    log(f"Converting Stokes I+V -> {zarr_path.name} …")
-    progress = _convert_progress_callback(log)
-    zarr_path = convert_fits_dir_to_zarr(
-        input_dir=staging,
-        out_dir=cfg.zarr_root,
-        zarr_name=zarr_path.name,
-        fixed_dir=fixed,
-        chunk_lm=1024,
-        rebuild=True,
-        lm_reference_target_size=target_size,
-        progress_callback=progress,
-    )
-    log(f"Wrote combined QA Zarr: {zarr_path}")
-    _remove_staging_dir(staging, log)
-    _remove_staging_dir(fixed, log)
-    return {"I": zarr_path, "V": zarr_path}
+    try:
+        stage_symlinks(i_paths, staging)
+        stage_v_fits_with_beam_from_i(v_paths, i_paths, staging)
+        log(f"Staged {len(i_paths)} I + {len(v_paths)} V files -> {staging}")
+        log(f"Converting Stokes I+V -> {zarr_path.name} …")
+        progress = _convert_progress_callback(log)
+        zarr_path = convert_fits_dir_to_zarr(
+            input_dir=staging,
+            out_dir=cfg.zarr_root,
+            zarr_name=zarr_path.name,
+            fixed_dir=fixed,
+            chunk_lm=1024,
+            rebuild=True,
+            lm_reference_target_size=target_size,
+            progress_callback=progress,
+        )
+        log(f"Wrote combined QA Zarr: {zarr_path}")
+        return {"I": zarr_path, "V": zarr_path}
+    finally:
+        _remove_staging_dir(staging, log)
+        _remove_staging_dir(fixed, log)
 
 
 def load_qa_datasets(

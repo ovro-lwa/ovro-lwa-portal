@@ -3385,4 +3385,3 @@ def test_convert_fits_dir_to_zarr_i_and_v_single_store(tmp_path: Path) -> None:
             assert str(hdr["CTYPE3"]).strip() == "FREQ"
             assert str(hdr["CTYPE4"]).strip() == "STOKES"
             assert float(hdr["CRVAL4"]) == pytest.approx(stokes)
-

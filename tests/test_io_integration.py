@@ -80,13 +80,13 @@ def small_chunk_zarr_store(tmp_path: Path) -> Path:
     zarr_path = tmp_path / "small_chunk_observation.zarr"
     time = np.arange(2)
     frequency = np.linspace(50e6, 55e6, 4)
-    l = np.arange(256)
-    m = np.arange(256)
+    l = np.arange(512)
+    m = np.arange(512)
     ds = xr.Dataset(
         {
             "SKY": (
                 ["time", "frequency", "polarization", "l", "m"],
-                np.random.rand(2, 4, 1, 256, 256).astype(np.float32),
+                np.random.rand(2, 4, 1, 512, 512).astype(np.float32),
             ),
         },
         coords={
@@ -108,8 +108,10 @@ class TestLmChunkSummary:
         summary = summarize_lm_chunks(small_chunk_zarr_store)
         assert summary["l_min"] == 128
         assert summary["m_min"] == 128
-        assert summary["l_chunks"] == (128, 128)
-        assert summary["m_chunks"] == (128, 128)
+        assert summary["l_size"] == 512
+        assert summary["m_size"] == 512
+        assert summary["l_chunks"] == (128, 128, 128, 128)
+        assert summary["m_chunks"] == (128, 128, 128, 128)
 
     def test_warn_if_suboptimal_lm_chunks(self, small_chunk_zarr_store: Path) -> None:
         with pytest.warns(UserWarning, match="small on-disk l/m chunks"):
