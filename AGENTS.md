@@ -611,21 +611,21 @@ differ — follow `source_review_app.py` instead.
 #### Simpler notebooks: SkyWidget + Bokeh (`metacatalog_sky_view.ipynb`)
 
 For notebooks that combine **SkyWidget** with a **Bokeh scatter/map** (catalog
-overlay, tap-to-focus) but **not** the full `SourceReview` app, use the validated
-pattern in `notebooks/metacatalog_sky_view.ipynb`. Do **not** port
-`JupyterPanelUISession`, `schedule_when_panel_loaded`, or VBox placeholder mounts
-unless you are building another `source_review`-class app with the matching
-Panel push helpers.
+overlay, tap-to-focus) but **not** the full `SourceReview` app, use the
+validated pattern in `notebooks/metacatalog_sky_view.ipynb`. Do **not** port
+`JupyterPanelUISession`, `schedule_when_panel_loaded`, or VBox placeholder
+mounts unless you are building another `source_review`-class app with the
+matching Panel push helpers.
 
 **Validated layout (two interactive cells, two comm tiers):**
 
-| Layer | Embed | Comm | Python callbacks? |
-| ----- | ----- | ---- | ------------------- |
-| Matplotlib overlays | `%matplotlib inline` | None (static PNG) | N/A |
-| SkyWidget | `widgets.VBox([…, sky])` or bare `sky` in **same cell** | ipywidgets / anywidget | Yes |
-| Bokeh map | `pn.extension("bokeh")` + `pn.pane.Bokeh(fig, …)` | Panel / `@pyviz/jupyterlab_pyviz` | Yes |
-| Bokeh standalone | `bokeh.io.show(fig)` | None (embedded JS snapshot) | **No** |
-| BokehModel | `jupyter_bokeh.widgets.BokehModel(fig)` | ipywidgets + `@bokeh/jupyter_bokeh` | Yes (when extension loads) |
+| Layer               | Embed                                                   | Comm                                | Python callbacks?          |
+| ------------------- | ------------------------------------------------------- | ----------------------------------- | -------------------------- |
+| Matplotlib overlays | `%matplotlib inline`                                    | None (static PNG)                   | N/A                        |
+| SkyWidget           | `widgets.VBox([…, sky])` or bare `sky` in **same cell** | ipywidgets / anywidget              | Yes                        |
+| Bokeh map           | `pn.extension("bokeh")` + `pn.pane.Bokeh(fig, …)`       | Panel / `@pyviz/jupyterlab_pyviz`   | Yes                        |
+| Bokeh standalone    | `bokeh.io.show(fig)`                                    | None (embedded JS snapshot)         | **No**                     |
+| BokehModel          | `jupyter_bokeh.widgets.BokehModel(fig)`                 | ipywidgets + `@bokeh/jupyter_bokeh` | Yes (when extension loads) |
 
 **Rules that stuck (do not regress):**
 
@@ -648,8 +648,9 @@ Panel push helpers.
    different frontend module and can fail with
    `Failed to create view for 'BokehView' … BokehModel`.
 6. **Matplotlib:** use **`%matplotlib inline`** when SkyWidget and Panel share
-   the same notebook. Do **not** mix `%matplotlib widget` (ipympl) with SkyWidget
-   + Panel in one notebook — both compete for ipywidgets comm.
+   the same notebook. Do **not** mix `%matplotlib widget` (ipympl) with
+   SkyWidget
+   - Panel in one notebook — both compete for ipywidgets comm.
 7. **Cross-cell wiring:** Bokeh tap handlers may call functions that mutate
    `sky` defined in an earlier cell (e.g. `focus_sky_widget(coord)`), but the
    **widget comm must be established in the cell that constructs and displays
@@ -660,14 +661,15 @@ Panel push helpers.
 - Launch with `pixi run jupyter lab` so OVRO-LWA HiPS is served at
   `HIPS_HTTP_PREFIX` (default `/calibration/hips`; see `source_review.ipynb`
   config).
-- When comm misbehaves on **one notebook**, use **Kernel → Restart** and
-  **Edit → Clear All Outputs** on **that file only** — you do not need a
-  full-browser hard refresh or to interrupt other notebook kernels.
+- When comm misbehaves on **one notebook**, use **Kernel → Restart** and **Edit
+  → Clear All Outputs** on **that file only** — you do not need a full-browser
+  hard refresh or to interrupt other notebook kernels.
 - **Clear saved widget/Panel/Bokeh outputs** before commit. Bloated `.ipynb`
   files (multi‑MB from embedded comm state) cause stale **"model not found"**
   after reopen and can corrupt JSON.
 - After changing viz comm code in `src/`, restart the kernel and confirm
-  `ovro_lwa_portal.__file__` points at `src/ovro_lwa_portal/` (editable install).
+  `ovro_lwa_portal.__file__` points at `src/ovro_lwa_portal/` (editable
+  install).
 
 **Kernel / package path (live Jupyter):** The notebook kernel must import the
 **editable** repo (Pixi: `sys.executable` under `.pixi/envs/default/`, or
@@ -1768,16 +1770,16 @@ testing clicks.
 ### Issue: SkyWidget shows "model not found" in a simple notebook
 
 **Symptoms:** Matplotlib or other cells run; SkyWidget cell shows **Error
-displaying widget: model not found**. A fresh cell with only `sky` fails the same
-way if `sky` was created in a different cell.
+displaying widget: model not found**. A fresh cell with only `sky` fails the
+same way if `sky` was created in a different cell.
 
 **Cause:** Widget model was created in one kernel session or cell but displayed
 from another comm path; or stale widget model IDs in saved notebook outputs
 (multi‑MB `.ipynb`); or ipympl / Panel / SkyWidget comm conflict in the same
 notebook.
 
-**Solution:** Follow **Simpler notebooks: SkyWidget + Bokeh** above:
-create and display SkyWidget in **one cell** via native ipywidgets; use
+**Solution:** Follow **Simpler notebooks: SkyWidget + Bokeh** above: create and
+display SkyWidget in **one cell** via native ipywidgets; use
 `%matplotlib inline` not `%matplotlib widget`; restart this notebook's kernel
 and **Clear All Outputs** on this file; avoid `pn.pane.IPyWidget` wrappers and
 `display(..., display_id=…)` for SkyWidget. Reference:
@@ -1796,23 +1798,26 @@ callbacks … This combination cannot work.
 **Cause:** Figure embedded with **`bokeh.io.show()`** / standalone output —
 Python `on_event` handlers never reach the kernel.
 
-**Solution:** Use **`pn.extension("bokeh")`** and **`pn.pane.Bokeh(fig, …)`**
-as the cell's return value (Panel / PyViz comm). Wire `scatter_fig.on_event("tap",
-…)` before displaying the pane. Do **not** use `output_notebook()` + `show()`
-for interactive notebook maps. Reference: `notebooks/metacatalog_sky_view.ipynb`.
+**Solution:** Use **`pn.extension("bokeh")`** and **`pn.pane.Bokeh(fig, …)`** as
+the cell's return value (Panel / PyViz comm). Wire
+`scatter_fig.on_event("tap", …)` before displaying the pane. Do **not** use
+`output_notebook()` + `show()` for interactive notebook maps. Reference:
+`notebooks/metacatalog_sky_view.ipynb`.
 
 ### Issue: `BokehModel` / `@bokeh/jupyter_bokeh` view creation fails
 
 **Symptoms:** Cell output shows a JavaScript error such as **Failed to create
-view for 'BokehView' … BokehModel** while `pn.pane.Bokeh` worked in the same env.
+view for 'BokehView' … BokehModel** while `pn.pane.Bokeh` worked in the same
+env.
 
-**Cause:** `jupyter_bokeh.widgets.BokehModel` uses the **`@bokeh/jupyter_bokeh`**
-frontend, separate from Panel's **`@pyviz/jupyterlab_pyviz`** bridge. Version or
-session mismatches can break `BokehModel` even when Panel Bokeh embed works.
+**Cause:** `jupyter_bokeh.widgets.BokehModel` uses the
+**`@bokeh/jupyter_bokeh`** frontend, separate from Panel's
+**`@pyviz/jupyterlab_pyviz`** bridge. Version or session mismatches can break
+`BokehModel` even when Panel Bokeh embed works.
 
 **Solution:** Prefer **`pn.pane.Bokeh`** for notebook Bokeh maps with Python
-callbacks in this repo. Reserve `BokehModel` only if you explicitly validate that
-extension in the target JupyterLab session.
+callbacks in this repo. Reserve `BokehModel` only if you explicitly validate
+that extension in the target JupyterLab session.
 
 ### Issue: SkyWidget stuck on "loads after comm is ready" placeholder
 
