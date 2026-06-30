@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import warnings
 from contextlib import contextmanager
@@ -34,7 +35,11 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 )
 from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
+    IngestDiscoverySummary,
+    collect_glob_sources,
     discover_time_grouped_fits,
+    discover_time_grouped_paths,
+    plan_convert_discovery,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
 from ovro_lwa_portal.ingest.dewarp_convert import (
@@ -42,6 +47,11 @@ from ovro_lwa_portal.ingest.dewarp_convert import (
     run_cascade_per_time_group,
 )
 from ovro_lwa_portal.ingest.metadata_audit import audit_directory, print_audit_reports
+from ovro_lwa_portal.ingest.per_time_convert import (
+    PerTimeGlobConvertConfig,
+    run_per_time_glob_convert,
+    sources_need_funpack,
+)
 
 __all__ = ["main", "app"]
 
@@ -150,6 +160,92 @@ def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> N
     )
 
 
+def _print_convert_discovery_summary(
+    discovered: IngestDiscoverySummary,
+    to_process: IngestDiscoverySummary,
+    *,
+    resume: bool,
+) -> None:
+    """Print grouped input counts before convert starts."""
+    pol_discovered = ", ".join(discovered.polarization_labels) or "—"
+    pol_to_process = ", ".join(to_process.polarization_labels) or "—"
+
+    console.print("[bold]Discovery summary[/bold]")
+    console.print(f"  Input FITS files:                 {discovered.input_files}")
+    console.print(f"  Time groups:                      {discovered.time_groups}")
+    console.print(f"  Frequency subbands:               {discovered.frequency_groups}")
+    console.print(
+        f"  Polarization products:            "
+        f"{discovered.polarization_groups} ({pol_discovered})"
+    )
+    console.print(
+        f"  Time×frequency×polarization cells: "
+        f"{discovered.time_frequency_polarization_cells} "
+        f"(Zarr hint {discovered.zarr_shape_hint})"
+    )
+
+    if resume and to_process.time_groups != discovered.time_groups:
+        console.print("\n[bold]To process this run[/bold] (resume skips completed times)")
+        console.print(f"  Input FITS files:                 {to_process.input_files}")
+        console.print(f"  Time groups:                      {to_process.time_groups}")
+        console.print(f"  Frequency subbands:               {to_process.frequency_groups}")
+        console.print(
+            f"  Polarization products:            "
+            f"{to_process.polarization_groups} ({pol_to_process})"
+        )
+        console.print(
+            f"  Time×frequency×polarization cells: "
+            f"{to_process.time_frequency_polarization_cells} "
+            f"(Zarr hint {to_process.zarr_shape_hint})"
+        )
+    elif to_process.input_files == 0 and discovered.input_files > 0 and resume:
+        console.print(
+            "\n[bold yellow]Nothing to process:[/bold yellow] every discovered time is "
+            "already in the output Zarr."
+        )
+    console.print()
+
+
+def _resolve_convert_discovery_summary(
+    *,
+    discovery: IngestDiscoveryConfig,
+    input_dir: Path,
+    output_dir: Path,
+    zarr_name: str,
+    rebuild: bool,
+    resume: bool,
+    glob_pattern: str | None = None,
+    funpack: bool | None = None,
+) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary]:
+    """Discover grouped FITS and return summary counts for the convert CLI."""
+    out_zarr = output_dir / zarr_name
+    if glob_pattern is not None:
+        source_paths = collect_glob_sources(glob_pattern)
+        if not source_paths:
+            msg = f"Glob matched no files: {glob_pattern}"
+            raise FileNotFoundError(msg)
+        by_time = discover_time_grouped_paths(source_paths, discovery=discovery)
+        use_funpack = funpack if funpack is not None else sources_need_funpack(source_paths)
+        filter_invalid_beam = not use_funpack
+    else:
+        by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
+        filter_invalid_beam = True
+
+    if not by_time:
+        raise FileNotFoundError(
+            f"No groupable FITS found under {input_dir if glob_pattern is None else glob_pattern}"
+        )
+
+    return plan_convert_discovery(
+        by_time,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=rebuild,
+        resume=resume,
+        filter_invalid_beam=filter_invalid_beam,
+    )
+
+
 def _execute_fits_to_zarr_conversion(
     config: ConversionConfig,
     *,
@@ -248,11 +344,85 @@ def _execute_fits_to_zarr_conversion(
             raise typer.Exit(code=1) from e
 
 
+def _execute_per_time_glob_conversion(
+    config: PerTimeGlobConvertConfig,
+    *,
+    log_level: LogLevel,
+) -> Path:
+    """Run glob-driven per-time FITS→Zarr; raise :class:`typer.Exit` on failure."""
+    verbose = log_level == LogLevel.DEBUG
+
+    if log_level != LogLevel.DEBUG:
+        logging.getLogger("ovro_lwa_portal.fits_to_zarr_xradio").setLevel(logging.WARNING)
+        logging.getLogger("ovro_lwa_portal.ingest.core").setLevel(logging.WARNING)
+        logging.getLogger("ovro_lwa_portal.ingest.per_time_convert").setLevel(logging.WARNING)
+        logging.getLogger("viperlog").setLevel(logging.ERROR)
+        logging.getLogger("astropy").setLevel(logging.ERROR)
+        warnings.filterwarnings("ignore", category=Warning, module="astropy")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Converting per time step...", total=100)
+
+        def progress_callback(stage: str, current: int, total: int, message: str) -> None:
+            if total > 0:
+                percentage = (current / total) * 100
+                progress.update(task, completed=percentage, description=message)
+
+        try:
+            if log_level != LogLevel.DEBUG:
+                with suppress_stderr():
+                    result = run_per_time_glob_convert(
+                        config,
+                        progress_callback=progress_callback,
+                    )
+            else:
+                result = run_per_time_glob_convert(
+                    config,
+                    progress_callback=progress_callback,
+                )
+            progress.update(task, completed=100, description="Conversion complete")
+            console.print(f"\n[bold green]✓[/bold green] Successfully created: {result}")
+            return result
+
+        except FileNotFoundError as e:
+            console.print(f"\n[bold red]✗[/bold red] Error: {e}", style="red")
+            console.print(
+                "\nNo matching source files found. Please check:\n"
+                "  • The --glob-pattern matches your FITS or .fits.fs files\n"
+                "  • Basenames include ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tokens\n"
+                "  • Use --discovery-metadata-source filename for large nested trees"
+            )
+            raise typer.Exit(code=1) from e
+
+        except (RuntimeError, ValueError, subprocess.CalledProcessError) as e:
+            console.print(f"\n[bold red]✗[/bold red] Conversion failed: {e}", style="red")
+            raise typer.Exit(code=1) from e
+
+        except Exception as e:
+            console.print(
+                f"\n[bold red]✗[/bold red] Unexpected error: {e}",
+                style="red",
+            )
+            if verbose:
+                console.print_exception()
+            raise typer.Exit(code=1) from e
+
+
 @app.command()
 def convert(
     input_dir: Path = typer.Argument(
         ...,
-        help="Directory containing input FITS files",
+        help=(
+            "Directory containing input FITS files, or a per-time staging directory when "
+            "using --glob-pattern"
+        ),
         exists=True,
         file_okay=False,
         dir_okay=True,
@@ -373,6 +543,35 @@ def convert(
             "subbands; frequency from FITS headers)."
         ),
     ),
+    glob_pattern: Optional[str] = typer.Option(
+        None,
+        "--glob-pattern",
+        help=(
+            "Python glob matching source FITS across nested directories. When set, "
+            "INPUT_DIR is the per-time staging directory (only one time group's "
+            "``{time_key}__*.fits`` links exist at a time) and sources are discovered "
+            "from the glob without listing the full tree in a flat directory."
+        ),
+    ),
+    work_root: Optional[Path] = typer.Option(
+        None,
+        "--work-root",
+        help=(
+            "Per-time funpack work directories for compressed ``*.fits.fs`` sources "
+            "(required when funpack runs; default: INPUT_DIR/.work)"
+        ),
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    funpack: Optional[bool] = typer.Option(
+        None,
+        "--funpack/--no-funpack",
+        help=(
+            "Funpack compressed ``*.fits.fs`` sources before convert. Default: auto-detect "
+            "from matched paths."
+        ),
+    ),
     log_level: LogLevel = typer.Option(
         LogLevel.INFO,
         "--log-level",
@@ -412,6 +611,12 @@ def convert(
         # LST color-band filenames (Blue/Green/Red subbands)
         ovro-ingest convert /data/fits /data/output \\
             --discovery-filename-convention lst-color
+
+        # Per-time ingest from a nested pipeline tree (avoids mass symlinks)
+        ovro-ingest convert /fast/staging /fast/output \\
+            --glob-pattern '/lustre/pipeline/.../*/*MHz/snapshots_clean/*image.fits.fs' \\
+            --work-root /fast/work --discovery-metadata-source filename \\
+            --cleanup-fixed-fits
     """
     _configure_logging(log_level)
     _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
@@ -428,7 +633,82 @@ def convert(
             'use --discovery-metadata-source fits.',
             param_hint="--discovery-filename-convention",
         )
+
+    if glob_pattern is not None:
+        discovery = IngestDiscoveryConfig(
+            freq_bin_hz=discovery_freq_bin_hz,
+            group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
+            filename_convention=filename_convention,
+        )
+        per_time_config = PerTimeGlobConvertConfig(
+            glob_pattern=glob_pattern,
+            staging_dir=input_dir,
+            output_dir=output_dir,
+            fixed_dir=fixed_dir or (output_dir / "fixed_fits"),
+            zarr_name=zarr_name,
+            work_root=work_root,
+            chunk_lm=chunk_lm,
+            rebuild=rebuild,
+            resume=not no_resume,
+            fix_headers_on_demand=not skip_header_fixing,
+            cleanup_fixed_fits=cleanup_fixed_fits or True,
+            funpack=funpack,
+            discovery=discovery,
+            lm_reference_target_size=target_size,
+            verbose=verbose,
+        )
+
+        console.print("\n[bold cyan]OVRO-LWA FITS → Zarr Conversion (per-time glob)[/bold cyan]")
+        console.print(f"  Glob pattern:     {glob_pattern}")
+        console.print(f"  Staging dir:      {input_dir}")
+        console.print(f"  Output directory: {output_dir}")
+        console.print(f"  Zarr store name:  {zarr_name}")
+        console.print(f"  Fixed FITS dir:   {per_time_config.fixed_dir}")
+        console.print(f"  Work root:        {work_root or input_dir / '.work'}")
+        console.print(f"  Chunk size (l,m): {chunk_lm}")
+        console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
+        console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
+        console.print(f"  Funpack:          {funpack if funpack is not None else 'auto'}")
+        if target_size is not None:
+            console.print(f"  Target size (px): {target_size}")
+        console.print(
+            f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}"
+        )
+        console.print(
+            f"  Cleanup fixed:    {'YES' if per_time_config.cleanup_fixed_fits else 'NO'}"
+        )
+        console.print(f"  Discovery meta:   {group_metadata_source}")
+        console.print(f"  Time key source:  {time_key_source}")
+        console.print(f"  Filename conv.:   {filename_convention}")
+        console.print(f"  Log level:        {log_level.value.upper()}\n")
+
+        try:
+            discovered, to_process = _resolve_convert_discovery_summary(
+                discovery=discovery,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                zarr_name=zarr_name,
+                rebuild=rebuild,
+                resume=not no_resume,
+                glob_pattern=glob_pattern,
+                funpack=funpack,
+            )
+        except FileNotFoundError as exc:
+            console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+            raise typer.Exit(code=1) from exc
+        _print_convert_discovery_summary(discovered, to_process, resume=not no_resume)
+
+        _execute_per_time_glob_conversion(per_time_config, log_level=log_level)
+        return
+
     # Build configuration
+    discovery = IngestDiscoveryConfig(
+        freq_bin_hz=discovery_freq_bin_hz,
+        group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
+        filename_convention=filename_convention,
+    )
     config = ConversionConfig(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -465,6 +745,20 @@ def convert(
     console.print(f"  Time key source:  {time_key_source}")
     console.print(f"  Filename conv.:   {filename_convention}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
+
+    try:
+        discovered, to_process = _resolve_convert_discovery_summary(
+            discovery=discovery,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            zarr_name=zarr_name,
+            rebuild=rebuild,
+            resume=not no_resume,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+        raise typer.Exit(code=1) from exc
+    _print_convert_discovery_summary(discovered, to_process, resume=not no_resume)
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
 
