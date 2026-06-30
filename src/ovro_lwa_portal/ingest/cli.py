@@ -35,8 +35,11 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 )
 from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
+    IngestDiscoverySummary,
     collect_glob_sources,
     discover_time_grouped_fits,
+    discover_time_grouped_paths,
+    plan_convert_discovery,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
 from ovro_lwa_portal.ingest.dewarp_convert import (
@@ -47,6 +50,7 @@ from ovro_lwa_portal.ingest.metadata_audit import audit_directory, print_audit_r
 from ovro_lwa_portal.ingest.per_time_convert import (
     PerTimeGlobConvertConfig,
     run_per_time_glob_convert,
+    sources_need_funpack,
 )
 
 __all__ = ["main", "app"]
@@ -153,6 +157,92 @@ def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> N
         f"{_MIN_RECOMMENDED_LM_CHUNK} for interactive overlay reads. "
         "Pass --allow-small-lm-chunks to override, or use 512 or higher.",
         param_hint="--chunk-lm",
+    )
+
+
+def _print_convert_discovery_summary(
+    discovered: IngestDiscoverySummary,
+    to_process: IngestDiscoverySummary,
+    *,
+    resume: bool,
+) -> None:
+    """Print grouped input counts before convert starts."""
+    pol_discovered = ", ".join(discovered.polarization_labels) or "—"
+    pol_to_process = ", ".join(to_process.polarization_labels) or "—"
+
+    console.print("[bold]Discovery summary[/bold]")
+    console.print(f"  Input FITS files:                 {discovered.input_files}")
+    console.print(f"  Time groups:                      {discovered.time_groups}")
+    console.print(f"  Frequency subbands:               {discovered.frequency_groups}")
+    console.print(
+        f"  Polarization products:            "
+        f"{discovered.polarization_groups} ({pol_discovered})"
+    )
+    console.print(
+        f"  Time×frequency×polarization cells: "
+        f"{discovered.time_frequency_polarization_cells} "
+        f"(Zarr hint {discovered.zarr_shape_hint})"
+    )
+
+    if resume and to_process.time_groups != discovered.time_groups:
+        console.print("\n[bold]To process this run[/bold] (resume skips completed times)")
+        console.print(f"  Input FITS files:                 {to_process.input_files}")
+        console.print(f"  Time groups:                      {to_process.time_groups}")
+        console.print(f"  Frequency subbands:               {to_process.frequency_groups}")
+        console.print(
+            f"  Polarization products:            "
+            f"{to_process.polarization_groups} ({pol_to_process})"
+        )
+        console.print(
+            f"  Time×frequency×polarization cells: "
+            f"{to_process.time_frequency_polarization_cells} "
+            f"(Zarr hint {to_process.zarr_shape_hint})"
+        )
+    elif to_process.input_files == 0 and discovered.input_files > 0 and resume:
+        console.print(
+            "\n[bold yellow]Nothing to process:[/bold yellow] every discovered time is "
+            "already in the output Zarr."
+        )
+    console.print()
+
+
+def _resolve_convert_discovery_summary(
+    *,
+    discovery: IngestDiscoveryConfig,
+    input_dir: Path,
+    output_dir: Path,
+    zarr_name: str,
+    rebuild: bool,
+    resume: bool,
+    glob_pattern: str | None = None,
+    funpack: bool | None = None,
+) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary]:
+    """Discover grouped FITS and return summary counts for the convert CLI."""
+    out_zarr = output_dir / zarr_name
+    if glob_pattern is not None:
+        source_paths = collect_glob_sources(glob_pattern)
+        if not source_paths:
+            msg = f"Glob matched no files: {glob_pattern}"
+            raise FileNotFoundError(msg)
+        by_time = discover_time_grouped_paths(source_paths, discovery=discovery)
+        use_funpack = funpack if funpack is not None else sources_need_funpack(source_paths)
+        filter_invalid_beam = not use_funpack
+    else:
+        by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
+        filter_invalid_beam = True
+
+    if not by_time:
+        raise FileNotFoundError(
+            f"No groupable FITS found under {input_dir if glob_pattern is None else glob_pattern}"
+        )
+
+    return plan_convert_discovery(
+        by_time,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=rebuild,
+        resume=resume,
+        filter_invalid_beam=filter_invalid_beam,
     )
 
 
@@ -593,10 +683,32 @@ def convert(
         console.print(f"  Filename conv.:   {filename_convention}")
         console.print(f"  Log level:        {log_level.value.upper()}\n")
 
+        try:
+            discovered, to_process = _resolve_convert_discovery_summary(
+                discovery=discovery,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                zarr_name=zarr_name,
+                rebuild=rebuild,
+                resume=not no_resume,
+                glob_pattern=glob_pattern,
+                funpack=funpack,
+            )
+        except FileNotFoundError as exc:
+            console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+            raise typer.Exit(code=1) from exc
+        _print_convert_discovery_summary(discovered, to_process, resume=not no_resume)
+
         _execute_per_time_glob_conversion(per_time_config, log_level=log_level)
         return
 
     # Build configuration
+    discovery = IngestDiscoveryConfig(
+        freq_bin_hz=discovery_freq_bin_hz,
+        group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
+        filename_convention=filename_convention,
+    )
     config = ConversionConfig(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -633,6 +745,20 @@ def convert(
     console.print(f"  Time key source:  {time_key_source}")
     console.print(f"  Filename conv.:   {filename_convention}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
+
+    try:
+        discovered, to_process = _resolve_convert_discovery_summary(
+            discovery=discovery,
+            input_dir=input_dir,
+            output_dir=output_dir,
+            zarr_name=zarr_name,
+            rebuild=rebuild,
+            resume=not no_resume,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+        raise typer.Exit(code=1) from exc
+    _print_convert_discovery_summary(discovered, to_process, resume=not no_resume)
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
 

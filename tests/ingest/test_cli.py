@@ -12,12 +12,24 @@ from typer.testing import CliRunner
 
 from ovro_lwa_portal.ingest.cli import app
 from ovro_lwa_portal.ingest.core import ConversionConfig
+from ovro_lwa_portal.ingest.discovery import IngestDiscoverySummary
 
 
 runner = CliRunner()
 
 # GitHub Actions sets FORCE_COLOR=3; disable color for stable help/substring checks.
 _CI_PLAIN_ENV = {"NO_COLOR": "1", "FORCE_COLOR": "0"}
+
+
+def _mock_discovery_summary() -> IngestDiscoverySummary:
+    return IngestDiscoverySummary(
+        input_files=1,
+        time_groups=1,
+        frequency_groups=1,
+        polarization_groups=1,
+        polarization_labels=("I",),
+        time_frequency_polarization_cells=1,
+    )
 
 
 class TestCLI:
@@ -85,9 +97,16 @@ class TestCLI:
             captured.append(config.glob_pattern)
             return out / "store.zarr"
 
-        with patch(
-            "ovro_lwa_portal.ingest.cli._execute_per_time_glob_conversion",
-            side_effect=fake_per_time,
+        summary = _mock_discovery_summary()
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_per_time_glob_conversion",
+                side_effect=fake_per_time,
+            ),
         ):
             result = runner.invoke(
                 app,
@@ -101,6 +120,41 @@ class TestCLI:
             )
         assert result.exit_code == 0, result.stdout + result.stderr
         assert captured == ["/lustre/**/*.fits.fs"]
+
+    def test_convert_prints_discovery_summary(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+
+        discovered = IngestDiscoverySummary(
+            input_files=12,
+            time_groups=3,
+            frequency_groups=4,
+            polarization_groups=1,
+            polarization_labels=("I",),
+            time_frequency_polarization_cells=12,
+        )
+        to_process = discovered
+
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(discovered, to_process),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                return_value=out / "dummy.zarr",
+            ),
+        ):
+            result = runner.invoke(app, ["convert", str(inp), str(out)])
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Discovery summary" in result.stdout
+        assert "Input FITS files:" in result.stdout
+        assert "Time groups:" in result.stdout
+        assert "Frequency subbands:" in result.stdout
+        assert "Polarization products:" in result.stdout
 
     def test_validate_help(self) -> None:
         """Test validate command help."""
@@ -341,9 +395,16 @@ class TestCLI:
         out = tmp_path / "out"
         inp.mkdir()
         out.mkdir()
-        with patch(
-            "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
-            return_value=out / "dummy.zarr",
+        summary = _mock_discovery_summary()
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                return_value=out / "dummy.zarr",
+            ),
         ):
             result = runner.invoke(
                 app,
