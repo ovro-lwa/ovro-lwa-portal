@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import glob
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Literal
@@ -10,6 +12,7 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
     DiscoveryFilenameConvention,
     _discover_groups,
+    _discover_groups_from_files,
     _filter_completed_time_keys,
     _filter_invalid_beam_files,
 )
@@ -17,7 +20,9 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 __all__ = [
     "DEFAULT_INGEST_DISCOVERY",
     "IngestDiscoveryConfig",
+    "collect_glob_sources",
     "discover_time_grouped_fits",
+    "discover_time_grouped_paths",
     "prepare_ingest_time_groups",
 ]
 
@@ -35,6 +40,11 @@ class IngestDiscoveryConfig:
 DEFAULT_INGEST_DISCOVERY = IngestDiscoveryConfig()
 
 
+def collect_glob_sources(glob_pattern: str) -> list[Path]:
+    """Return sorted paths matched by a Python :func:`glob.glob` pattern."""
+    return [Path(p) for p in sorted(glob.glob(glob_pattern))]
+
+
 def discover_time_grouped_fits(
     in_dir: Path,
     *,
@@ -45,6 +55,24 @@ def discover_time_grouped_fits(
     cfg = discovery or DEFAULT_INGEST_DISCOVERY
     return _discover_groups(
         in_dir,
+        duplicate_resolver=duplicate_resolver,
+        freq_bin_hz=cfg.freq_bin_hz,
+        time_key_source=cfg.time_key_source,
+        group_metadata_source=cfg.group_metadata_source,
+        filename_convention=cfg.filename_convention,
+    )
+
+
+def discover_time_grouped_paths(
+    paths: Sequence[Path],
+    *,
+    duplicate_resolver: Callable[[str, float, List[Path]], Path] | None = None,
+    discovery: IngestDiscoveryConfig | None = None,
+) -> Dict[str, List[Path]]:
+    """Group explicit FITS paths by observation time and frequency bin."""
+    cfg = discovery or DEFAULT_INGEST_DISCOVERY
+    return _discover_groups_from_files(
+        paths,
         duplicate_resolver=duplicate_resolver,
         freq_bin_hz=cfg.freq_bin_hz,
         time_key_source=cfg.time_key_source,

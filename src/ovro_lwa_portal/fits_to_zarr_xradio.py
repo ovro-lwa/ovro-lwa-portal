@@ -3517,6 +3517,129 @@ def _filter_completed_time_keys(
     return remaining
 
 
+def _discover_groups_from_files(
+    fits_files: Sequence[Path],
+    duplicate_resolver: Optional[Callable[[str, float, List[Path]], Path]] = None,
+    *,
+    freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
+    time_key_source: Literal["header", "filename"] = "filename",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
+) -> Dict[str, List[Path]]:
+    """Group *fits_files* by observation time and frequency.
+
+    See :func:`_discover_groups` for parameter semantics and duplicate handling.
+    """
+    if freq_bin_hz <= 0.0:
+        msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
+        raise ValueError(msg)
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        msg = (
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            'use group_metadata_source="fits".'
+        )
+        raise ValueError(msg)
+
+    by_time: Dict[str, List[Path]] = {}
+    by_time_freq_stokes: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
+    for f in sorted(fits_files):
+        time_key, frequency_hz, notes = _extract_group_metadata_for_discovery(
+            f,
+            filename_convention=filename_convention,
+            group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
+        )
+        if time_key is None:
+            if filename_convention == "lst-color":
+                t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
+            elif group_metadata_source == "filename":
+                t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
+            elif time_key_source == "filename":
+                t_hint = "-image-YYYYMMDD_HHMMSS in basename or DATE-OBS"
+            else:
+                t_hint = "DATE-OBS"
+            logger.warning(f"Skipping {f.name}: missing usable observation time ({t_hint}).")
+            continue
+        if frequency_hz is None:
+            logger.warning(
+                f"Could not determine frequency for {f.name}; duplicate detection disabled for this file."
+            )
+            by_time.setdefault(time_key, []).append(f)
+            continue
+
+        freq_key = int(round(frequency_hz / freq_bin_hz))
+        stokes_key = _stokes_key_for_discovery(f, group_metadata_source=group_metadata_source)
+        time_freq_map = by_time_freq_stokes.setdefault(time_key, {})
+        bucket_key = (freq_key, stokes_key)
+        candidates = time_freq_map.setdefault(bucket_key, [])
+        candidates.append(f)
+
+        if len(candidates) > 1:
+            duplicate_names = [p.name for p in candidates]
+            if duplicate_resolver is None:
+                kept = candidates[0]
+                logger.warning(
+                    "Multiple FITS share time=%s, frequency bin %g Hz (key=%s, ~%.3f MHz), "
+                    "and Stokes %s: %s. Using only %s. "
+                    "Remove extras or pass duplicate_resolver to select a file.",
+                    time_key,
+                    freq_bin_hz,
+                    freq_key,
+                    frequency_hz / 1e6,
+                    stokes_key,
+                    duplicate_names,
+                    kept.name,
+                )
+                time_freq_map[bucket_key] = [kept]
+                continue
+
+            if group_metadata_source == "filename":
+                _, rep_hz, _ = _extract_group_metadata_filename_only(candidates[0])
+            else:
+                _, rep_hz, _ = _extract_group_metadata_for_discovery(
+                    candidates[0],
+                    filename_convention=filename_convention,
+                    group_metadata_source=group_metadata_source,
+                    time_key_source=time_key_source,
+                )
+            resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
+            selected = duplicate_resolver(time_key, resolver_hz, candidates.copy())
+            if selected not in candidates:
+                msg = (
+                    f"Duplicate resolver returned unknown file {selected} for "
+                    f"time={time_key}, frequency_hz={resolver_hz}."
+                )
+                raise RuntimeError(msg)
+
+            by_time.setdefault(time_key, [])
+            by_time[time_key] = [p for p in by_time[time_key] if p not in candidates]
+            by_time[time_key].append(selected)
+            time_freq_map[bucket_key] = [selected]
+            logger.warning(
+                "Duplicate FITS files for time=%s, frequency_hz=%.1f, Stokes=%s. "
+                "Selected: %s. Candidates: %s",
+                time_key,
+                resolver_hz,
+                stokes_key,
+                selected.name,
+                duplicate_names,
+            )
+            continue
+
+        if notes:
+            logger.warning(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
+        by_time.setdefault(time_key, []).append(f)
+
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+    for time_key, files in by_time.items():
+        by_time[time_key] = sorted(files, key=sort_key)
+    return by_time
+
+
 def _discover_groups(
     in_dir: Path,
     duplicate_resolver: Optional[Callable[[str, float, List[Path]], Path]] = None,
@@ -3566,120 +3689,14 @@ def _discover_groups(
     Dict[str, List[Path]]
         Dictionary mapping time keys to lists of FITS file paths.
     """
-    if freq_bin_hz <= 0.0:
-        msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
-        raise ValueError(msg)
-    if filename_convention == "lst-color" and group_metadata_source == "filename":
-        msg = (
-            '"lst-color" grouping requires FITS header reads for subband frequency; '
-            'use group_metadata_source="fits".'
-        )
-        raise ValueError(msg)
-
-    by_time: Dict[str, List[Path]] = {}
-    by_time_freq_stokes: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
-    for f in sorted(in_dir.glob("*.fits")):
-        time_key, frequency_hz, notes = _extract_group_metadata_for_discovery(
-            f,
-            filename_convention=filename_convention,
-            group_metadata_source=group_metadata_source,
-            time_key_source=time_key_source,
-        )
-        if time_key is None:
-            if filename_convention == "lst-color":
-                t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
-            elif group_metadata_source == "filename":
-                t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
-            elif time_key_source == "filename":
-                t_hint = "-image-YYYYMMDD_HHMMSS in basename or DATE-OBS"
-            else:
-                t_hint = "DATE-OBS"
-            logger.warning(f"Skipping {f.name}: missing usable observation time ({t_hint}).")
-            continue
-        if frequency_hz is None:
-            logger.warning(
-                f"Could not determine frequency for {f.name}; duplicate detection disabled for this file."
-            )
-            by_time.setdefault(time_key, []).append(f)
-            continue
-
-        freq_key = int(round(frequency_hz / freq_bin_hz))
-        stokes_key = _stokes_key_for_discovery(f, group_metadata_source=group_metadata_source)
-        time_freq_map = by_time_freq_stokes.setdefault(time_key, {})
-        bucket_key = (freq_key, stokes_key)
-        candidates = time_freq_map.setdefault(bucket_key, [])
-        candidates.append(f)
-
-        if len(candidates) > 1:
-            duplicate_names = [p.name for p in candidates]
-            if duplicate_resolver is None:
-                # Same time + same binned subband + same Stokes: stacking would be wrong;
-                # keep the first file and drop the rest (typical: symlink pairs or header jitter).
-                kept = candidates[0]
-                logger.warning(
-                    "Multiple FITS share time=%s, frequency bin %g Hz (key=%s, ~%.3f MHz), "
-                    "and Stokes %s: %s. Using only %s. "
-                    "Remove extras or pass duplicate_resolver to select a file.",
-                    time_key,
-                    freq_bin_hz,
-                    freq_key,
-                    frequency_hz / 1e6,
-                    stokes_key,
-                    duplicate_names,
-                    kept.name,
-                )
-                time_freq_map[bucket_key] = [kept]
-                continue
-
-            if group_metadata_source == "filename":
-                _, rep_hz, _ = _extract_group_metadata_filename_only(candidates[0])
-            else:
-                _, rep_hz, _ = _extract_group_metadata_for_discovery(
-                    candidates[0],
-                    filename_convention=filename_convention,
-                    group_metadata_source=group_metadata_source,
-                    time_key_source=time_key_source,
-                )
-            resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
-            selected = duplicate_resolver(time_key, resolver_hz, candidates.copy())
-            if selected not in candidates:
-                msg = (
-                    f"Duplicate resolver returned unknown file {selected} for "
-                    f"time={time_key}, frequency_hz={resolver_hz}."
-                )
-                raise RuntimeError(msg)
-
-            by_time.setdefault(time_key, [])
-            by_time[time_key] = [p for p in by_time[time_key] if p not in candidates]
-            by_time[time_key].append(selected)
-            # Replace the pending duplicate bucket so the next file with this (time, freq)
-            # starts from the chosen file only. Otherwise `candidates` never shrinks and
-            # grows as [f1, f2, f3, ...], re-invoking the resolver with stale paths and
-            # widening the filter that strips `by_time[time_key]`.
-            time_freq_map[bucket_key] = [selected]
-            logger.warning(
-                "Duplicate FITS files for time=%s, frequency_hz=%.1f, Stokes=%s. "
-                "Selected: %s. Candidates: %s",
-                time_key,
-                resolver_hz,
-                stokes_key,
-                selected.name,
-                duplicate_names,
-            )
-            continue
-
-        if notes:
-            logger.warning(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
-        by_time.setdefault(time_key, []).append(f)
-
-    sort_key = lambda p: _discovery_frequency_sort_tuple(
-        p,
+    return _discover_groups_from_files(
+        sorted(in_dir.glob("*.fits")),
+        duplicate_resolver,
+        freq_bin_hz=freq_bin_hz,
+        time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
     )
-    for time_key, files in by_time.items():
-        by_time[time_key] = sorted(files, key=sort_key)
-    return by_time
 
 
 def _combine_time_step(
