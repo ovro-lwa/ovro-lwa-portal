@@ -254,9 +254,10 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 ├── fixed_fits/                 # Directory for corrected FITS files (empty)
 ├── notebooks/                  # Jupyter notebooks for data analysis
 │   ├── README.md              # Documentation for notebooks directory
+│   ├── metacatalog_sky_view.ipynb  # Metacatalog on FITS + SkyWidget + Bokeh (simple comm pattern)
 │   ├── fits2zarr.ipynb        # Main FITS to Zarr conversion notebook
 │   ├── fits2zarr_and_viz_user_cases.ipynb  # User case examples with visualization
-│   ├── source_review.ipynb    # LPT source review; per-time WCS + SkyWidget
+│   ├── source_review.ipynb    # LPT source review; per-time WCS + SkyWidget (canonical Panel comm)
 │   └── test_fits_files/       # Sample FITS files for testing
 │       ├── README.md          # Documentation for test FITS files
 │       └── .gitignore         # Ignores FITS files (downloaded separately)
@@ -606,6 +607,69 @@ heatmap + coord field — **not** the ipywidgets log/spinner panes). **Do not**
 use `hold_and_push` in production `SourceReview`. **Do not** copy
 `jupiter_flux_review`'s Panel HTML log or inline-class structure when they
 differ — follow `source_review_app.py` instead.
+
+#### Simpler notebooks: SkyWidget + Bokeh (`metacatalog_sky_view.ipynb`)
+
+For notebooks that combine **SkyWidget** with a **Bokeh scatter/map** (catalog
+overlay, tap-to-focus) but **not** the full `SourceReview` app, use the
+validated pattern in `notebooks/metacatalog_sky_view.ipynb`. Do **not** port
+`JupyterPanelUISession`, `schedule_when_panel_loaded`, or VBox placeholder
+mounts unless you are building another `source_review`-class app with the
+matching Panel push helpers.
+
+**Validated layout (two interactive cells, two comm tiers):**
+
+| Layer               | Embed                                                   | Comm                                | Python callbacks?          |
+| ------------------- | ------------------------------------------------------- | ----------------------------------- | -------------------------- |
+| Matplotlib overlays | `%matplotlib inline`                                    | None (static PNG)                   | N/A                        |
+| SkyWidget           | `widgets.VBox([…, sky])` or bare `sky` in **same cell** | ipywidgets / anywidget              | Yes                        |
+| Bokeh map           | `pn.extension("bokeh")` + `pn.pane.Bokeh(fig, …)`       | Panel / `@pyviz/jupyterlab_pyviz`   | Yes                        |
+| Bokeh standalone    | `bokeh.io.show(fig)`                                    | None (embedded JS snapshot)         | **No**                     |
+| BokehModel          | `jupyter_bokeh.widgets.BokehModel(fig)`                 | ipywidgets + `@bokeh/jupyter_bokeh` | Yes (when extension loads) |
+
+**Rules that stuck (do not regress):**
+
+1. **SkyWidget:** create and display in **one cell** (same pattern as
+   `flux_position_testing.ipynb`). Do **not** create `sky` in one cell and
+   `display(sky)` in another — that often yields **"model not found"**.
+2. **SkyWidget:** use native **ipywidgets** display (`widgets.VBox` or trailing
+   `sky`). Do **not** nest SkyWidget in `pn.pane.IPyWidget` for simple notebooks
+   — child swaps and deferred mounts often never reach the browser.
+3. **SkyWidget:** do **not** use `schedule_when_panel_loaded` + VBox placeholder
+   unless you also implement `source_review`-style Panel push/remount (see
+   `_mount_sky_widget` in `source_review_app.py`). Placeholder text can stick
+   forever while Bokeh/Panel comm works fine.
+4. **Bokeh:** use **`pn.pane.Bokeh`** after `pn.extension("bokeh")` for notebook
+   maps that need Python `on_event` / tap handlers. Do **not** use
+   `bokeh.io.show()` — it emits standalone HTML/JS; Bokeh logs that Python
+   callbacks cannot run.
+5. **Bokeh:** prefer Panel over `jupyter_bokeh.BokehModel` in this repo's Pixi
+   env when `@pyviz/jupyterlab_pyviz` is already enabled. `BokehModel` uses a
+   different frontend module and can fail with
+   `Failed to create view for 'BokehView' … BokehModel`.
+6. **Matplotlib:** use **`%matplotlib inline`** when SkyWidget and Panel share
+   the same notebook. Do **not** mix `%matplotlib widget` (ipympl) with
+   SkyWidget
+   - Panel in one notebook — both compete for ipywidgets comm.
+7. **Cross-cell wiring:** Bokeh tap handlers may call functions that mutate
+   `sky` defined in an earlier cell (e.g. `focus_sky_widget(coord)`), but the
+   **widget comm must be established in the cell that constructs and displays
+   `sky`**.
+
+**Practical ops notes:**
+
+- Launch with `pixi run jupyter lab` so OVRO-LWA HiPS is served at
+  `HIPS_HTTP_PREFIX` (default `/calibration/hips`; see `source_review.ipynb`
+  config).
+- When comm misbehaves on **one notebook**, use **Kernel → Restart** and **Edit
+  → Clear All Outputs** on **that file only** — you do not need a full-browser
+  hard refresh or to interrupt other notebook kernels.
+- **Clear saved widget/Panel/Bokeh outputs** before commit. Bloated `.ipynb`
+  files (multi‑MB from embedded comm state) cause stale **"model not found"**
+  after reopen and can corrupt JSON.
+- After changing viz comm code in `src/`, restart the kernel and confirm
+  `ovro_lwa_portal.__file__` points at `src/ovro_lwa_portal/` (editable
+  install).
 
 **Kernel / package path (live Jupyter):** The notebook kernel must import the
 **editable** repo (Pixi: `sys.executable` under `.pixi/envs/default/`, or
@@ -1702,6 +1766,71 @@ Panel path broken while activity log still works.
 `_schedule_overlay_slice_load`, not `defer_dispatch`. After comm fixes, restart
 the kernel and confirm the heatmap title changes from “Heatmap loads…” before
 testing clicks.
+
+### Issue: SkyWidget shows "model not found" in a simple notebook
+
+**Symptoms:** Matplotlib or other cells run; SkyWidget cell shows **Error
+displaying widget: model not found**. A fresh cell with only `sky` fails the
+same way if `sky` was created in a different cell.
+
+**Cause:** Widget model was created in one kernel session or cell but displayed
+from another comm path; or stale widget model IDs in saved notebook outputs
+(multi‑MB `.ipynb`); or ipympl / Panel / SkyWidget comm conflict in the same
+notebook.
+
+**Solution:** Follow **Simpler notebooks: SkyWidget + Bokeh** above: create and
+display SkyWidget in **one cell** via native ipywidgets; use
+`%matplotlib inline` not `%matplotlib widget`; restart this notebook's kernel
+and **Clear All Outputs** on this file; avoid `pn.pane.IPyWidget` wrappers and
+`display(..., display_id=…)` for SkyWidget. Reference:
+`notebooks/metacatalog_sky_view.ipynb`.
+
+### Issue: Bokeh tap/click does nothing in a notebook map
+
+**Symptoms:** Bokeh scatter renders; taps/clicks produce no Python-side effect
+(e.g. SkyWidget does not slew). Bokeh may log:
+
+```text
+You are generating standalone HTML/JS output, but trying to use real Python
+callbacks … This combination cannot work.
+```
+
+**Cause:** Figure embedded with **`bokeh.io.show()`** / standalone output —
+Python `on_event` handlers never reach the kernel.
+
+**Solution:** Use **`pn.extension("bokeh")`** and **`pn.pane.Bokeh(fig, …)`** as
+the cell's return value (Panel / PyViz comm). Wire
+`scatter_fig.on_event("tap", …)` before displaying the pane. Do **not** use
+`output_notebook()` + `show()` for interactive notebook maps. Reference:
+`notebooks/metacatalog_sky_view.ipynb`.
+
+### Issue: `BokehModel` / `@bokeh/jupyter_bokeh` view creation fails
+
+**Symptoms:** Cell output shows a JavaScript error such as **Failed to create
+view for 'BokehView' … BokehModel** while `pn.pane.Bokeh` worked in the same
+env.
+
+**Cause:** `jupyter_bokeh.widgets.BokehModel` uses the
+**`@bokeh/jupyter_bokeh`** frontend, separate from Panel's
+**`@pyviz/jupyterlab_pyviz`** bridge. Version or session mismatches can break
+`BokehModel` even when Panel Bokeh embed works.
+
+**Solution:** Prefer **`pn.pane.Bokeh`** for notebook Bokeh maps with Python
+callbacks in this repo. Reserve `BokehModel` only if you explicitly validate
+that extension in the target JupyterLab session.
+
+### Issue: SkyWidget stuck on "loads after comm is ready" placeholder
+
+**Symptoms:** Panel/Bokeh parts of the notebook work; sky pane shows placeholder
+text forever.
+
+**Cause:** Simple notebook copied **`schedule_when_panel_loaded`** +
+`pn.pane.IPyWidget(VBox placeholder)` from `source_review` without the Panel
+push/remount path that replaces placeholder children on the browser.
+
+**Solution:** For simple SkyWidget + Bokeh notebooks, display SkyWidget via
+**native ipywidgets in one cell** — do not defer mount through Panel. Full
+deferred mount remains **`source_review` only** (see `_mount_sky_widget`).
 
 ### Issue: Radio overlay flipped or rotated relative to HiPS
 
