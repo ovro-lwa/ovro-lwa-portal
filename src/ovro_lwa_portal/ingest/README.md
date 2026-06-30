@@ -221,24 +221,34 @@ The resulting Zarr store contains:
 - **Coordinates**:
   - `time`: Observation timestamps
   - `frequency`: Frequency values in Hz
+  - `polarization`: FITS Stokes values (e.g. `1` = I, `4` = V)
   - `l`, `m`: Spatial pixel coordinates
   - `right_ascension`, `declination`: 2D celestial coordinates (degrees,
     FK5/J2000)
 - **Data Variables**: Intensity values (e.g., `SKY`, `BEAM`)
-- **Metadata**: Per-time celestial WCS in `wcs_header_str(time)` (see below)
+- **Metadata**: Full primary HDU header per slice in
+  `fits_header_str(time, frequency, polarization)` (see below)
 
-### WCS metadata in the Zarr store
+### Header metadata in the Zarr store
 
-Snapshot ingest stores **one FITS WCS header per time step** (zenith-tracking;
-`CRVAL1`/`CRVAL2` change with time). The canonical on-disk field is the data
-variable **`wcs_header_str`**, indexed by `time` (sometimes `(time, frequency)`
-before collapse).
+New ingests persist the **complete primary FITS header** for each
+`(time, frequency, polarization)` slice in **`fits_header_str`**. Headers are
+**pixel-faithful**: they describe the stored pixels after `_fix_headers`, regrid
+(if any), and celestial WCS rebuild — not necessarily the pre-regrid input file.
+
+Separate Stokes I and V FITS at the same `(time, frequency)` are combined into
+**one** Zarr with `polarization = [1, 4]` (or the subset present). Each pol
+plane has its own `fits_header_str` entry.
+
+**`wcs_header_str` is not written** on new ingests. Portal WCS is derived in
+memory from `fits_header_str` via `_read_wcs_header_str` (celestial subset,
+default `freq_idx=0`).
 
 **Do not rely on `fits_wcs_header` in `SKY.attrs` or dataset attrs** on
 multi-time stores: Zarr array metadata is written once per array and would
 freeze the time-0 phase center after incremental append. Before every Zarr
-write/append and on load, the library strips those attrs when `wcs_header_str`
-is present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called
+write/append and on load, the library strips those attrs when per-slice headers
+are present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called
 from `_write_or_append_zarr` and `open_dataset`). See **Per-Time WCS and CRVAL**
 in `AGENTS.md`.
 
@@ -247,6 +257,28 @@ Audit per-time CRVAL drift:
 ```bash
 pixi run python scripts/audit_zarr_wcs_timeline.py /path/to/store.zarr
 ```
+
+### Exporting FITS slices
+
+Any `(time, frequency, polarization)` cell can be exported back to a standalone
+**4D singleton-axis** FITS file (`NAXIS=4`, `NAXIS3=NAXIS4=1`) for external
+tools:
+
+```python
+import ovro_lwa_portal as ovro
+from ovro_lwa_portal import write_fits_slice
+
+ds = ovro.open_dataset("/path/to/output/ovro_lwa_full_lm_only.zarr")
+
+# One slice → one FITS file
+write_fits_slice(ds, "image_t000_f000_I.fits", time_idx=0, freq_idx=0, pol_idx=0)
+
+# Batch export (default filename: image_t{time}_f{freq_mhz}MHz_s{stokes}.fits)
+ds.radport.export_fits("/path/to/exported_fits")
+```
+
+Legacy stores without `fits_header_str` cannot be exported — re-ingest from
+original FITS. See `ovro_lwa_portal.export_fits` module docstring for details.
 
 ### Reading the Output
 
@@ -259,6 +291,7 @@ ds = ovro.open_dataset("/path/to/output/ovro_lwa_full_lm_only.zarr")
 print(ds)
 print(f"Time range: {ds.time.values[0]} to {ds.time.values[-1]}")
 print(f"Frequency range: {ds.frequency.values.min():.2e} to {ds.frequency.values.max():.2e} Hz")
+print(f"Polarization (FITS Stokes): {ds.polarization.values}")
 
 # WCS for one time index (required when the store has multiple times)
 time_idx = 0

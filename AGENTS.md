@@ -369,15 +369,16 @@ a single header from time 0 or from static dataset attrs.
   **preserves native `CRVAL1`/`CRVAL2`** (and `LATPOLE` when present). Also
   applies BSCALE/BZERO, Stokes-axis promotion, and spectral/frame keywords. **Do
   not** overwrite the phase center from filename timestamps.
-- **Combine** (`_load_for_combine`, `_combine_time_step`): each time step gets
-  its own header string from the fixed FITS WCS;
-  `_collapse_wcs_header_str_variable` reduces auxiliary frequency dimensions so
-  the persisted variable is **`wcs_header_str(time)`** (or `(time, frequency)`
-  with one channel—see accessor handling). Regrid uses the reference LM pixel
-  grid but keeps each source's native `CRVAL1`/`CRVAL2`
-  (`_wcs_header_from_ref_grid_and_source_crval`).
+- **Combine** (`_load_for_combine`, `_combine_time_step`): after regrid, each
+  `(time, frequency, polarization)` slice gets a pixel-faithful full primary
+  header in **`fits_header_str`** (not collapsed across frequency). Regrid uses
+  the reference LM pixel grid but keeps each source's native `CRVAL1`/`CRVAL2`
+  (`_wcs_header_from_ref_grid_and_source_crval` →
+  `_fits_header_bytes_for_slice`).
 - **Zarr append** (`_align_time_dimension_for_zarr_write`): scalar metadata is
-  promoted to `(time,)` so incremental appends stay consistent.
+  promoted to `(time, frequency, polarization)` so incremental appends stay
+  consistent. **`wcs_header_str` is not written** to new ingests (in-memory only
+  during combine).
 - **Do not** assume all slices share one phase center.
 
 #### Filename timestamps vs WCS (do not confuse)
@@ -391,11 +392,11 @@ The FITS header `CRVAL1`/`CRVAL2` are **authoritative** for each integration's
 phase center. Filename time tokens are for **sorting files into time bins
 only**—not for recomputing celestial reference values.
 
-Per-time `wcs_header_str` drift in a Zarr store should match the native FITS
-headers written through `_fix_headers`, not a recomputed zenith from the
-basename. `_zenith_fk5_crvals_deg()` remains in the codebase for **audit
-diagnostics only** (`scripts/audit_zarr_wcs_timeline.py --sample-fits`); it is
-**not** called during convert.
+Per-time `fits_header_str` drift in a Zarr store should match the pixel-faithful
+headers captured after regrid (before celestial harmonization), not a recomputed
+zenith from the basename. `_zenith_fk5_crvals_deg()` remains in the codebase for
+**audit diagnostics only** (`scripts/audit_zarr_wcs_timeline.py --sample-fits`);
+it is **not** called during convert.
 
 **If you change `_fix_headers`:** extend
 `tests/test_fits_to_zarr.py::test_fix_headers_preserves_crval_from_input_not_filename`
@@ -404,13 +405,14 @@ separate from WCS stamping.
 
 #### Canonical Zarr metadata (do not regress)
 
-When **`wcs_header_str`** is a data variable, it is the **only** persisted
-celestial WCS for multi-time stores:
+When **`fits_header_str`** is a data variable, it is the **only** persisted
+metadata array for multi-time stores:
 
-| Storage                                                                  | Allowed?                  | Notes                                                                                                                                                                               |
-| ------------------------------------------------------------------------ | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wcs_header_str(time)` (or `(time, frequency)` collapsed to time)        | **Yes**                   | One FITS header string per time step; updates on every append.                                                                                                                      |
-| `fits_wcs_header` on `ds.attrs`, `SKY.attrs`, other data vars, or coords | **No** on Zarr write/open | Zarr array attrs are **not** per-slice; a single `SKY.attrs["fits_wcs_header"]` freezes **time-0** CRVAL and breaks SkyWidget or any code that reads attrs before `wcs_header_str`. |
+| Storage                                                                  | Allowed?                  | Notes                                                                                                     |
+| ------------------------------------------------------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `fits_header_str(time, frequency, polarization)`                         | **Yes**                   | Full primary HDU header per slice (pixel-faithful after regrid).                                          |
+| `wcs_header_str` on new ingests                                          | **No**                    | Legacy only; portal WCS is derived in memory from `fits_header_str`.                                      |
+| `fits_wcs_header` on `ds.attrs`, `SKY.attrs`, other data vars, or coords | **No** on Zarr write/open | Zarr array attrs are **not** per-slice; a single `SKY.attrs["fits_wcs_header"]` freezes **time-0** CRVAL. |
 
 **Enforcement (already in the library — keep these calls when touching I/O):**
 
@@ -424,31 +426,33 @@ celestial WCS for multi-time stores:
 
 `_load_for_combine` may still set `fits_wcs_header` **in memory** for
 combine/regrid; that is internal only. **Never** rely on those attrs after Zarr
-export—always `wcs_header_str` + `_read_wcs_header_str(ds, time_idx=…)`.
+export—always `fits_header_str` + `_read_fits_header_str` /
+`_read_wcs_header_str(ds, time_idx=…)` (celestial subset derived in memory).
 
 **If you change ingest or I/O:** extend
-`tests/test_fits_to_zarr.py::test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present`
-and
-`tests/test_io_integration.py::test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str`.
-Do **not** re-add `fits_wcs_header` to Zarr `.zattrs` for QA/review paths.
+`tests/test_fits_to_zarr.py::test_write_or_append_omits_fits_wcs_header_when_fits_header_str_present`
+and `test_new_ingest_omits_wcs_header_str_from_zarr`. Do **not** re-add
+`fits_wcs_header` to Zarr `.zattrs` for QA/review paths.
 
 ### How WCS is read (accessor)
 
 Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 
-| Function                                    | Role                                                                                                           |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `_has_per_time_wcs_header_str(ds)`          | True when `wcs_header_str` is indexed by `time` (1-D or `(time, frequency)`)                                   |
-| `_read_wcs_header_str(ds, time_idx=…)`      | FITS header string for one time index                                                                          |
-| `strip_redundant_fits_wcs_header_attrs(ds)` | Drop static `fits_wcs_header` attrs when `wcs_header_str` is canonical (used by `open_dataset` and Zarr write) |
-| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                             |
-| `pixel_to_coords` / `coords_to_pixel`       | Must pass `time_idx` when per-time WCS exists                                                                  |
+| Function                                                 | Role                                                                                                             |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `_has_fits_header_str(ds)`                               | True when `fits_header_str` is present                                                                           |
+| `_has_per_time_wcs_header_str(ds)`                       | True when `fits_header_str` or legacy `wcs_header_str` is indexed by `time`                                      |
+| `_read_fits_header_str(ds, time_idx, freq_idx, pol_idx)` | Full FITS primary header string for one slice (export)                                                           |
+| `_read_wcs_header_str(ds, time_idx=…)`                   | Celestial subset derived from `fits_header_str` (default `freq_idx=0`)                                           |
+| `strip_redundant_fits_wcs_header_attrs(ds)`              | Drop static `fits_wcs_header` attrs when per-slice headers are canonical (used by `open_dataset` and Zarr write) |
+| `RadportAccessor._get_wcs(time_idx=…)`                   | Astropy WCS for pixel↔sky mapping (`_wcs_cache` keyed by `(time_idx, freq_idx)`)                                |
+| `pixel_to_coords` / `coords_to_pixel`                    | Must pass `time_idx` when per-time WCS exists                                                                    |
 
 **Strict rules (do not break these):**
 
-1. When per-time `wcs_header_str` exists, **always** select `time_idx` (and
-   `frequency=0` if the variable is 2-D). Never use static `fits_wcs_header`
-   attrs for a different time index.
+1. When per-time `fits_header_str` exists, **always** select `time_idx` (and
+   `freq_idx` / `pol` when exporting a specific slice). Never use static
+   `fits_wcs_header` attrs for a different time index.
 2. If a per-time header entry is **empty**, return `None`—**do not** fall back
    to time-0 or static attrs (that mis-registers late slices and freezes
    `CRVAL1`).
@@ -463,6 +467,29 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
    an extra `ds.chunk({"time": 1, …})` under an active distributed Dask `Client`
    on large incremental stores (unnecessary rechunk/shuffle); Jupiter-style
    review works without a `Client` for SkyWidget + tracked extractions.
+
+### FITS export from Zarr (`export_fits.py`)
+
+Zarr is the consolidated archive; **`export_fits`** recovers any
+`(time, frequency, polarization)` slice as a **pixel-faithful** standalone FITS
+file for external tools (pybdsf, CASA, DS9, `ovro-ingest convert`, xradio).
+
+| API                                                         | Role                                                                       |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `build_fits_header` / `build_fits_hdu` / `write_fits_slice` | One 4D singleton-axis `PrimaryHDU` per call (`NAXIS=4`, `NAXIS3=NAXIS4=1`) |
+| `ds.radport.build_fits_hdu(...)`                            | Accessor wrapper                                                           |
+| `ds.radport.export_fits(output_dir, ...)`                   | Batch writer; default `image_t{time}_f{freq_mhz}MHz_s{stokes}.fits`        |
+
+**Export rules:**
+
+- Metadata from `fits_header_str` + live `frequency` / `polarization` coords for
+  `CRVAL3` / `CRVAL4`; `SKY` pixels only (`BEAM` not exported as a data var).
+- Combined I+V Zarr → **two** FITS files (`pol_idx=0`, `pol_idx=1`), not one
+  multi-Stokes cube.
+- Legacy stores without `fits_header_str` → `ValueError` (re-ingest required).
+- Do **not** export multi-frequency or multi-time cubes in one FITS file.
+
+Tests: `tests/test_export_fits.py` (round-trip FITS→Zarr→FITS→Zarr).
 
 ### Fixed-sky source tracking (`dynamic_spectrum`, `patch_*`, `light_curve`)
 

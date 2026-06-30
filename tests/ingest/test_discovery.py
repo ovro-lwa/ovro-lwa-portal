@@ -7,7 +7,10 @@ from pathlib import Path
 from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
     discover_time_grouped_fits,
+    discover_time_grouped_paths,
+    plan_convert_discovery,
     prepare_ingest_time_groups,
+    summarize_time_grouped_fits,
 )
 
 
@@ -83,3 +86,71 @@ def test_discover_time_grouped_fits_forwards_time_key_source(monkeypatch, tmp_pa
         discovery=IngestDiscoveryConfig(time_key_source="header"),
     )
     assert seen == ["header"]
+
+
+def _image_name(time_key: str, mhz: int) -> str:
+    date, hms = time_key.split("_")
+    return f"{date}_{hms}_{mhz}MHz_averaged_Run-I-image-{date}_{hms}.fits"
+
+
+def test_summarize_time_grouped_fits_counts_time_freq_pol(tmp_path: Path) -> None:
+    """Summary reports input files and time/frequency/polarization groups."""
+    tkey_a = "20250106_051855"
+    tkey_b = "20250106_052955"
+    paths = [
+        tmp_path / _image_name(tkey_a, 41),
+        tmp_path / _image_name(tkey_a, 55),
+        tmp_path / _image_name(tkey_b, 41),
+    ]
+    for path in paths:
+        path.write_bytes(b"")
+
+    discovery = IngestDiscoveryConfig(group_metadata_source="filename")
+    by_time = discover_time_grouped_paths(paths, discovery=discovery)
+    summary = summarize_time_grouped_fits(by_time, discovery=discovery)
+
+    assert summary.input_files == 3
+    assert summary.time_groups == 2
+    assert summary.frequency_groups == 2
+    assert summary.polarization_groups == 1
+    assert summary.polarization_labels == ("I",)
+    assert summary.time_frequency_polarization_cells == 3
+    assert summary.zarr_shape_hint == "(2, 2, 1)"
+
+
+def test_plan_convert_discovery_splits_discovered_and_to_process(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """plan_convert_discovery returns separate summaries for resume filtering."""
+    out_zarr = tmp_path / "store.zarr"
+    out_zarr.mkdir()
+    tkey_a = "20250106_051855"
+    tkey_b = "20250106_052955"
+    by_time = {
+        tkey_a: [tmp_path / _image_name(tkey_a, 41)],
+        tkey_b: [tmp_path / _image_name(tkey_b, 41)],
+    }
+    for files in by_time.values():
+        files[0].write_bytes(b"")
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery._filter_invalid_beam_files",
+        lambda groups: groups,
+    )
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery._filter_completed_time_keys",
+        lambda groups, path, *, rebuild, context: {tkey_b: groups[tkey_b]},
+    )
+
+    discovery = IngestDiscoveryConfig(group_metadata_source="filename")
+    discovered, to_process = plan_convert_discovery(
+        by_time,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=False,
+        resume=True,
+    )
+    assert discovered.time_groups == 2
+    assert discovered.input_files == 2
+    assert to_process.time_groups == 1
+    assert to_process.input_files == 1

@@ -45,6 +45,8 @@ class LmChunkSummary(TypedDict):
 
     l_min: int
     m_min: int
+    l_size: int
+    m_size: int
     l_chunks: tuple[int, ...]
     m_chunks: tuple[int, ...]
 
@@ -433,11 +435,15 @@ def summarize_lm_chunks(
         msg = f"Variable {var!r} lacks l/m dimensions; found {dims!r}"
         raise DataSourceError(msg) from exc
 
-    l_chunks = _chunk_sizes_on_axis(int(chunks[l_idx]), shape[l_idx])
-    m_chunks = _chunk_sizes_on_axis(int(chunks[m_idx]), shape[m_idx])
+    l_size = int(shape[l_idx])
+    m_size = int(shape[m_idx])
+    l_chunks = _chunk_sizes_on_axis(int(chunks[l_idx]), l_size)
+    m_chunks = _chunk_sizes_on_axis(int(chunks[m_idx]), m_size)
     return {
         "l_min": min(l_chunks),
         "m_min": min(m_chunks),
+        "l_size": l_size,
+        "m_size": m_size,
         "l_chunks": l_chunks,
         "m_chunks": m_chunks,
     }

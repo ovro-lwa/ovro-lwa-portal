@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -274,6 +275,40 @@ def _radec_from_header_str(
 import numpy as np  # noqa: E402
 
 
+def _encoded_fits_header_bytes(hdr_str: str, *, nl: int, nm: int) -> np.bytes_:
+    """Encode a pixel-faithful ``fits_header_str`` payload for synthetic datasets."""
+    from astropy.io import fits as afits
+
+    mod = _import_module()
+    return np.bytes_(
+        mod._fits_header_bytes_for_slice(
+            afits.Header.fromstring(hdr_str, sep="\n"),
+            post_regrid_wcs_hdr=hdr_str,
+            nl=nl,
+            nm=nm,
+        )
+    )
+
+
+def _attach_ingest_header_fixtures(
+    xds,
+    hdr_str: str,
+    *,
+    include_fits_header_str: bool = True,
+):
+    """Attach in-memory ingest header fields used by regrid/combine helpers."""
+    out = xds.copy(deep=False)
+    out.attrs["fits_wcs_header"] = hdr_str
+    out.attrs["_fits_primary_header_str"] = hdr_str
+    out = out.assign(wcs_header_str=((), np.bytes_(hdr_str.encode("utf-8"))))
+    if include_fits_header_str:
+        mod = _import_module()
+        out = mod._assign_pixel_faithful_fits_header_str(
+            out, post_regrid_wcs_hdr=hdr_str
+        )
+    return out
+
+
 def test_regrid_to_reference_lm_mixed_shapes():
     """Smaller (m,l) grids interpolate onto the reference LM grid."""
     import xarray as xr
@@ -296,9 +331,8 @@ def test_regrid_to_reference_lm_mixed_shapes():
             "right_ascension": (("l", "m"), expected_ra),
             "declination": (("l", "m"), expected_dec),
         },
-        attrs={"fits_wcs_header": hdr_ref},
     )
-    xds_ref = xds_ref.assign(wcs_header_str=((), np.bytes_(hdr_ref.encode("utf-8"))))
+    xds_ref = _attach_ingest_header_fixtures(xds_ref, hdr_ref)
 
     l_sm = np.linspace(-0.5, 0.5, 4)
     m_sm = np.linspace(-0.5, 0.5, 3)
@@ -312,9 +346,8 @@ def test_regrid_to_reference_lm_mixed_shapes():
             "right_ascension": (("m", "l"), np.zeros((3, 4))),
             "declination": (("m", "l"), np.zeros((3, 4))),
         },
-        attrs={"fits_wcs_header": hdr_sm},
     )
-    xds_sm = xds_sm.assign(wcs_header_str=((), np.bytes_(hdr_sm.encode("utf-8"))))
+    xds_sm = _attach_ingest_header_fixtures(xds_sm, hdr_sm)
 
     out = fits_to_zarr_xradio._regrid_to_reference_lm(xds_sm, xds_ref)
 
@@ -327,7 +360,14 @@ def test_regrid_to_reference_lm_mixed_shapes():
     assert out["SKY"].attrs["fits_wcs_header"] == out_hdr_str
     np.testing.assert_allclose(out["right_ascension"].values, expected_ra)
     np.testing.assert_allclose(out["declination"].values, expected_dec)
-    assert bytes(out["wcs_header_str"].values.item()) == out_hdr_str.encode("utf-8")
+    # Pixel-faithful header keeps post-regrid celestial reference values.
+    from astropy.io import fits as afits
+
+    out_hdr = afits.Header.fromstring(
+        bytes(out["fits_header_str"].values.item()).decode("utf-8"), sep="\n"
+    )
+    assert out_hdr["CRVAL1"] == pytest.approx(180.0)
+    assert out_hdr["CRVAL2"] == pytest.approx(45.0)
 
 
 def test_regrid_to_reference_lm_same_shape_different_index_coords():
@@ -346,7 +386,7 @@ def test_regrid_to_reference_lm_same_shape_different_index_coords():
     hdr = _make_sin_wcs_header_str(nx=n, ny=n, crval1=180.0, crval2=45.0)
 
     def mk_ds(l_arr: np.ndarray, m_arr: np.ndarray) -> xr.Dataset:
-        return xr.Dataset(
+        ds = xr.Dataset(
             {"SKY": (("m", "l"), sky.copy())},
             coords={
                 "l": ("l", l_arr),
@@ -354,8 +394,8 @@ def test_regrid_to_reference_lm_same_shape_different_index_coords():
                 "right_ascension": (("m", "l"), np.full((n, n), 180.0)),
                 "declination": (("m", "l"), np.full((n, n), 45.0)),
             },
-            attrs={"fits_wcs_header": hdr},
-        ).assign(wcs_header_str=((), np.bytes_(hdr.encode("utf-8"))))
+        )
+        return _attach_ingest_header_fixtures(ds, hdr)
 
     xds_ref = mk_ds(l_ref, m_ref)
     l_other = np.linspace(-0.5, 0.5, n)
@@ -467,16 +507,18 @@ def test_regrid_to_reference_lm_uses_source_crval_for_radec():
     hdr_ref = _make_sin_wcs_header_str(
         nx=n_ref, ny=n_ref, crval1=ref_crval[0], crval2=ref_crval[1]
     )
-    xds_ref = xr.Dataset(
-        data_vars={"SKY": (("m", "l"), sky_ref)},
-        coords={
-            "l": ("l", l_ref),
-            "m": ("m", m_ref),
-            "right_ascension": (("l", "m"), np.full((n_ref, n_ref), ref_crval[0])),
-            "declination": (("l", "m"), np.full((n_ref, n_ref), ref_crval[1])),
-        },
-        attrs={"fits_wcs_header": hdr_ref},
-    ).assign(wcs_header_str=((), np.bytes_(hdr_ref.encode("utf-8"))))
+    xds_ref = _attach_ingest_header_fixtures(
+        xr.Dataset(
+            data_vars={"SKY": (("m", "l"), sky_ref)},
+            coords={
+                "l": ("l", l_ref),
+                "m": ("m", m_ref),
+                "right_ascension": (("l", "m"), np.full((n_ref, n_ref), ref_crval[0])),
+                "declination": (("l", "m"), np.full((n_ref, n_ref), ref_crval[1])),
+            },
+        ),
+        hdr_ref,
+    )
 
     n_sm = 4
     l_sm = np.linspace(-0.5, 0.5, n_sm)
@@ -485,16 +527,18 @@ def test_regrid_to_reference_lm_uses_source_crval_for_radec():
     hdr_sm = _make_sin_wcs_header_str(
         nx=n_sm, ny=n_sm, crval1=src_crval[0], crval2=src_crval[1]
     )
-    xds_sm = xr.Dataset(
-        data_vars={"SKY": (("m", "l"), sky_sm)},
-        coords={
-            "l": ("l", l_sm),
-            "m": ("m", m_sm),
-            "right_ascension": (("m", "l"), np.zeros((n_sm, n_sm))),
-            "declination": (("m", "l"), np.zeros((n_sm, n_sm))),
-        },
-        attrs={"fits_wcs_header": hdr_sm},
-    ).assign(wcs_header_str=((), np.bytes_(hdr_sm.encode("utf-8"))))
+    xds_sm = _attach_ingest_header_fixtures(
+        xr.Dataset(
+            data_vars={"SKY": (("m", "l"), sky_sm)},
+            coords={
+                "l": ("l", l_sm),
+                "m": ("m", m_sm),
+                "right_ascension": (("m", "l"), np.zeros((n_sm, n_sm))),
+                "declination": (("m", "l"), np.zeros((n_sm, n_sm))),
+            },
+        ),
+        hdr_sm,
+    )
 
     out = mod._regrid_to_reference_lm(xds_sm, xds_ref)
 
@@ -528,7 +572,14 @@ def test_regrid_to_reference_lm_uses_source_crval_for_radec():
     # Persisted strings agree across attrs and the 0-D wcs_header_str variable.
     out_hdr_str = out.attrs["fits_wcs_header"]
     assert out["SKY"].attrs["fits_wcs_header"] == out_hdr_str
-    assert bytes(out["wcs_header_str"].values.item()) == out_hdr_str.encode("utf-8")
+    # Pixel-faithful header keeps post-regrid celestial reference values.
+    from astropy.io import fits as afits
+
+    out_hdr = afits.Header.fromstring(
+        bytes(out["fits_header_str"].values.item()).decode("utf-8"), sep="\n"
+    )
+    assert out_hdr["CRVAL1"] == pytest.approx(src_crval[0])
+    assert out_hdr["CRVAL2"] == pytest.approx(src_crval[1])
 
 
 def test_load_global_lm_reference_selects_largest_shape(monkeypatch, tmp_path: Path):
@@ -1967,19 +2018,30 @@ def test_discovery_completed_matches_mjd_when_filename_differs(tmp_path: Path) -
     )
 
 
-def test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present(
+def test_write_or_append_omits_fits_wcs_header_when_fits_header_str_present(
     tmp_path: Path,
 ) -> None:
     """Zarr must not persist time-0 ``fits_wcs_header`` on SKY when headers vary per time."""
-    import numpy as np
     import xarray as xr
 
     mod = _import_module()
     out_zarr = tmp_path / "wcs_attrs.zarr"
     l_ = np.linspace(-1.0, 1.0, 8)
     m_ = np.linspace(-1.0, 1.0, 8)
-    hdr0 = np.bytes_(b"SIMPLE  = T\nCRVAL1  = 10.0\n")
-    hdr1 = np.bytes_(b"SIMPLE  = T\nCRVAL1  = 20.0\n")
+    hdr0_str = _make_sin_wcs_header_str(nx=8, ny=8, crval1=10.0, crval2=20.0)
+    hdr1_str = _make_sin_wcs_header_str(nx=8, ny=8, crval1=20.0, crval2=30.0)
+    hdr0 = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr0_str, sep="\n"),
+        post_regrid_wcs_hdr=hdr0_str,
+        nl=8,
+        nm=8,
+    )
+    hdr1 = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr1_str, sep="\n"),
+        post_regrid_wcs_hdr=hdr1_str,
+        nl=8,
+        nm=8,
+    )
     mjd0, mjd1 = 60695.17, 60695.18
 
     def _step(mjd: float, hdr: bytes, value: float) -> xr.Dataset:
@@ -1989,12 +2051,12 @@ def test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present(
                     ("time", "frequency", "polarization", "m", "l"),
                     np.full((1, 1, 1, 8, 8), value, dtype=np.float32),
                 ),
-                "wcs_header_str": (("time",), np.array([hdr])),
+                "fits_header_str": (("time",), np.array([np.bytes_(hdr)])),
             },
             coords={
                 "time": ("time", np.array([mjd], dtype=np.float64)),
                 "frequency": ("frequency", np.array([5.0e7])),
-                "polarization": ("polarization", np.array(["I"])),
+                "polarization": ("polarization", np.array([1.0])),
                 "l": ("l", l_),
                 "m": ("m", m_),
             },
@@ -2014,7 +2076,8 @@ def test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present(
         assert "fits_wcs_header" not in ds.attrs
         assert "fits_wcs_header" not in ds["SKY"].attrs
         assert "fits_wcs_header" not in ds["right_ascension"].attrs
-        assert bytes(ds["wcs_header_str"].isel(time=1).values.item()) == hdr1
+        assert "wcs_header_str" not in ds
+        assert bytes(ds["fits_header_str"].isel(time=1).values.item()) == hdr1
 
 
 def test_write_or_append_skips_duplicate_mjd_by_default(tmp_path: Path, caplog) -> None:
@@ -2030,19 +2093,27 @@ def test_write_or_append_skips_duplicate_mjd_by_default(tmp_path: Path, caplog) 
     mjd = 60695.17
     l_ = np.linspace(-1.0, 1.0, 8)
     m_ = np.linspace(-1.0, 1.0, 8)
-    wcs_hdr = np.bytes_(b"SIMPLE  = T\nNAXIS   = 2\n")
+    wcs_hdr = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(
+            _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0),
+            sep="\n",
+        ),
+        post_regrid_wcs_hdr=_make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0),
+        nl=8,
+        nm=8,
+    )
     base = xr.Dataset(
         {
             "SKY": (
                 ("time", "frequency", "polarization", "m", "l"),
                 np.zeros((1, 1, 1, 8, 8), dtype=np.float32),
             ),
-            "wcs_header_str": (("time",), np.array([wcs_hdr])),
+            "fits_header_str": (("time",), np.array([np.bytes_(wcs_hdr)])),
         },
         coords={
             "time": ("time", np.array([mjd], dtype=np.float64)),
             "frequency": ("frequency", np.array([5.0e7])),
-            "polarization": ("polarization", np.array(["I"])),
+            "polarization": ("polarization", np.array([1.0])),
             "l": ("l", l_),
             "m": ("m", m_),
         },
@@ -2238,6 +2309,50 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
     assert combine_calls == []
     assert write_calls == []
     assert consolidate_calls == [out_zarr]
+
+
+def test_lm_reference_from_existing_zarr_reads_fits_header_str(tmp_path: Path) -> None:
+    """Stokes V convert must load LM reference WCS from ``fits_header_str`` Zarr stores."""
+    import xarray as xr
+
+    mod = _import_module()
+    hdr_str = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+    hdr = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr_str, sep="\n"),
+        post_regrid_wcs_hdr=hdr_str,
+        nl=8,
+        nm=8,
+    )
+    out_zarr = tmp_path / "fits_hdr_ref.zarr"
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "m", "l"),
+                np.zeros((1, 2, 1, 8, 8), dtype=np.float32),
+            ),
+            "fits_header_str": (
+                ("time", "frequency"),
+                np.array([[np.bytes_(hdr), np.bytes_(hdr)]], dtype=object),
+            ),
+        },
+        coords={
+            "time": ("time", np.array([59000.0])),
+            "frequency": ("frequency", np.array([55e6, 65e6])),
+            "polarization": ("polarization", np.array([1.0])),
+            "l": ("l", np.linspace(-0.1, 0.1, 8)),
+            "m": ("m", np.linspace(-0.1, 0.1, 8)),
+        },
+    )
+    ds.to_zarr(out_zarr, mode="w", consolidated=False)
+
+    ref = mod._lm_reference_from_existing_zarr(out_zarr)
+    assert "fits_wcs_header" in ref.attrs
+    from astropy.io import fits as afits
+    from astropy.wcs import WCS
+
+    ref_hdr = afits.Header.fromstring(ref.attrs["fits_wcs_header"], sep="\n")
+    assert WCS(ref_hdr).wcs.crval[0] == pytest.approx(180.0)
+    assert ref.sizes == {"l": 8, "m": 8}
 
 
 def test_read_wcs_header_str_from_time_promoted_zarr(tmp_path: Path) -> None:
@@ -2836,3 +2951,437 @@ def test_align_zarr_first_write_keeps_dimension_coords_1d():
     assert aligned.coords["frequency"].dims == ("frequency",)
     assert aligned.coords["l"].dims == ("l",)
     assert aligned.coords["velocity"].dims == ("time", "frequency")
+
+
+def test_fits_header_bytes_for_slice_patches_celestial_and_shape() -> None:
+    """Pixel-faithful headers keep provenance while adopting post-regrid celestial cards."""
+    from astropy.io import fits as afits
+    from astropy.wcs import WCS
+
+    mod = _import_module()
+    primary = afits.Header()
+    primary["SIMPLE"] = True
+    primary["BITPIX"] = -32
+    primary["NAXIS"] = 4
+    primary["NAXIS1"] = 4
+    primary["NAXIS2"] = 4
+    primary["NAXIS3"] = 1
+    primary["NAXIS4"] = 1
+    primary["CTYPE3"] = "FREQ"
+    primary["CRVAL3"] = 55e6
+    primary["CTYPE4"] = "STOKES"
+    primary["CRVAL4"] = 1.0
+    primary["DATE-OBS"] = "2025-01-20T04:03:33"
+    primary["TELESCOP"] = "OVRO-LWA"
+    primary["BMAJ"] = 0.25
+    primary["BMIN"] = 0.20
+    primary["BPA"] = 15.0
+
+    post_wcs = _make_sin_wcs_header_str(nx=6, ny=5, crval1=181.0, crval2=46.0)
+    payload = mod._fits_header_bytes_for_slice(
+        primary, post_regrid_wcs_hdr=post_wcs, nl=6, nm=5
+    )
+    out = afits.Header.fromstring(payload.decode("utf-8"), sep="\n")
+    assert int(out["NAXIS"]) == 4
+    assert int(out["NAXIS1"]) == 6
+    assert int(out["NAXIS2"]) == 5
+    assert int(out["NAXIS3"]) == 1
+    assert int(out["NAXIS4"]) == 1
+    assert int(out["BITPIX"]) == -32
+    assert str(out["CTYPE3"]).strip() == "FREQ"
+    assert str(out["CTYPE4"]).strip() == "STOKES"
+    assert out["DATE-OBS"] == "2025-01-20T04:03:33"
+    assert out["TELESCOP"] == "OVRO-LWA"
+    assert out["RESTFREQ"] == pytest.approx(55e6)
+    assert out["CRVAL3"] == pytest.approx(55e6)
+    assert out["CRVAL1"] == pytest.approx(181.0)
+    assert out["CRVAL2"] == pytest.approx(46.0)
+    assert out["CRVAL4"] == pytest.approx(1.0)
+    assert "BSCALE" not in out
+    from astropy.wcs import FITSFixedWarning
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FITSFixedWarning)
+        assert WCS(out).celestial.wcs.crval[0] == pytest.approx(181.0)
+
+
+def test_fits_header_str_preserves_singleton_freq_stokes_cards() -> None:
+    """Ingest stores ``NAXIS=4`` singleton FREQ/Stokes cards matching Zarr coords."""
+    import xarray as xr
+    from astropy.io import fits as afits
+
+    from ovro_lwa_portal.accessor import _read_fits_header_str
+
+    mod = _import_module()
+    freq_hz = 55e6
+    post_wcs = _make_sin_wcs_header_str(nx=4, ny=4, crval1=180.0, crval2=45.0)
+    primary = afits.Header.fromstring(post_wcs, sep="\n")
+    primary["RESTFREQ"] = freq_hz
+    primary["DATE-OBS"] = "2025-01-20T04:03:33"
+    payload = mod._fits_header_bytes_for_slice(
+        primary,
+        post_regrid_wcs_hdr=post_wcs,
+        nl=4,
+        nm=4,
+        freq_hz=freq_hz,
+        stokes=4.0,
+    )
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "m", "l"),
+                np.zeros((1, 1, 1, 4, 4), dtype=np.float32),
+            ),
+            "fits_header_str": (
+                ("time", "frequency", "polarization"),
+                np.array([[[np.bytes_(payload)]]], dtype=object),
+            ),
+        },
+        coords={
+            "time": ("time", np.array([60695.0])),
+            "frequency": ("frequency", np.array([freq_hz])),
+            "polarization": ("polarization", np.array([4.0])),
+            "l": ("l", np.arange(4)),
+            "m": ("m", np.arange(4)),
+        },
+    )
+    hdr_str = _read_fits_header_str(ds, time_idx=0, freq_idx=0, pol_idx=0)
+    out = afits.Header.fromstring(hdr_str, sep="\n")
+    assert int(out["NAXIS"]) == 4
+    assert int(out["NAXIS3"]) == 1
+    assert int(out["NAXIS4"]) == 1
+    assert str(out["CTYPE3"]).strip() == "FREQ"
+    assert str(out["CTYPE4"]).strip() == "STOKES"
+    assert float(out["CRVAL3"]) == pytest.approx(freq_hz)
+    assert float(out["CRVAL4"]) == pytest.approx(4.0)
+    assert float(ds.coords["frequency"].values[0]) == pytest.approx(float(out["CRVAL3"]))
+    assert float(ds.coords["polarization"].values[0]) == pytest.approx(float(out["CRVAL4"]))
+
+
+def test_assert_nonempty_fits_header_str_before_zarr_write_raises() -> None:
+    import xarray as xr
+
+    mod = _import_module()
+    ds = xr.Dataset(
+        {
+            "SKY": (("time", "frequency", "m", "l"), np.zeros((1, 2, 4, 4))),
+            "fits_header_str": (("time",), np.array([np.bytes_(b"")])),
+        },
+        coords={"time": [60000.0], "frequency": [45e6, 55e6], "l": np.arange(4), "m": np.arange(4)},
+    )
+    with pytest.raises(RuntimeError, match="fits_header_str is empty"):
+        mod._assert_nonempty_fits_header_str_before_zarr_write(ds)
+
+
+def test_new_ingest_omits_wcs_header_str_from_zarr(tmp_path: Path) -> None:
+    """New ingest writes ``fits_header_str`` only — no legacy ``wcs_header_str`` on disk."""
+    import xarray as xr
+
+    mod = _import_module()
+    out_zarr = tmp_path / "fits_headers.zarr"
+    hdr_str = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+    hdr = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr_str, sep="\n"),
+        post_regrid_wcs_hdr=hdr_str,
+        nl=8,
+        nm=8,
+    )
+    step = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "m", "l"),
+                np.zeros((1, 2, 1, 8, 8), dtype=np.float32),
+            ),
+            "fits_header_str": (
+                ("time", "frequency"),
+                np.array([[np.bytes_(hdr), np.bytes_(hdr)]], dtype=object),
+            ),
+        },
+        coords={
+            "time": ("time", np.array([60695.17])),
+            "frequency": ("frequency", np.array([45e6, 55e6])),
+            "polarization": ("polarization", np.array([1.0])),
+            "l": ("l", np.linspace(-1, 1, 8)),
+            "m": ("m", np.linspace(-1, 1, 8)),
+        },
+    )
+    mod._write_or_append_zarr(step, out_zarr, first_write=True, chunk_lm=4)
+    with xr.open_zarr(out_zarr, consolidated=False) as ds:
+        assert "fits_header_str" in ds
+        assert "wcs_header_str" not in ds
+        assert ds["fits_header_str"].dims == ("time", "frequency")
+
+
+def test_read_wcs_header_str_derived_from_fits_header_str() -> None:
+    """Portal WCS reads the celestial subset from ``fits_header_str``."""
+    import xarray as xr
+
+    from ovro_lwa_portal.accessor import _read_wcs_header_str
+
+    hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+    hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=190.0, crval2=50.0)
+    mod = _import_module()
+    enc0 = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr0, sep="\n"),
+        post_regrid_wcs_hdr=hdr0,
+        nl=8,
+        nm=8,
+    )
+    enc1 = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr1, sep="\n"),
+        post_regrid_wcs_hdr=hdr1,
+        nl=8,
+        nm=8,
+    )
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "m", "l"),
+                np.zeros((2, 1, 1, 8, 8), dtype=np.float32),
+            ),
+            "fits_header_str": (
+                ("time",),
+                np.array([np.bytes_(enc0), np.bytes_(enc1)], dtype=object),
+            ),
+        },
+        coords={
+            "time": ("time", np.arange(2, dtype=float)),
+            "frequency": ("frequency", np.array([55e6])),
+            "polarization": ("polarization", np.array([1.0])),
+            "l": ("l", np.linspace(-0.1, 0.1, 8)),
+            "m": ("m", np.linspace(-0.1, 0.1, 8)),
+        },
+    )
+    wcs1 = _read_wcs_header_str(ds, time_idx=1)
+    assert wcs1 is not None
+    from astropy.io import fits as afits
+    from astropy.wcs import WCS
+
+    assert WCS(afits.Header.fromstring(wcs1, sep="\n")).wcs.crval[0] == pytest.approx(190.0)
+    assert ds.radport._get_wcs(time_idx=1).wcs.crval[0] == pytest.approx(190.0)
+
+
+def test_polarization_coord_stokes_values() -> None:
+    """``polarization`` coord carries FITS Stokes codes from stored headers."""
+    import xarray as xr
+
+    mod = _import_module()
+    hdr_i = _make_sin_wcs_header_str(nx=4, ny=4, crval1=180.0, crval2=45.0)
+    primary_i = fits.Header.fromstring(hdr_i, sep="\n")
+    primary_i["CTYPE4"] = "STOKES"
+    primary_i["CRVAL4"] = 1.0
+    bytes_i = mod._fits_header_bytes_for_slice(
+        primary_i, post_regrid_wcs_hdr=hdr_i, nl=4, nm=4
+    )
+    ds = xr.Dataset(
+        {
+            "SKY": (("polarization", "m", "l"), np.zeros((1, 4, 4))),
+            "fits_header_str": ((), np.bytes_(bytes_i)),
+        },
+        coords={
+            "polarization": ("polarization", [99]),
+            "l": ("l", np.arange(4)),
+            "m": ("m", np.arange(4)),
+        },
+    )
+    out = mod._set_polarization_coord_from_fits_headers(ds)
+    assert float(out.coords["polarization"].values[0]) == pytest.approx(1.0)
+
+
+def test_fits_header_str_not_collapsed_on_combine() -> None:
+    """``fits_header_str`` must remain per-frequency after celestial harmonization."""
+    import xarray as xr
+
+    mod = _import_module()
+    hdr_a = _make_sin_wcs_header_str(nx=4, ny=4, crval1=180.0, crval2=45.0)
+    hdr_b = _make_sin_wcs_header_str(nx=4, ny=4, crval1=180.1, crval2=45.1)
+    bytes_a = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr_a, sep="\n"),
+        post_regrid_wcs_hdr=hdr_a,
+        nl=4,
+        nm=4,
+    )
+    bytes_b = mod._fits_header_bytes_for_slice(
+        fits.Header.fromstring(hdr_b, sep="\n"),
+        post_regrid_wcs_hdr=hdr_b,
+        nl=4,
+        nm=4,
+    )
+    ra = np.full((2, 4, 4), 180.0)
+    dec = np.full((2, 4, 4), 45.0)
+    ds = xr.Dataset(
+        {
+            "SKY": (("frequency", "l", "m"), np.ones((2, 4, 4))),
+            "fits_header_str": (
+                ("frequency",),
+                np.array([np.bytes_(bytes_a), np.bytes_(bytes_b)], dtype=object),
+            ),
+        },
+        coords={
+            "frequency": np.array([45e6, 55e6], dtype=float),
+            "l": np.linspace(-0.1, 0.1, 4),
+            "m": np.linspace(-0.1, 0.1, 4),
+            "right_ascension": (("frequency", "l", "m"), ra),
+            "declination": (("frequency", "l", "m"), dec),
+        },
+    )
+    out = mod._harmonize_celestial_coords_independent_of_frequency(ds)
+    assert out["fits_header_str"].dims == ("frequency",)
+    assert bytes(out["fits_header_str"].isel(frequency=1).values.item()) == bytes_b
+
+
+def _write_ovro_stokes_fits(
+    path: Path,
+    *,
+    stokes: int,
+    mhz: int = 18,
+    time_key: str = "20240817_120000",
+    pixel_value: float | None = None,
+    n: int = 8,
+) -> None:
+    """Write a minimal OVRO-style 4D FITS with one frequency and one Stokes plane."""
+    pix = float(stokes) if pixel_value is None else float(pixel_value)
+    data = np.full((1, 1, n, n), pix, dtype=np.float32)
+    freq_hz = float(mhz) * 1e6
+    date_obs = datetime.strptime(time_key, "%Y%m%d_%H%M%S").strftime("%Y-%m-%dT%H:%M:%S.0")
+    from astropy.time import Time
+
+    mjd_obs = Time(date_obs, format="fits", scale="utc").mjd
+    header = fits.Header(
+        {
+            "NAXIS": 4,
+            "NAXIS1": n,
+            "NAXIS2": n,
+            "NAXIS3": 1,
+            "NAXIS4": 1,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CTYPE3": "FREQ",
+            "CTYPE4": "STOKES",
+            "CRVAL1": 180.0,
+            "CRVAL2": 45.0,
+            "CRVAL3": freq_hz,
+            "CRVAL4": float(stokes),
+            "CRPIX1": (n + 1) / 2.0,
+            "CRPIX2": (n + 1) / 2.0,
+            "CRPIX3": 1.0,
+            "CRPIX4": 1.0,
+            "CDELT1": -0.03,
+            "CDELT2": 0.03,
+            "CDELT3": 1.0,
+            "CDELT4": 1.0,
+            "CUNIT1": "deg",
+            "CUNIT2": "deg",
+            "CUNIT3": "Hz",
+            "CUNIT4": "",
+            "DATE-OBS": date_obs,
+            "MJD-OBS": mjd_obs,
+            "TELESCOP": "OVRO-LWA",
+            "RADESYS": "FK5",
+            "EQUINOX": 2000.0,
+            "LONPOLE": 180.0,
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+            "BUNIT": "Jy/beam",
+        }
+    )
+    fits.PrimaryHDU(data=data, header=header).writeto(path)
+
+
+def test_discover_groups_keeps_i_and_v_same_time_freq(tmp_path: Path) -> None:
+    """Stokes I and V at the same time/subband must not be treated as duplicates."""
+    mod = _import_module()
+    time_key = "20240817_120000"
+    f_i = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-I.fits"
+    f_v = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-V.fits"
+    _write_ovro_stokes_fits(f_i, stokes=1)
+    _write_ovro_stokes_fits(f_v, stokes=4)
+
+    groups = mod._discover_groups(tmp_path)
+
+    assert time_key in groups
+    assert {p.name for p in groups[time_key]} == {f_i.name, f_v.name}
+
+
+def test_combine_time_step_stacks_i_and_v_polarization(tmp_path: Path) -> None:
+    """One time step with I+V FITS stacks along ``polarization`` with sorted Stokes coords."""
+    mod = _import_module()
+    time_key = "20240817_120000"
+    f_i = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-I.fits"
+    f_v = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-V.fits"
+    _write_ovro_stokes_fits(f_i, stokes=1, pixel_value=1.0)
+    _write_ovro_stokes_fits(f_v, stokes=4, pixel_value=4.0)
+    fixed_dir = tmp_path / "fixed"
+    fixed_dir.mkdir()
+
+    xds_t, freqs, _ = mod._combine_time_step(
+        [f_i, f_v],
+        fixed_dir,
+        chunk_lm=0,
+        fix_headers_on_demand=True,
+    )
+
+    assert int(xds_t.sizes["polarization"]) == 2
+    assert list(np.sort(xds_t.coords["polarization"].values)) == [1.0, 4.0]
+    assert len(freqs) == 1
+    pol_vals = list(xds_t.coords["polarization"].values)
+    i_idx = pol_vals.index(1.0)
+    v_idx = pol_vals.index(4.0)
+    assert float(np.nanmean(xds_t["SKY"].isel(polarization=i_idx).values)) == pytest.approx(1.0)
+    assert float(np.nanmean(xds_t["SKY"].isel(polarization=v_idx).values)) == pytest.approx(4.0)
+    assert "fits_header_str" in xds_t.data_vars
+    assert "polarization" in xds_t["fits_header_str"].dims
+
+
+def test_convert_fits_dir_to_zarr_i_and_v_single_store(tmp_path: Path) -> None:
+    """End-to-end: separate I and V FITS ingest into one Zarr with ``polarization=[1, 4]``."""
+    import xarray as xr
+
+    mod = _import_module()
+    time_key = "20240817_120000"
+    f_i = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-I.fits"
+    f_v = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-V.fits"
+    _write_ovro_stokes_fits(f_i, stokes=1, pixel_value=1.0)
+    _write_ovro_stokes_fits(f_v, stokes=4, pixel_value=4.0)
+    out_dir = tmp_path / "zarr_out"
+    fixed_dir = tmp_path / "fixed"
+
+    out_zarr = mod.convert_fits_dir_to_zarr(
+        input_dir=tmp_path,
+        out_dir=out_dir,
+        zarr_name="combined_iv.zarr",
+        fixed_dir=fixed_dir,
+        chunk_lm=4,
+        rebuild=True,
+        consolidate_metadata_at_end=False,
+    )
+
+    with xr.open_zarr(out_zarr, consolidated=False) as ds:
+        assert "fits_header_str" in ds
+        assert "wcs_header_str" not in ds
+        assert int(ds.sizes["polarization"]) == 2
+        assert list(np.sort(ds.coords["polarization"].values)) == [1.0, 4.0]
+        assert int(ds.sizes["time"]) == 1
+        pol_vals = list(ds.coords["polarization"].values)
+        i_idx = pol_vals.index(1.0)
+        v_idx = pol_vals.index(4.0)
+        assert float(np.nanmean(ds["SKY"].isel(time=0, polarization=i_idx).values)) == pytest.approx(
+            1.0
+        )
+        assert float(np.nanmean(ds["SKY"].isel(time=0, polarization=v_idx).values)) == pytest.approx(
+            4.0
+        )
+        from astropy.io import fits as afits
+
+        from ovro_lwa_portal.accessor import _read_fits_header_str
+
+        for pol_idx, stokes in ((i_idx, 1.0), (v_idx, 4.0)):
+            hdr_str = _read_fits_header_str(ds, time_idx=0, freq_idx=0, pol_idx=pol_idx)
+            hdr = afits.Header.fromstring(hdr_str, sep="\n")
+            assert int(hdr["NAXIS"]) == 4
+            assert int(hdr["NAXIS3"]) == 1
+            assert int(hdr["NAXIS4"]) == 1
+            assert str(hdr["CTYPE3"]).strip() == "FREQ"
+            assert str(hdr["CTYPE4"]).strip() == "STOKES"
+            assert float(hdr["CRVAL4"]) == pytest.approx(stokes)

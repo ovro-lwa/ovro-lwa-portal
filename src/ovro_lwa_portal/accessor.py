@@ -54,34 +54,42 @@ _MAX_PIXEL_TRACK_CHUNK_ELEMENTS = 40_000_000
 
 def _decode_wcs_header_bytes(raw: object) -> str:
     """Decode a scalar WCS header payload from Zarr (bytes or str)."""
-    if isinstance(raw, np.ndarray):
+    while isinstance(raw, np.ndarray):
         raw = raw.item()
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
         return raw.decode("utf-8", errors="replace").rstrip("\x00")
     return str(raw).rstrip("\x00")
 
 
+def _has_fits_header_str(ds: xr.Dataset) -> bool:
+    """True when the dataset carries persisted ``fits_header_str`` metadata."""
+    return "fits_header_str" in ds.data_vars
+
+
 def _has_per_time_wcs_header_str(ds: xr.Dataset) -> bool:
-    """True when ``wcs_header_str`` is stored along the dataset ``time`` axis."""
-    if "wcs_header_str" not in ds:
-        return False
-    wcs_var = ds["wcs_header_str"]
-    if "time" not in wcs_var.dims or int(wcs_var.sizes.get("time", 0)) <= 0:
-        return False
-    if wcs_var.ndim == 1:
-        return True
-    return bool(wcs_var.ndim == 2 and "frequency" in wcs_var.dims)
+    """True when per-time FITS headers are stored for portal WCS lookup."""
+    for var_name in ("fits_header_str", "wcs_header_str"):
+        if var_name not in ds:
+            continue
+        header_var = ds[var_name]
+        if "time" not in header_var.dims or int(header_var.sizes.get("time", 0)) <= 0:
+            continue
+        if header_var.ndim == 1:
+            return True
+        if header_var.ndim >= 2 and "frequency" in header_var.dims:
+            return True
+    return False
 
 
 def strip_redundant_fits_wcs_header_attrs(ds: xr.Dataset) -> xr.Dataset:
-    """Remove static ``fits_wcs_header`` attrs when ``wcs_header_str`` is canonical.
+    """Remove static ``fits_wcs_header`` attrs when per-slice headers are canonical.
 
-    Incremental Zarr ingest stores one header per time in ``wcs_header_str`` but
-    array-level ``fits_wcs_header`` on ``SKY`` (and similar) only reflects the first
-    write. Drop those attrs on load and before Zarr export so consumers never
-    prefer a frozen time-0 phase center over per-time headers.
+    Incremental Zarr ingest stores one header per time in ``fits_header_str`` (or
+    legacy ``wcs_header_str``) but array-level ``fits_wcs_header`` on ``SKY`` only
+    reflects the first write. Drop those attrs on load and before Zarr export so
+    consumers never prefer a frozen time-0 phase center over per-time headers.
     """
-    if "wcs_header_str" not in ds.data_vars:
+    if "fits_header_str" not in ds.data_vars and "wcs_header_str" not in ds.data_vars:
         return ds
     out = ds.copy(deep=False)
     out.attrs.pop("fits_wcs_header", None)
@@ -92,25 +100,77 @@ def strip_redundant_fits_wcs_header_attrs(ds: xr.Dataset) -> xr.Dataset:
     return out
 
 
+def _read_fits_header_str(
+    ds: xr.Dataset,
+    *,
+    time_idx: int = 0,
+    freq_idx: int = 0,
+    pol_idx: int = 0,
+) -> str:
+    """Return the persisted full FITS primary header string for one slice."""
+    if not _has_fits_header_str(ds):
+        msg = (
+            "Dataset is missing fits_header_str. Re-ingest from original FITS files "
+            "to enable FITS export and per-slice WCS."
+        )
+        raise ValueError(msg)
+
+    fh = ds["fits_header_str"]
+    sel = fh
+    if "time" in fh.dims:
+        sel = sel.isel(time=time_idx)
+    if "frequency" in sel.dims:
+        sel = sel.isel(frequency=freq_idx)
+    if "polarization" in sel.dims:
+        sel = sel.isel(polarization=pol_idx)
+    hdr = _decode_wcs_header_bytes(sel.values)
+    if not hdr.strip():
+        msg = (
+            f"fits_header_str is empty for time_idx={time_idx}, "
+            f"freq_idx={freq_idx}, pol_idx={pol_idx}."
+        )
+        raise ValueError(msg)
+    return hdr
+
+
 def _read_wcs_header_str(
     ds: xr.Dataset,
     *,
     var: str = "SKY",
     time_idx: int = 0,
+    freq_idx: int = 0,
 ) -> str | None:
-    """Return the persisted FITS WCS header string from *ds*, if any.
+    """Return the celestial WCS header string derived from ``fits_header_str``.
 
-    When ``wcs_header_str`` is stored per ``time`` step (incremental Zarr),
+    When ``fits_header_str`` is stored per ``time`` step (incremental Zarr),
     that header is preferred over static ``fits_wcs_header`` attrs so each
     slice keeps its own phase-center CRVAL. Empty per-time entries do **not**
     fall back to static attrs (that would mis-register late time slices).
-    Otherwise falls back to attrs, then scalar ``wcs_header_str``.
     """
-    if _has_per_time_wcs_header_str(ds):
+    if _has_fits_header_str(ds):
+        try:
+            from astropy.io.fits import Header
+            from astropy.wcs import WCS
+
+            full_hdr = _read_fits_header_str(
+                ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=0
+            )
+            from astropy.wcs import FITSFixedWarning
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=FITSFixedWarning)
+                wcs = WCS(Header.fromstring(full_hdr, sep="\n"))
+            if not wcs.has_celestial:
+                return None
+            return wcs.celestial.to_header(relax=True).tostring(sep="\n")
+        except ValueError:
+            return None
+
+    if _has_per_time_wcs_header_str(ds) and "wcs_header_str" in ds:
         wcs_var = ds["wcs_header_str"]
         sel = wcs_var.isel(time=time_idx)
         if "frequency" in sel.dims:
-            sel = sel.isel(frequency=0)
+            sel = sel.isel(frequency=freq_idx)
         hdr = _decode_wcs_header_bytes(sel.values)
         if hdr.strip():
             return hdr
@@ -571,7 +631,13 @@ def _world2pix_from_header_str(
 
 
 def _bulk_per_time_wcs_header_strings(ds: xr.Dataset, n_times: int) -> list[str]:
-    """Load decoded ``wcs_header_str`` for every time index in one pass."""
+    """Load decoded celestial WCS header strings for every time index in one pass."""
+    if _has_fits_header_str(ds):
+        return [
+            _read_wcs_header_str(ds, time_idx=ti, freq_idx=0) or ""
+            for ti in range(n_times)
+        ]
+
     wcs_var = ds["wcs_header_str"]
     sel = wcs_var
     if wcs_var.ndim == 2 and "frequency" in wcs_var.dims:
@@ -2040,6 +2106,7 @@ class RadportAccessor:
         """
         self._obj = xarray_obj
         self._lst_cache: dict[tuple, np.ndarray] = {}
+        self._wcs_cache: dict[tuple[int, int], Any] = {}
         self._patch_metadata_cache: _PatchMetadataCache | None = None
         self._validate_structure()
 
@@ -6708,6 +6775,7 @@ class RadportAccessor:
         var: Literal["SKY", "BEAM"] = "SKY",
         *,
         time_idx: int = 0,
+        freq_idx: int = 0,
     ):
         """Get WCS object from the dataset.
 
@@ -6716,8 +6784,11 @@ class RadportAccessor:
         var : {'SKY', 'BEAM'}, default 'SKY'
             Data variable to get WCS from (checks attrs first).
         time_idx : int, default 0
-            Time index when ``wcs_header_str`` is stored per time step (common
+            Time index when ``fits_header_str`` is stored per time step (common
             after incremental Zarr writes).
+        freq_idx : int, default 0
+            Frequency index for per-subband celestial WCS when stored in
+            ``fits_header_str(time, frequency, polarization)``.
 
         Returns
         -------
@@ -6732,6 +6803,11 @@ class RadportAccessor:
             If no WCS header is found in the dataset, or the header has no
             celestial axes.
         """
+        cache_key = (int(time_idx), int(freq_idx))
+        cached = self._wcs_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             from astropy.io.fits import Header
             from astropy.wcs import WCS
@@ -6741,17 +6817,21 @@ class RadportAccessor:
                 "Install with: pip install astropy"
             ) from e
 
-        hdr_str = _read_wcs_header_str(self._obj, var=var, time_idx=time_idx)
+        hdr_str = _read_wcs_header_str(
+            self._obj, var=var, time_idx=time_idx, freq_idx=freq_idx
+        )
         if not hdr_str:
             raise ValueError(
-                "No WCS header found in dataset. Expected 'fits_wcs_header' "
-                "attribute on variable/dataset or 'wcs_header_str' variable."
+                "No WCS header found in dataset. Expected 'fits_header_str' "
+                "(or legacy 'wcs_header_str') with a celestial subset."
             )
 
         wcs = WCS(Header.fromstring(hdr_str, sep="\n"))
         if not wcs.has_celestial:
             raise ValueError("WCS header has no celestial axes (RA/Dec)")
-        return wcs.celestial
+        celestial = wcs.celestial
+        self._wcs_cache[cache_key] = celestial
+        return celestial
 
     @property
     def has_wcs(self) -> bool:
@@ -7804,6 +7884,127 @@ class RadportAccessor:
                 exported_files.append(filepath)
 
         return exported_files
+
+    def build_fits_hdu(
+        self,
+        *,
+        time_idx: int = 0,
+        freq_idx: int = 0,
+        pol_idx: int = 0,
+        var: str = "SKY",
+    ):
+        """Build a 4D singleton-axis ``PrimaryHDU`` for one exported ``SKY`` slice.
+
+        Delegates to :func:`ovro_lwa_portal.export_fits.build_fits_hdu`.
+        """
+        from ovro_lwa_portal import export_fits as export_fits_module
+
+        return export_fits_module.build_fits_hdu(
+            self._obj,
+            time_idx=time_idx,
+            freq_idx=freq_idx,
+            pol_idx=pol_idx,
+            var=var,
+        )
+
+    def export_fits(
+        self,
+        output_dir: str | Path,
+        *,
+        var: str = "SKY",
+        pol_idx: int = 0,
+        pol_indices: list[int] | None = None,
+        time_indices: list[int] | None = None,
+        freq_indices: list[int] | None = None,
+        filename_template: str = "image_t{time_idx:04d}_f{freq_mhz:.3f}MHz_s{stokes}.fits",
+        overwrite: bool = False,
+    ) -> list[str]:
+        """Export ``SKY`` slices as standalone 4D singleton-axis FITS files.
+
+        Writes one FITS file per ``(time_idx, freq_idx, pol_idx)`` combination.
+        Each file has ``NAXIS=4`` with ``NAXIS3=NAXIS4=1`` (singleton FREQ and
+        Stokes axes). Requires persisted ``fits_header_str`` on the dataset.
+
+        Parameters
+        ----------
+        output_dir : str or Path
+            Directory for exported FITS files (created if missing).
+        var : str, default "SKY"
+            Data variable to export (``SKY`` only in practice).
+        pol_idx : int, default 0
+            Polarization index used when *pol_indices* is ``None``.
+        pol_indices : list of int, optional
+            Polarization indices to export. Defaults to ``[pol_idx]``.
+        time_indices : list of int, optional
+            Time indices to export. Defaults to all times.
+        freq_indices : list of int, optional
+            Frequency indices to export. Defaults to all frequencies.
+        filename_template : str
+            Template for output filenames. Placeholders: ``{time_idx}``,
+            ``{freq_idx}``, ``{pol_idx}``, ``{freq_mhz}``, ``{stokes}``.
+        overwrite : bool, default False
+            Overwrite existing files.
+
+        Returns
+        -------
+        list of str
+            Paths to written FITS files.
+        """
+        from pathlib import Path
+
+        from ovro_lwa_portal import export_fits as export_fits_module
+        from ovro_lwa_portal.fits_to_zarr_xradio import _fits_stokes_from_polarization_coord
+
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if var not in self._obj.data_vars:
+            msg = (
+                f"Variable {var!r} not found in dataset. "
+                f"Available variables: {list(self._obj.data_vars)}."
+            )
+            raise ValueError(msg)
+
+        if time_indices is None:
+            time_indices = list(range(int(self._obj.sizes.get("time", 1))))
+        if freq_indices is None:
+            freq_indices = list(range(int(self._obj.sizes.get("frequency", 1))))
+        if pol_indices is None:
+            pol_indices = [pol_idx]
+
+        freq_values = np.asarray(self._obj.coords["frequency"].values).ravel()
+        pol_values = np.asarray(self._obj.coords["polarization"].values).ravel()
+
+        exported: list[str] = []
+        for ti in time_indices:
+            for fi in freq_indices:
+                freq_hz = float(freq_values[fi])
+                freq_mhz = freq_hz / 1e6
+                for pi in pol_indices:
+                    stokes_raw = pol_values[pi]
+                    mapped = _fits_stokes_from_polarization_coord(stokes_raw)
+                    stokes_label = (
+                        f"{mapped:.0f}" if mapped is not None else str(stokes_raw)
+                    )
+                    filename = filename_template.format(
+                        time_idx=ti,
+                        freq_idx=fi,
+                        pol_idx=pi,
+                        freq_mhz=freq_mhz,
+                        stokes=stokes_label,
+                    )
+                    filepath = out_dir / filename
+                    export_fits_module.write_fits_slice(
+                        self._obj,
+                        filepath,
+                        time_idx=ti,
+                        freq_idx=fi,
+                        pol_idx=pi,
+                        var=var,
+                        overwrite=overwrite,
+                    )
+                    exported.append(str(filepath))
+        return exported
 
     # =========================================================================
     # Phase G: Source Detection Methods
