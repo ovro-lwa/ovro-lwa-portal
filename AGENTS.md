@@ -438,15 +438,15 @@ and `test_new_ingest_omits_wcs_header_str_from_zarr`. Do **not** re-add
 
 Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 
-| Function                                    | Role                                                                                                           |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `_has_fits_header_str(ds)`                  | True when `fits_header_str` is present                                                                         |
-| `_has_per_time_wcs_header_str(ds)`          | True when `fits_header_str` or legacy `wcs_header_str` is indexed by `time`                                     |
+| Function                                                 | Role                                                                                                             |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `_has_fits_header_str(ds)`                               | True when `fits_header_str` is present                                                                           |
+| `_has_per_time_wcs_header_str(ds)`                       | True when `fits_header_str` or legacy `wcs_header_str` is indexed by `time`                                      |
 | `_read_fits_header_str(ds, time_idx, freq_idx, pol_idx)` | Full FITS primary header string for one slice (export)                                                           |
-| `_read_wcs_header_str(ds, time_idx=…)`      | Celestial subset derived from `fits_header_str` (default `freq_idx=0`)                                           |
-| `strip_redundant_fits_wcs_header_attrs(ds)` | Drop static `fits_wcs_header` attrs when per-slice headers are canonical (used by `open_dataset` and Zarr write) |
-| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping (`_wcs_cache` keyed by `(time_idx, freq_idx)`)                               |
-| `pixel_to_coords` / `coords_to_pixel`       | Must pass `time_idx` when per-time WCS exists                                                                  |
+| `_read_wcs_header_str(ds, time_idx=…)`                   | Celestial subset derived from `fits_header_str` (default `freq_idx=0`)                                           |
+| `strip_redundant_fits_wcs_header_attrs(ds)`              | Drop static `fits_wcs_header` attrs when per-slice headers are canonical (used by `open_dataset` and Zarr write) |
+| `RadportAccessor._get_wcs(time_idx=…)`                   | Astropy WCS for pixel↔sky mapping (`_wcs_cache` keyed by `(time_idx, freq_idx)`)                                |
+| `pixel_to_coords` / `coords_to_pixel`                    | Must pass `time_idx` when per-time WCS exists                                                                    |
 
 **Strict rules (do not break these):**
 
