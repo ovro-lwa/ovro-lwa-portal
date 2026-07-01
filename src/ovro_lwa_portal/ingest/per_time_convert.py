@@ -19,6 +19,7 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
 from ovro_lwa_portal.ingest.dewarp_convert import remove_staged_files_for_time_key
 from ovro_lwa_portal.ingest.discovery import (
+    GlobConvertDiscoveryPlan,
     IngestDiscoveryConfig,
     collect_glob_sources,
     discover_time_grouped_paths,
@@ -138,6 +139,7 @@ class PerTimeGlobConvertConfig:
     lm_reference_target_size: int | None = None
     duplicate_resolver: Callable[[str, float, list[Path]], Path] | None = None
     verbose: bool = False
+    prepared_discovery: GlobConvertDiscoveryPlan | None = None
 
 
 def run_per_time_glob_convert(
@@ -151,21 +153,41 @@ def run_per_time_glob_convert(
         time_key_source="filename",
     )
 
-    source_paths = collect_glob_sources(config.glob_pattern)
-    if not source_paths:
-        msg = f"Glob matched no files: {config.glob_pattern}"
-        raise FileNotFoundError(msg)
+    plan = config.prepared_discovery
+    if plan is not None:
+        source_paths = list(plan.source_paths)
+        by_time_all = plan.by_time_filtered
+        use_funpack = plan.use_funpack
+        repair_zero_beam = (
+            config.repair_zero_beam
+            if config.repair_zero_beam is not None
+            else use_funpack
+        )
+    else:
+        source_paths = collect_glob_sources(config.glob_pattern)
+        if not source_paths:
+            msg = f"Glob matched no files: {config.glob_pattern}"
+            raise FileNotFoundError(msg)
 
-    use_funpack = (
-        config.funpack
-        if config.funpack is not None
-        else sources_need_funpack(source_paths)
-    )
-    repair_zero_beam = (
-        config.repair_zero_beam
-        if config.repair_zero_beam is not None
-        else use_funpack
-    )
+        use_funpack = (
+            config.funpack
+            if config.funpack is not None
+            else sources_need_funpack(source_paths)
+        )
+        repair_zero_beam = (
+            config.repair_zero_beam
+            if config.repair_zero_beam is not None
+            else use_funpack
+        )
+
+        by_time_all = discover_time_grouped_paths(
+            source_paths,
+            duplicate_resolver=config.duplicate_resolver,
+            discovery=discovery,
+        )
+        if not by_time_all:
+            msg = "No groupable source files after discovery."
+            raise FileNotFoundError(msg)
 
     work_root = config.work_root
     if use_funpack and work_root is None:
@@ -173,15 +195,6 @@ def run_per_time_glob_convert(
         raise ValueError(msg)
     if work_root is None:
         work_root = config.staging_dir / ".work"
-
-    by_time_all = discover_time_grouped_paths(
-        source_paths,
-        duplicate_resolver=config.duplicate_resolver,
-        discovery=discovery,
-    )
-    if not by_time_all:
-        msg = "No groupable source files after discovery."
-        raise FileNotFoundError(msg)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     config.fixed_dir.mkdir(parents=True, exist_ok=True)
@@ -211,14 +224,18 @@ def run_per_time_glob_convert(
         filename_convention=discovery.filename_convention,
     )
 
-    by_time = prepare_ingest_time_groups(
-        by_time_all,
-        out_zarr=out_zarr,
-        rebuild=config.rebuild,
-        resume=config.resume,
-        require_73mhz=False,
-        context="convert",
-        filter_invalid_beam=not repair_zero_beam,
+    by_time = (
+        plan.to_process
+        if plan is not None
+        else prepare_ingest_time_groups(
+            by_time_all,
+            out_zarr=out_zarr,
+            rebuild=config.rebuild,
+            resume=config.resume,
+            require_73mhz=False,
+            context="convert",
+            filter_invalid_beam=not repair_zero_beam,
+        )
     )
     if not by_time:
         logger.info("Every time key is already in %s.", out_zarr)

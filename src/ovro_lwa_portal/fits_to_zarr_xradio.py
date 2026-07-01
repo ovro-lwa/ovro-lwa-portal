@@ -80,7 +80,7 @@ import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 import xarray as xr
@@ -258,10 +258,123 @@ _LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
 
 DiscoveryFilenameConvention = Literal["image", "lst-color"]
 
-# LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
-_LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
 
-DiscoveryFilenameConvention = Literal["image", "lst-color"]
+class _DiscoveryFileMetadata(NamedTuple):
+    """Cached per-file metadata for FITS discovery (one header read when possible)."""
+
+    time_key: Optional[str]
+    frequency_hz: Optional[float]
+    notes: tuple[str, ...]
+    stokes_key: int
+    ingest_header: Optional[fits.Header]
+
+
+def _discovery_metadata_cache_key(fp: Path) -> tuple[Path, int, int]:
+    """Cache key from resolved path and file identity (mtime + size)."""
+    st = fp.stat()
+    return (fp.resolve(), st.st_mtime_ns, st.st_size)
+
+
+def _build_discovery_file_metadata(
+    fp: Path,
+    *,
+    filename_convention: DiscoveryFilenameConvention = "image",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
+) -> _DiscoveryFileMetadata:
+    """Extract discovery metadata with at most one FITS header read per file."""
+    if filename_convention == "lst-color":
+        notes: list[str] = []
+        time_key = _time_key_from_lst_color_filename(fp)
+        if time_key is not None:
+            notes.append("time-from-lst-color-filename")
+        frequency_hz: Optional[float] = None
+        header: Optional[fits.Header] = None
+        try:
+            header = _getheader_for_ingest(fp)
+        except Exception as exc:
+            logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+        if header is not None:
+            frequency_hz = _frequency_hz_from_header(header)
+            if frequency_hz is not None:
+                notes.append("frequency-from-header")
+        stokes_key = (
+            int(round(_stokes_value_from_header(header))) if header is not None else 1
+        )
+        return _DiscoveryFileMetadata(
+            time_key, frequency_hz, tuple(notes), stokes_key, header
+        )
+
+    if group_metadata_source == "filename":
+        time_key, frequency_hz, note_list = _extract_group_metadata_filename_only(fp)
+        stokes_key = _stokes_key_from_filename(fp)
+        return _DiscoveryFileMetadata(
+            time_key, frequency_hz, tuple(note_list), stokes_key, None
+        )
+
+    notes: list[str] = []
+    time_key: Optional[str] = None
+    frequency_hz = None
+    stokes_key = 1
+    header = None
+    try:
+        header = _getheader_for_ingest(fp)
+    except Exception as exc:
+        logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+
+    if header is not None:
+        frequency_hz = _frequency_hz_from_header(header)
+        stokes_key = int(round(_stokes_value_from_header(header)))
+        if time_key_source == "header":
+            time_key = _time_key_from_header(header)
+
+    if time_key_source == "filename":
+        tk_fn = _time_key_from_filename(fp)
+        if tk_fn is not None:
+            time_key = tk_fn
+            notes.append("time-from-filename")
+        elif header is not None and time_key is None:
+            time_key = _time_key_from_header(header)
+
+    if frequency_hz is None:
+        mhz = _mhz_from_name(fp)
+        if mhz != 10**9:
+            frequency_hz = float(mhz * 1e6)
+            notes.append("frequency-from-filename")
+
+    return _DiscoveryFileMetadata(time_key, frequency_hz, tuple(notes), stokes_key, header)
+
+
+def _get_discovery_file_metadata(
+    fp: Path,
+    *,
+    cache: Dict[tuple[Path, int, int], _DiscoveryFileMetadata],
+    filename_convention: DiscoveryFilenameConvention = "image",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: Literal["header", "filename"] = "filename",
+) -> _DiscoveryFileMetadata:
+    """Return cached discovery metadata for *fp*, building it on first access."""
+    key = _discovery_metadata_cache_key(fp)
+    meta = cache.get(key)
+    if meta is None:
+        meta = _build_discovery_file_metadata(
+            fp,
+            filename_convention=filename_convention,
+            group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
+        )
+        cache[key] = meta
+    return meta
+
+
+def _discovery_frequency_sort_key_from_metadata(
+    meta: _DiscoveryFileMetadata,
+    name: str,
+) -> Tuple[float, str]:
+    """Sort key for deterministic frequency ordering from cached metadata."""
+    if meta.frequency_hz is None:
+        return (float(10**15), name)
+    return (float(meta.frequency_hz), name)
 
 
 def _mhz_from_name(p: Path) -> int:
@@ -3177,6 +3290,8 @@ def _truncated_fits_reason(fp: Path) -> Optional[str]:
 
 def _filter_invalid_beam_files(
     by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Drop FITS files with truncated data or a missing/non-positive synthesized beam.
 
@@ -3188,10 +3303,15 @@ def _filter_invalid_beam_files(
     check are dropped from the result (with a warning) so the outer convert loop
     does not attempt to combine an empty group.
 
+    When *discovery_metadata* is provided (from :func:`_discover_groups_from_files`),
+    beam checks reuse cached ingest headers instead of opening each FITS again.
+
     Parameters
     ----------
     by_time
         Discovery output mapping observation-time key → list of FITS file paths.
+    discovery_metadata
+        Optional per-file metadata keyed by ``Path.resolve()``.
 
     Returns
     -------
@@ -3215,18 +3335,23 @@ def _filter_invalid_beam_files(
                 )
                 n_dropped_files += 1
                 continue
-            try:
-                hdr = _getheader_for_ingest(fp)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping %s: could not read image HDU header to check beam (%s); "
-                    "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
-                    fp.name,
-                    exc,
-                    tkey,
-                )
-                n_dropped_files += 1
-                continue
+            cached = (
+                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+            )
+            hdr = cached.ingest_header if cached is not None else None
+            if hdr is None:
+                try:
+                    hdr = _getheader_for_ingest(fp)
+                except Exception as exc:
+                    logger.warning(
+                        "Skipping %s: could not read image HDU header to check beam (%s); "
+                        "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
+                        fp.name,
+                        exc,
+                        tkey,
+                    )
+                    n_dropped_files += 1
+                    continue
             reason = _invalid_beam_reason(hdr)
             if reason is None:
                 kept.append(fp)
@@ -3561,10 +3686,15 @@ def _discover_groups_from_files(
     time_key_source: Literal["header", "filename"] = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Group *fits_files* by observation time and frequency.
 
     See :func:`_discover_groups` for parameter semantics and duplicate handling.
+
+    When *discovery_metadata_out* is provided, it is filled with per-file metadata
+    keyed by ``Path.resolve()`` so callers can reuse discovery results without
+    re-reading FITS headers.
     """
     if freq_bin_hz <= 0.0:
         msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
@@ -3576,15 +3706,22 @@ def _discover_groups_from_files(
         )
         raise ValueError(msg)
 
+    metadata_cache: Dict[tuple[Path, int, int], _DiscoveryFileMetadata] = {}
     by_time: Dict[str, List[Path]] = {}
     by_time_freq_stokes: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
     for f in sorted(fits_files):
-        time_key, frequency_hz, notes = _extract_group_metadata_for_discovery(
+        meta = _get_discovery_file_metadata(
             f,
+            cache=metadata_cache,
             filename_convention=filename_convention,
             group_metadata_source=group_metadata_source,
             time_key_source=time_key_source,
         )
+        if discovery_metadata_out is not None:
+            discovery_metadata_out[f.resolve()] = meta
+        time_key = meta.time_key
+        frequency_hz = meta.frequency_hz
+        notes = meta.notes
         if time_key is None:
             if filename_convention == "lst-color":
                 t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
@@ -3604,7 +3741,7 @@ def _discover_groups_from_files(
             continue
 
         freq_key = int(round(frequency_hz / freq_bin_hz))
-        stokes_key = _stokes_key_for_discovery(f, group_metadata_source=group_metadata_source)
+        stokes_key = meta.stokes_key
         time_freq_map = by_time_freq_stokes.setdefault(time_key, {})
         bucket_key = (freq_key, stokes_key)
         candidates = time_freq_map.setdefault(bucket_key, [])
@@ -3629,15 +3766,14 @@ def _discover_groups_from_files(
                 time_freq_map[bucket_key] = [kept]
                 continue
 
-            if group_metadata_source == "filename":
-                _, rep_hz, _ = _extract_group_metadata_filename_only(candidates[0])
-            else:
-                _, rep_hz, _ = _extract_group_metadata_for_discovery(
-                    candidates[0],
-                    filename_convention=filename_convention,
-                    group_metadata_source=group_metadata_source,
-                    time_key_source=time_key_source,
-                )
+            rep_meta = _get_discovery_file_metadata(
+                candidates[0],
+                cache=metadata_cache,
+                filename_convention=filename_convention,
+                group_metadata_source=group_metadata_source,
+                time_key_source=time_key_source,
+            )
+            rep_hz = rep_meta.frequency_hz
             resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
             selected = duplicate_resolver(time_key, resolver_hz, candidates.copy())
             if selected not in candidates:
@@ -3663,16 +3799,23 @@ def _discover_groups_from_files(
             continue
 
         if notes:
-            logger.warning(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
+            logger.debug(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
         by_time.setdefault(time_key, []).append(f)
 
-    sort_key = lambda p: _discovery_frequency_sort_tuple(
-        p,
-        group_metadata_source=group_metadata_source,
-        filename_convention=filename_convention,
-    )
     for time_key, files in by_time.items():
-        by_time[time_key] = sorted(files, key=sort_key)
+        by_time[time_key] = sorted(
+            files,
+            key=lambda p: _discovery_frequency_sort_key_from_metadata(
+                _get_discovery_file_metadata(
+                    p,
+                    cache=metadata_cache,
+                    filename_convention=filename_convention,
+                    group_metadata_source=group_metadata_source,
+                    time_key_source=time_key_source,
+                ),
+                p.name,
+            ),
+        )
     return by_time
 
 
@@ -3684,6 +3827,7 @@ def _discover_groups(
     time_key_source: Literal["header", "filename"] = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Group input FITS by observation time and frequency (filename time stamp, header fallback).
 
@@ -3732,6 +3876,7 @@ def _discover_groups(
         time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        discovery_metadata_out=discovery_metadata_out,
     )
 
 
@@ -4460,6 +4605,7 @@ def convert_fits_dir_to_zarr(
         msg = f"lm_reference_target_size must be positive, got {lm_reference_target_size}"
         raise ValueError(msg)
 
+    discovery_metadata: Dict[Path, _DiscoveryFileMetadata] = {}
     by_time = _discover_groups(
         input_dir,
         duplicate_resolver=duplicate_resolver,
@@ -4467,6 +4613,7 @@ def convert_fits_dir_to_zarr(
         time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        discovery_metadata_out=discovery_metadata,
     )
     if time_keys_only is not None:
         allowed = {str(k) for k in time_keys_only}
@@ -4478,14 +4625,16 @@ def convert_fits_dir_to_zarr(
                 input_dir,
                 ", ".join(sorted(missing)),
             )
-    by_time = _filter_invalid_beam_files(by_time)
+    by_time = _filter_invalid_beam_files(by_time, discovery_metadata=discovery_metadata)
     if filename_convention == "lst-color":
         by_time = _filter_lst_color_groups_with_mismatched_header_times(by_time)
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
     for k, v in by_time.items():
         freqs_hz = [
-            _extract_group_metadata_for_discovery(
+            discovery_metadata[p.resolve()].frequency_hz
+            if p.resolve() in discovery_metadata
+            else _extract_group_metadata_for_discovery(
                 p,
                 filename_convention=filename_convention,
                 group_metadata_source=group_metadata_source,

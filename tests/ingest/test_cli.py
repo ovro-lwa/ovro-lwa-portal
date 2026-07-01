@@ -101,7 +101,7 @@ class TestCLI:
         with (
             patch(
                 "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
-                return_value=(summary, summary),
+                return_value=(summary, summary, None),
             ),
             patch(
                 "ovro_lwa_portal.ingest.cli._execute_per_time_glob_conversion",
@@ -141,7 +141,7 @@ class TestCLI:
         with (
             patch(
                 "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
-                return_value=(discovered, to_process),
+                return_value=(discovered, to_process, None),
             ),
             patch(
                 "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
@@ -401,7 +401,7 @@ class TestCLI:
         with (
             patch(
                 "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
-                return_value=(summary, summary),
+                return_value=(summary, summary, None),
             ),
             patch(
                 "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",

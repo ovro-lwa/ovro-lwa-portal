@@ -34,12 +34,12 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     validate_zarr_store,
 )
 from ovro_lwa_portal.ingest.discovery import (
+    GlobConvertDiscoveryPlan,
     IngestDiscoveryConfig,
     IngestDiscoverySummary,
-    collect_glob_sources,
     discover_time_grouped_fits,
-    discover_time_grouped_paths,
     plan_convert_discovery,
+    resolve_glob_convert_discovery,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
 from ovro_lwa_portal.ingest.dewarp_convert import (
@@ -50,7 +50,6 @@ from ovro_lwa_portal.ingest.metadata_audit import audit_directory, print_audit_r
 from ovro_lwa_portal.ingest.per_time_convert import (
     PerTimeGlobConvertConfig,
     run_per_time_glob_convert,
-    sources_need_funpack,
 )
 
 __all__ = ["main", "app"]
@@ -224,34 +223,33 @@ def _resolve_convert_discovery_summary(
     resume: bool,
     glob_pattern: str | None = None,
     funpack: bool | None = None,
-) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary]:
+) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary, GlobConvertDiscoveryPlan | None]:
     """Discover grouped FITS and return summary counts for the convert CLI."""
     out_zarr = output_dir / zarr_name
     if glob_pattern is not None:
-        source_paths = collect_glob_sources(glob_pattern)
-        if not source_paths:
-            msg = f"Glob matched no files: {glob_pattern}"
-            raise FileNotFoundError(msg)
-        by_time = discover_time_grouped_paths(source_paths, discovery=discovery)
-        use_funpack = funpack if funpack is not None else sources_need_funpack(source_paths)
-        filter_invalid_beam = not use_funpack
-    else:
-        by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
-        filter_invalid_beam = True
-
-    if not by_time:
-        raise FileNotFoundError(
-            f"No groupable FITS found under {input_dir if glob_pattern is None else glob_pattern}"
+        plan = resolve_glob_convert_discovery(
+            glob_pattern,
+            discovery=discovery,
+            out_zarr=out_zarr,
+            rebuild=rebuild,
+            resume=resume,
+            funpack=funpack,
         )
+        return plan.discovered, plan.to_process_summary, plan
 
-    return plan_convert_discovery(
+    by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
+    if not by_time:
+        raise FileNotFoundError(f"No groupable FITS found under {input_dir}")
+
+    discovered, to_process = plan_convert_discovery(
         by_time,
         discovery=discovery,
         out_zarr=out_zarr,
         rebuild=rebuild,
         resume=resume,
-        filter_invalid_beam=filter_invalid_beam,
+        filter_invalid_beam=True,
     )
+    return discovered, to_process, None
 
 
 def _execute_fits_to_zarr_conversion(
@@ -649,30 +647,14 @@ def convert(
             time_key_source=time_key_source,
             filename_convention=filename_convention,
         )
-        per_time_config = PerTimeGlobConvertConfig(
-            glob_pattern=glob_pattern,
-            staging_dir=input_dir,
-            output_dir=output_dir,
-            fixed_dir=fixed_dir or (output_dir / "fixed_fits"),
-            zarr_name=zarr_name,
-            work_root=work_root,
-            chunk_lm=chunk_lm,
-            rebuild=rebuild,
-            resume=not no_resume,
-            fix_headers_on_demand=not skip_header_fixing,
-            cleanup_fixed_fits=cleanup_fixed_fits or True,
-            funpack=funpack,
-            discovery=discovery,
-            lm_reference_target_size=target_size,
-            verbose=verbose,
-        )
+        fixed_dir_resolved = fixed_dir or (output_dir / "fixed_fits")
 
         console.print("\n[bold cyan]OVRO-LWA FITS → Zarr Conversion (per-time glob)[/bold cyan]")
         console.print(f"  Glob pattern:     {glob_pattern}")
         console.print(f"  Staging dir:      {input_dir}")
         console.print(f"  Output directory: {output_dir}")
         console.print(f"  Zarr store name:  {zarr_name}")
-        console.print(f"  Fixed FITS dir:   {per_time_config.fixed_dir}")
+        console.print(f"  Fixed FITS dir:   {fixed_dir_resolved}")
         console.print(f"  Work root:        {work_root or input_dir / '.work'}")
         console.print(f"  Chunk size (l,m): {chunk_lm}")
         console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
@@ -684,7 +666,7 @@ def convert(
             f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}"
         )
         console.print(
-            f"  Cleanup fixed:    {'YES' if per_time_config.cleanup_fixed_fits else 'NO'}"
+            f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits or True else 'NO'}"
         )
         console.print(f"  Discovery meta:   {group_metadata_source}")
         console.print(f"  Time key source:  {time_key_source}")
@@ -692,7 +674,7 @@ def convert(
         console.print(f"  Log level:        {log_level.value.upper()}\n")
 
         try:
-            discovered, to_process = _resolve_convert_discovery_summary(
+            discovered, to_process, glob_plan = _resolve_convert_discovery_summary(
                 discovery=discovery,
                 input_dir=input_dir,
                 output_dir=output_dir,
@@ -706,6 +688,25 @@ def convert(
             console.print(f"[bold red]✗[/bold red] {exc}", style="red")
             raise typer.Exit(code=1) from exc
         _print_convert_discovery_summary(discovered, to_process, resume=not no_resume)
+
+        per_time_config = PerTimeGlobConvertConfig(
+            glob_pattern=glob_pattern,
+            staging_dir=input_dir,
+            output_dir=output_dir,
+            fixed_dir=fixed_dir_resolved,
+            zarr_name=zarr_name,
+            work_root=work_root,
+            chunk_lm=chunk_lm,
+            rebuild=rebuild,
+            resume=not no_resume,
+            fix_headers_on_demand=not skip_header_fixing,
+            cleanup_fixed_fits=cleanup_fixed_fits or True,
+            funpack=funpack,
+            discovery=discovery,
+            lm_reference_target_size=target_size,
+            verbose=verbose,
+            prepared_discovery=glob_plan,
+        )
 
         _execute_per_time_glob_conversion(per_time_config, log_level=log_level)
         return
@@ -755,7 +756,7 @@ def convert(
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     try:
-        discovered, to_process = _resolve_convert_discovery_summary(
+        discovered, to_process, _ = _resolve_convert_discovery_summary(
             discovery=discovery,
             input_dir=input_dir,
             output_dir=output_dir,

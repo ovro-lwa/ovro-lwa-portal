@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Literal
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
     DiscoveryFilenameConvention,
+    _DiscoveryFileMetadata,
     _discover_groups,
     _discover_groups_from_files,
     _extract_group_metadata_for_discovery,
@@ -24,6 +25,7 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 
 __all__ = [
     "DEFAULT_INGEST_DISCOVERY",
+    "GlobConvertDiscoveryPlan",
     "IngestDiscoveryConfig",
     "IngestDiscoverySummary",
     "collect_glob_sources",
@@ -32,6 +34,7 @@ __all__ = [
     "format_data_size",
     "plan_convert_discovery",
     "prepare_ingest_time_groups",
+    "resolve_glob_convert_discovery",
     "summarize_time_grouped_fits",
 ]
 
@@ -58,6 +61,21 @@ class IngestDiscoveryConfig:
 
 
 DEFAULT_INGEST_DISCOVERY = IngestDiscoveryConfig()
+
+
+@dataclass(frozen=True)
+class GlobConvertDiscoveryPlan:
+    """Single-pass glob discovery result reused by the CLI summary and per-time convert."""
+
+    source_paths: tuple[Path, ...]
+    by_time_all: dict[str, list[Path]]
+    by_time_filtered: dict[str, list[Path]]
+    discovery_metadata: dict[Path, _DiscoveryFileMetadata]
+    to_process: dict[str, list[Path]]
+    discovered: IngestDiscoverySummary
+    to_process_summary: IngestDiscoverySummary
+    filter_invalid_beam: bool
+    use_funpack: bool
 
 
 @dataclass(frozen=True)
@@ -91,6 +109,7 @@ def summarize_time_grouped_fits(
     by_time: Dict[str, List[Path]],
     *,
     discovery: IngestDiscoveryConfig | None = None,
+    discovery_metadata: dict[Path, _DiscoveryFileMetadata] | None = None,
 ) -> IngestDiscoverySummary:
     """Summarize grouped FITS paths by time, frequency subband, and polarization."""
     cfg = discovery or DEFAULT_INGEST_DISCOVERY
@@ -101,20 +120,25 @@ def summarize_time_grouped_fits(
     for files in by_time.values():
         input_files += len(files)
         for fp in files:
-            _, frequency_hz, _ = _extract_group_metadata_for_discovery(
-                fp,
-                filename_convention=cfg.filename_convention,
-                group_metadata_source=cfg.group_metadata_source,
-                time_key_source=cfg.time_key_source,
-            )
+            meta = discovery_metadata.get(fp.resolve()) if discovery_metadata else None
+            if meta is not None:
+                frequency_hz = meta.frequency_hz
+                stokes_keys.add(meta.stokes_key)
+            else:
+                _, frequency_hz, _ = _extract_group_metadata_for_discovery(
+                    fp,
+                    filename_convention=cfg.filename_convention,
+                    group_metadata_source=cfg.group_metadata_source,
+                    time_key_source=cfg.time_key_source,
+                )
+                stokes_keys.add(
+                    _stokes_key_for_discovery(
+                        fp,
+                        group_metadata_source=cfg.group_metadata_source,
+                    )
+                )
             if frequency_hz is not None:
                 freq_bins.add(int(round(float(frequency_hz) / cfg.freq_bin_hz)))
-            stokes_keys.add(
-                _stokes_key_for_discovery(
-                    fp,
-                    group_metadata_source=cfg.group_metadata_source,
-                )
-            )
 
     labels = tuple(
         _STOKES_LABELS.get(code, str(code)) for code in sorted(stokes_keys)
@@ -135,8 +159,13 @@ def _apply_convert_discovery_filters(
     *,
     discovery: IngestDiscoveryConfig,
     filter_invalid_beam: bool,
+    discovery_metadata: dict[Path, _DiscoveryFileMetadata] | None = None,
 ) -> Dict[str, List[Path]]:
-    filtered = _filter_invalid_beam_files(by_time) if filter_invalid_beam else dict(by_time)
+    filtered = (
+        _filter_invalid_beam_files(by_time, discovery_metadata=discovery_metadata)
+        if filter_invalid_beam
+        else dict(by_time)
+    )
     if discovery.filename_convention == "lst-color":
         filtered = _filter_lst_color_groups_with_mismatched_header_times(filtered)
     return filtered
@@ -150,14 +179,20 @@ def plan_convert_discovery(
     rebuild: bool,
     resume: bool,
     filter_invalid_beam: bool = True,
+    discovery_metadata: dict[Path, _DiscoveryFileMetadata] | None = None,
 ) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary]:
     """Return discovery and to-process summaries for convert / per-time glob."""
     filtered = _apply_convert_discovery_filters(
         by_time,
         discovery=discovery,
         filter_invalid_beam=filter_invalid_beam,
+        discovery_metadata=discovery_metadata,
     )
-    discovered = summarize_time_grouped_fits(filtered, discovery=discovery)
+    discovered = summarize_time_grouped_fits(
+        filtered,
+        discovery=discovery,
+        discovery_metadata=discovery_metadata,
+    )
     to_process_groups = prepare_ingest_time_groups(
         filtered,
         out_zarr=out_zarr,
@@ -167,7 +202,11 @@ def plan_convert_discovery(
         context="convert",
         filter_invalid_beam=False,
     )
-    to_process = summarize_time_grouped_fits(to_process_groups, discovery=discovery)
+    to_process = summarize_time_grouped_fits(
+        to_process_groups,
+        discovery=discovery,
+        discovery_metadata=discovery_metadata,
+    )
     return discovered, to_process
 
 
@@ -181,6 +220,7 @@ def discover_time_grouped_fits(
     *,
     duplicate_resolver: Callable[[str, float, List[Path]], Path] | None = None,
     discovery: IngestDiscoveryConfig | None = None,
+    discovery_metadata_out: dict[Path, _DiscoveryFileMetadata] | None = None,
 ) -> Dict[str, List[Path]]:
     """Group FITS under *in_dir* by observation time and frequency bin."""
     cfg = discovery or DEFAULT_INGEST_DISCOVERY
@@ -191,6 +231,7 @@ def discover_time_grouped_fits(
         time_key_source=cfg.time_key_source,
         group_metadata_source=cfg.group_metadata_source,
         filename_convention=cfg.filename_convention,
+        discovery_metadata_out=discovery_metadata_out,
     )
 
 
@@ -199,6 +240,7 @@ def discover_time_grouped_paths(
     *,
     duplicate_resolver: Callable[[str, float, List[Path]], Path] | None = None,
     discovery: IngestDiscoveryConfig | None = None,
+    discovery_metadata_out: dict[Path, _DiscoveryFileMetadata] | None = None,
 ) -> Dict[str, List[Path]]:
     """Group explicit FITS paths by observation time and frequency bin."""
     cfg = discovery or DEFAULT_INGEST_DISCOVERY
@@ -209,6 +251,76 @@ def discover_time_grouped_paths(
         time_key_source=cfg.time_key_source,
         group_metadata_source=cfg.group_metadata_source,
         filename_convention=cfg.filename_convention,
+        discovery_metadata_out=discovery_metadata_out,
+    )
+
+
+def resolve_glob_convert_discovery(
+    glob_pattern: str,
+    *,
+    discovery: IngestDiscoveryConfig,
+    out_zarr: Path,
+    rebuild: bool,
+    resume: bool,
+    funpack: bool | None = None,
+    duplicate_resolver: Callable[[str, float, List[Path]], Path] | None = None,
+) -> GlobConvertDiscoveryPlan:
+    """Discover and plan a glob-driven convert run in a single metadata pass."""
+    from ovro_lwa_portal.ingest.per_time_convert import sources_need_funpack
+
+    source_paths = tuple(collect_glob_sources(glob_pattern))
+    if not source_paths:
+        msg = f"Glob matched no files: {glob_pattern}"
+        raise FileNotFoundError(msg)
+
+    discovery_metadata: dict[Path, _DiscoveryFileMetadata] = {}
+    by_time_all = discover_time_grouped_paths(
+        source_paths,
+        duplicate_resolver=duplicate_resolver,
+        discovery=discovery,
+        discovery_metadata_out=discovery_metadata,
+    )
+    if not by_time_all:
+        msg = f"No groupable FITS found for glob: {glob_pattern}"
+        raise FileNotFoundError(msg)
+
+    use_funpack = funpack if funpack is not None else sources_need_funpack(source_paths)
+    filter_invalid_beam = not use_funpack
+    by_time_filtered = _apply_convert_discovery_filters(
+        by_time_all,
+        discovery=discovery,
+        filter_invalid_beam=filter_invalid_beam,
+        discovery_metadata=discovery_metadata,
+    )
+    discovered = summarize_time_grouped_fits(
+        by_time_filtered,
+        discovery=discovery,
+        discovery_metadata=discovery_metadata,
+    )
+    to_process = prepare_ingest_time_groups(
+        by_time_filtered,
+        out_zarr=out_zarr,
+        rebuild=rebuild,
+        resume=resume,
+        require_73mhz=False,
+        context="convert",
+        filter_invalid_beam=False,
+    )
+    to_process_summary = summarize_time_grouped_fits(
+        to_process,
+        discovery=discovery,
+        discovery_metadata=discovery_metadata,
+    )
+    return GlobConvertDiscoveryPlan(
+        source_paths=source_paths,
+        by_time_all=by_time_all,
+        by_time_filtered=by_time_filtered,
+        discovery_metadata=discovery_metadata,
+        to_process=to_process,
+        discovered=discovered,
+        to_process_summary=to_process_summary,
+        filter_invalid_beam=filter_invalid_beam,
+        use_funpack=use_funpack,
     )
 
 

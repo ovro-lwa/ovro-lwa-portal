@@ -2181,7 +2181,7 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
 
     by_time = {"20241218_063336": [f1], "20241218_063337": [f2]}
     monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
-    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
+    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups, **kwargs: groups)
     monkeypatch.setattr(
         mod,
         "_filter_completed_time_keys",
@@ -2248,7 +2248,7 @@ def test_convert_skips_consolidate_when_disabled(monkeypatch, tmp_path: Path):
     f1.touch()
     by_time = {"20241218_063336": [f1]}
     monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
-    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
+    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups, **kwargs: groups)
     monkeypatch.setattr(
         mod,
         "_global_frequency_coord_hz",
@@ -2301,7 +2301,7 @@ def test_convert_resume_returns_early_when_no_pending(monkeypatch, tmp_path: Pat
 
     by_time = {"20241218_063336": [f1]}
     monkeypatch.setattr(mod, "_discover_groups", lambda *_args, **_kwargs: by_time)
-    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups: groups)
+    monkeypatch.setattr(mod, "_filter_invalid_beam_files", lambda groups, **kwargs: groups)
     monkeypatch.setattr(
         mod,
         "_filter_completed_time_keys",
