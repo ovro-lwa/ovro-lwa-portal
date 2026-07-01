@@ -216,12 +216,14 @@ def run_per_time_glob_convert(
         target_size=config.lm_reference_target_size,
         group_metadata_source=discovery.group_metadata_source,
         filename_convention=discovery.filename_convention,
+        discovery_metadata=plan.discovery_metadata if plan is not None else None,
     ).copy(deep=True)
 
     global_freq_hz = _global_frequency_coord_hz(
         by_time_all,
         group_metadata_source=discovery.group_metadata_source,
         filename_convention=discovery.filename_convention,
+        discovery_metadata=plan.discovery_metadata if plan is not None else None,
     )
 
     by_time = (

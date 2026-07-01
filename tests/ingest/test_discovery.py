@@ -166,7 +166,7 @@ def test_summarize_time_grouped_fits_attaches_zarr_size_estimate(
 
     monkeypatch.setattr(
         "ovro_lwa_portal.ingest.discovery.estimate_zarr_store_bytes",
-        lambda groups: 12_345,
+        lambda groups, **kwargs: 12_345,
     )
     summary = summarize_time_grouped_fits(
         by_time,

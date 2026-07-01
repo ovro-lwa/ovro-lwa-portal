@@ -788,8 +788,8 @@ def test_format_data_size_uses_binary_units() -> None:
     assert mod.format_data_size(42_000_000) == "40.1 MiB"
 
 
-def test_estimate_zarr_store_bytes_sums_per_file_pixels(tmp_path: Path) -> None:
-    """Zarr size estimate is 4 bytes times each input image's pixel count."""
+def test_estimate_zarr_store_bytes_uses_stokes_i_sample(tmp_path: Path) -> None:
+    """Zarr size estimate scales one Stokes-I pixel scale by the total file count."""
     import numpy as np
 
     mod = _import_module()
@@ -802,14 +802,45 @@ def test_estimate_zarr_store_bytes_sums_per_file_pixels(tmp_path: Path) -> None:
         hdr["NAXIS2"] = n_m
         fits.writeto(path, data, hdr, overwrite=True)
 
-    f1 = tmp_path / "a.fits"
-    f2 = tmp_path / "b.fits"
+    f1 = tmp_path / "82MHz-I-Taper-602s-Robust-0-20260419_071829-image.pbcorr_dewarped.fits"
+    f2 = tmp_path / "82MHz-I-Taper-602s-Robust-0-20260419_072826-image.pbcorr_dewarped.fits"
     write_shape(f1, 10, 20)
     write_shape(f2, 30, 40)
     by_time = {"t1": [f1], "t2": [f2]}
 
     nbytes = mod.estimate_zarr_store_bytes(by_time)
-    assert nbytes == (10 * 20 + 30 * 40) * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
+    assert nbytes == 2 * 10 * 20 * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
+
+
+def test_stokes_label_from_dewarped_basename() -> None:
+    mod = _import_module()
+    assert (
+        mod._stokes_label_from_basename(
+            Path("82MHz-I-Taper-602s-Robust-0-20260419_071829-image.pbcorr_dewarped.fits")
+        )
+        == 1
+    )
+    assert (
+        mod._stokes_label_from_basename(
+            Path("82MHz-V-Taper-602s-Robust-0-20260419_071829-image.pbcorr_dewarped.fits")
+        )
+        == 4
+    )
+
+
+def test_discover_groups_keeps_dewarped_i_and_v_same_time_freq(tmp_path: Path) -> None:
+    """Dewarped ``NNMHz-I-Taper`` and ``NNMHz-V-Taper`` products stay separate Stokes bins."""
+    mod = _import_module()
+    time_key = "20260419_071829"
+    f_i = tmp_path / f"82MHz-I-Taper-602s-Robust-0-{time_key}-image.pbcorr_dewarped.fits"
+    f_v = tmp_path / f"82MHz-V-Taper-602s-Robust-0-{time_key}-image.pbcorr_dewarped.fits"
+    _write_ovro_stokes_fits(f_i, stokes=1)
+    _write_ovro_stokes_fits(f_v, stokes=1)
+
+    groups = mod._discover_groups(tmp_path)
+
+    assert time_key in groups
+    assert {p.name for p in groups[time_key]} == {f_i.name, f_v.name}
 
 
 def test_assert_same_lm_clear_error_on_length_mismatch():

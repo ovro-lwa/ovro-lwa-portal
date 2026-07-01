@@ -247,6 +247,10 @@ def _sky_coord_cache_size() -> int:
 # Subband MHz in OVRO-style basenames, e.g. ``82MHz-I-...``, ``..._41MHz_...``,
 # ``...__18MHz-I-...`` (dewarp staging uses ``{time_key}__{original_name}``).
 MHZ_RE = re.compile(r"(?:^|_)(\d+)MHz(?:_|-|\.|$)")
+_STOKES_MHZ_POL_RE = re.compile(r"\d+MHz-([IV])(?:-|_)", re.IGNORECASE)
+_STOKES_IMAGE_SUFFIX_RE = re.compile(r"-IMAGE-([IV])(?:\.|-|_)", re.IGNORECASE)
+_STOKES_TOKEN_RE = re.compile(r"(?:^|[-_])STOKES[-_]([IV])(?:[-_.]|$)", re.IGNORECASE)
+_METADATA_PROGRESS_INTERVAL_CAP = 500
 
 # OVRO-LWA observation-time tokens in basenames (UTC wall-clock for the map).
 # Phase1: ``...-image-YYYYMMDD_HHMMSS...``; phase2 dewarped: ``...YYYYMMDD_HHMMSS-image...``.
@@ -298,16 +302,14 @@ def _build_discovery_file_metadata(
             frequency_hz = _frequency_hz_from_header(header)
             if frequency_hz is not None:
                 notes.append("frequency-from-header")
-        stokes_key = (
-            int(round(_stokes_value_from_header(header))) if header is not None else 1
-        )
+        stokes_key = _resolve_stokes_key_for_discovery(fp, header)
         return _DiscoveryFileMetadata(
             time_key, frequency_hz, tuple(notes), stokes_key, header
         )
 
     if group_metadata_source == "filename":
         time_key, frequency_hz, note_list = _extract_group_metadata_filename_only(fp)
-        stokes_key = _stokes_key_from_filename(fp)
+        stokes_key = _resolve_stokes_key_for_discovery(fp, None)
         return _DiscoveryFileMetadata(
             time_key, frequency_hz, tuple(note_list), stokes_key, None
         )
@@ -315,7 +317,6 @@ def _build_discovery_file_metadata(
     notes: list[str] = []
     time_key: Optional[str] = None
     frequency_hz = None
-    stokes_key = 1
     header = None
     try:
         header = _getheader_for_ingest(fp)
@@ -324,7 +325,6 @@ def _build_discovery_file_metadata(
 
     if header is not None:
         frequency_hz = _frequency_hz_from_header(header)
-        stokes_key = int(round(_stokes_value_from_header(header)))
         if time_key_source == "header":
             time_key = _time_key_from_header(header)
 
@@ -342,6 +342,7 @@ def _build_discovery_file_metadata(
             frequency_hz = float(mhz * 1e6)
             notes.append("frequency-from-filename")
 
+    stokes_key = _resolve_stokes_key_for_discovery(fp, header)
     return _DiscoveryFileMetadata(time_key, frequency_hz, tuple(notes), stokes_key, header)
 
 
@@ -375,6 +376,23 @@ def _discovery_frequency_sort_key_from_metadata(
     if meta.frequency_hz is None:
         return (float(10**15), name)
     return (float(meta.frequency_hz), name)
+
+
+def _metadata_progress_interval(total: int) -> int:
+    """Log metadata progress about every 5% of files, capped for very large sets."""
+    if total <= 1:
+        return 1
+    return min(_METADATA_PROGRESS_INTERVAL_CAP, max(1, total // 20))
+
+
+def _log_metadata_progress(stage: str, current: int, total: int) -> None:
+    """Emit INFO progress while scanning FITS metadata on slow filesystems."""
+    if total <= 0:
+        return
+    every = _metadata_progress_interval(total)
+    if current == 1 or current >= total or current % every == 0:
+        pct = 100.0 * float(current) / float(total)
+        logger.info("[%s] metadata progress: %d / %d files (%.1f%%)", stage, current, total, pct)
 
 
 def _mhz_from_name(p: Path) -> int:
@@ -608,6 +626,7 @@ def _canonical_stack_frequency_hz(
     group_metadata_source: Literal["fits", "filename"],
     time_key_source: Literal["header", "filename"] = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata: Optional[_DiscoveryFileMetadata] = None,
 ) -> Optional[float]:
     """Hz label to use when stacking single-channel slices along ``frequency``.
 
@@ -621,6 +640,8 @@ def _canonical_stack_frequency_hz(
         mhz = _mhz_from_name(fp)
         if mhz != 10**9:
             return float(mhz * 1_000_000)
+    if discovery_metadata is not None and discovery_metadata.frequency_hz is not None:
+        return float(discovery_metadata.frequency_hz)
     _, hz, _ = _extract_group_metadata_for_discovery(
         fp,
         filename_convention=filename_convention,
@@ -659,16 +680,21 @@ def _global_frequency_coord_hz(
     *,
     group_metadata_source: Literal["fits", "filename"],
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> np.ndarray:
     """Union of canonical per-file Hz labels across all time groups (sorted ascending)."""
     hz_vals: set[float] = set()
     for files in by_time.values():
         for fp in files:
+            meta = (
+                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+            )
             hz = _canonical_stack_frequency_hz(
                 fp,
                 group_metadata_source=group_metadata_source,
                 time_key_source="filename",
                 filename_convention=filename_convention,
+                discovery_metadata=meta,
             )
             if hz is not None:
                 hz_vals.add(float(hz))
@@ -1997,20 +2023,81 @@ def format_data_size(num_bytes: int) -> str:
     return f"{value:.1f} TiB"
 
 
-def estimate_zarr_store_bytes(by_time: Dict[str, List[Path]]) -> int | None:
-    """Estimate Zarr store size as 4 bytes per image pixel across input FITS files."""
+def estimate_zarr_store_bytes(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+) -> int | None:
+    """Estimate Zarr store size from one Stokes-I reference image and the file count.
+
+  Assumes every input slice shares the same ``(l, m)`` pixel scale. Uses cached
+  discovery headers when available so Lustre is not re-read for every file.
+    """
     if not by_time:
         return None
 
-    total = 0
-    for files in by_time.values():
-        for fp in files:
-            try:
-                n_l, n_m = _peek_lm_shape(fp)
-            except Exception:
+    n_files = sum(len(files) for files in by_time.values())
+    if n_files <= 0:
+        return None
+
+    pixels_per_file = _sample_pixels_per_file_from_stokes_i_group(
+        by_time,
+        discovery_metadata=discovery_metadata,
+    )
+    if pixels_per_file is None:
+        return None
+    return n_files * pixels_per_file * _ZARR_ESTIMATE_BYTES_PER_PIXEL
+
+
+def _lm_shape_from_discovery_metadata(
+    fp: Path,
+    meta: _DiscoveryFileMetadata | None,
+) -> Tuple[int, int] | None:
+    """Return ``(l, m)`` from cached discovery metadata when possible."""
+    if meta is not None and meta.ingest_header is not None:
+        try:
+            return _lm_shape_from_header(meta.ingest_header)
+        except RuntimeError:
+            return None
+    return None
+
+
+def _sample_pixels_per_file_from_stokes_i_group(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+) -> int | None:
+    """Infer pixels per image from the first Stokes-I file in the first time group."""
+    for tkey in sorted(by_time):
+        for fp in by_time[tkey]:
+            meta = (
+                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+            )
+            if meta is not None:
+                stokes_key = meta.stokes_key
+            else:
+                stokes_key = _resolve_stokes_key_for_discovery(fp, None)
+            if stokes_key == 4:
                 continue
-            total += int(n_l) * int(n_m) * _ZARR_ESTIMATE_BYTES_PER_PIXEL
-    return total if total > 0 else None
+            shape = _lm_shape_from_discovery_metadata(fp, meta)
+            if shape is None:
+                try:
+                    shape = _peek_lm_shape(fp)
+                except Exception:
+                    continue
+            n_l, n_m = shape
+            if n_l > 0 and n_m > 0:
+                logger.info(
+                    "Zarr size estimate: using %d×%d pixels from %s (time=%s); "
+                    "assuming %d input file(s) share the same scale.",
+                    n_l,
+                    n_m,
+                    fp.name,
+                    tkey,
+                    sum(len(files) for files in by_time.values()),
+                )
+                return int(n_l) * int(n_m)
+    return None
 
 
 def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:
@@ -2184,24 +2271,47 @@ def _stokes_value_from_header(hdr: fits.Header) -> float:
     return 1.0
 
 
+def _stokes_label_from_basename(fp: Path) -> int | None:
+    """Return Stokes ``1`` (I) or ``4`` (V) when encoded in the basename, else ``None``."""
+    name = fp.name.upper()
+    for pattern in (_STOKES_MHZ_POL_RE, _STOKES_IMAGE_SUFFIX_RE, _STOKES_TOKEN_RE):
+        match = pattern.search(name)
+        if match is not None:
+            return 1 if match.group(1) == "I" else 4
+    stem = fp.stem.upper()
+    if stem.endswith("-V"):
+        return 4
+    if stem.endswith("-I"):
+        return 1
+    return None
+
+
+def _resolve_stokes_key_for_discovery(
+    fp: Path,
+    hdr: fits.Header | None,
+) -> int:
+    """Resolve the discovery Stokes bin, preferring OVRO basename tokens over headers."""
+    from_basename = _stokes_label_from_basename(fp)
+    if from_basename is not None:
+        return from_basename
+    if hdr is not None:
+        return int(round(_stokes_value_from_header(hdr)))
+    return 1
+
+
 def _stokes_key_from_fits_path(fp: Path) -> int:
     """Integer Stokes code for discovery duplicate bins (``1`` = I, ``4`` = V, …)."""
     try:
         hdr = _getheader_for_ingest(fp)
-        return int(round(_stokes_value_from_header(hdr)))
     except Exception as exc:
         logger.debug("Could not read Stokes from %s (%s); defaulting to I.", fp.name, exc)
-        return 1
+        return _resolve_stokes_key_for_discovery(fp, None)
+    return _resolve_stokes_key_for_discovery(fp, hdr)
 
 
 def _stokes_key_from_filename(fp: Path) -> int:
     """Best-effort Stokes code from basename when discovery skips FITS I/O."""
-    stem = fp.stem.upper()
-    if stem.endswith("-V") or "-STOKES-V" in stem or "STOKESV" in stem:
-        return 4
-    if stem.endswith("-I") or "-STOKES-I" in stem or "STOKESI" in stem:
-        return 1
-    return 1
+    return _resolve_stokes_key_for_discovery(fp, None)
 
 
 def _stokes_key_for_discovery(
@@ -2552,6 +2662,7 @@ def _load_global_lm_reference_dataset(
     group_metadata_source: Literal["fits", "filename"] = "fits",
     max_time_groups: int | None = _LM_REF_SCAN_TIME_GROUPS,
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> xr.Dataset:
     """Load the dataset whose LM grid has the largest shape for use as the global reference.
 
@@ -2599,13 +2710,20 @@ def _load_global_lm_reference_dataset(
                 filename_convention=filename_convention,
             )
         for fp in shape_paths:
+            meta = (
+                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+            )
             if fix_headers_on_demand:
-                hdr = _getheader_for_ingest(fp)
+                hdr = meta.ingest_header if meta is not None else None
+                if hdr is None:
+                    hdr = _getheader_for_ingest(fp)
                 if _invalid_beam_reason(hdr) is not None:
                     continue
                 shape = _lm_shape_from_header(hdr)
             else:
-                shape = _peek_lm_shape(fp)
+                shape = _lm_shape_from_discovery_metadata(fp, meta)
+                if shape is None:
+                    shape = _peek_lm_shape(fp)
             candidates.append((fp, shape))
 
     if not candidates:
@@ -3321,52 +3439,58 @@ def _filter_invalid_beam_files(
     """
     filtered: Dict[str, List[Path]] = {}
     n_dropped_files = 0
-    for tkey, files in by_time.items():
-        kept: List[Path] = []
-        for fp in files:
-            trunc_reason = _truncated_fits_reason(fp)
-            if trunc_reason is not None:
+    file_entries = [(tkey, fp) for tkey, files in by_time.items() for fp in files]
+    total_files = len(file_entries)
+    if total_files:
+        logger.info("Running beam-quality filter on %d FITS file(s).", total_files)
+    kept_by_time: Dict[str, List[Path]] = {}
+    for file_idx, (tkey, fp) in enumerate(file_entries, start=1):
+        _log_metadata_progress("beam-filter", file_idx, total_files)
+        trunc_reason = _truncated_fits_reason(fp)
+        if trunc_reason is not None:
+            logger.warning(
+                "Skipping %s: %s; its (time=%s, frequency=*) slot will be filled "
+                "with NaN in Zarr.",
+                fp.name,
+                trunc_reason,
+                tkey,
+            )
+            n_dropped_files += 1
+            continue
+        cached = (
+            discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+        )
+        hdr = cached.ingest_header if cached is not None else None
+        if hdr is None:
+            try:
+                hdr = _getheader_for_ingest(fp)
+            except Exception as exc:
                 logger.warning(
-                    "Skipping %s: %s; its (time=%s, frequency=*) slot will be filled "
-                    "with NaN in Zarr.",
+                    "Skipping %s: could not read image HDU header to check beam (%s); "
+                    "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
                     fp.name,
-                    trunc_reason,
+                    exc,
                     tkey,
                 )
                 n_dropped_files += 1
                 continue
-            cached = (
-                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+        reason = _invalid_beam_reason(hdr)
+        if reason is None:
+            kept_by_time.setdefault(tkey, []).append(fp)
+        else:
+            logger.warning(
+                "Skipping %s: invalid synthesized beam (%s); its (time=%s, "
+                "frequency=*) slot will be filled with NaN in Zarr.",
+                fp.name,
+                reason,
+                tkey,
             )
-            hdr = cached.ingest_header if cached is not None else None
-            if hdr is None:
-                try:
-                    hdr = _getheader_for_ingest(fp)
-                except Exception as exc:
-                    logger.warning(
-                        "Skipping %s: could not read image HDU header to check beam (%s); "
-                        "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
-                        fp.name,
-                        exc,
-                        tkey,
-                    )
-                    n_dropped_files += 1
-                    continue
-            reason = _invalid_beam_reason(hdr)
-            if reason is None:
-                kept.append(fp)
-            else:
-                logger.warning(
-                    "Skipping %s: invalid synthesized beam (%s); its (time=%s, "
-                    "frequency=*) slot will be filled with NaN in Zarr.",
-                    fp.name,
-                    reason,
-                    tkey,
-                )
-                n_dropped_files += 1
+            n_dropped_files += 1
+    for tkey, files in by_time.items():
+        kept = kept_by_time.get(tkey, [])
         if kept:
             filtered[tkey] = kept
-        else:
+        elif files:
             logger.warning(
                 "All FITS files for time=%s dropped because none have a valid "
                 "synthesized beam; this time step will not be written.",
@@ -3379,6 +3503,8 @@ def _filter_invalid_beam_files(
             n_dropped_files,
             len(filtered),
         )
+    elif total_files:
+        logger.info("Beam-quality filter retained all %d file(s).", total_files)
     return filtered
 
 
@@ -3709,7 +3835,12 @@ def _discover_groups_from_files(
     metadata_cache: Dict[tuple[Path, int, int], _DiscoveryFileMetadata] = {}
     by_time: Dict[str, List[Path]] = {}
     by_time_freq_stokes: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
-    for f in sorted(fits_files):
+    files_sorted = sorted(fits_files)
+    total_files = len(files_sorted)
+    if total_files:
+        logger.info("Discovering metadata for %d FITS file(s).", total_files)
+    for file_idx, f in enumerate(files_sorted, start=1):
+        _log_metadata_progress("discover", file_idx, total_files)
         meta = _get_discovery_file_metadata(
             f,
             cache=metadata_cache,

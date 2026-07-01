@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,8 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     estimate_zarr_store_bytes,
     format_data_size,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_INGEST_DISCOVERY",
@@ -150,7 +153,10 @@ def summarize_time_grouped_fits(
         polarization_groups=len(stokes_keys),
         polarization_labels=labels,
         time_frequency_polarization_cells=input_files,
-        estimated_zarr_bytes=estimate_zarr_store_bytes(by_time),
+        estimated_zarr_bytes=estimate_zarr_store_bytes(
+            by_time,
+            discovery_metadata=discovery_metadata,
+        ),
     )
 
 
@@ -272,6 +278,7 @@ def resolve_glob_convert_discovery(
     if not source_paths:
         msg = f"Glob matched no files: {glob_pattern}"
         raise FileNotFoundError(msg)
+    logger.info("Glob matched %d FITS file(s); starting metadata discovery.", len(source_paths))
 
     discovery_metadata: dict[Path, _DiscoveryFileMetadata] = {}
     by_time_all = discover_time_grouped_paths(
