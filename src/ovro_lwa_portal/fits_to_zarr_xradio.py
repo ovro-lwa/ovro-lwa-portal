@@ -95,7 +95,9 @@ from numpy.typing import NDArray
 __all__ = [
     "InvalidBeamError",
     "convert_fits_dir_to_zarr",
+    "estimate_zarr_store_bytes",
     "fix_fits_headers",
+    "format_data_size",
     "repair_zarr_crval_from_fits",
     "repair_zarr_store",
     "validate_zarr_store",
@@ -1862,6 +1864,40 @@ def _lm_shape_from_header(header: fits.Header) -> Tuple[int, int]:
 def _peek_lm_shape(fp: Path) -> Tuple[int, int]:
     """Return LM shape ``(l, m)`` from FITS header without loading pixel data."""
     return _lm_shape_from_header(_getheader_for_ingest(fp))
+
+
+_ZARR_ESTIMATE_BYTES_PER_PIXEL = 4
+
+
+def format_data_size(num_bytes: int) -> str:
+    """Format a byte count using binary SI units (KiB, MiB, GiB, TiB)."""
+    if num_bytes < 0:
+        msg = f"num_bytes must be non-negative, got {num_bytes}"
+        raise ValueError(msg)
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def estimate_zarr_store_bytes(by_time: Dict[str, List[Path]]) -> int | None:
+    """Estimate Zarr store size as 4 bytes per image pixel across input FITS files."""
+    if not by_time:
+        return None
+
+    total = 0
+    for files in by_time.values():
+        for fp in files:
+            try:
+                n_l, n_m = _peek_lm_shape(fp)
+            except Exception:
+                continue
+            total += int(n_l) * int(n_m) * _ZARR_ESTIMATE_BYTES_PER_PIXEL
+    return total if total > 0 else None
 
 
 def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:

@@ -154,3 +154,23 @@ def test_plan_convert_discovery_splits_discovered_and_to_process(
     assert discovered.input_files == 2
     assert to_process.time_groups == 1
     assert to_process.input_files == 1
+
+
+def test_summarize_time_grouped_fits_attaches_zarr_size_estimate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Discovery summary includes the per-file pixel size estimate when available."""
+    tkey = "20250106_051855"
+    by_time = {tkey: [tmp_path / _image_name(tkey, 41)]}
+    by_time[tkey][0].write_bytes(b"")
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery.estimate_zarr_store_bytes",
+        lambda groups: 12_345,
+    )
+    summary = summarize_time_grouped_fits(
+        by_time,
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+    )
+    assert summary.estimated_zarr_bytes == 12_345
+    assert summary.estimated_zarr_size == "12.1 KiB"

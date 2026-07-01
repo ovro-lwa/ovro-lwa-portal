@@ -183,6 +183,10 @@ def _print_convert_discovery_summary(
         f"{discovered.time_frequency_polarization_cells} "
         f"(Zarr hint {discovered.zarr_shape_hint})"
     )
+    if discovered.estimated_zarr_size is not None:
+        console.print(
+            f"  Estimated final Zarr size:        {discovered.estimated_zarr_size}"
+        )
 
     if resume and to_process.time_groups != discovered.time_groups:
         console.print("\n[bold]To process this run[/bold] (resume skips completed times)")
@@ -198,6 +202,10 @@ def _print_convert_discovery_summary(
             f"{to_process.time_frequency_polarization_cells} "
             f"(Zarr hint {to_process.zarr_shape_hint})"
         )
+        if to_process.estimated_zarr_size is not None:
+            console.print(
+                f"  Estimated Zarr size (this run):   {to_process.estimated_zarr_size}"
+            )
     elif to_process.input_files == 0 and discovered.input_files > 0 and resume:
         console.print(
             "\n[bold yellow]Nothing to process:[/bold yellow] every discovered time is "

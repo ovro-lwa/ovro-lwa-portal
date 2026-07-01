@@ -134,6 +134,7 @@ class TestCLI:
             polarization_groups=1,
             polarization_labels=("I",),
             time_frequency_polarization_cells=12,
+            estimated_zarr_bytes=1_073_741_824,
         )
         to_process = discovered
 
@@ -155,6 +156,7 @@ class TestCLI:
         assert "Time groups:" in result.stdout
         assert "Frequency subbands:" in result.stdout
         assert "Polarization products:" in result.stdout
+        assert "Estimated final Zarr size:" in result.stdout
 
     def test_validate_help(self) -> None:
         """Test validate command help."""

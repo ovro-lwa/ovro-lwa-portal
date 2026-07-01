@@ -780,6 +780,38 @@ def test_lm_shape_from_header_reads_naxis(tmp_path: Path) -> None:
     assert mod._lm_shape_from_header(fits.getheader(fpath)) == (7, 5)
 
 
+def test_format_data_size_uses_binary_units() -> None:
+    mod = _import_module()
+    assert mod.format_data_size(0) == "0 B"
+    assert mod.format_data_size(1023) == "1023 B"
+    assert mod.format_data_size(1024) == "1.0 KiB"
+    assert mod.format_data_size(42_000_000) == "40.1 MiB"
+
+
+def test_estimate_zarr_store_bytes_sums_per_file_pixels(tmp_path: Path) -> None:
+    """Zarr size estimate is 4 bytes times each input image's pixel count."""
+    import numpy as np
+
+    mod = _import_module()
+
+    def write_shape(path: Path, n_l: int, n_m: int) -> None:
+        data = np.zeros((n_m, n_l), dtype=np.float32)
+        hdr = fits.Header()
+        hdr["NAXIS"] = 2
+        hdr["NAXIS1"] = n_l
+        hdr["NAXIS2"] = n_m
+        fits.writeto(path, data, hdr, overwrite=True)
+
+    f1 = tmp_path / "a.fits"
+    f2 = tmp_path / "b.fits"
+    write_shape(f1, 10, 20)
+    write_shape(f2, 30, 40)
+    by_time = {"t1": [f1], "t2": [f2]}
+
+    nbytes = mod.estimate_zarr_store_bytes(by_time)
+    assert nbytes == (10 * 20 + 30 * 40) * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
+
+
 def test_assert_same_lm_clear_error_on_length_mismatch():
     """Length mismatch must raise RuntimeError, not a NumPy broadcast error."""
     import numpy as np

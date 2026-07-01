@@ -18,6 +18,8 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     _filter_invalid_beam_files,
     _filter_lst_color_groups_with_mismatched_header_times,
     _stokes_key_for_discovery,
+    estimate_zarr_store_bytes,
+    format_data_size,
 )
 
 __all__ = [
@@ -27,6 +29,7 @@ __all__ = [
     "collect_glob_sources",
     "discover_time_grouped_fits",
     "discover_time_grouped_paths",
+    "format_data_size",
     "plan_convert_discovery",
     "prepare_ingest_time_groups",
     "summarize_time_grouped_fits",
@@ -67,6 +70,7 @@ class IngestDiscoverySummary:
     polarization_groups: int
     polarization_labels: tuple[str, ...]
     time_frequency_polarization_cells: int
+    estimated_zarr_bytes: int | None = None
 
     @property
     def zarr_shape_hint(self) -> str:
@@ -74,6 +78,13 @@ class IngestDiscoverySummary:
         return (
             f"({self.time_groups}, {self.frequency_groups}, {self.polarization_groups})"
         )
+
+    @property
+    def estimated_zarr_size(self) -> str | None:
+        """Human-readable Zarr size estimate (4 B/pixel), if available."""
+        if self.estimated_zarr_bytes is None:
+            return None
+        return format_data_size(self.estimated_zarr_bytes)
 
 
 def summarize_time_grouped_fits(
@@ -115,6 +126,7 @@ def summarize_time_grouped_fits(
         polarization_groups=len(stokes_keys),
         polarization_labels=labels,
         time_frequency_polarization_cells=input_files,
+        estimated_zarr_bytes=estimate_zarr_store_bytes(by_time),
     )
 
 
