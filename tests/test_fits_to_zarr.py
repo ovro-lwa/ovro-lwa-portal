@@ -789,7 +789,7 @@ def test_format_data_size_uses_binary_units() -> None:
 
 
 def test_estimate_zarr_store_bytes_uses_stokes_i_sample(tmp_path: Path) -> None:
-    """Zarr size estimate scales one Stokes-I pixel scale by the total file count."""
+    """Zarr size estimate scales the reference LM grid by the total file count."""
     import numpy as np
 
     mod = _import_module()
@@ -810,6 +810,32 @@ def test_estimate_zarr_store_bytes_uses_stokes_i_sample(tmp_path: Path) -> None:
 
     nbytes = mod.estimate_zarr_store_bytes(by_time)
     assert nbytes == 2 * 10 * 20 * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
+
+
+def test_estimate_zarr_store_bytes_uses_largest_subband_in_time_group(tmp_path: Path) -> None:
+    """Multi-subband time groups use the largest Stokes-I grid (global LM reference rule)."""
+    import numpy as np
+
+    mod = _import_module()
+
+    def write_subband(path: Path, mhz: int, n_l: int, n_m: int) -> None:
+        data = np.zeros((n_m, n_l), dtype=np.float32)
+        hdr = fits.Header()
+        hdr["NAXIS"] = 2
+        hdr["NAXIS1"] = n_l
+        hdr["NAXIS2"] = n_m
+        hdr["RESTFREQ"] = float(mhz * 1e6)
+        fits.writeto(path, data, hdr, overwrite=True)
+
+    tkey = "20260419_071829"
+    low = tmp_path / f"41MHz-I-Taper-602s-Robust-0-{tkey}-image.pbcorr_dewarped.fits"
+    high = tmp_path / f"82MHz-I-Taper-602s-Robust-0-{tkey}-image.pbcorr_dewarped.fits"
+    write_subband(low, 41, 100, 100)
+    write_subband(high, 82, 200, 200)
+    by_time = {tkey: [low, high]}
+
+    nbytes = mod.estimate_zarr_store_bytes(by_time)
+    assert nbytes == 2 * 200 * 200 * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
 
 
 def test_stokes_label_from_dewarped_basename() -> None:

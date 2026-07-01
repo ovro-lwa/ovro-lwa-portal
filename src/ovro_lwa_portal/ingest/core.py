@@ -280,8 +280,6 @@ class FITSToZarrConverter:
             logger.info(f"  Output: {self.config.zarr_path}")
             logger.info(f"  Mode: {'rebuild' if self.config.rebuild else 'append'}")
 
-            self._report_progress("start", 0, 1, "Starting conversion")
-
             try:
                 result = convert_fits_dir_to_zarr(
                     input_dir=self.config.input_dir,
@@ -306,7 +304,6 @@ class FITSToZarrConverter:
                     global_frequency_coord_hz=self.config.global_frequency_coord_hz,
                 )
 
-                self._report_progress("complete", 1, 1, "Conversion complete")
                 logger.info(f"Conversion successful: {result}")
                 return result
 

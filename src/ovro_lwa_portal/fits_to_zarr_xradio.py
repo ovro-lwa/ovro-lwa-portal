@@ -2027,11 +2027,15 @@ def estimate_zarr_store_bytes(
     by_time: Dict[str, List[Path]],
     *,
     discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> int | None:
-    """Estimate Zarr store size from one Stokes-I reference image and the file count.
+    """Estimate Zarr store size from the global LM reference scale and file count.
 
-  Assumes every input slice shares the same ``(l, m)`` pixel scale. Uses cached
-  discovery headers when available so Lustre is not re-read for every file.
+    Every slice is regridded onto the same ``(l, m)`` grid before write. The
+    reference pixel count is taken from Stokes-I subbands in the first time
+    group (same rule as :func:`_load_global_lm_reference_dataset`: largest
+    ``l×m`` among subbands, typically the highest-frequency image).
     """
     if not by_time:
         return None
@@ -2040,9 +2044,11 @@ def estimate_zarr_store_bytes(
     if n_files <= 0:
         return None
 
-    pixels_per_file = _sample_pixels_per_file_from_stokes_i_group(
+    pixels_per_file = _reference_pixels_per_zarr_slice(
         by_time,
         discovery_metadata=discovery_metadata,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
     )
     if pixels_per_file is None:
         return None
@@ -2062,42 +2068,65 @@ def _lm_shape_from_discovery_metadata(
     return None
 
 
-def _sample_pixels_per_file_from_stokes_i_group(
+def _reference_pixels_per_zarr_slice(
     by_time: Dict[str, List[Path]],
     *,
     discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
 ) -> int | None:
-    """Infer pixels per image from the first Stokes-I file in the first time group."""
-    for tkey in sorted(by_time):
-        for fp in by_time[tkey]:
-            meta = (
-                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
-            )
-            if meta is not None:
-                stokes_key = meta.stokes_key
-            else:
-                stokes_key = _resolve_stokes_key_for_discovery(fp, None)
-            if stokes_key == 4:
+    """Infer per-slice pixel count from Stokes-I subbands in the first time group."""
+    if not by_time:
+        return None
+
+    tkey = sorted(by_time)[0]
+    files = list(by_time[tkey])
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+    files.sort(key=sort_key)
+
+    candidates: List[Tuple[Path, Tuple[int, int]]] = []
+    for fp in files:
+        meta = discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+        if meta is not None:
+            stokes_key = meta.stokes_key
+        else:
+            stokes_key = _resolve_stokes_key_for_discovery(fp, None)
+        if stokes_key == 4:
+            continue
+        shape = _lm_shape_from_discovery_metadata(fp, meta)
+        if shape is None:
+            try:
+                shape = _peek_lm_shape(fp)
+            except Exception:
                 continue
-            shape = _lm_shape_from_discovery_metadata(fp, meta)
-            if shape is None:
-                try:
-                    shape = _peek_lm_shape(fp)
-                except Exception:
-                    continue
-            n_l, n_m = shape
-            if n_l > 0 and n_m > 0:
-                logger.info(
-                    "Zarr size estimate: using %d×%d pixels from %s (time=%s); "
-                    "assuming %d input file(s) share the same scale.",
-                    n_l,
-                    n_m,
-                    fp.name,
-                    tkey,
-                    sum(len(files) for files in by_time.values()),
-                )
-                return int(n_l) * int(n_m)
-    return None
+        n_l, n_m = shape
+        if n_l > 0 and n_m > 0:
+            candidates.append((fp, (int(n_l), int(n_m))))
+
+    if not candidates:
+        return None
+
+    shapes = [shape for _, shape in candidates]
+    ref_idx = _select_reference_shape_index(shapes)
+    ref_fp, ref_shape = candidates[ref_idx]
+    unique_shapes = sorted(set(shapes))
+    logger.info(
+        "Zarr size estimate: reference grid %d×%d from %s (time=%s); "
+        "scanned %d Stokes-I subband(s) with shape(s) %s; assuming %d input "
+        "file(s) regrid to this scale.",
+        ref_shape[0],
+        ref_shape[1],
+        ref_fp.name,
+        tkey,
+        len(candidates),
+        unique_shapes,
+        sum(len(files) for files in by_time.values()),
+    )
+    return ref_shape[0] * ref_shape[1]
 
 
 def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:
@@ -4737,6 +4766,8 @@ def convert_fits_dir_to_zarr(
         raise ValueError(msg)
 
     discovery_metadata: Dict[Path, _DiscoveryFileMetadata] = {}
+    if progress_callback is not None:
+        progress_callback("setup", 0, 4, "Discovering FITS groups…")
     by_time = _discover_groups(
         input_dir,
         duplicate_resolver=duplicate_resolver,
@@ -4761,6 +4792,13 @@ def convert_fits_dir_to_zarr(
         by_time = _filter_lst_color_groups_with_mismatched_header_times(by_time)
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
+    if progress_callback is not None:
+        progress_callback(
+            "setup",
+            1,
+            4,
+            f"Discovered {total_files} file(s) in {len(by_time)} time step(s)",
+        )
     for k, v in by_time.items():
         freqs_hz = [
             discovery_metadata[p.resolve()].frequency_hz
@@ -4823,6 +4861,13 @@ def convert_fits_dir_to_zarr(
             float(np.min(freq_coord_hz)) / 1e6,
             float(np.max(freq_coord_hz)) / 1e6,
         )
+    if progress_callback is not None:
+        progress_callback(
+            "setup",
+            2,
+            4,
+            f"Frequency axis ready ({int(freq_coord_hz.size)} channel(s))",
+        )
 
     if lm_reference_ds is not None:
         lm_ref_ds = lm_reference_ds
@@ -4839,14 +4884,26 @@ def convert_fits_dir_to_zarr(
             group_metadata_source=group_metadata_source,
             filename_convention=filename_convention,
         )
+    if progress_callback is not None:
+        progress_callback("setup", 3, 4, "Global LM reference grid ready")
     lm_reference = (lm_ref_ds["l"].values.copy(), lm_ref_ds["m"].values.copy())
 
     # Decide whether we write a fresh store or append to an existing one
     first_write = not (out_zarr.exists() and not rebuild)
 
     total_time_steps = len(by_time)
+    if progress_callback is not None and total_time_steps:
+        progress_callback("setup", 4, 4, "Starting time-step conversion")
     for idx, tkey in enumerate(sorted(by_time.keys())):
         files = by_time[tkey]
+
+        if progress_callback is not None:
+            progress_callback(
+                "converting",
+                idx,
+                total_time_steps,
+                f"Converting time {idx + 1}/{total_time_steps}: {tkey}",
+            )
 
         logger.info(f"[read/combine] time {tkey}")
         xds_t, freqs, created_fixed_paths = _combine_time_step(
@@ -4885,7 +4942,7 @@ def convert_fits_dir_to_zarr(
                 "converting",
                 idx + 1,
                 total_time_steps,
-                f"Completed time step {idx + 1}/{total_time_steps}"
+                f"Completed time {idx + 1}/{total_time_steps}: {tkey}",
             )
 
     logger.info(f"[done] All times appended into: {out_zarr}")

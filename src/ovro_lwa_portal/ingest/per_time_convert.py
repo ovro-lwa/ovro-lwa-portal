@@ -25,6 +25,7 @@ from ovro_lwa_portal.ingest.discovery import (
     discover_time_grouped_paths,
     prepare_ingest_time_groups,
 )
+from ovro_lwa_portal.ingest.progress import report_ingest_progress
 
 __all__ = [
     "PerTimeGlobConvertConfig",
@@ -208,6 +209,13 @@ def run_per_time_glob_convert(
         len(by_time_all),
     )
 
+    report_ingest_progress(
+        progress_callback,
+        "setup",
+        0,
+        2,
+        "Loading global LM reference grid…",
+    )
     lm_ref_ds = _load_global_lm_reference_dataset(
         by_time_all,
         config.fixed_dir,
@@ -219,6 +227,13 @@ def run_per_time_glob_convert(
         discovery_metadata=plan.discovery_metadata if plan is not None else None,
     ).copy(deep=True)
 
+    report_ingest_progress(
+        progress_callback,
+        "setup",
+        1,
+        2,
+        "Building global frequency axis…",
+    )
     global_freq_hz = _global_frequency_coord_hz(
         by_time_all,
         group_metadata_source=discovery.group_metadata_source,
@@ -252,6 +267,14 @@ def run_per_time_glob_convert(
         sources = list(by_time[tkey])
         work_dir = work_root / tkey
         _cleanup_time_work(work_dir, config.staging_dir, tkey)
+
+        report_ingest_progress(
+            progress_callback,
+            "converting",
+            idx,
+            total,
+            f"Time step {idx + 1}/{total}: preparing {tkey}",
+        )
 
         logger.info(
             "Time %s (%d/%d): preparing %d source(s)",
@@ -306,7 +329,15 @@ def run_per_time_glob_convert(
             global_frequency_coord_hz=global_freq_hz if first_zarr_write else None,
             verbose=config.verbose,
         )
-        FITSToZarrConverter(convert_config, progress_callback=progress_callback).convert()
+        # Inner convert handles one staged time key; outer loop owns progress reporting.
+        FITSToZarrConverter(convert_config, progress_callback=None).convert()
+        report_ingest_progress(
+            progress_callback,
+            "converting",
+            idx + 1,
+            total,
+            f"Time step {idx + 1}/{total}: wrote {tkey}",
+        )
         first_zarr_write = False
         _clear_sky_coord_cache()
         _cleanup_time_work(work_dir, config.staging_dir, tkey)

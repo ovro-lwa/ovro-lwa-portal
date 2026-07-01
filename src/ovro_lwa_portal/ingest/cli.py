@@ -42,6 +42,7 @@ from ovro_lwa_portal.ingest.discovery import (
     resolve_glob_convert_discovery,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
+from ovro_lwa_portal.ingest.progress import ingest_progress_percent
 from ovro_lwa_portal.ingest.dewarp_convert import (
     dewarp_and_convert_append_each_time,
     run_cascade_per_time_group,
@@ -281,9 +282,8 @@ def _execute_fits_to_zarr_conversion(
         def progress_callback(stage: str, current: int, total: int, message: str) -> None:
             if duplicate_prompt_context["active"]:
                 return
-            if total > 0:
-                percentage = (current / total) * 100
-                progress.update(task, completed=percentage, description=message)
+            percentage = ingest_progress_percent(stage, current, total)
+            progress.update(task, completed=percentage, description=message)
 
         def duplicate_resolver(time_key: str, frequency_hz: float, candidates: list[Path]) -> Path:
             duplicate_prompt_context["active"] = True
@@ -377,9 +377,8 @@ def _execute_per_time_glob_conversion(
         task = progress.add_task("Converting per time step...", total=100)
 
         def progress_callback(stage: str, current: int, total: int, message: str) -> None:
-            if total > 0:
-                percentage = (current / total) * 100
-                progress.update(task, completed=percentage, description=message)
+            percentage = ingest_progress_percent(stage, current, total)
+            progress.update(task, completed=percentage, description=message)
 
         try:
             if log_level != LogLevel.DEBUG:

@@ -156,6 +156,8 @@ def summarize_time_grouped_fits(
         estimated_zarr_bytes=estimate_zarr_store_bytes(
             by_time,
             discovery_metadata=discovery_metadata,
+            group_metadata_source=cfg.group_metadata_source,
+            filename_convention=cfg.filename_convention,
         ),
     )
 
