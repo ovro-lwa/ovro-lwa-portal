@@ -224,6 +224,8 @@ def _resolve_convert_discovery_summary(
     resume: bool,
     glob_pattern: str | None = None,
     funpack: bool | None = None,
+    use_discovery_cache: bool = True,
+    refresh_discovery: bool = False,
 ) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary, GlobConvertDiscoveryPlan | None]:
     """Discover grouped FITS and return summary counts for the convert CLI."""
     out_zarr = output_dir / zarr_name
@@ -235,6 +237,8 @@ def _resolve_convert_discovery_summary(
             rebuild=rebuild,
             resume=resume,
             funpack=funpack,
+            use_discovery_cache=use_discovery_cache,
+            refresh_discovery=refresh_discovery,
         )
         return plan.discovered, plan.to_process_summary, plan
 
@@ -577,6 +581,19 @@ def convert(
             "from matched paths."
         ),
     ),
+    refresh_discovery: bool = typer.Option(
+        False,
+        "--refresh-discovery",
+        help=(
+            "Re-scan FITS headers for glob discovery instead of reusing "
+            "``{zarr_stem}_metadata.json`` beside the output Zarr."
+        ),
+    ),
+    no_discovery_cache: bool = typer.Option(
+        False,
+        "--no-discovery-cache",
+        help="Do not read or write the glob discovery sidecar JSON.",
+    ),
     log_level: LogLevel = typer.Option(
         LogLevel.INFO,
         "--log-level",
@@ -682,6 +699,8 @@ def convert(
                 resume=not no_resume,
                 glob_pattern=glob_pattern,
                 funpack=funpack,
+                use_discovery_cache=not no_discovery_cache,
+                refresh_discovery=refresh_discovery,
             )
         except FileNotFoundError as exc:
             console.print(f"[bold red]✗[/bold red] {exc}", style="red")

@@ -330,7 +330,19 @@ def run_per_time_glob_convert(
             verbose=config.verbose,
         )
         # Inner convert handles one staged time key; outer loop owns progress reporting.
-        FITSToZarrConverter(convert_config, progress_callback=None).convert()
+        try:
+            FITSToZarrConverter(convert_config, progress_callback=None).convert()
+        except Exception:
+            logger.error(
+                "Conversion failed at time %s (%d/%d). Times already written to %s "
+                "are kept; re-run the same command with resume enabled (default) to "
+                "continue from the next time key.",
+                tkey,
+                idx + 1,
+                total,
+                out_zarr,
+            )
+            raise
         report_ingest_progress(
             progress_callback,
             "converting",

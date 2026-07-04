@@ -1895,6 +1895,51 @@ def test_fix_headers_adds_stokes_axis_when_missing(tmp_path: Path):
     assert out_data.shape == (1, 1, 4, 4)
 
 
+def test_fix_headers_normalizes_string_stokes_crval_on_2d_promotion(tmp_path: Path) -> None:
+    """2D images with leftover ``CRVAL4='I'`` must promote to numeric Stokes codes."""
+    mod = _import_module()
+    in_path = tmp_path / "82MHz-I-Taper-test.fits"
+    out_path = tmp_path / "82MHz-I-Taper-test_fixed.fits"
+
+    data = np.ones((4, 4), dtype=np.float32)
+    header = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 4,
+            "NAXIS2": 4,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CRVAL1": 180.0,
+            "CRVAL2": 45.0,
+            "CRPIX1": 2.5,
+            "CRPIX2": 2.5,
+            "CDELT1": -0.01,
+            "CDELT2": 0.01,
+            "CRVAL4": "I",
+            "RESTFREQ": 82e6,
+            "BMAJ": 0.25,
+            "BMIN": 0.25,
+        }
+    )
+    fits.PrimaryHDU(data=data, header=header).writeto(in_path)
+
+    mod._fix_headers(in_path, out_path)
+
+    with fits.open(out_path) as hdul:
+        hdr = hdul[0].header
+    assert hdr["NAXIS"] == 4
+    assert hdr["CTYPE4"] == "STOKES"
+    assert float(hdr["CRVAL4"]) == pytest.approx(1.0)
+
+
+def test_stokes_numeric_from_value_accepts_string_labels() -> None:
+    """Stokes helpers map OVRO string tokens to FITS numeric codes."""
+    mod = _import_module()
+    assert mod._stokes_numeric_from_value("I") == pytest.approx(1.0)
+    assert mod._stokes_numeric_from_value(np.str_("V")) == pytest.approx(4.0)
+    assert mod._stokes_value_from_header(fits.Header({"CTYPE4": "STOKES", "CRVAL4": "I", "NAXIS": 4})) == pytest.approx(1.0)
+
+
 def test_fix_headers_2d_promotion_uses_restfrq_for_synthetic_freq_axis(tmp_path: Path) -> None:
     """2D dewarped planes often carry ``RESTFRQ`` only; promotion must not default to 60 MHz."""
     import numpy as np
@@ -3328,11 +3373,12 @@ def _write_ovro_stokes_fits(
     time_key: str = "20240817_120000",
     pixel_value: float | None = None,
     n: int = 8,
+    restfreq_hz: float | None = None,
 ) -> None:
     """Write a minimal OVRO-style 4D FITS with one frequency and one Stokes plane."""
     pix = float(stokes) if pixel_value is None else float(pixel_value)
     data = np.full((1, 1, n, n), pix, dtype=np.float32)
-    freq_hz = float(mhz) * 1e6
+    freq_hz = float(restfreq_hz) if restfreq_hz is not None else float(mhz) * 1e6
     date_obs = datetime.strptime(time_key, "%Y%m%d_%H%M%S").strftime("%Y-%m-%dT%H:%M:%S.0")
     from astropy.time import Time
 
@@ -3421,6 +3467,82 @@ def test_combine_time_step_stacks_i_and_v_polarization(tmp_path: Path) -> None:
     assert float(np.nanmean(xds_t["SKY"].isel(polarization=v_idx).values)) == pytest.approx(4.0)
     assert "fits_header_str" in xds_t.data_vars
     assert "polarization" in xds_t["fits_header_str"].dims
+
+
+def test_stokes_key_prefers_basename_over_misleading_header(tmp_path: Path) -> None:
+    """Stacking uses ``NNMHz-I-`` / ``NNMHz-V-`` basename tokens, not stray ``CRVAL4``."""
+    mod = _import_module()
+    time_key = "20240817_120000"
+    f_i = tmp_path / f"82MHz-I-Taper-602s-Robust-0-{time_key}-image.pbcorr_dewarped.fits"
+    f_v = tmp_path / f"82MHz-V-Taper-602s-Robust-0-{time_key}-image.pbcorr_dewarped.fits"
+    # Headers claim Stokes Q (2) and U (3) while basenames encode I and V.
+    _write_ovro_stokes_fits(f_i, stokes=2, pixel_value=1.0)
+    _write_ovro_stokes_fits(f_v, stokes=3, pixel_value=4.0)
+    fixed_dir = tmp_path / "fixed"
+    fixed_dir.mkdir()
+
+    xds_t, _, _ = mod._combine_time_step(
+        [f_i, f_v],
+        fixed_dir,
+        chunk_lm=0,
+        fix_headers_on_demand=True,
+    )
+
+    assert int(xds_t.sizes["polarization"]) == 2
+    assert list(np.sort(xds_t.coords["polarization"].values)) == [1.0, 4.0]
+
+
+def test_combine_time_step_dedupes_two_i_in_different_discovery_freq_bins(tmp_path: Path) -> None:
+    """Two I products with the same ``NNMHz`` basename but header Hz in different 23 kHz bins.
+
+    Discovery keeps both (different frequency bins, same Stokes I). Stack must not
+  produce ``polarization=[1, 4, 1]`` when combined with V at that subband.
+    """
+    mod = _import_module()
+    time_key = "20260419_071829"
+    f_i_a = tmp_path / f"82MHz-I-Taper-602s-Robust-0-{time_key}-image.pbcorr_dewarped.fits"
+    f_i_b = tmp_path / f"82MHz-I-Taper-602s-Robust-0-{time_key}-image-rerun.pbcorr_dewarped.fits"
+    f_v = tmp_path / f"82MHz-V-Taper-602s-Robust-0-{time_key}-image.pbcorr_dewarped.fits"
+    _write_ovro_stokes_fits(f_i_a, stokes=1, mhz=82, time_key=time_key, restfreq_hz=82.0e6)
+    _write_ovro_stokes_fits(
+        f_i_b, stokes=1, mhz=82, time_key=time_key, restfreq_hz=82.0e6 + 50_000.0
+    )
+    _write_ovro_stokes_fits(f_v, stokes=4, mhz=82, time_key=time_key, restfreq_hz=82.0e6)
+
+    groups = mod._discover_groups(tmp_path)
+    assert len(groups[time_key]) == 3
+
+    fixed_dir = tmp_path / "fixed"
+    fixed_dir.mkdir()
+    xds_t, _, _ = mod._combine_time_step(
+        groups[time_key],
+        fixed_dir,
+        chunk_lm=0,
+        fix_headers_on_demand=True,
+    )
+
+    assert int(xds_t.sizes["polarization"]) == 2
+    assert list(np.sort(xds_t.coords["polarization"].values)) == [1.0, 4.0]
+
+
+def test_align_time_step_to_polarization_grid_fills_missing_stokes() -> None:
+    """Append alignment adds NaN planes for Stokes present in the store but not the step."""
+    import xarray as xr
+
+    mod = _import_module()
+    ds = xr.Dataset(
+        {"SKY": (("polarization", "m", "l"), np.ones((2, 2, 2)))},
+        coords={
+            "polarization": ("polarization", [1.0, 4.0]),
+            "l": ("l", [0, 1]),
+            "m": ("m", [0, 1]),
+        },
+    )
+    aligned = mod._align_time_step_to_polarization_grid(ds, np.array([1.0, 4.0, 2.0]))
+    assert int(aligned.sizes["polarization"]) == 3
+    assert list(aligned.coords["polarization"].values) == [1.0, 4.0, 2.0]
+    q_plane = aligned["SKY"].isel(polarization=2).values
+    assert np.isnan(q_plane).all()
 
 
 def test_convert_fits_dir_to_zarr_i_and_v_single_store(tmp_path: Path) -> None:

@@ -261,3 +261,126 @@ def test_summarize_time_grouped_fits_uses_cached_metadata(
     )
     assert summary.input_files == 1
     assert summary.frequency_groups == 1
+
+
+def test_discovery_sidecar_path_for_zarr() -> None:
+    """Sidecar name replaces ``.zarr`` with ``_metadata.json`` beside the store."""
+    from ovro_lwa_portal.ingest.discovery_sidecar import discovery_sidecar_path_for_zarr
+
+    out = Path("/fast/claw/IV-10min-Taper-Robust-0_30jun26.zarr")
+    assert discovery_sidecar_path_for_zarr(out) == Path(
+        "/fast/claw/IV-10min-Taper-Robust-0_30jun26_metadata.json"
+    )
+
+
+def test_resolve_glob_convert_discovery_uses_sidecar_on_rerun(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A second convert run loads discovery from the sidecar instead of re-reading FITS."""
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    paths = [
+        tmp_path / _image_name(tkey, 41),
+        tmp_path / _image_name(tkey, 55),
+    ]
+    for mhz, path in zip((41, 55), paths, strict=True):
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header(
+                {"RESTFREQ": float(mhz * 1e6), "BMAJ": 0.25, "BMIN": 0.25}
+            ),
+        ).writeto(path)
+
+    discover_calls = 0
+    original = __import__(
+        "ovro_lwa_portal.ingest.discovery", fromlist=["discover_time_grouped_paths"]
+    ).discover_time_grouped_paths
+
+    def counting_discover(*args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal discover_calls
+        discover_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery.discover_time_grouped_paths",
+        counting_discover,
+    )
+
+    out_zarr = tmp_path / "store.zarr"
+    glob_pattern = str(tmp_path / "*.fits")
+    discovery = IngestDiscoveryConfig(group_metadata_source="fits")
+
+    plan1 = resolve_glob_convert_discovery(
+        glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert discover_calls == 1
+    assert (tmp_path / "store_metadata.json").is_file()
+
+    plan2 = resolve_glob_convert_discovery(
+        glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert discover_calls == 1
+    assert plan2.discovered.input_files == plan1.discovered.input_files
+    assert len(plan2.discovery_metadata) == len(plan1.discovery_metadata)
+
+
+def test_discovery_sidecar_invalidates_on_mtime_change(tmp_path: Path) -> None:
+    """Sidecar is ignored when a source FITS file changes on disk."""
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    path = tmp_path / _image_name(tkey, 41)
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 41e6, "BMAJ": 0.25, "BMIN": 0.25}),
+    ).writeto(path)
+
+    out_zarr = tmp_path / "store.zarr"
+    glob_pattern = str(tmp_path / "*.fits")
+    discovery = IngestDiscoveryConfig(group_metadata_source="fits")
+
+    resolve_glob_convert_discovery(
+        glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+
+    path.write_bytes(path.read_bytes() + b" ")
+
+    from ovro_lwa_portal.ingest.discovery_sidecar import load_glob_discovery_sidecar
+
+    sidecar = tmp_path / "store_metadata.json"
+    loaded = load_glob_discovery_sidecar(
+        sidecar,
+        glob_pattern=glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert loaded is None

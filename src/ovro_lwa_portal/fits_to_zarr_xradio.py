@@ -729,6 +729,83 @@ def _align_time_step_to_frequency_grid(ds: xr.Dataset, freq_hz: np.ndarray) -> x
     return ds.reindex(frequency=template, fill_value=np.nan)
 
 
+def _polarization_coord_from_zarr(out_zarr: Path) -> np.ndarray:
+    """Read the store's ``polarization`` coordinate (Stokes codes)."""
+    with xr.open_zarr(str(out_zarr), consolidated=False) as ds:
+        if "polarization" not in ds.coords:
+            return np.asarray([1.0], dtype=np.float64)
+        return np.asarray(ds["polarization"].values, dtype=np.float64).copy()
+
+
+def _align_time_step_to_polarization_grid(
+    ds: xr.Dataset,
+    pol_stokes: np.ndarray,
+) -> xr.Dataset:
+    """Reindex one time step onto the store ``polarization`` axis (NaN for missing Stokes)."""
+    pol_vals = np.asarray(pol_stokes, dtype=np.float64).ravel()
+    if pol_vals.size == 0:
+        return ds
+    if "polarization" not in ds.dims:
+        if pol_vals.size == 1:
+            return ds.expand_dims(polarization=[float(pol_vals[0])])
+        return ds
+    template = xr.DataArray(
+        pol_vals,
+        dims=("polarization",),
+        name="polarization",
+    )
+    return ds.reindex(polarization=template, fill_value=np.nan)
+
+
+def _stokes_numeric_from_value(raw: object, *, default: float = 1.0) -> float:
+    """Map FITS/xarray Stokes tokens (``1``, ``'I'``, ``np.str_('V')``) to numeric codes."""
+    if raw is None:
+        return float(default)
+    if isinstance(raw, (str, np.str_)):
+        label = str(raw).strip().upper()
+        table = {"I": 1.0, "Q": 2.0, "U": 3.0, "V": 4.0, "RR": -1.0, "LL": -2.0, "RL": -3.0, "LR": -4.0}
+        if label in table:
+            return table[label]
+        try:
+            return float(label)
+        except (TypeError, ValueError):
+            return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _polarization_coord_values_float64(values: object) -> np.ndarray:
+    """Coerce polarization coordinate values to FITS Stokes ``float64`` codes."""
+    return np.asarray(
+        [_stokes_numeric_from_value(v) for v in np.asarray(values).ravel()],
+        dtype=np.float64,
+    )
+
+
+def _normalize_polarization_coord(xds: xr.Dataset) -> xr.Dataset:
+    """Ensure ``polarization`` uses numeric Stokes codes (not ``'I'``/``'V'`` strings)."""
+    if "polarization" not in xds.coords:
+        return xds
+    pol = xds["polarization"]
+    vals = _polarization_coord_values_float64(pol.values)
+    if "polarization" in pol.dims:
+        return xds.assign_coords(polarization=("polarization", vals))
+    return xds.assign_coords(polarization=vals)
+
+
+def _format_stokes_coord(values: np.ndarray) -> str:
+    """Human-readable Stokes list for log messages."""
+    labels = {1.0: "I", 4.0: "V", 2.0: "Q", 3.0: "U", -1.0: "RR", -2.0: "LL"}
+    parts: list[str] = []
+    for v in np.asarray(values).ravel():
+        fv = _stokes_numeric_from_value(v)
+        label = labels.get(fv, str(int(fv)) if fv == int(fv) else str(fv))
+        parts.append(f"{label}({fv:g})")
+    return "[" + ", ".join(parts) + "]"
+
+
 def _lm_reference_from_existing_zarr(out_zarr: Path) -> xr.Dataset:
     """Minimal LM + WCS reference from an on-disk Zarr (resume / append without re-scanning FITS)."""
     with xr.open_zarr(str(out_zarr), consolidated=False) as ex:
@@ -1552,6 +1629,9 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         # equal to ``'STOKES'``, which raises ``ValueError: 'STOKES' is not in the list``.
         _strip_fits_ctype_cards(hdr)
         naxis_in = int(hdr.get("NAXIS", 0))
+        for axis in range(1, naxis_in + 1):
+            if str(hdr.get(f"CTYPE{axis}", "")).strip().upper() == "STOKES":
+                hdr[f"CRVAL{axis}"] = _stokes_numeric_from_value(hdr.get(f"CRVAL{axis}", 1.0))
         if data is not None and not _header_has_exact_stokes_axis(hdr) and naxis_in == 4:
             # 4D cubes sometimes carry a length-1 axis mis-labeled (not RA/DEC/FREQ). xradio
             # still requires a literal ``STOKES`` axis name for polarization metadata.
@@ -1579,7 +1659,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 data = np.expand_dims(data, axis=0)
                 hdr["NAXIS"] = 4
                 hdr["CTYPE4"] = "STOKES"
-                hdr["CRVAL4"] = float(hdr.get("CRVAL4", 1.0))
+                hdr["CRVAL4"] = _stokes_numeric_from_value(hdr.get("CRVAL4", 1.0))
                 hdr["CRPIX4"] = 1.0
                 hdr["CDELT4"] = 1.0
                 if "CUNIT4" not in hdr:
@@ -1601,7 +1681,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 hdr["CUNIT3"] = "Hz"
                 hdr["NAXIS4"] = 1
                 hdr["CTYPE4"] = "STOKES"
-                hdr["CRVAL4"] = float(hdr.get("CRVAL4", 1.0))
+                hdr["CRVAL4"] = _stokes_numeric_from_value(hdr.get("CRVAL4", 1.0))
                 hdr["CRPIX4"] = 1.0
                 hdr["CDELT4"] = 1.0
                 if "CUNIT4" not in hdr:
@@ -2211,7 +2291,10 @@ def _fits_stokes_from_polarization_coord(raw: object) -> float | None:
         table = {"I": 1.0, "Q": 2.0, "U": 3.0, "V": 4.0, "RR": -1.0, "LL": -2.0}
         if label in table:
             return table[label]
-        return None
+        try:
+            return float(label)
+        except (TypeError, ValueError):
+            return None
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -2294,9 +2377,9 @@ def _stokes_value_from_header(hdr: fits.Header) -> float:
     naxis = int(hdr.get("NAXIS", 0))
     for axis in range(1, naxis + 1):
         if str(hdr.get(f"CTYPE{axis}", "")).strip().upper() == "STOKES":
-            return float(hdr.get(f"CRVAL{axis}", 1.0))
+            return _stokes_numeric_from_value(hdr.get(f"CRVAL{axis}", 1.0))
     if "CRVAL4" in hdr:
-        return float(hdr["CRVAL4"])
+        return _stokes_numeric_from_value(hdr["CRVAL4"])
     return 1.0
 
 
@@ -2353,8 +2436,23 @@ def _stokes_key_for_discovery(
     return _stokes_key_from_fits_path(fp)
 
 
-def _stokes_sort_key_from_dataset(xds: xr.Dataset) -> float:
+def _stokes_key_for_loaded_slice(xds: xr.Dataset, source_path: Path) -> float:
+    """Stokes code for stacking, preferring OVRO basename tokens over FITS ``CRVAL``."""
+    hdr: fits.Header | None = None
+    primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
+    if primary_str is not None:
+        hdr = fits.Header.fromstring(str(primary_str), sep="\n")
+    return float(_resolve_stokes_key_for_discovery(source_path, hdr))
+
+
+def _stokes_sort_key_from_dataset(
+    xds: xr.Dataset,
+    *,
+    source_path: Path | None = None,
+) -> float:
     """Stokes value used to order polarization slices before ``xr.concat``."""
+    if source_path is not None:
+        return _stokes_key_for_loaded_slice(xds, source_path)
     primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
     if primary_str is not None:
         hdr = fits.Header.fromstring(str(primary_str), sep="\n")
@@ -2371,10 +2469,18 @@ def _stokes_sort_key_from_dataset(xds: xr.Dataset) -> float:
     return 1.0
 
 
-def _stack_polarization_slices_per_frequency(xds_list: List[xr.Dataset]) -> List[xr.Dataset]:
+def _stack_polarization_slices_per_frequency(
+    xds_list: List[xr.Dataset],
+    source_paths: List[Path],
+) -> List[xr.Dataset]:
     """Merge datasets that share a frequency but differ in Stokes along ``polarization``."""
     if len(xds_list) <= 1:
         return xds_list
+    if len(source_paths) != len(xds_list):
+        msg = (
+            f"source_paths length ({len(source_paths)}) must match xds_list ({len(xds_list)})."
+        )
+        raise ValueError(msg)
 
     from collections import defaultdict
 
@@ -2396,11 +2502,38 @@ def _stack_polarization_slices_per_frequency(xds_list: List[xr.Dataset]) -> List
         if len(indices) == 1:
             merged.append(xds_list[indices[0]])
             continue
-        pol_slices = [xds_list[i] for i in indices]
-        pol_slices.sort(key=_stokes_sort_key_from_dataset)
+        pairs: list[tuple[xr.Dataset, Path]] = []
+        seen_stokes: dict[float, Path] = {}
+        for i in indices:
+            path = source_paths[i]
+            xds = xds_list[i]
+            stokes = _stokes_key_for_loaded_slice(xds, path)
+            if stokes not in (1.0, 4.0):
+                logger.warning(
+                    "Unexpected Stokes %s from %s at %.3f MHz; OVRO ingest expects "
+                    "I (1) and/or V (4) from basename or header.",
+                    stokes,
+                    path.name,
+                    freq_hz / 1e6,
+                )
+            if stokes in seen_stokes:
+                logger.warning(
+                    "Skipping duplicate Stokes %s at %.3f MHz (%s); keeping %s.",
+                    stokes,
+                    freq_hz / 1e6,
+                    path.name,
+                    seen_stokes[stokes].name,
+                )
+                continue
+            seen_stokes[stokes] = path
+            pairs.append((xds, path))
+        if len(pairs) == 1:
+            merged.append(pairs[0][0])
+            continue
+        pairs.sort(key=lambda item: _stokes_key_for_loaded_slice(item[0], item[1]))
         expanded: list[xr.Dataset] = []
-        for xds in pol_slices:
-            stokes = _stokes_sort_key_from_dataset(xds)
+        for xds, path in pairs:
+            stokes = _stokes_key_for_loaded_slice(xds, path)
             if "polarization" in xds.dims:
                 xds = xds.assign_coords(polarization=[stokes])
             else:
@@ -2470,6 +2603,21 @@ def _set_polarization_coord_from_fits_headers(xds: xr.Dataset) -> xr.Dataset:
     if "polarization" in xds.dims:
         return xds.assign_coords(polarization=("polarization", np.asarray(stokes_vals)))
     return xds.assign_coords(polarization=np.asarray(stokes_vals, dtype=np.float64))
+
+
+def _ensure_polarization_coord(
+    xds: xr.Dataset,
+    source_paths: Sequence[Path],
+) -> xr.Dataset:
+    """Attach ``polarization`` when missing; keep basename-based coords from stacking."""
+    if "polarization" in xds.coords and int(xds.sizes.get("polarization", 0)) >= 1:
+        return _normalize_polarization_coord(xds)
+    if source_paths:
+        stokes = _stokes_key_for_loaded_slice(xds, source_paths[0])
+        if "polarization" in xds.dims:
+            return xds.assign_coords(polarization=("polarization", np.asarray([stokes])))
+        return xds.expand_dims(polarization=[stokes])
+    return _set_polarization_coord_from_fits_headers(xds)
 
 
 def _expand_fits_header_str_to_data_dims(xds: xr.Dataset) -> xr.Dataset:
@@ -4161,7 +4309,7 @@ def _combine_time_step(
                 )
             xds_list[i] = _regrid_to_reference_lm(xds, ref_ds, source_label=str(fixed_paths[i]))
 
-        xds_list = _stack_polarization_slices_per_frequency(xds_list)
+        xds_list = _stack_polarization_slices_per_frequency(xds_list, fixed_paths)
 
         try:
             xds_t = xr.combine_by_coords(
@@ -4200,7 +4348,12 @@ def _combine_time_step(
 
         xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
         xds_t = _expand_fits_header_str_to_data_dims(xds_t)
-        xds_t = _set_polarization_coord_from_fits_headers(xds_t)
+        xds_t = _ensure_polarization_coord(xds_t, fixed_paths)
+        if "polarization" in xds_t.coords:
+            logger.info(
+                "  polarization Stokes: %s",
+                _format_stokes_coord(np.asarray(xds_t["polarization"].values)),
+            )
 
         xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
 
@@ -4518,12 +4671,16 @@ def _write_or_append_zarr(
                 existing_npol = int(existing.sizes.get("polarization", 1))
                 incoming_npol = int(to_write.sizes.get("polarization", 1))
                 if existing_npol != incoming_npol:
-                    msg = (
-                        f"Cannot append to {out_zarr}: polarization size mismatch "
-                        f"(store has {existing_npol}, new time step has {incoming_npol}). "
-                        "Re-ingest with a consistent I+V (or single-Stokes) layout."
+                    store_pol = np.asarray(existing["polarization"].values, dtype=np.float64)
+                    logger.warning(
+                        "Polarization size mismatch on append to %s (store=%d %s, "
+                        "incoming=%d); reindexing to store layout with NaN fill.",
+                        out_zarr,
+                        existing_npol,
+                        _format_stokes_coord(store_pol),
+                        incoming_npol,
                     )
-                    raise RuntimeError(msg)
+                    to_write = _align_time_step_to_polarization_grid(to_write, store_pol)
 
     _assert_nonempty_fits_header_str_before_zarr_write(to_write)
     to_write = _rechunk_lm_for_zarr(to_write, chunk_lm)
@@ -4916,6 +5073,26 @@ def convert_fits_dir_to_zarr(
             filename_convention=filename_convention,
         )
         xds_t = _align_time_step_to_frequency_grid(xds_t, freq_coord_hz)
+        if not first_write and out_zarr.exists():
+            store_pol = _polarization_coord_from_zarr(out_zarr)
+            if "polarization" in xds_t.coords:
+                incoming_pol = _polarization_coord_values_float64(xds_t["polarization"].values)
+            else:
+                incoming_pol = np.asarray([1.0], dtype=np.float64)
+            if incoming_pol.size != store_pol.size or not np.allclose(
+                incoming_pol, store_pol, rtol=0.0, atol=0.0, equal_nan=True
+            ):
+                logger.warning(
+                    "Polarization layout mismatch for time %s: store has %s (%d plane(s)), "
+                    "incoming step has %s (%d plane(s)); reindexing with NaN fill for missing "
+                    "Stokes (same as missing frequency subbands).",
+                    tkey,
+                    _format_stokes_coord(store_pol),
+                    int(store_pol.size),
+                    _format_stokes_coord(incoming_pol),
+                    int(incoming_pol.size),
+                )
+            xds_t = _align_time_step_to_polarization_grid(xds_t, store_pol)
         logger.info(f"  combined dims: {dict(xds_t.sizes)}")
         logger.info(f"  combined freqs (Hz): {freqs[:8]}{' ...' if len(freqs) > 8 else ''}")
 

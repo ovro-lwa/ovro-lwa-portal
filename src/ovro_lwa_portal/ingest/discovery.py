@@ -272,9 +272,30 @@ def resolve_glob_convert_discovery(
     resume: bool,
     funpack: bool | None = None,
     duplicate_resolver: Callable[[str, float, List[Path]], Path] | None = None,
+    use_discovery_cache: bool = True,
+    refresh_discovery: bool = False,
 ) -> GlobConvertDiscoveryPlan:
     """Discover and plan a glob-driven convert run in a single metadata pass."""
+    from ovro_lwa_portal.ingest.discovery_sidecar import (
+        discovery_sidecar_path_for_zarr,
+        load_glob_discovery_sidecar,
+        save_glob_discovery_sidecar,
+    )
     from ovro_lwa_portal.ingest.per_time_convert import sources_need_funpack
+
+    sidecar_path = discovery_sidecar_path_for_zarr(out_zarr)
+    if use_discovery_cache and not refresh_discovery:
+        cached = load_glob_discovery_sidecar(
+            sidecar_path,
+            glob_pattern=glob_pattern,
+            discovery=discovery,
+            out_zarr=out_zarr,
+            rebuild=rebuild,
+            resume=resume,
+            funpack=funpack,
+        )
+        if cached is not None:
+            return cached
 
     source_paths = tuple(collect_glob_sources(glob_pattern))
     if not source_paths:
@@ -320,7 +341,7 @@ def resolve_glob_convert_discovery(
         discovery=discovery,
         discovery_metadata=discovery_metadata,
     )
-    return GlobConvertDiscoveryPlan(
+    plan = GlobConvertDiscoveryPlan(
         source_paths=source_paths,
         by_time_all=by_time_all,
         by_time_filtered=by_time_filtered,
@@ -331,6 +352,14 @@ def resolve_glob_convert_discovery(
         filter_invalid_beam=filter_invalid_beam,
         use_funpack=use_funpack,
     )
+    if use_discovery_cache:
+        save_glob_discovery_sidecar(
+            sidecar_path,
+            glob_pattern=glob_pattern,
+            discovery=discovery,
+            plan=plan,
+        )
+    return plan
 
 
 def prepare_ingest_time_groups(
