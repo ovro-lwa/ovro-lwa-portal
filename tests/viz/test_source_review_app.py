@@ -437,6 +437,51 @@ def test_configure_stokes_enables_toggle_for_iv_dataset(tmp_path: Path) -> None:
     assert review._pol_idx() == 1
 
 
+def test_configure_stokes_pushes_toggle_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import numpy as np
+    import xarray as xr
+
+    pushed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.source_review_app.set_notebook_widget_params",
+        lambda widget, *views, **params: pushed.append(params),
+    )
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    ds = xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.ones((1, 1, 2, 4, 4)),
+            ),
+        },
+        coords={
+            "time": [60000.0],
+            "frequency": [50e6],
+            "polarization": [1, 4],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    review._configure_stokes_from_dataset(ds)
+    assert pushed
+    assert pushed[-1]["visible"] is True
+    assert pushed[-1]["disabled"] is False
+
+
 def test_stokes_change_clears_computed_heatmap(tmp_path: Path) -> None:
     zarr = tmp_path / "store.zarr"
     zarr.mkdir()

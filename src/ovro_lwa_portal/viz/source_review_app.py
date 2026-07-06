@@ -1372,6 +1372,7 @@ class SourceReview(param.Parameterized):
         if not options:
             self._stokes_toggle.visible = False
             self._stokes_toggle.disabled = True
+            self._sync_stokes_toggle_display()
             return
         with param.parameterized.batch_call_watchers(self):
             self.param.stokes.objects = options
@@ -1383,6 +1384,20 @@ class SourceReview(param.Parameterized):
         self._stokes_toggle.visible = len(options) >= 2
         if len(options) >= 2:
             self._log(f"Stokes planes available: {', '.join(options)}")
+        self._sync_stokes_toggle_display()
+
+    def _sync_stokes_toggle_display(self) -> None:
+        """Push Stokes toggle visibility/options to the notebook after Zarr open."""
+        toggle = self._stokes_toggle
+        if self._panel_serve_mode:
+            return
+        set_notebook_widget_params(
+            toggle,
+            *self._notebook_ui_views(),
+            visible=bool(toggle.visible),
+            disabled=bool(toggle.disabled),
+            options=dict(toggle.options),
+        )
 
     def _apply_sky_widget_pol(self) -> None:
         widget = self._sky_widget
