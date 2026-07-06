@@ -139,6 +139,7 @@ def _read_wcs_header_str(
     var: str = "SKY",
     time_idx: int = 0,
     freq_idx: int = 0,
+    pol_idx: int = 0,
 ) -> str | None:
     """Return the celestial WCS header string derived from ``fits_header_str``.
 
@@ -153,7 +154,7 @@ def _read_wcs_header_str(
             from astropy.wcs import WCS
 
             full_hdr = _read_fits_header_str(
-                ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=0
+                ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=int(pol_idx)
             )
             from astropy.wcs import FITSFixedWarning
 
@@ -171,6 +172,8 @@ def _read_wcs_header_str(
         sel = wcs_var.isel(time=time_idx)
         if "frequency" in sel.dims:
             sel = sel.isel(frequency=freq_idx)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=int(pol_idx))
         hdr = _decode_wcs_header_bytes(sel.values)
         if hdr.strip():
             return hdr

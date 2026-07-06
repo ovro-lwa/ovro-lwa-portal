@@ -7,10 +7,12 @@ from pathlib import Path
 import astropy.units as u
 import numpy as np
 import pytest
+import xarray as xr
 from astropy.coordinates import SkyCoord
 
 from ovro_lwa_portal.viz.source_review_data import (
     HEATMAP_METHOD_OPTIONS,
+    available_stokes_labels,
     build_source_from_coordinate,
     calendar_mmdd_labels_for_time_coord,
     compute_overlay_patch_fit,
@@ -18,6 +20,7 @@ from ovro_lwa_portal.viz.source_review_data import (
     filter_known_source_names,
     format_heatmap_time_axis_label,
     load_known_sources,
+    polarization_index_for_stokes,
     resolve_known_sources_path,
 )
 
@@ -113,3 +116,61 @@ def test_compute_overlay_patch_fit(
     assert result.frequency_idx == 0
     diag = result.cell_diagnostics(6, 0)
     assert "reduced_chi_squared" in diag
+
+
+@pytest.fixture
+def iv_polarization_dataset() -> xr.Dataset:
+    """Two-plane I+V store (FITS Stokes 1 and 4) after ``isel`` cleanup."""
+    plane_shape = (2, 3, 8, 8)
+    i_data = np.ones(plane_shape, dtype=np.float64)
+    v_data = np.full(plane_shape, 2.0, dtype=np.float64)
+    stacked = np.stack([i_data, v_data], axis=2)
+    return xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                stacked,
+            ),
+        },
+        coords={
+            "time": [60000.0, 60000.1],
+            "frequency": [46e6, 50e6, 54e6],
+            "polarization": [1, 4],
+            "l": np.arange(8),
+            "m": np.arange(8),
+        },
+    )
+
+
+def test_available_stokes_labels_iv(iv_polarization_dataset: xr.Dataset) -> None:
+    assert available_stokes_labels(iv_polarization_dataset) == ["I", "V"]
+
+
+def test_polarization_index_for_stokes_iv(iv_polarization_dataset: xr.Dataset) -> None:
+    assert polarization_index_for_stokes(iv_polarization_dataset, "I") == 0
+    assert polarization_index_for_stokes(iv_polarization_dataset, "V") == 1
+
+
+def test_compute_source_heatmap_uses_selected_pol(iv_polarization_dataset: xr.Dataset) -> None:
+    src = build_source_from_coordinate(
+        "Test",
+        SkyCoord(ra=180.0 * u.deg, dec=37.0 * u.deg, frame="icrs"),
+    )
+    calls: list[int] = []
+
+    def _track(ra, dec, pol=0, progress_callback=None):  # noqa: ANN001
+        calls.append(int(pol))
+        return iv_polarization_dataset["SKY"].isel(
+            polarization=int(pol), l=4, m=4
+        )
+
+    iv_polarization_dataset.radport.dynamic_spectrum = _track  # type: ignore[method-assign]
+    compute_source_heatmap(
+        iv_polarization_dataset,
+        src,
+        method="dynamic_spectrum",
+        scale=3.0,
+        patch_fit_max_reduced_chi_squared=3.0,
+        pol=1,
+    )
+    assert calls == [1]

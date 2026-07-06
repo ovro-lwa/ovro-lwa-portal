@@ -376,3 +376,113 @@ def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:
     review._apply_overlay_fixed_scale(widget)
     assert widget.vmin == -2.0
     assert widget.vmax == 20.0
+
+
+def test_stokes_toggle_hidden_until_iv_store_opened(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    assert review._stokes_toggle.visible is False
+    assert review._stokes_toggle in review._layout.objects[0].objects
+
+
+def test_configure_stokes_enables_toggle_for_iv_dataset(tmp_path: Path) -> None:
+    import numpy as np
+    import xarray as xr
+
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    ds = xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.ones((1, 1, 2, 4, 4)),
+            ),
+        },
+        coords={
+            "time": [60000.0],
+            "frequency": [50e6],
+            "polarization": [1, 4],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    review._dataset = ds
+    review._configure_stokes_from_dataset(ds)
+    assert review._stokes_toggle.visible is True
+    assert review.param.stokes.objects == ["I", "V"]
+    assert review._pol_idx() == 0
+    review.stokes = "V"
+    assert review._pol_idx() == 1
+
+
+def test_stokes_change_clears_computed_heatmap(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+
+    def _inline_dispatch(callback) -> None:
+        callback()
+
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        dispatch_override=_inline_dispatch,
+    )
+    import numpy as np
+    import xarray as xr
+
+    ds = xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.ones((2, 2, 2, 4, 4)),
+            ),
+        },
+        coords={
+            "time": [60000.0, 60000.1],
+            "frequency": [46e6, 50e6],
+            "polarization": [1, 4],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    review._dataset = ds
+    review._lst_hours = np.array([12.0, 13.0])
+    review._freq_mhz = np.array([46.0, 50.0])
+    review._configure_stokes_from_dataset(ds)
+    review._cache[("Cas A", "mad", "I")] = object()
+    review._heatmap_coord = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
+    review._heatmap_values = np.zeros((2, 2))
+    review._heatmap_grid_ready = True
+    review.stokes = "V"
+    review._on_stokes_change_impl()
+    assert review._cache == {}
+    assert review._heatmap_coord is None

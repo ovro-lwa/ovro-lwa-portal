@@ -99,6 +99,7 @@ __all__ = [
     "fix_fits_headers",
     "format_data_size",
     "repair_zarr_crval_from_fits",
+    "repair_zarr_polarization",
     "repair_zarr_store",
     "validate_zarr_store",
 ]
@@ -737,24 +738,136 @@ def _polarization_coord_from_zarr(out_zarr: Path) -> np.ndarray:
         return np.asarray(ds["polarization"].values, dtype=np.float64).copy()
 
 
+def _polarization_plane_finite_score(ds: xr.Dataset, pol_idx: int) -> float:
+    """Return a rough finite-pixel count for one polarization plane (SKY, then BEAM)."""
+    score = 0.0
+    for var in ("SKY", "BEAM"):
+        if var not in ds:
+            continue
+        da = ds[var]
+        if "polarization" not in da.dims:
+            continue
+        plane = da.isel(polarization=pol_idx)
+        if hasattr(plane.data, "compute"):
+            score += float(plane.notnull().sum().compute())
+        else:
+            score += float(plane.notnull().sum())
+    return score
+
+
+def _canonicalize_polarization_coord(xds: xr.Dataset) -> xr.Dataset:
+    """Collapse duplicate Stokes labels on ``polarization`` to one plane per Stokes code.
+
+    When ``combine_by_coords`` or legacy ingest produced ``polarization=[1, 4, 1]``,
+    keep the plane with the most finite SKY/BEAM per Stokes value and drop extras.
+    """
+    if "polarization" not in xds.dims:
+        return xds
+    pol_vals = _polarization_coord_values_float64(xds["polarization"].values)
+    if pol_vals.size <= 1 or pol_vals.size == len(np.unique(pol_vals)):
+        return _normalize_polarization_coord(xds)
+
+    keep_indices: list[int] = []
+    new_pol: list[float] = []
+    seen: set[float] = set()
+    for stokes in pol_vals:
+        sf = float(stokes)
+        if sf in seen:
+            continue
+        candidates = [i for i, pv in enumerate(pol_vals) if float(pv) == sf]
+        best_idx = max(candidates, key=lambda i: _polarization_plane_finite_score(xds, i))
+        keep_indices.append(best_idx)
+        new_pol.append(sf)
+        seen.add(sf)
+
+    logger.warning(
+        "Canonicalizing duplicate polarization coordinate %s → %s",
+        _format_stokes_coord(pol_vals),
+        _format_stokes_coord(np.asarray(new_pol)),
+    )
+    out = xds.isel(polarization=keep_indices)
+    return _normalize_polarization_coord(
+        out.assign_coords(polarization=("polarization", np.asarray(new_pol, dtype=np.float64)))
+    )
+
+
+def _assert_unique_polarization_coord(xds: xr.Dataset) -> None:
+    """Fail fast when ``polarization`` carries duplicate Stokes codes."""
+    if "polarization" not in xds.coords:
+        return
+    pol = _polarization_coord_values_float64(xds["polarization"].values)
+    if pol.size != len(np.unique(pol)):
+        msg = (
+            "polarization coordinate has duplicate Stokes values before Zarr write: "
+            f"{_format_stokes_coord(pol)}"
+        )
+        raise RuntimeError(msg)
+
+
+def _polarization_plane_nan_fill(ds_slice: xr.Dataset) -> xr.Dataset:
+    """Return one polarization slice with NaN image data and empty ``fits_header_str``."""
+    out = ds_slice.copy(deep=True)
+    for name in list(out.data_vars):
+        da = out[name]
+        if name == "fits_header_str":
+            out = out.assign({name: xr.full_like(da, np.bytes_(b""))})
+        elif np.issubdtype(da.dtype, np.floating) or np.issubdtype(da.dtype, np.complexfloating):
+            out = out.assign({name: xr.full_like(da, np.nan)})
+        elif da.dtype == bool:
+            out = out.assign({name: xr.full_like(da, False)})
+        elif np.issubdtype(da.dtype, np.integer):
+            out = out.assign({name: xr.zeros_like(da)})
+    return out
+
+
+def _drop_polarization_coord(ds: xr.Dataset) -> xr.Dataset:
+    """Remove the ``polarization`` coordinate so ``xr.concat`` uses positional order."""
+    if "polarization" in ds.coords:
+        return ds.drop_vars("polarization")
+    return ds
+
+
 def _align_time_step_to_polarization_grid(
     ds: xr.Dataset,
     pol_stokes: np.ndarray,
 ) -> xr.Dataset:
-    """Reindex one time step onto the store ``polarization`` axis (NaN for missing Stokes)."""
-    pol_vals = np.asarray(pol_stokes, dtype=np.float64).ravel()
-    if pol_vals.size == 0:
+    """Align one time step onto the store ``polarization`` axis (NaN for missing Stokes).
+
+    Uses label-based assignment so a legacy store template ``[1, 4, 1]`` does not
+    copy the I plane into both Stokes-1 slots (``xarray.Dataset.reindex`` would).
+    """
+    target = _polarization_coord_values_float64(pol_stokes)
+    if target.size == 0:
         return ds
     if "polarization" not in ds.dims:
-        if pol_vals.size == 1:
-            return ds.expand_dims(polarization=[float(pol_vals[0])])
+        if target.size == 1:
+            return ds.expand_dims(polarization=[float(target[0])])
         return ds
-    template = xr.DataArray(
-        pol_vals,
-        dims=("polarization",),
-        name="polarization",
-    )
-    return ds.reindex(polarization=template, fill_value=np.nan)
+
+    incoming = _canonicalize_polarization_coord(ds)
+    incoming_pol = _polarization_coord_values_float64(incoming["polarization"].values)
+    incoming_by_stokes = {float(s): int(i) for i, s in enumerate(incoming_pol)}
+
+    seen_target_stokes: set[float] = set()
+    planes: list[xr.Dataset] = []
+    for stokes in target:
+        sf = float(_stokes_numeric_from_value(stokes))
+        if sf not in seen_target_stokes and sf in incoming_by_stokes:
+            planes.append(
+                _drop_polarization_coord(
+                    incoming.isel(polarization=incoming_by_stokes[sf])
+                )
+            )
+            seen_target_stokes.add(sf)
+        else:
+            planes.append(
+                _drop_polarization_coord(
+                    _polarization_plane_nan_fill(incoming.isel(polarization=0))
+                )
+            )
+
+    merged = xr.concat(planes, dim="polarization")
+    return merged.assign_coords(polarization=("polarization", target))
 
 
 def _stokes_numeric_from_value(raw: object, *, default: float = 1.0) -> float:
@@ -1146,6 +1259,158 @@ def repair_zarr_store(
         "pre": pre,
         "post": post,
     }
+
+
+def _polarization_plane_scores_from_zarr(zg: zarr.Group, n_pol: int) -> dict[int, float]:
+    """Finite-pixel counts per polarization index from a small on-disk SKY/BEAM sample."""
+    scores = {i: 0.0 for i in range(n_pol)}
+    for var in ("SKY", "BEAM"):
+        if var not in zg:
+            continue
+        arr = zg[var]
+        dims_attr = arr.attrs.get("_ARRAY_DIMENSIONS")
+        if dims_attr is None:
+            continue
+        dims = [dims_attr] if isinstance(dims_attr, str) else [str(d) for d in dims_attr]
+        if "polarization" not in dims:
+            continue
+        pol_axis = dims.index("polarization")
+        slicer: list[slice | int] = [slice(None)] * arr.ndim
+        for ax, dim in enumerate(dims):
+            if dim == "time":
+                slicer[ax] = 0
+            elif dim == "frequency":
+                slicer[ax] = 0
+            elif dim == "l":
+                slicer[ax] = slice(2048, 2112, 16)
+            elif dim == "m":
+                slicer[ax] = slice(2048, 2112, 16)
+        for i in range(n_pol):
+            slicer[pol_axis] = i
+            block = np.asarray(arr[tuple(slicer)])
+            scores[i] += float(np.isfinite(block).sum())
+        break
+    return scores
+
+
+def _polarization_keep_indices_from_values(
+    pol_values: np.ndarray,
+    *,
+    plane_scores: dict[int, float] | None = None,
+) -> tuple[list[int], np.ndarray]:
+    """Choose one index per unique Stokes code; prefer the plane with more finite data."""
+    pol = _polarization_coord_values_float64(pol_values)
+    if pol.size <= 1 or pol.size == len(np.unique(pol)):
+        return list(range(int(pol.size))), pol
+
+    scores = plane_scores or {i: 0.0 for i in range(int(pol.size))}
+    keep_indices: list[int] = []
+    new_pol: list[float] = []
+    seen: set[float] = set()
+    for stokes in pol:
+        sf = float(stokes)
+        if sf in seen:
+            continue
+        candidates = [i for i, pv in enumerate(pol) if float(pv) == sf]
+        best_idx = max(candidates, key=lambda i: scores.get(i, 0.0))
+        keep_indices.append(best_idx)
+        new_pol.append(sf)
+        seen.add(sf)
+    return keep_indices, np.asarray(new_pol, dtype=np.float64)
+
+
+def repair_zarr_polarization(
+    out_zarr: str | Path,
+    *,
+    backup_suffix: str = ".backup-before-pol-repair",
+    skip_backup: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, object]:
+    """Drop duplicate Stokes planes from a Zarr store (e.g. ``polarization=[1, 4, 1]`` → ``[1, 4]``)."""
+    out_zarr = Path(out_zarr)
+    if not out_zarr.exists():
+        msg = f"Zarr store does not exist: {out_zarr}"
+        raise FileNotFoundError(msg)
+
+    zg = zarr.open_group(str(out_zarr), mode="r")
+    if "polarization" not in zg:
+        return {
+            "store": str(out_zarr),
+            "changed": False,
+            "message": "Store has no polarization coordinate; nothing to repair.",
+        }
+
+    pol_values = np.asarray(zg["polarization"][:], dtype=np.float64)
+    scores = _polarization_plane_scores_from_zarr(zg, int(pol_values.size))
+    keep_indices, new_pol = _polarization_keep_indices_from_values(
+        pol_values, plane_scores=scores
+    )
+    if len(keep_indices) == int(pol_values.size):
+        return {
+            "store": str(out_zarr),
+            "changed": False,
+            "polarization_before": [float(v) for v in pol_values],
+            "polarization_after": [float(v) for v in pol_values],
+            "message": "Polarization coordinate is already unique.",
+        }
+
+    dropped = [i for i in range(int(pol_values.size)) if i not in keep_indices]
+    report: Dict[str, object] = {
+        "store": str(out_zarr),
+        "changed": not dry_run,
+        "dry_run": dry_run,
+        "polarization_before": [float(v) for v in pol_values],
+        "polarization_after": [float(v) for v in new_pol],
+        "keep_indices": keep_indices,
+        "dropped_indices": dropped,
+        "plane_scores": {str(k): scores.get(k, 0.0) for k in range(int(pol_values.size))},
+    }
+    if dry_run:
+        report["message"] = (
+            f"Would drop polarization indices {dropped} "
+            f"({_format_stokes_coord(pol_values)} → {_format_stokes_coord(new_pol)})"
+        )
+        return report
+
+    rewritten_arrays = [
+        name
+        for name in zg.array_keys()
+        if name == "polarization"
+        or "polarization"
+        in (
+            [str(zg[name].attrs.get("_ARRAY_DIMENSIONS"))]
+            if isinstance(zg[name].attrs.get("_ARRAY_DIMENSIONS"), str)
+            else [str(d) for d in zg[name].attrs.get("_ARRAY_DIMENSIONS", [])]
+        )
+    ]
+
+    backup_path: str | None = None
+    if not skip_backup:
+        backup_path = str(out_zarr.with_name(out_zarr.name + backup_suffix))
+        if Path(backup_path).exists():
+            msg = f"Backup path already exists: {backup_path}"
+            raise FileExistsError(msg)
+        shutil.copytree(out_zarr, backup_path)
+        report["backup"] = backup_path
+
+    tmp_path = out_zarr.with_name(out_zarr.name + ".pol-repair-tmp")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+
+    with xr.open_zarr(str(out_zarr), consolidated=False) as ds:
+        repaired = ds.isel(polarization=keep_indices)
+        repaired = repaired.assign_coords(polarization=("polarization", new_pol))
+        repaired.to_zarr(str(tmp_path), mode="w", consolidated=False)
+
+    shutil.rmtree(out_zarr)
+    shutil.move(str(tmp_path), str(out_zarr))
+    _consolidate_zarr_metadata(out_zarr)
+    report["rewritten_arrays"] = rewritten_arrays
+    report["message"] = (
+        f"Dropped polarization indices {dropped} "
+        f"({_format_stokes_coord(pol_values)} → {_format_stokes_coord(new_pol)})"
+    )
+    return report
 
 
 def _patch_celestial_crval_in_header_str(ref_hdr_str: str, src_hdr: fits.Header) -> str:
@@ -4349,6 +4614,7 @@ def _combine_time_step(
         xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
         xds_t = _expand_fits_header_str_to_data_dims(xds_t)
         xds_t = _ensure_polarization_coord(xds_t, fixed_paths)
+        xds_t = _canonicalize_polarization_coord(xds_t)
         if "polarization" in xds_t.coords:
             logger.info(
                 "  polarization Stokes: %s",
@@ -4664,6 +4930,8 @@ def _write_or_append_zarr(
 
     if first_write or not out_zarr.exists():
         to_write = _align_time_dimension_for_zarr_write(xds_t)
+        to_write = _canonicalize_polarization_coord(to_write)
+        _assert_unique_polarization_coord(to_write)
     else:
         with xr.open_zarr(str(out_zarr), consolidated=False) as existing:
             to_write = _align_time_dimension_for_zarr_write(xds_t, schema=existing)

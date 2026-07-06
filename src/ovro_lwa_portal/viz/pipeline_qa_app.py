@@ -61,18 +61,29 @@ check_viz_deps()
 def _patch_astrowidget_get_wcs() -> None:
     """Use strict per-time WCS lookup so late time indices do not fall back to time 0."""
     import astrowidget.wcs as awcs
+    from astrowidget import SkyWidget
 
     if getattr(awcs.get_wcs, "_ovro_portal_patched", False):
         return
 
     original_get_wcs = awcs.get_wcs
 
-    def get_wcs(ds: xr.Dataset, var: str = "SKY", time_idx: int = 0):
+    def get_wcs(
+        ds: xr.Dataset,
+        var: str = "SKY",
+        time_idx: int = 0,
+        pol_idx: int = 0,
+    ):
         from astropy.io.fits import Header
         from astropy.wcs import WCS
 
         if _has_per_time_wcs_header_str(ds):
-            hdr_str = _read_wcs_header_str(ds, var=var, time_idx=int(time_idx))
+            hdr_str = _read_wcs_header_str(
+                ds,
+                var=var,
+                time_idx=int(time_idx),
+                pol_idx=int(pol_idx),
+            )
             if hdr_str is None:
                 n_time = int(ds.sizes.get("time", 0))
                 msg = (
@@ -91,6 +102,21 @@ def _patch_astrowidget_get_wcs() -> None:
 
     get_wcs._ovro_portal_patched = True  # type: ignore[attr-defined]
     awcs.get_wcs = get_wcs
+
+    if not getattr(SkyWidget._update_display_wcs, "_ovro_portal_patched", False):
+        def _update_display_wcs(self) -> None:
+            from astrowidget.wcs import adjust_wcs_for_array_stride, get_wcs
+
+            if self._ds is None or self._cube is None:
+                return
+            pol_idx = int(self._cube.pol)
+            wcs = get_wcs(self._ds, var=self._var, time_idx=self.time_idx, pol_idx=pol_idx)
+            self._display_wcs = adjust_wcs_for_array_stride(
+                wcs, self._cube.stride_l, self._cube.stride_m
+            )
+
+        _update_display_wcs._ovro_portal_patched = True  # type: ignore[attr-defined]
+        SkyWidget._update_display_wcs = _update_display_wcs
 
 
 _patch_astrowidget_get_wcs()

@@ -48,6 +48,7 @@ from ovro_lwa_portal.viz.pipeline_qa_app import (
     set_notebook_pane_object,
     set_notebook_widget_params,
 )
+from ovro_lwa_portal.viz.panel_compat import button_appearance_kwargs
 from ovro_lwa_portal.viz.panel_ui_session import (
     CallbackPanelUISession,
     JupyterPanelUISession,
@@ -71,6 +72,7 @@ from ovro_lwa_portal.viz.source_review_data import (
     _format_patch_fit_diagnostics,
     _heatmap_index_from_coord,
     _row_hover,
+    available_stokes_labels,
     build_source_from_coordinate,
     calendar_mmdd_labels_for_time_coord,
     compute_overlay_patch_fit,
@@ -81,6 +83,7 @@ from ovro_lwa_portal.viz.source_review_data import (
     format_heatmap_time_axis_label,
     load_known_sources,
     lst_hours_for_dataset,
+    polarization_index_for_stokes,
     resolve_known_sources_path,
 )
 
@@ -106,6 +109,7 @@ class SourceReviewConfig:
     """Runtime paths and tuning knobs normally set in the notebook config cell."""
 
     zarr_lm_chunk: int = 512
+    polarization_isel: tuple[int, ...] | None = None
     skip_first_valid_sky_scan: bool = True
     use_ned_fallback: bool = True
     ned_timeout_s: float = 10.0
@@ -214,6 +218,11 @@ class SourceReview(param.Parameterized):
         default="mad",
         objects=HEATMAP_METHOD_OPTIONS,
         doc="Quantity plotted in the time–frequency heatmap.",
+    )
+    stokes = param.Selector(
+        default="I",
+        objects=["I", "V"],
+        doc="Stokes parameter for overlay, heatmap, and patch fit.",
     )
     loading = param.Boolean(default=False)
     status = param.String(default="Opening Zarr store…")
@@ -389,6 +398,12 @@ class SourceReview(param.Parameterized):
             width=150,
         )
         self._coord_generate.on_click(self._on_generate_heatmap)
+        self._stokes_toggle = pn.widgets.RadioButtonGroup.from_param(
+            self.param.stokes,
+            name="Stokes",
+            visible=False,
+            **button_appearance_kwargs("default", widget_class=pn.widgets.RadioButtonGroup),
+        )
         self._overlay_toggle = pn.widgets.Toggle(
             name="Overlay: on",
             value=True,
@@ -407,6 +422,7 @@ class SourceReview(param.Parameterized):
                 self._coord_input,
                 self._coord_slew,
                 self._coord_generate,
+                self._stokes_toggle,
                 self._overlay_toggle,
                 self._fit_overlay_button,
                 self._method_selector,
@@ -426,6 +442,7 @@ class SourceReview(param.Parameterized):
             max_width=1048,
         )
         self.param.watch(self._on_heatmap_method_change, "heatmap_method")
+        self.param.watch(self._on_stokes_change, "stokes")
         if self._known_sources_path is not None:
             resolved_sources = resolve_known_sources_path(self._known_sources_path)
             if resolved_sources is None:
@@ -783,12 +800,14 @@ class SourceReview(param.Parameterized):
         dataset = self._dataset
         time_idx = int(self._time_idx)
         freq_idx = int(self._freq_idx)
+        pol_idx = self._pol_idx()
 
         def _work() -> None:
             try:
                 populated = dataset.radport._var_cell_has_finite_data(
                     time_idx=time_idx,
                     frequency_idx=freq_idx,
+                    pol=pol_idx,
                 )
             except (ValueError, KeyError, AttributeError):
                 populated = False
@@ -826,13 +845,14 @@ class SourceReview(param.Parameterized):
         time_idx = int(self._time_idx)
         freq_idx = int(self._freq_idx)
         dataset = self._dataset
+        pol_idx = self._pol_idx()
 
         def _begin() -> None:
             self.loading = True
             self._sync_spinner(True)
             self._log(
                 f"Fitting overlay patch for {src['name']} "
-                f"(t={time_idx}, f={freq_idx})…"
+                f"(Stokes {self.stokes}, t={time_idx}, f={freq_idx})…"
             )
 
         self._schedule_main(_begin)
@@ -846,6 +866,7 @@ class SourceReview(param.Parameterized):
                     freq_idx=freq_idx,
                     scale=self._patch_scale,
                     patch_fit_max_reduced_chi_squared=self._patch_fit_max_chi2,
+                    pol=pol_idx,
                 )
             except Exception as exc:
                 captured_error = exc
@@ -1321,7 +1342,7 @@ class SourceReview(param.Parameterized):
             src = self._current_source
             subject = src["name"] if src is not None else "Time × frequency"
         return (
-            f"{subject} — {self.heatmap_method} "
+            f"{subject} — Stokes {self.stokes} — {self.heatmap_method} "
             f"({self._heatmap_method_label()}; click a cell for sky view)"
         )
 
@@ -1335,6 +1356,72 @@ class SourceReview(param.Parameterized):
             "min": "patch min",
         }
         return labels.get(self.heatmap_method, self.heatmap_method)
+
+    def _pol_idx(self) -> int:
+        if self._dataset is None or "polarization" not in self._dataset.dims:
+            return 0
+        options = available_stokes_labels(self._dataset)
+        if not options:
+            return 0
+        label = str(self.stokes) if self.stokes in options else options[0]
+        return polarization_index_for_stokes(self._dataset, label)
+
+    def _configure_stokes_from_dataset(self, ds: xr.Dataset) -> None:
+        """Show the Stokes toggle when the opened store has I and/or V planes."""
+        options = available_stokes_labels(ds)
+        if not options:
+            self._stokes_toggle.visible = False
+            self._stokes_toggle.disabled = True
+            return
+        with param.parameterized.batch_call_watchers(self):
+            self.param.stokes.objects = options
+            if self.stokes not in options:
+                self.stokes = options[0]
+        toggle_options = {f"Stokes {label}": label for label in options}
+        self._stokes_toggle.options = toggle_options
+        self._stokes_toggle.disabled = len(options) < 2
+        self._stokes_toggle.visible = len(options) >= 2
+        if len(options) >= 2:
+            self._log(f"Stokes planes available: {', '.join(options)}")
+
+    def _apply_sky_widget_pol(self) -> None:
+        widget = self._sky_widget
+        if widget is None:
+            return
+        cube = getattr(widget, "_cube", None)
+        if cube is None:
+            return
+        cube.pol = self._pol_idx()
+
+    def _on_stokes_change(self, *_events: object) -> None:
+        self._schedule_ui_action(self._on_stokes_change_impl)
+
+    def _on_stokes_change_impl(self) -> None:
+        if self._dataset is None:
+            return
+        self._apply_sky_widget_pol()
+        self._cache.clear()
+        self._invalidate_overlay_patch_fit()
+        had_computed_heatmap = self._heatmap_coord is not None
+        if had_computed_heatmap:
+            self._heatmap_coord = None
+            self._heatmap_values = None
+            self._current_source = None
+            self._ensure_heatmap_grid(force=True)
+            self._log(
+                f"Switched to Stokes {self.stokes} — press **Generate heatmap** "
+                "to recompute the spectrum."
+            )
+        else:
+            self._sync_heatmap_method_display()
+        if self._overlay_enabled and self._coord is not None:
+            self._schedule_overlay_slice_load(
+                self._time_idx,
+                self._freq_idx,
+                center_on_target=True,
+                center=self._coord,
+                manage_spinner=True,
+            )
 
     def _set_status(self, text: str) -> None:
         self.status = text
@@ -1414,6 +1501,10 @@ class SourceReview(param.Parameterized):
             ds = ovro.open_dataset(self._zarr_path, chunks="auto").chunk(
                 {"l": self._config.zarr_lm_chunk, "m": self._config.zarr_lm_chunk}
             )
+            if self._config.polarization_isel is not None and "polarization" in ds.dims:
+                pol_sel = tuple(int(i) for i in self._config.polarization_isel)
+                report(f"Selecting polarization indices {pol_sel} (isel)")
+                ds = ds.isel(polarization=list(pol_sel))
             report(f"Zarr opened ({time.perf_counter() - t_meta:.1f} s)")
 
             if self._config.skip_first_valid_sky_scan:
@@ -1518,6 +1609,8 @@ class SourceReview(param.Parameterized):
             clear_loading=_clear_loading,
             on_step_error=_report_step_error,
         )
+        self._configure_stokes_from_dataset(ds)
+        self._apply_sky_widget_pol()
         self._set_status(
             f"**Zarr ready** — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs. "
             "Enter a coordinate, then **click a heatmap cell** to load a slice or "
@@ -1548,7 +1641,7 @@ class SourceReview(param.Parameterized):
             return
         src = self._current_source
         method = str(self.heatmap_method)
-        cache_key = (self.coordinate_string.strip(), method)
+        cache_key = (self.coordinate_string.strip(), method, str(self.stokes))
         if cache_key in self._cache:
             cached = self._cache[cache_key]
             self._dispatch(lambda: self._apply_heatmap(src, cached))
@@ -1568,6 +1661,7 @@ class SourceReview(param.Parameterized):
                     method=method,
                     scale=self._patch_scale,
                     patch_fit_max_reduced_chi_squared=self._patch_fit_max_chi2,
+                    pol=self._pol_idx(),
                     progress_callback=self._heatmap_progress_callback(),
                 )
             except Exception as exc:
@@ -1599,12 +1693,13 @@ class SourceReview(param.Parameterized):
             n_freqs = int(self._dataset.sizes["frequency"])
             label = src["name"]
             self._log(
-                f"Computing {self._heatmap_method_label()} for {label} "
+                f"Computing {self._heatmap_method_label()} (Stokes {self.stokes}) for {label} "
                 f"({n_times} times × {n_freqs} freqs, "
                 f"RA={src['ra']:.4f}°, Dec={src['dec']:.4f}°)…"
             )
             status_text = (
-                f"Computing **{self._heatmap_method_label()}** for **{label}**…"
+                f"Computing **{self._heatmap_method_label()}** (Stokes {self.stokes}) "
+                f"for **{label}**…"
             )
             with param.parameterized.discard_events(self):
                 self.status = status_text
@@ -1633,7 +1728,7 @@ class SourceReview(param.Parameterized):
             return
 
         assert payload is not None
-        cache_key = (self.coordinate_string.strip(), str(self.heatmap_method))
+        cache_key = (self.coordinate_string.strip(), str(self.heatmap_method), str(self.stokes))
         self._cache[cache_key] = payload
         arr = payload.values
         finite = arr[np.isfinite(arr)]
@@ -1693,7 +1788,8 @@ class SourceReview(param.Parameterized):
         status_text = (
             f"**{src['name']}** — l={src['l']:.2f}°, b={src['b']:.2f}°, "
             f"RA={ra_h}, Dec={dec_s} · "
-            f"Heatmap: **{self._heatmap_method_label()}** (scale={self._patch_scale:g}) · "
+            f"Heatmap: **{self._heatmap_method_label()}** (Stokes {self.stokes}, "
+            f"scale={self._patch_scale:g}) · "
             f"{overlay_hint}"
         )
 
@@ -1843,6 +1939,7 @@ class SourceReview(param.Parameterized):
         reproject_center = center if center is not None else self._coord
         if reproject_center is None:
             return
+        self._apply_sky_widget_pol()
         if log_loading and self._freq_mhz is not None:
             freq = float(self._freq_mhz[int(freq_idx)])
             self._log(

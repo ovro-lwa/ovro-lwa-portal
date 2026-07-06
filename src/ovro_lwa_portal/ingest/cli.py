@@ -30,6 +30,7 @@ from rich.prompt import Prompt
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
     fix_fits_headers,
+    repair_zarr_polarization,
     repair_zarr_store,
     validate_zarr_store,
 )
@@ -1525,6 +1526,61 @@ def repair(
     if not result["post"]["consistent"]:
         console.print("\n[bold red]✗[/bold red] Store remains inconsistent after repair", style="red")
         raise typer.Exit(code=1)
+
+
+@app.command("repair-polarization")
+def repair_polarization(
+    zarr_path: Path = typer.Argument(
+        ...,
+        help="Path to an existing Zarr store with duplicate Stokes on polarization",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    backup_suffix: str = typer.Option(
+        ".backup-before-pol-repair",
+        "--backup-suffix",
+        help="Suffix for the backup copy created before repair",
+    ),
+    skip_backup: bool = typer.Option(
+        False,
+        "--skip-backup",
+        help="Repair in place without creating a backup (not recommended)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report planned changes without modifying the store",
+    ),
+) -> None:
+    """Drop duplicate Stokes planes from polarization (e.g. ``[I, V, I]`` → ``[I, V]``)."""
+    console.print("\n[bold cyan]OVRO-LWA Zarr polarization repair[/bold cyan]")
+    console.print(f"  Store:         {zarr_path}")
+    console.print(f"  Dry run:       {dry_run}")
+    if not skip_backup and not dry_run:
+        console.print(f"  Backup suffix: {backup_suffix}")
+
+    try:
+        result = repair_zarr_polarization(
+            zarr_path,
+            backup_suffix=backup_suffix,
+            skip_backup=skip_backup,
+            dry_run=dry_run,
+        )
+    except Exception as e:
+        console.print(f"\n[bold red]✗[/bold red] Repair failed: {e}", style="red")
+        raise typer.Exit(code=1) from e
+
+    console.print(f"\n{result.get('message', 'Done')}")
+    if result.get("changed"):
+        console.print("\n[bold green]✓[/bold green] Polarization repair completed")
+        if backup := result.get("backup"):
+            console.print(f"  Backup: {backup}")
+        console.print(f"  Before: {result.get('polarization_before')}")
+        console.print(f"  After:  {result.get('polarization_after')}")
+    elif not dry_run:
+        console.print("\n[bold green]✓[/bold green] No changes needed")
 
 
 @app.command()

@@ -29,6 +29,39 @@ HEATMAP_METHOD_OPTIONS = [
     "min",
 ]
 
+_STOKES_FITS_VALUE: dict[str, int] = {"I": 1, "V": 4}
+
+
+def available_stokes_labels(dataset: xr.Dataset) -> list[str]:
+    """Return ``I`` / ``V`` labels present on the dataset ``polarization`` coordinate."""
+    if "polarization" not in dataset.dims:
+        return []
+    pol_values = np.asarray(dataset.coords["polarization"].values).ravel().astype(int)
+    labels: list[str] = []
+    for val in pol_values:
+        for label, fits_val in _STOKES_FITS_VALUE.items():
+            if int(val) == int(fits_val) and label not in labels:
+                labels.append(label)
+    return labels
+
+
+def polarization_index_for_stokes(dataset: xr.Dataset, stokes: str) -> int:
+    """Map a Stokes label to the dataset ``polarization`` dimension index."""
+    label = str(stokes).strip().upper()
+    if label not in _STOKES_FITS_VALUE:
+        msg = f"Unknown Stokes label {stokes!r}; expected one of {sorted(_STOKES_FITS_VALUE)}"
+        raise ValueError(msg)
+    target = int(_STOKES_FITS_VALUE[label])
+    pol_values = np.asarray(dataset.coords["polarization"].values).ravel().astype(int)
+    matches = np.flatnonzero(pol_values == target)
+    if matches.size == 0:
+        msg = (
+            f"Dataset polarization coordinate {list(pol_values)} "
+            f"does not include Stokes {label} (FITS value {target})."
+        )
+        raise ValueError(msg)
+    return int(matches[0])
+
 def filter_known_source_names(text: str, names: list[str]) -> list[str]:
     """``includes`` match on known names when input starts with a letter."""
     stripped = text.lstrip()
@@ -98,11 +131,16 @@ def lst_hours_for_dataset(ds: xr.Dataset) -> np.ndarray:
     return np.mod(lst_deg / 15.0, 24.0)
 
 
-def first_valid_sky_slice(dataset: xr.Dataset, freq_idx: int | None = None) -> tuple[int, int]:
+def first_valid_sky_slice(
+    dataset: xr.Dataset,
+    freq_idx: int | None = None,
+    *,
+    pol: int = 0,
+) -> tuple[int, int]:
     """First time index with finite SKY at the image centre."""
     fi = dataset.sizes["frequency"] // 2 if freq_idx is None else int(freq_idx)
     center = dataset.sizes["l"] // 2
-    ts = dataset["SKY"].isel(polarization=0, frequency=fi, l=center, m=center)
+    ts = dataset["SKY"].isel(polarization=int(pol), frequency=fi, l=center, m=center)
     data = ts.data
     vals = np.asarray(data.compute() if hasattr(data, "compute") else data)
     valid = np.flatnonzero(np.isfinite(vals))
@@ -135,6 +173,7 @@ def compute_source_heatmap(
     method: str,
     scale: float,
     patch_fit_max_reduced_chi_squared: float,
+    pol: int = 0,
     progress_callback: Callable[[str, int, int, str], None] | None = None,
 ) -> HeatmapLoad:
     """Build the (time, frequency) array used to fill the heatmap."""
@@ -142,7 +181,10 @@ def compute_source_heatmap(
     dec = float(src["dec"])
     if method == "dynamic_spectrum":
         da = dataset.radport.dynamic_spectrum(
-            ra=ra, dec=dec, progress_callback=progress_callback
+            ra=ra,
+            dec=dec,
+            pol=int(pol),
+            progress_callback=progress_callback,
         )
         return HeatmapLoad(np.asarray(da.values, dtype=np.float64))
     if method == "patch_fit":
@@ -157,6 +199,7 @@ def compute_source_heatmap(
             dec=dec,
             statistic="max",
             scale=scale,
+            pol=int(pol),
             progress_callback=progress_callback,
         )
         return HeatmapLoad(np.asarray(result.stat_map.values, dtype=np.float64), patch_stat_result=result)
@@ -166,6 +209,7 @@ def compute_source_heatmap(
             dec=dec,
             statistic=method,
             scale=scale,
+            pol=int(pol),
             progress_callback=progress_callback,
         )
         return HeatmapLoad(np.asarray(result.stat_map.values, dtype=np.float64), patch_stat_result=result)
@@ -181,6 +225,7 @@ def compute_overlay_patch_fit(
     freq_idx: int,
     scale: float,
     patch_fit_max_reduced_chi_squared: float,
+    pol: int = 0,
 ) -> PatchFitCellResult:
     """Fit a Gaussian patch on the overlay cell at ``(time_idx, freq_idx)``."""
     return dataset.radport.patch_fit_cell(
@@ -191,6 +236,7 @@ def compute_overlay_patch_fit(
         scale=float(scale),
         max_reduced_chi_squared=float(patch_fit_max_reduced_chi_squared),
         allow_position_offset=True,
+        pol=int(pol),
     )
 
 

@@ -3596,3 +3596,90 @@ def test_convert_fits_dir_to_zarr_i_and_v_single_store(tmp_path: Path) -> None:
             assert str(hdr["CTYPE3"]).strip() == "FREQ"
             assert str(hdr["CTYPE4"]).strip() == "STOKES"
             assert float(hdr["CRVAL4"]) == pytest.approx(stokes)
+
+
+def test_align_time_step_does_not_duplicate_i_for_legacy_store_template() -> None:
+    """Label-based align must not copy I into a second Stokes-1 slot (reindex would)."""
+    import xarray as xr
+
+    mod = _import_module()
+    ds = xr.Dataset(
+        {"SKY": (("polarization",), np.array([10.0, 40.0], dtype=np.float64))},
+        coords={"polarization": ("polarization", [1.0, 4.0])},
+    )
+    aligned = mod._align_time_step_to_polarization_grid(ds, np.array([1.0, 4.0, 1.0]))
+    assert list(aligned.coords["polarization"].values) == [1.0, 4.0, 1.0]
+    assert float(aligned["SKY"].isel(polarization=0).values) == pytest.approx(10.0)
+    assert float(aligned["SKY"].isel(polarization=1).values) == pytest.approx(40.0)
+    assert np.isnan(float(aligned["SKY"].isel(polarization=2).values))
+
+
+def test_canonicalize_polarization_coord_keeps_best_i_plane() -> None:
+    """Duplicate I planes collapse to the one with more finite data."""
+    import xarray as xr
+
+    mod = _import_module()
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("polarization", "m", "l"),
+                np.array(
+                    [
+                        [[1.0, 1.0], [1.0, 1.0]],
+                        [[4.0, 4.0], [4.0, 4.0]],
+                        [[np.nan, np.nan], [np.nan, np.nan]],
+                    ]
+                ),
+            )
+        },
+        coords={
+            "polarization": ("polarization", [1.0, 4.0, 1.0]),
+            "l": ("l", [0, 1]),
+            "m": ("m", [0, 1]),
+        },
+    )
+    out = mod._canonicalize_polarization_coord(ds)
+    assert list(out.coords["polarization"].values) == [1.0, 4.0]
+    assert float(out["SKY"].isel(polarization=0).mean()) == pytest.approx(1.0)
+    assert float(out["SKY"].isel(polarization=1).mean()) == pytest.approx(4.0)
+
+
+def test_repair_zarr_polarization_drops_duplicate_plane(tmp_path: Path) -> None:
+    """In-place repair rewrites arrays to unique Stokes polarization."""
+    import xarray as xr
+
+    mod = _import_module()
+    store = tmp_path / "dup_pol.zarr"
+    ds = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "polarization", "l", "m"),
+                np.array(
+                    [[[[[1.0]], [[4.0]], [[1.0]]]]],
+                    dtype=np.float64,
+                ),
+            ),
+            "fits_header_str": (
+                ("time", "frequency", "polarization"),
+                np.array([[["hdr-i", "hdr-v", "hdr-dup"]]], dtype="S8"),
+            ),
+        },
+        coords={
+            "time": [0.0],
+            "frequency": [70e6],
+            "polarization": [1.0, 4.0, 1.0],
+            "l": [0],
+            "m": [0],
+        },
+    )
+    ds.to_zarr(store, mode="w", consolidated=False)
+
+    result = mod.repair_zarr_polarization(store, skip_backup=True)
+    assert result["changed"] is True
+    assert result["polarization_after"] == [1.0, 4.0]
+
+    with xr.open_zarr(store, consolidated=False) as repaired:
+        assert list(repaired.coords["polarization"].values) == [1.0, 4.0]
+        assert int(repaired.sizes["polarization"]) == 2
+        assert float(repaired["SKY"].isel(polarization=0).values.item()) == pytest.approx(1.0)
+        assert float(repaired["SKY"].isel(polarization=1).values.item()) == pytest.approx(4.0)
