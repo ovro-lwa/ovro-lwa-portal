@@ -379,7 +379,43 @@ a single header from time 0 or from static dataset attrs.
   promoted to `(time, frequency, polarization)` so incremental appends stay
   consistent. **`wcs_header_str` is not written** to new ingests (in-memory only
   during combine).
+- **Frequency reindex** (`_align_time_step_to_frequency_grid`): when a time step
+  is aligned onto the store's full frequency grid, **missing subbands** are
+  NaN-filled for float data (SKY, BEAM). Use `_reindex_fill_values()` so
+  **`fits_header_str` fills with empty bytes** (`np.bytes_(b"")`), not
+  `np.nan`—see **Missing subband placeholders** below.
 - **Do not** assume all slices share one phase center.
+
+#### Missing subband placeholders in `fits_header_str` (do not regress)
+
+Incremental ingest reindexes each time step onto the store's fixed
+`frequency` axis. Slots with no input subband are **empty cells** (all-NaN SKY /
+BEAM and empty header).
+
+| On-disk `fits_header_str` payload | Cause | Read behavior |
+| --------------------------------- | ----- | ------------- |
+| `np.bytes_(b"")` | Current ingest (`_reindex_fill_values`) | Empty → skip time step in WCS track |
+| `np.nan`, `"nan"`, `b"nan"` | Legacy reindex used `fill_value=np.nan` for all vars | **Sanitize to empty** — never `Header.fromstring` |
+
+**Why this matters:** `str(np.nan)` and UTF-8 decode of placeholder bytes become
+the literal FITS card `nan`. Astropy warns (`invalid header keyword`); with
+`warnings.filterwarnings("error")`, **Generate heatmap** in `source_review`
+fails even though SKY at that cell is already NaN.
+
+**Enforcement:**
+
+- **Ingest:** `_reindex_fill_values()` — `fits_header_str` → `np.bytes_(b"")`;
+  test `test_reindex_time_step_preserves_empty_fits_header_str_fill`.
+- **Read:** `_decode_wcs_header_bytes()` → `_sanitize_decoded_header_text()` /
+  `_is_nan_like_header_text()` on **all** branches (float NaN, `str`, **bytes**).
+  `_parse_sin_celestial_keywords` and `_world2pix_from_header_str` guard at
+  entry. Empty headers → `header_valid[ti]=False` in pixel track (gray heatmap
+  cell), not an exception.
+- **FITS export:** `_read_fits_header_str` still **raises** on empty slots —
+  export only populated `(time, frequency, polarization)` cells.
+
+Legacy stores with on-disk `b"nan"` headers do **not** require re-ingest once
+read guards are in place; re-ingest optional for cleaner on-disk metadata.
 
 #### Filename timestamps vs WCS (do not confuse)
 
@@ -442,6 +478,7 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `_has_fits_header_str(ds)`                               | True when `fits_header_str` is present                                                                           |
 | `_has_per_time_wcs_header_str(ds)`                       | True when `fits_header_str` or legacy `wcs_header_str` is indexed by `time`                                      |
+| `_decode_wcs_header_bytes(raw)`                          | Decode Zarr scalar to str; NaN / `"nan"` / `b"nan"` → `""`                                                       |
 | `_read_fits_header_str(ds, time_idx, freq_idx, pol_idx)` | Full FITS primary header string for one slice (export)                                                           |
 | `_read_wcs_header_str(ds, time_idx=…)`                   | Celestial subset derived from `fits_header_str` (default `freq_idx=0`)                                           |
 | `strip_redundant_fits_wcs_header_attrs(ds)`              | Drop static `fits_wcs_header` attrs when per-slice headers are canonical (used by `open_dataset` and Zarr write) |
@@ -453,9 +490,10 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 1. When per-time `fits_header_str` exists, **always** select `time_idx` (and
    `freq_idx` / `pol` when exporting a specific slice). Never use static
    `fits_wcs_header` attrs for a different time index.
-2. If a per-time header entry is **empty**, return `None`—**do not** fall back
-   to time-0 or static attrs (that mis-registers late slices and freezes
-   `CRVAL1`).
+2. If a per-time header entry is **empty or a NaN placeholder**, return
+   `None`—**do not** fall back to time-0 or static attrs (that mis-registers late
+   slices and freezes `CRVAL1`). Pixel tracking marks those time steps not
+   visible (NaN heatmap cells); do not call `Header.fromstring` on `"nan"`.
 3. Tests live in `tests/test_accessor.py`
    (`TestRadportGetWcsTimePromotedHeader`); extend them when changing WCS
    lookup.
@@ -576,7 +614,12 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
    axis 1, column = axis 2). Transposing to `(m, l)` mis-registers the overlay
    (fixed catalog targets drift in RA as `CRVAL` changes). The editable package
    is `../astrowidget` via Pixi feature `astrowidget-local`.
-7. **WebGL texture UV vs numpy `(l, m)`** — the JS shader uploads
+7. **PreloadedCube slice cache must include Stokes** — `PreloadedCube._load_slice`
+   LRU key is `(time_idx, freq_idx, pol)`. `update_slice` / `image()` /
+   `spectrum()` / `light_curve()` must pass `int(self.pol)`. Omitting `pol` from
+   the cache key made the SkyWidget overlay stick on the previous Stokes after
+   switching I ↔ V in `source_review` even when the heatmap used the new Stokes.
+8. **WebGL texture UV vs numpy `(l, m)`** — the JS shader uploads
    `image_shape = (n_l, n_m)` as texture **height × width** (`n_l` rows, `n_m`
    columns). WCS `world2pix` yields `px` on axis 1 and `py` on axis 2; texture
    sampling must be **`uv = (py/n_m, px/n_l)`** (axis 2 → `u`, axis 1 → `v`).
@@ -831,7 +874,10 @@ frozen (activity log often still worked via ipywidgets):
    `_republish_heatmap_figure_for_notebook` only when mutation did not reach the
    browser. Overlay load follows via `_ui.schedule`.
 7. **`_schedule_overlay_slice_load`** — overlay on heatmap tap / overlay toggle:
-   spinner on, `self._ui.schedule(_update_sky)`, spinner off in `finally`.
+   spinner on, `self._ui.schedule(_update_sky)`, spinner off in `finally` when
+   `update_slice` returns. Post-load activity log and `send_state()` are
+   **deferred** on another io_loop turn (`_post_overlay_loaded`) so the spinner
+   does not track Panel comm latency after the overlay is already visible.
 8. **`finalize_dataset_load` builds the zeros grid synchronously** — call
    `_ensure_heatmap_grid()` from the `build_heatmap_grid` step in
    `_finish_open`, not `defer_dispatch` afterward. `_apply_heatmap` sets
@@ -1124,6 +1170,12 @@ its tests first, then the notebook call site.
   `_coord`, the current overlay center). **Method dropdown** only updates the
   heatmap title via `_sync_heatmap_method_display()` — it does **not** recompute
   until **Generate heatmap** is pressed.
+- **Stokes (I/V)** — when the Zarr has multiple polarizations, a Stokes radio
+  toggle appears. It drives overlay, heatmap, and patch fit via `pol_idx`.
+  Switching Stokes logs a hint to press **Generate heatmap**; overlay slice loads
+  and activity-log lines include `Stokes`, `t=`, and `f=` (`_slice_descriptor`).
+  Astrowidget `PreloadedCube` must cache slices per `(time_idx, freq_idx, pol)` —
+  see **How WCS is shown** above.
 - **Fit overlay** — per-cell Gaussian patch fit at the selected heatmap
   `(time_idx, freq_idx)` via `compute_overlay_patch_fit()` /
   `dataset.radport.patch_fit_cell()`. Full-cube `patch_fit` is **not** a heatmap
@@ -1469,6 +1521,37 @@ platforms = ["osx-arm64", "linux-64", "win-64"]
 ```
 
 Then run `pixi install`.
+
+### Issue: `invalid header keyword` / `nan` FITS warnings on Zarr open or heatmap
+
+**Symptoms:** Astropy logs `invalid header keyword … nan` when opening a store or
+during **Generate heatmap**; with `warnings.filterwarnings("error")` the activity
+log shows `ERROR (RA, Dec): The following header keyword is invalid…` and the
+heatmap aborts.
+
+**Cause:** Legacy frequency reindex wrote `fill_value=np.nan` into
+`fits_header_str` for missing subbands. On read, placeholders become the literal
+string/card `nan` (including **`b"nan"` bytes** that bypassed an early string-only
+guard). `dynamic_spectrum` bulk-loads per-time headers for pixel tracking.
+
+**Solution:** Use current `accessor.py` (`_sanitize_decoded_header_text` on all
+decode paths). New ingests use `_reindex_fill_values()` (empty bytes for headers).
+Restart the Jupyter kernel after upgrading. Gray heatmap cells at missing subbands
+are expected; FITS export of those slots still requires a populated cell.
+Regression: `test_decode_wcs_header_bytes_treats_nan_as_empty`,
+`test_parse_sin_celestial_keywords_ignores_nan_placeholder`.
+
+### Issue: Overlay stays on wrong Stokes after switching I ↔ V
+
+**Symptoms:** Heatmap updates after **Generate heatmap** on Stokes V, but the
+SkyWidget overlay still shows Stokes I until a heatmap cell click.
+
+**Cause:** `PreloadedCube._load_slice` LRU cache key omitted `pol`; slice image
+was reused across Stokes.
+
+**Solution:** Use editable `../astrowidget` with `pol` in `_load_slice` cache
+key. Restart kernel after upgrading astrowidget. Press **Generate heatmap** after
+Stokes change; heatmap taps load the active Stokes.
 
 ### Issue: LPT heatmap / dynamic spectrum looks like RA drifts in time
 
