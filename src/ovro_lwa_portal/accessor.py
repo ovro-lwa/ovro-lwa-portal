@@ -194,7 +194,14 @@ def _read_wcs_header_str(
     if not hdr_str:
         hdr_str = ds.attrs.get("fits_wcs_header")
     if hdr_str is not None:
-        return str(hdr_str)
+        # Some legacy stores accidentally persisted NaN as the WCS header attr.
+        # Treat it as missing to avoid astropy parsing warnings ("invalid keyword: nan").
+        if isinstance(hdr_str, (float, np.floating)) and not np.isfinite(hdr_str):
+            return None
+        text = str(hdr_str)
+        if text.strip().lower() == "nan":
+            return None
+        return text
 
     if "wcs_header_str" not in ds:
         return None
