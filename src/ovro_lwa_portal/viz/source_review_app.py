@@ -1998,30 +1998,42 @@ class SourceReview(param.Parameterized):
         self._apply_overlay_fixed_scale(widget)
         if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
             return
-        self._log_overlay_diagnostics(diag_center, context=diag_context)
-        if log_loading:
-            nbytes = len(getattr(widget, "image_data", b"") or b"")
-            self._log(
-                f"Overlay slice loaded ({self._slice_descriptor(int(time_idx), int(freq_idx))}, "
-                f"{nbytes // 1024} KB)."
-            )
-        # User-visible overlay loads always push widget state; revision-gated
-        # skip is only for silent/internal paths.
-        if self._panel_serve_mode and log_loading:
+        # NOTE: Users perceive the overlay as "loaded" once the image is visible, which
+        # happens immediately after ``update_slice``. Any extra logging / forced comm
+        # flush can take seconds, so keep it off the critical path for the spinner.
+        def _post_overlay_loaded() -> None:
+            if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
+                return
+            self._log_overlay_diagnostics(diag_center, context=diag_context)
+            if log_loading:
+                nbytes = len(getattr(widget, "image_data", b"") or b"")
+                self._log(
+                    f"Overlay slice loaded ({self._slice_descriptor(int(time_idx), int(freq_idx))}, "
+                    f"{nbytes // 1024} KB)."
+                )
+            # User-visible overlay loads always push widget state; revision-gated
+            # skip is only for silent/internal paths.
+            if self._panel_serve_mode and log_loading:
 
-            def _after_overlay_push(comm_ms: float) -> None:
-                if self._config.log_overlay_timing:
+                def _after_overlay_push(comm_ms: float) -> None:
+                    if self._config.log_overlay_timing:
+                        self._log_overlay_push_timing(widget, comm_ms=comm_ms)
+
+                self._schedule_sky_widget_push(
+                    widget,
+                    force=True,
+                    after_push=_after_overlay_push,
+                )
+            else:
+                comm_ms = self._maybe_send_sky_widget_state(widget, force=log_loading)
+                if self._config.log_overlay_timing and log_loading:
                     self._log_overlay_push_timing(widget, comm_ms=comm_ms)
 
-            self._schedule_sky_widget_push(
-                widget,
-                force=True,
-                after_push=_after_overlay_push,
-            )
+        # Defer post-load comm/log work so the spinner can stop promptly.
+        if log_loading:
+            self._ui.schedule(_post_overlay_loaded)
         else:
-            comm_ms = self._maybe_send_sky_widget_state(widget, force=log_loading)
-            if self._config.log_overlay_timing and log_loading:
-                self._log_overlay_push_timing(widget, comm_ms=comm_ms)
+            _post_overlay_loaded()
 
     def _on_heatmap_tap(self, time_idx: int, freq_idx: int) -> None:
         self._time_idx = time_idx
