@@ -3455,6 +3455,8 @@ def _sky_sep_max_vs_ref_arcsec(
 
 def _decode_wcs_header_payload(raw: object) -> str:
     """Decode a scalar ``wcs_header_str`` payload to a stripped UTF-8 string."""
+    from ovro_lwa_portal.accessor import _sanitize_decoded_header_text
+
     if isinstance(raw, np.ndarray):
         raw = raw.item() if raw.ndim == 0 else np.ravel(raw)[0]
     if raw is None:
@@ -3462,11 +3464,10 @@ def _decode_wcs_header_payload(raw: object) -> str:
     if isinstance(raw, (float, np.floating)) and not np.isfinite(raw):
         return ""
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
-        return raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
-    text = str(raw).rstrip("\x00").strip()
-    if text.lower() == "nan":
-        return ""
-    return text
+        return _sanitize_decoded_header_text(
+            raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
+        )
+    return _sanitize_decoded_header_text(str(raw).rstrip("\x00").strip())
 
 
 def _collapse_wcs_header_str_variable(

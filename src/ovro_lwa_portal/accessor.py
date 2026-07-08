@@ -52,6 +52,25 @@ _MAX_PIXEL_TRACK_PLANE_ELEMENTS = 72_000_000
 _MAX_PIXEL_TRACK_CHUNK_ELEMENTS = 40_000_000
 
 
+def _is_nan_like_header_text(text: str) -> bool:
+    """True when a decoded header payload is a placeholder NaN, not real FITS."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.lower() == "nan":
+        return True
+    first_line = stripped.splitlines()[0].strip().lower()
+    return first_line == "nan"
+
+
+def _sanitize_decoded_header_text(text: str) -> str:
+    """Normalize decoded header text; map NaN placeholders to empty."""
+    cleaned = text.rstrip("\x00")
+    if _is_nan_like_header_text(cleaned):
+        return ""
+    return cleaned
+
+
 def _decode_wcs_header_bytes(raw: object) -> str:
     """Decode a scalar WCS header payload from Zarr (bytes or str)."""
     while isinstance(raw, np.ndarray):
@@ -63,11 +82,10 @@ def _decode_wcs_header_bytes(raw: object) -> str:
         # ingests; treat as empty rather than the literal FITS card ``nan``.
         return ""
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
-        return raw.decode("utf-8", errors="replace").rstrip("\x00")
-    text = str(raw).rstrip("\x00")
-    if text.lower() == "nan":
-        return ""
-    return text
+        return _sanitize_decoded_header_text(
+            raw.decode("utf-8", errors="replace").rstrip("\x00")
+        )
+    return _sanitize_decoded_header_text(str(raw).rstrip("\x00"))
 
 
 def _has_fits_header_str(ds: xr.Dataset) -> bool:
@@ -199,7 +217,7 @@ def _read_wcs_header_str(
         if isinstance(hdr_str, (float, np.floating)) and not np.isfinite(hdr_str):
             return None
         text = str(hdr_str)
-        if text.strip().lower() == "nan":
+        if _is_nan_like_header_text(text):
             return None
         return text
 
@@ -500,7 +518,7 @@ def _header_has_sin_celestial(hdr: object) -> bool:
 
 def _parse_sin_celestial_keywords(hdr_str: str) -> dict[str, float | str] | None:
     """Return normalized celestial WCS keywords from one FITS header string."""
-    if not hdr_str.strip():
+    if _is_nan_like_header_text(hdr_str) or not hdr_str.strip():
         return None
     try:
         from astropy.io.fits import Header
@@ -619,7 +637,7 @@ def _world2pix_from_header_str(
     pixels, returns out-of-range sentinels ``(n_l, n_m)`` with ``visible=False``,
     matching :meth:`RadportAccessor._compute_pixel_track` error handling.
     """
-    if not hdr_str.strip():
+    if _is_nan_like_header_text(hdr_str) or not hdr_str.strip():
         return int(n_l), int(n_m), False
     try:
         from astropy.io.fits import Header
