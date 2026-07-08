@@ -56,9 +56,18 @@ def _decode_wcs_header_bytes(raw: object) -> str:
     """Decode a scalar WCS header payload from Zarr (bytes or str)."""
     while isinstance(raw, np.ndarray):
         raw = raw.item()
+    if raw is None:
+        return ""
+    if isinstance(raw, (float, np.floating)) and not np.isfinite(raw):
+        # Frequency reindex used ``fill_value=np.nan`` on ``fits_header_str`` in older
+        # ingests; treat as empty rather than the literal FITS card ``nan``.
+        return ""
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
         return raw.decode("utf-8", errors="replace").rstrip("\x00")
-    return str(raw).rstrip("\x00")
+    text = str(raw).rstrip("\x00")
+    if text.lower() == "nan":
+        return ""
+    return text
 
 
 def _has_fits_header_str(ds: xr.Dataset) -> bool:

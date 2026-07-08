@@ -11,6 +11,7 @@ pn = pytest.importorskip("panel")
 pytest.importorskip("astrowidget")
 
 import astropy.units as u
+import numpy as np
 from astropy.coordinates import SkyCoord
 
 from astrowidget import SkyWidget
@@ -531,3 +532,20 @@ def test_stokes_change_clears_computed_heatmap(tmp_path: Path) -> None:
     review._on_stokes_change_impl()
     assert review._cache == {}
     assert review._heatmap_coord is None
+
+
+def test_slice_descriptor_includes_stokes_and_frequency(tmp_path: Path) -> None:
+    review = SourceReview(
+        tmp_path / "store.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    review.stokes = "V"
+    review._freq_mhz = np.array([46.0, 50.0])
+    assert review._slice_descriptor(3, 1) == "Stokes V, t=3, f=1, 50.0 MHz"

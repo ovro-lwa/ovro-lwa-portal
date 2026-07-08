@@ -718,6 +718,23 @@ def _frequency_coord_hz_from_zarr(out_zarr: Path) -> np.ndarray:
         return np.asarray(ds["frequency"].values, dtype=np.float64).copy()
 
 
+def _reindex_fill_values(ds: xr.Dataset) -> dict[str, object]:
+    """Per-variable fill values for frequency/polarization reindex operations."""
+    fill: dict[str, object] = {}
+    for name, da in ds.data_vars.items():
+        if name == "fits_header_str":
+            fill[name] = np.bytes_(b"")
+        elif da.dtype == bool:
+            fill[name] = False
+        elif np.issubdtype(da.dtype, np.complexfloating):
+            fill[name] = np.complex(np.nan, np.nan)
+        elif np.issubdtype(da.dtype, np.floating):
+            fill[name] = np.nan
+        elif np.issubdtype(da.dtype, np.integer):
+            fill[name] = 0
+    return fill
+
+
 def _align_time_step_to_frequency_grid(ds: xr.Dataset, freq_hz: np.ndarray) -> xr.Dataset:
     """Reindex one time step onto the fixed full-store ``frequency`` axis (NaN for missing subbands)."""
     if "frequency" not in ds.dims:
@@ -727,7 +744,7 @@ def _align_time_step_to_frequency_grid(ds: xr.Dataset, freq_hz: np.ndarray) -> x
         dims=("frequency",),
         name="frequency",
     )
-    return ds.reindex(frequency=template, fill_value=np.nan)
+    return ds.reindex(frequency=template, fill_value=_reindex_fill_values(ds))
 
 
 def _polarization_coord_from_zarr(out_zarr: Path) -> np.ndarray:
@@ -1054,8 +1071,9 @@ def _reindex_time_step_to_expected_frequencies(
 
     expected = np.asarray(expected_frequencies_hz, dtype=float)
     observed = np.asarray(np.atleast_1d(xds_t["frequency"].values), dtype=float)
+    fill_value = _reindex_fill_values(xds_t)
     if observed.size == 0:
-        return xds_t.reindex({"frequency": expected}, fill_value=np.nan)
+        return xds_t.reindex({"frequency": expected}, fill_value=fill_value)
 
     mapped = observed.copy()
     max_jitter_hz = _DISCOVERY_FREQ_BIN_HZ / 2.0
@@ -1071,7 +1089,7 @@ def _reindex_time_step_to_expected_frequencies(
         xds_norm = xds_norm.isel(frequency=np.sort(first_indices))
 
     xds_norm = xds_norm.sortby("frequency")
-    return xds_norm.reindex({"frequency": expected}, fill_value=np.nan)
+    return xds_norm.reindex({"frequency": expected}, fill_value=fill_value)
 
 
 def _validate_time_axis_consistency_zarr(out_zarr: Path) -> None:
@@ -3439,9 +3457,16 @@ def _decode_wcs_header_payload(raw: object) -> str:
     """Decode a scalar ``wcs_header_str`` payload to a stripped UTF-8 string."""
     if isinstance(raw, np.ndarray):
         raw = raw.item() if raw.ndim == 0 else np.ravel(raw)[0]
+    if raw is None:
+        return ""
+    if isinstance(raw, (float, np.floating)) and not np.isfinite(raw):
+        return ""
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
         return raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
-    return str(raw).rstrip("\x00").strip()
+    text = str(raw).rstrip("\x00").strip()
+    if text.lower() == "nan":
+        return ""
+    return text
 
 
 def _collapse_wcs_header_str_variable(

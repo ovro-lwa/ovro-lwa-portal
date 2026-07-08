@@ -933,7 +933,7 @@ class SourceReview(param.Parameterized):
                     else "field"
                 )
                 status = (
-                    f"**{name}** · LST {lst}, {freq:.1f} MHz "
+                    f"**{name}** · Stokes {self.stokes} · LST {lst}, {freq:.1f} MHz "
                     f"(t={result.time_idx}, f={result.frequency_idx})\n\n"
                     f"{_format_patch_fit_diagnostics(result, result.time_idx, result.frequency_idx)}"
                 )
@@ -1365,6 +1365,13 @@ class SourceReview(param.Parameterized):
             return 0
         label = str(self.stokes) if self.stokes in options else options[0]
         return polarization_index_for_stokes(self._dataset, label)
+
+    def _slice_descriptor(self, time_idx: int, freq_idx: int) -> str:
+        """Stokes + time/frequency label for overlay logs, status, and titles."""
+        parts = [f"Stokes {self.stokes}", f"t={int(time_idx)}", f"f={int(freq_idx)}"]
+        if self._freq_mhz is not None:
+            parts.append(f"{float(self._freq_mhz[int(freq_idx)]):.1f} MHz")
+        return ", ".join(parts)
 
     def _configure_stokes_from_dataset(self, ds: xr.Dataset) -> None:
         """Show the Stokes toggle when the opened store has I and/or V planes."""
@@ -1956,10 +1963,8 @@ class SourceReview(param.Parameterized):
             return
         self._apply_sky_widget_pol()
         if log_loading and self._freq_mhz is not None:
-            freq = float(self._freq_mhz[int(freq_idx)])
             self._log(
-                f"Loading overlay slice t={int(time_idx)}, f={int(freq_idx)} "
-                f"({freq:.1f} MHz)…"
+                f"Loading overlay slice {self._slice_descriptor(int(time_idx), int(freq_idx))}…"
             )
         scale = self._overlay_scale_kwargs()
         if preserve_view:
@@ -1997,7 +2002,7 @@ class SourceReview(param.Parameterized):
         if log_loading:
             nbytes = len(getattr(widget, "image_data", b"") or b"")
             self._log(
-                f"Overlay slice loaded (t={int(time_idx)}, f={int(freq_idx)}, "
+                f"Overlay slice loaded ({self._slice_descriptor(int(time_idx), int(freq_idx))}, "
                 f"{nbytes // 1024} KB)."
             )
         # User-visible overlay loads always push widget state; revision-gated
@@ -2043,12 +2048,12 @@ class SourceReview(param.Parameterized):
                 coord = self._coord
         if coord is None:
             self._set_status(
-                f"Selected t={time_idx}, f={freq_idx} ({freq:.1f} MHz) · "
+                f"Selected {self._slice_descriptor(time_idx, freq_idx)} · "
                 "**Enter a coordinate** (RA/Dec or name), then click a cell to load "
                 "that slice as an overlay."
             )
             self._log(
-                f"Heatmap cell t={time_idx}, f={freq_idx} ({freq:.1f} MHz) selected — "
+                f"Heatmap cell {self._slice_descriptor(time_idx, freq_idx)} selected — "
                 "no coordinate set yet."
             )
             return
@@ -2078,7 +2083,8 @@ class SourceReview(param.Parameterized):
                 track_note = f" · tracked@slice: {exc}"
         self._set_overlay_toggle_display(True)
         status = (
-            f"**{name}** · LST {lst}, {freq:.1f} MHz (t={time_idx}, f={freq_idx}) · "
+            f"**{name}** · Stokes {self.stokes} · LST {lst}, {freq:.1f} MHz "
+            f"(t={time_idx}, f={freq_idx}) · "
             f"{self._heatmap_method_label()}={val_s} · target RA={ra_h}, Dec={dec_s}"
             f"{track_note}"
         )
@@ -2093,7 +2099,7 @@ class SourceReview(param.Parameterized):
             )
         self._set_status(status)
         self._log(
-            f"Heatmap cell — {name}, t={time_idx}, f={freq_idx} ({freq:.1f} MHz); "
+            f"Heatmap cell — {name}, {self._slice_descriptor(time_idx, freq_idx)}; "
             "loading overlay at current view."
         )
         self._schedule_overlay_slice_load(
@@ -2197,7 +2203,9 @@ class SourceReview(param.Parameterized):
                     center_on_target=True,
                     center=self._coord,
                 )
-                msg = f"Overlay **on** — slice t={self._time_idx}, f={self._freq_idx}."
+                msg = (
+                    f"Overlay **on** — slice {self._slice_descriptor(self._time_idx, self._freq_idx)}."
+                )
             else:
                 msg = (
                     "Overlay **on** — enter a coordinate and click a heatmap cell "

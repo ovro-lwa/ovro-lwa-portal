@@ -2071,6 +2071,49 @@ def test_reindex_time_step_to_expected_frequencies_fills_missing_with_nan():
     assert np.isnan(out["SKY"].isel(frequency=1).values).all()
 
 
+def test_reindex_time_step_preserves_empty_fits_header_str_fill() -> None:
+    """Missing frequency subbands must not store ``np.nan`` in ``fits_header_str``."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    primary = fits.Header()
+    primary["SIMPLE"] = True
+    primary["BITPIX"] = -32
+    payload = mod._fits_header_bytes_for_slice(
+        primary,
+        post_regrid_wcs_hdr=_make_sin_wcs_header_str(nx=2, ny=2, crval1=180.0, crval2=45.0),
+        nl=2,
+        nm=2,
+    )
+    xds_t = xr.Dataset(
+        {
+            "SKY": (
+                ("time", "frequency", "m", "l"),
+                np.arange(8, dtype=np.float32).reshape(1, 2, 2, 2),
+            ),
+            "fits_header_str": (("time", "frequency"), np.array([[payload, payload]])),
+        },
+        coords={
+            "time": np.array(["2024-12-18T06:33:36"], dtype="datetime64[s]"),
+            "frequency": np.array([41_000_000.0, 55_000_000.0]),
+            "m": np.array([0.0, 1.0]),
+            "l": np.array([0.0, 1.0]),
+        },
+    )
+
+    out = mod._reindex_time_step_to_expected_frequencies(
+        xds_t,
+        [41_000_000.0, 48_000_000.0, 55_000_000.0],
+    )
+
+    filled = out["fits_header_str"].isel(frequency=1).values
+    assert filled == np.bytes_(b"") or filled == b""
+    from ovro_lwa_portal.accessor import _decode_wcs_header_bytes
+
+    assert _decode_wcs_header_bytes(filled) == ""
+
+
 def test_sky_coord_cache_is_bounded_and_clearable() -> None:
     """Sky-coord LRU must not grow without bound across many WCS variants."""
     from astropy.wcs import WCS
