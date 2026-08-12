@@ -254,7 +254,6 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 ├── fixed_fits/                 # Directory for corrected FITS files (empty)
 ├── notebooks/                  # Jupyter notebooks for data analysis
 │   ├── README.md              # Documentation for notebooks directory
-│   ├── metacatalog_sky_view.ipynb  # Metacatalog on FITS + SkyWidget + Bokeh (simple comm pattern)
 │   ├── fits2zarr.ipynb        # Main FITS to Zarr conversion notebook
 │   ├── fits2zarr_and_viz_user_cases.ipynb  # User case examples with visualization
 │   ├── source_review.ipynb    # LPT source review; per-time WCS + SkyWidget (canonical Panel comm)
@@ -678,11 +677,11 @@ use `hold_and_push` in production `SourceReview`. **Do not** copy
 `jupiter_flux_review`'s Panel HTML log or inline-class structure when they
 differ — follow `source_review_app.py` instead.
 
-#### Simpler notebooks: SkyWidget + Bokeh (`metacatalog_sky_view.ipynb`)
+#### Simpler notebooks: SkyWidget + Bokeh (see `lwa-catalog`)
 
 For notebooks that combine **SkyWidget** with a **Bokeh scatter/map** (catalog
 overlay, tap-to-focus) but **not** the full `SourceReview` app, use the
-validated pattern in `notebooks/metacatalog_sky_view.ipynb`. Do **not** port
+validated pattern formerly in `metacatalog_sky_view.ipynb` (now in [`lwa-catalog`](https://github.com/ovro-lwa/lwa-catalog) `notebooks/`). Do **not** port
 `JupyterPanelUISession`, `schedule_when_panel_loaded`, or VBox placeholder
 mounts unless you are building another `source_review`-class app with the
 matching Panel push helpers.
@@ -1893,6 +1892,7 @@ display SkyWidget in **one cell** via native ipywidgets; use
 `%matplotlib inline` not `%matplotlib widget`; restart this notebook's kernel
 and **Clear All Outputs** on this file; avoid `pn.pane.IPyWidget` wrappers and
 `display(..., display_id=…)` for SkyWidget. Reference:
+[`lwa-catalog`](https://github.com/ovro-lwa/lwa-catalog)
 `notebooks/metacatalog_sky_view.ipynb`.
 
 ### Issue: Bokeh tap/click does nothing in a notebook map
@@ -1912,6 +1912,7 @@ Python `on_event` handlers never reach the kernel.
 the cell's return value (Panel / PyViz comm). Wire
 `scatter_fig.on_event("tap", …)` before displaying the pane. Do **not** use
 `output_notebook()` + `show()` for interactive notebook maps. Reference:
+[`lwa-catalog`](https://github.com/ovro-lwa/lwa-catalog)
 `notebooks/metacatalog_sky_view.ipynb`.
 
 ### Issue: `BokehModel` / `@bokeh/jupyter_bokeh` view creation fails
