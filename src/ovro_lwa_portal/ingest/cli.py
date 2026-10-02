@@ -543,6 +543,16 @@ def convert(
             "DATE-OBS only."
         ),
     ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging). Use 60 for 10 min co-add products whose subbands differ "
+            "by seconds in DATE-OBS."
+        ),
+        min=0.0,
+    ),
     discovery_filename_convention: str = typer.Option(
         "image",
         "--discovery-filename-convention",
@@ -663,6 +673,7 @@ def convert(
             group_metadata_source=group_metadata_source,
             time_key_source=time_key_source,
             filename_convention=filename_convention,
+            time_key_tolerance_sec=discovery_time_key_tolerance,
         )
         fixed_dir_resolved = fixed_dir or (output_dir / "fixed_fits")
 
@@ -687,6 +698,8 @@ def convert(
         )
         console.print(f"  Discovery meta:   {group_metadata_source}")
         console.print(f"  Time key source:  {time_key_source}")
+        if discovery_time_key_tolerance > 0.0:
+            console.print(f"  Time key tol.:    {discovery_time_key_tolerance:g} s")
         console.print(f"  Filename conv.:   {filename_convention}")
         console.print(f"  Log level:        {log_level.value.upper()}\n")
 
@@ -736,6 +749,7 @@ def convert(
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
         filename_convention=filename_convention,
+        time_key_tolerance_sec=discovery_time_key_tolerance,
     )
     config = ConversionConfig(
         input_dir=input_dir,
@@ -753,6 +767,7 @@ def convert(
         group_metadata_source=group_metadata_source,
         discovery_time_key_source=time_key_source,
         discovery_filename_convention=filename_convention,
+        discovery_time_key_tolerance_sec=discovery_time_key_tolerance,
         lm_reference_target_size=target_size,
     )
 
@@ -771,6 +786,8 @@ def convert(
     console.print(f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits else 'NO'}")
     console.print(f"  Discovery meta:   {group_metadata_source}")
     console.print(f"  Time key source:  {time_key_source}")
+    if discovery_time_key_tolerance > 0.0:
+        console.print(f"  Time key tol.:    {discovery_time_key_tolerance:g} s")
     console.print(f"  Filename conv.:   {filename_convention}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
@@ -905,6 +922,16 @@ def dewarp_convert(
             'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
             "DATE-OBS only."
         ),
+    ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging). Use 60 for 10 min co-add products whose subbands differ "
+            "by seconds in DATE-OBS."
+        ),
+        min=0.0,
     ),
     cascade_parent: Optional[Path] = typer.Option(
         None,
@@ -1051,6 +1078,7 @@ def dewarp_convert(
                 progress_callback=None,
                 group_metadata_source=group_metadata_source,
                 time_key_source=time_key_source,
+                time_key_tolerance_sec=discovery_time_key_tolerance,
                 resume=resume,
             )
         else:
@@ -1068,6 +1096,7 @@ def dewarp_convert(
                 target_size=target_size,
                 group_metadata_source=group_metadata_source,
                 time_key_source=time_key_source,
+                time_key_tolerance_sec=discovery_time_key_tolerance,
                 out_zarr=output_dir / zarr_name,
                 rebuild=rebuild,
                 resume=resume,
@@ -1135,6 +1164,7 @@ def dewarp_convert(
         verbose=verbose,
         group_metadata_source=group_metadata_source,
         discovery_time_key_source=time_key_source,
+        discovery_time_key_tolerance_sec=discovery_time_key_tolerance,
         lm_reference_ds=lm_ref_ds,
         lm_reference_target_size=target_size,
     )
@@ -1224,6 +1254,15 @@ def audit_metadata(
             '"filename" (default) or "header" (DATE-OBS only)'
         ),
     ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging)."
+        ),
+        min=0.0,
+    ),
     strict: bool = typer.Option(
         False,
         "--strict",
@@ -1263,6 +1302,7 @@ def audit_metadata(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
+        time_key_tolerance_sec=discovery_time_key_tolerance,
     )
 
     input_dir = Path(input_dir)

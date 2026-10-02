@@ -916,6 +916,80 @@ def test_extract_group_metadata_filename_time_overrides_header(tmp_path: Path) -
     assert time_header == "20241221_000000"
 
 
+def test_merge_time_groups_within_tolerance_merges_nearby_keys(tmp_path: Path) -> None:
+    mod = _import_module()
+    a = tmp_path / "41MHz_I_10min_20241218T031854.fits"
+    b = tmp_path / "41MHz_V_10min_20241218T031854.fits"
+    c = tmp_path / "64MHz_I_10min_20241218T031904.fits"
+    a.touch()
+    b.touch()
+    c.touch()
+    by_time = {
+        "20241218_031353": [a, b],
+        "20241218_031404": [c],
+    }
+    merged = mod._merge_time_groups_within_tolerance(by_time, 60.0)
+    assert len(merged) == 1
+    assert sorted(p.name for p in merged["20241218_031353"]) == sorted(
+        [a.name, b.name, c.name]
+    )
+
+
+def test_discover_groups_header_time_tolerance_merges_subbands(tmp_path: Path) -> None:
+    """Subbands with DATE-OBS within 60 s merge into one discovery group."""
+    mod = _import_module()
+    a = tmp_path / "41MHz_I_10min_Taper_Robust+0.0_dewarped_aligned_LST01h_bin2.fits"
+    b = tmp_path / "64MHz_I_10min_Taper_Robust+0.0_dewarped_aligned_LST01h_bin2.fits"
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"DATE-OBS": "2024-12-18T03:13:53", "RESTFREQ": 41e6}),
+    ).writeto(a)
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"DATE-OBS": "2024-12-18T03:14:04", "RESTFREQ": 64e6}),
+    ).writeto(b)
+
+    exact = mod._discover_groups(
+        tmp_path,
+        time_key_source="header",
+        time_key_tolerance_sec=0.0,
+    )
+    merged = mod._discover_groups(
+        tmp_path,
+        time_key_source="header",
+        time_key_tolerance_sec=60.0,
+    )
+    assert len(exact) == 2
+    assert len(merged) == 1
+    assert len(next(iter(merged.values()))) == 2
+
+
+def test_assert_nonempty_fits_header_str_allows_nan_placeholder() -> None:
+    import xarray as xr
+
+    mod = _import_module()
+    sky = np.full((1, 2, 1, 1, 1), np.nan, dtype=np.float32)
+    sky[0, 1, 0, 0, 0] = 1.0
+    fh = np.array(
+        [[np.bytes_(b""), np.bytes_(b"SIMPLE  =                    T")]],
+        dtype=object,
+    ).reshape(1, 2, 1)
+    ds = xr.Dataset(
+        {
+            "SKY": (("time", "frequency", "polarization", "m", "l"), sky),
+            "fits_header_str": (("time", "frequency", "polarization"), fh),
+        },
+        coords={
+            "time": [60000.0],
+            "frequency": [18e6, 41e6],
+            "polarization": [1.0],
+            "l": np.arange(1),
+            "m": np.arange(1),
+        },
+    )
+    mod._assert_nonempty_fits_header_str_before_zarr_write(ds)
+
+
 def test_discover_groups_filename_time_merges_same_image_id(tmp_path: Path) -> None:
     """Same ``-image-YYYYMMDD_HHMMSS`` basename groups together even if DATE-OBS differs."""
     mod = _import_module()
@@ -2677,6 +2751,88 @@ def test_fix_headers_strips_padded_stokes_ctype_for_xradio(tmp_path: Path) -> No
 
     xds = mod._read_fits_via_xradio(out_path, do_sky_coords=False, compute_mask=False)
     assert "SKY" in xds.data_vars
+
+
+def test_fix_headers_defaults_missing_telescop_for_xradio(tmp_path: Path) -> None:
+    """Phase-3 aligned FITS omit ``TELESCOP``; xradio indexes that card without ``.get``."""
+    import numpy as np
+
+    mod = _import_module()
+    in_path = tmp_path / "no_telescop.fits"
+    out_path = tmp_path / "no_telescop_fixed.fits"
+    data = np.zeros((4, 4), dtype=np.float32)
+    header = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 4,
+            "NAXIS2": 4,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CRVAL1": 180.0,
+            "CRVAL2": 45.0,
+            "CRPIX1": 2.5,
+            "CRPIX2": 2.5,
+            "CDELT1": -0.03,
+            "CDELT2": 0.03,
+            "CUNIT1": "deg",
+            "CUNIT2": "deg",
+            "DATE-OBS": "2025-01-11T05:59:05.600",
+            "RADESYS": "FK5",
+            "EQUINOX": 2000.0,
+            "LONPOLE": 180.0,
+            "RESTFREQ": 66.2e6,
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+        }
+    )
+    fits.PrimaryHDU(data=data, header=header).writeto(in_path)
+
+    mod._fix_headers(in_path, out_path)
+
+    hdr = fits.getheader(out_path)
+    assert hdr["TELESCOP"] == "OVRO-LWA"
+
+    xds = mod._read_fits_via_xradio(out_path, do_sky_coords=False, compute_mask=False)
+    assert "SKY" in xds.data_vars
+    # Also retry the unfixed source (xradio KeyError → _fix_headers).
+    xds_raw = mod._read_fits_via_xradio(in_path, do_sky_coords=False, compute_mask=False)
+    assert "SKY" in xds_raw.data_vars
+
+
+def test_fix_headers_preserves_existing_telescop(tmp_path: Path) -> None:
+    """Do not overwrite a present ``TELESCOP`` card."""
+    import numpy as np
+
+    mod = _import_module()
+    in_path = tmp_path / "has_telescop.fits"
+    out_path = tmp_path / "has_telescop_fixed.fits"
+    data = np.zeros((4, 4), dtype=np.float32)
+    header = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 4,
+            "NAXIS2": 4,
+            "CTYPE1": "RA---SIN",
+            "CTYPE2": "DEC--SIN",
+            "CRVAL1": 180.0,
+            "CRVAL2": 45.0,
+            "CRPIX1": 2.5,
+            "CRPIX2": 2.5,
+            "CDELT1": -0.03,
+            "CDELT2": 0.03,
+            "CUNIT1": "deg",
+            "CUNIT2": "deg",
+            "DATE-OBS": "2025-01-11T05:59:05.600",
+            "TELESCOP": "TEST-SCOPE",
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+        }
+    )
+    fits.PrimaryHDU(data=data, header=header).writeto(in_path)
+
+    mod._fix_headers(in_path, out_path)
+
+    assert fits.getheader(out_path)["TELESCOP"] == "TEST-SCOPE"
 
 
 def test_fix_headers_preserves_crval_from_input_not_filename(tmp_path: Path):

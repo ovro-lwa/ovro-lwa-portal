@@ -244,6 +244,7 @@ def run_cascade_per_time_group(
     clear_staging: bool = True,
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: Literal["header", "filename"] = "filename",
+    time_key_tolerance_sec: float = 0.0,
     out_zarr: Path | None = None,
     rebuild: bool = False,
     resume: bool = True,
@@ -339,6 +340,7 @@ def run_cascade_per_time_group(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
+        time_key_tolerance_sec=time_key_tolerance_sec,
     )
     by_time = discover_time_grouped_fits(
         input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
@@ -440,6 +442,7 @@ def dewarp_and_convert_append_each_time(
     progress_callback: Callable[[str, int, int, str], None] | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: Literal["header", "filename"] = "filename",
+    time_key_tolerance_sec: float = 0.0,
     resume: bool = True,
 ) -> tuple[int, list[str]]:
     """Dewarp each time group, append its Zarr slice, then clean staging/cascade for that time.
@@ -490,6 +493,7 @@ def dewarp_and_convert_append_each_time(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
+        time_key_tolerance_sec=time_key_tolerance_sec,
     )
     by_time = discover_time_grouped_fits(
         input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
@@ -583,6 +587,7 @@ def dewarp_and_convert_append_each_time(
             lm_reference_ds=lm_ref_ds,
             group_metadata_source=group_metadata_source,
             discovery_time_key_source=time_key_source,
+            discovery_time_key_tolerance_sec=time_key_tolerance_sec,
             lm_reference_target_size=target_size,
             consolidate_metadata_at_end=False,
         )

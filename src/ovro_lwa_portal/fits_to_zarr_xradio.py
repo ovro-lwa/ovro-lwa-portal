@@ -126,6 +126,45 @@ def _is_xradio_stokes_missing_valueerror(exc: BaseException) -> bool:
     return "stokes" in msg and "not in" in msg and "list" in msg
 
 
+def _is_xradio_missing_fits_keyword_error(exc: BaseException) -> bool:
+    """True when xradio/Astropy failed because a required FITS card is absent.
+
+    Astropy raises ``KeyError: Keyword 'TELESCOP' not found.`` when xradio does
+    ``header["TELESCOP"]`` (and similarly for ``CUNIT*`` / ``LONPOLE`` / ``EQUINOX``).
+    """
+    if not isinstance(exc, KeyError):
+        return False
+    msg = str(exc)
+    return "Keyword" in msg and "not found" in msg
+
+
+def _ensure_xradio_required_header_cards(hdr: fits.Header) -> None:
+    """Fill FITS cards xradio indexes that OVRO-LWA products sometimes omit.
+
+    Does not overwrite cards already present. ``TELESCOP`` is provenance only
+    (not used for WCS or pixel values); missing it must not abort ingest.
+    """
+    if "TELESCOP" not in hdr:
+        hdr["TELESCOP"] = _OVRO_LWA_DEFAULT_TELESCOP
+    radesys = str(hdr.get("RADESYS", "")).strip().upper()
+    if "EQUINOX" not in hdr and radesys != "ICRS":
+        hdr["EQUINOX"] = 2000.0
+    if "LONPOLE" not in hdr:
+        hdr["LONPOLE"] = 180.0
+    naxis = int(hdr.get("NAXIS", 0))
+    for i in range(1, naxis + 1):
+        key = f"CUNIT{i}"
+        if key in hdr:
+            continue
+        ctype = str(hdr.get(f"CTYPE{i}", "")).strip().upper()
+        if ctype.startswith("RA") or ctype.startswith("DEC"):
+            hdr[key] = "deg"
+        elif _fits_axis_is_freq_like(ctype):
+            hdr[key] = "Hz"
+        else:
+            hdr[key] = ""
+
+
 def _read_fits_via_xradio(
     path: str | Path,
     *,
@@ -148,9 +187,11 @@ def _read_fits_via_xradio(
 
     xradio's FITS reader assumes a literal ``STOKES`` axis in ``CTYPE`` when it
     builds polarization coordinates. Legitimate 3D RA/DEC/FREQ cubes therefore
-    raise ``ValueError: 'STOKES' is not in list``. On that specific failure we
-    materialize a temporary copy with :func:`_fix_headers` and read again so raw
-    paths and stale ``*_fixed.fits`` still work without a separate fix step.
+    raise ``ValueError: 'STOKES' is not in list``. It also indexes ``TELESCOP``
+    (and a few other cards) without ``.get``, so missing keywords raise
+    ``KeyError``. On those failures we materialize a temporary copy with
+    :func:`_fix_headers` and read again so raw paths and stale ``*_fixed.fits``
+    still work without a separate fix step.
 
     Pixel data are Dask-delayed reads of that temp path; we :meth:`xarray.Dataset.load`
     before unlinking so later ``compute()`` does not hit a missing file.
@@ -161,8 +202,11 @@ def _read_fits_via_xradio(
     p = Path(os.path.expanduser(str(path)))
     try:
         return _fits_image_to_xds(str(p), c, verbose, do_sky_coords, compute_mask)
-    except ValueError as exc:
-        if not _is_xradio_stokes_missing_valueerror(exc):
+    except (ValueError, KeyError) as exc:
+        if not (
+            _is_xradio_stokes_missing_valueerror(exc)
+            or _is_xradio_missing_fits_keyword_error(exc)
+        ):
             raise
         logger.info(
             "Re-reading FITS via temporary header fix copy: %s (%s)",
@@ -217,6 +261,9 @@ _CELESTIAL_DRIFT_SAMPLE_SEED: int = 0
 _OVRO_LWA_DEFAULT_LON_DEG = -118.28340511
 _OVRO_LWA_DEFAULT_LAT_DEG = 37.23338698
 _OVRO_LWA_DEFAULT_HEIGHT_M = 1188.6
+# xradio's FITS reader indexes ``header["TELESCOP"]`` (not ``.get``); phase-3 aligned
+# 10 min products omit the card. Ingest is OVRO-LWA-only, so this default is safe.
+_OVRO_LWA_DEFAULT_TELESCOP = "OVRO-LWA"
 
 # LRU cache for RA/Dec ``all_pix2world`` grids within one time step (~15 subbands).
 # Cleared after each :func:`_combine_time_step` so multi-hour ingest runs do not retain
@@ -249,6 +296,7 @@ def _sky_coord_cache_size() -> int:
 # ``...__18MHz-I-...`` (dewarp staging uses ``{time_key}__{original_name}``).
 MHZ_RE = re.compile(r"(?:^|_)(\d+)MHz(?:_|-|\.|$)")
 _STOKES_MHZ_POL_RE = re.compile(r"\d+MHz-([IV])(?:-|_)", re.IGNORECASE)
+_STOKES_MHZ_UNDERSCORE_POL_RE = re.compile(r"\d+MHz_([IV])_", re.IGNORECASE)
 _STOKES_IMAGE_SUFFIX_RE = re.compile(r"-IMAGE-([IV])(?:\.|-|_)", re.IGNORECASE)
 _STOKES_TOKEN_RE = re.compile(r"(?:^|[-_])STOKES[-_]([IV])(?:[-_.]|$)", re.IGNORECASE)
 _METADATA_PROGRESS_INTERVAL_CAP = 500
@@ -1862,7 +1910,8 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
     Adds/ensures:
       RESTFREQ/RESTFRQ when axis 3 is spectral (not after a synthetic Stokes axis),
       SPECSYS=LSRK, TIMESYS=UTC, RADESYS=FK5, LATPOLE=90,
-      identity PC matrix for LM, BUNIT=Jy/beam. ``BMAJ``/``BMIN`` from the input are
+      identity PC matrix for LM, BUNIT=Jy/beam, TELESCOP=OVRO-LWA when absent
+      (xradio requires the card). ``BMAJ``/``BMIN`` from the input are
       preserved verbatim — no placeholder beam is ever written. Inputs without a
       real (present, finite, strictly positive) ``BMAJ``/``BMIN`` raise
       :class:`InvalidBeamError`; the convert pipeline drops such files at discovery
@@ -2006,6 +2055,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
             H["BUNIT"] = "Jy/beam"
 
         _strip_fits_ctype_cards(H)
+        _ensure_xradio_required_header_cards(H)
 
         # Write via temporary file + atomic replace to avoid leaving a partial
         # output file when the underlying filesystem intermittently short-writes.
@@ -2669,7 +2719,12 @@ def _stokes_value_from_header(hdr: fits.Header) -> float:
 def _stokes_label_from_basename(fp: Path) -> int | None:
     """Return Stokes ``1`` (I) or ``4`` (V) when encoded in the basename, else ``None``."""
     name = fp.name.upper()
-    for pattern in (_STOKES_MHZ_POL_RE, _STOKES_IMAGE_SUFFIX_RE, _STOKES_TOKEN_RE):
+    for pattern in (
+        _STOKES_MHZ_POL_RE,
+        _STOKES_MHZ_UNDERSCORE_POL_RE,
+        _STOKES_IMAGE_SUFFIX_RE,
+        _STOKES_TOKEN_RE,
+    ):
         match = pattern.search(name)
         if match is not None:
             return 1 if match.group(1) == "I" else 4
@@ -3054,8 +3109,7 @@ def _resample_lm_reference_to_target_size(
     hdr["NAXIS"] = 2
     hdr["NAXIS1"] = target_size
     hdr["NAXIS2"] = target_size
-    if "TELESCOP" not in hdr:
-        hdr["TELESCOP"] = "UNKNOWN"
+    _ensure_xradio_required_header_cards(hdr)
 
     fd, tmp_name = tempfile.mkstemp(suffix=".fits")
     os.close(fd)
@@ -3486,8 +3540,22 @@ def _collapse_wcs_header_str_variable(
     return xds.assign(wcs_header_str=wh.isel(frequency=ri, drop=True))
 
 
+def _sky_slice_has_finite_data(xds: xr.Dataset, indexers: dict[str, int]) -> bool:
+    """Return True when the ``SKY`` plane selected by *indexers* contains finite data."""
+    if "SKY" not in xds:
+        return False
+    sky = xds["SKY"]
+    for dim, idx in indexers.items():
+        if dim in sky.dims:
+            sky = sky.isel({dim: idx})
+    if hasattr(sky.data, "compute"):
+        return bool(sky.notnull().any().compute())
+    values = np.asarray(sky.values)
+    return bool(np.any(np.isfinite(values)))
+
+
 def _assert_nonempty_fits_header_str_before_zarr_write(xds: xr.Dataset) -> None:
-    """Fail fast when a time step would be written without usable ``fits_header_str``."""
+    """Fail fast when a populated slice would be written without ``fits_header_str``."""
     if "fits_header_str" not in xds.data_vars:
         msg = (
             "Dataset is missing fits_header_str before Zarr write; each "
@@ -3496,6 +3564,7 @@ def _assert_nonempty_fits_header_str_before_zarr_write(xds: xr.Dataset) -> None:
         raise RuntimeError(msg)
 
     fh = xds["fits_header_str"]
+    populated_cells = 0
     if "time" in fh.dims:
         for ti in range(int(fh.sizes["time"])):
             sel = fh.isel(time=ti)
@@ -3504,28 +3573,51 @@ def _assert_nonempty_fits_header_str_before_zarr_write(xds: xr.Dataset) -> None:
                     freq_sel = sel.isel(frequency=fi)
                     if "polarization" in freq_sel.dims:
                         for pi in range(int(freq_sel.sizes["polarization"])):
+                            indexers = {"time": ti, "frequency": fi, "polarization": pi}
+                            has_data = _sky_slice_has_finite_data(xds, indexers)
                             hdr = _decode_wcs_header_payload(
                                 freq_sel.isel(polarization=pi).values
                             )
                             if not hdr:
-                                msg = (
-                                    f"fits_header_str is empty for time={ti}, "
-                                    f"frequency={fi}, polarization={pi} before Zarr write."
-                                )
-                                raise RuntimeError(msg)
+                                if has_data:
+                                    msg = (
+                                        f"fits_header_str is empty for time={ti}, "
+                                        f"frequency={fi}, polarization={pi} before Zarr write."
+                                    )
+                                    raise RuntimeError(msg)
+                                continue
+                            if has_data:
+                                populated_cells += 1
                     else:
+                        indexers = {"time": ti, "frequency": fi}
+                        has_data = _sky_slice_has_finite_data(xds, indexers)
                         hdr = _decode_wcs_header_payload(freq_sel.values)
                         if not hdr:
-                            msg = (
-                                f"fits_header_str is empty for time={ti}, "
-                                f"frequency={fi} before Zarr write."
-                            )
-                            raise RuntimeError(msg)
+                            if has_data:
+                                msg = (
+                                    f"fits_header_str is empty for time={ti}, "
+                                    f"frequency={fi} before Zarr write."
+                                )
+                                raise RuntimeError(msg)
+                            continue
+                        if has_data:
+                            populated_cells += 1
             else:
+                indexers = {"time": ti}
+                has_data = _sky_slice_has_finite_data(xds, indexers)
                 hdr = _decode_wcs_header_payload(sel.values)
                 if not hdr:
-                    msg = f"fits_header_str is empty for time index {ti} before Zarr write."
-                    raise RuntimeError(msg)
+                    if has_data:
+                        msg = f"fits_header_str is empty for time index {ti} before Zarr write."
+                        raise RuntimeError(msg)
+                    continue
+                if has_data:
+                    populated_cells += 1
+        if populated_cells == 0:
+            msg = (
+                "Dataset has no populated SKY cells with fits_header_str before Zarr write."
+            )
+            raise RuntimeError(msg)
         return
 
     hdr = _decode_wcs_header_payload(fh.values)
@@ -3698,6 +3790,91 @@ def _harmonize_celestial_coords_independent_of_frequency(
 def _parse_discovery_time_key(time_key: str) -> datetime:
     """Parse ``YYYYMMDD_HHMMSS`` observation keys for temporal distance."""
     return datetime.strptime(time_key, "%Y%m%d_%H%M%S")
+
+
+def _discovery_subband_stokes_key(fp: Path) -> tuple[int, int] | None:
+    """Return ``(mhz_token, stokes)`` for deduplicating merged discovery groups."""
+    mhz = _mhz_from_name(fp)
+    if mhz == 10**9:
+        return None
+    stokes = _stokes_label_from_basename(fp)
+    if stokes is None:
+        stokes = 1
+    return (int(mhz), int(stokes))
+
+
+def _dedupe_discovery_files_by_subband_stokes(files: Sequence[Path]) -> list[Path]:
+    """Keep one FITS per ``(MHz basename, Stokes)`` when merging discovery time keys."""
+    kept: dict[tuple[int, int], Path] = {}
+    extras: list[Path] = []
+    for fp in files:
+        key = _discovery_subband_stokes_key(fp)
+        if key is None:
+            extras.append(fp)
+            continue
+        if key not in kept:
+            kept[key] = fp
+    return extras + list(kept.values())
+
+
+def _merge_time_groups_within_tolerance(
+    by_time: Dict[str, List[Path]],
+    tolerance_sec: float,
+) -> Dict[str, List[Path]]:
+    """Merge discovery groups whose ``DATE-OBS`` keys fall within *tolerance_sec*.
+
+    Connected components use single-linkage clustering: two keys belong to the same
+    group when their absolute UTC separation is at most *tolerance_sec*. The earliest
+    key in each component becomes the canonical group name.
+    """
+    if tolerance_sec <= 0.0 or len(by_time) <= 1:
+        return by_time
+
+    keys = sorted(by_time.keys(), key=_parse_discovery_time_key)
+    n_keys = len(keys)
+    parent = list(range(n_keys))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    times = [_parse_discovery_time_key(key) for key in keys]
+    for left in range(n_keys):
+        for right in range(left + 1, n_keys):
+            delta_sec = abs((times[right] - times[left]).total_seconds())
+            if delta_sec <= tolerance_sec:
+                union(left, right)
+
+    clusters: Dict[int, list[str]] = {}
+    for index, key in enumerate(keys):
+        clusters.setdefault(find(index), []).append(key)
+
+    merged: Dict[str, List[Path]] = {}
+    for cluster_keys in clusters.values():
+        cluster_keys.sort(key=_parse_discovery_time_key)
+        canonical = cluster_keys[0]
+        files: list[Path] = []
+        for key in cluster_keys:
+            files.extend(by_time[key])
+        merged[canonical] = _dedupe_discovery_files_by_subband_stokes(files)
+
+    if len(merged) < n_keys:
+        logger.info(
+            "Merged discovery time groups using %.0f s DATE-OBS tolerance "
+            "(%d -> %d groups).",
+            tolerance_sec,
+            n_keys,
+            len(merged),
+        )
+    return merged
 
 
 def _same_frequency_subband(a: Path, b: Path) -> bool:
@@ -4280,6 +4457,7 @@ def _discover_groups_from_files(
     time_key_source: Literal["header", "filename"] = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
+    time_key_tolerance_sec: float = 0.0,
     discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Group *fits_files* by observation time and frequency.
@@ -4415,7 +4593,7 @@ def _discover_groups_from_files(
                 p.name,
             ),
         )
-    return by_time
+    return _merge_time_groups_within_tolerance(by_time, time_key_tolerance_sec)
 
 
 def _discover_groups(
@@ -4426,6 +4604,7 @@ def _discover_groups(
     time_key_source: Literal["header", "filename"] = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
+    time_key_tolerance_sec: float = 0.0,
     discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Group input FITS by observation time and frequency (filename time stamp, header fallback).
@@ -4475,6 +4654,7 @@ def _discover_groups(
         time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        time_key_tolerance_sec=time_key_tolerance_sec,
         discovery_metadata_out=discovery_metadata_out,
     )
 
@@ -5085,6 +5265,7 @@ def convert_fits_dir_to_zarr(
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: Literal["header", "filename"] = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
+    time_key_tolerance_sec: float = 0.0,
     consolidate_metadata_at_end: bool = True,
     global_frequency_coord_hz: np.ndarray | None = None,
 ) -> Path:
@@ -5226,6 +5407,7 @@ def convert_fits_dir_to_zarr(
         time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        time_key_tolerance_sec=time_key_tolerance_sec,
         discovery_metadata_out=discovery_metadata,
     )
     if time_keys_only is not None:

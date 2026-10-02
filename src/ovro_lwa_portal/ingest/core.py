@@ -121,9 +121,10 @@ class ConversionConfig:
         time_keys_only: Sequence[str] | None = None,
         lm_reference_ds: Any | None = None,
         group_metadata_source: Literal["fits", "filename"] = "fits",
-        discovery_time_key_source: Literal["header", "filename"] = "filename",
-        discovery_filename_convention: Literal["image", "lst-color"] = "image",
-        lm_reference_target_size: int | None = None,
+    discovery_time_key_source: Literal["header", "filename"] = "filename",
+    discovery_filename_convention: Literal["image", "lst-color"] = "image",
+    discovery_time_key_tolerance_sec: float = 0.0,
+    lm_reference_target_size: int | None = None,
         consolidate_metadata_at_end: bool = True,
         global_frequency_coord_hz: Any | None = None,
     ) -> None:
@@ -144,6 +145,7 @@ class ConversionConfig:
         self.group_metadata_source = group_metadata_source
         self.discovery_time_key_source = discovery_time_key_source
         self.discovery_filename_convention = discovery_filename_convention
+        self.discovery_time_key_tolerance_sec = discovery_time_key_tolerance_sec
         self.lm_reference_target_size = lm_reference_target_size
         self.consolidate_metadata_at_end = consolidate_metadata_at_end
         self.global_frequency_coord_hz = global_frequency_coord_hz
@@ -299,6 +301,7 @@ class FITSToZarrConverter:
                     group_metadata_source=self.config.group_metadata_source,
                     time_key_source=self.config.discovery_time_key_source,
                     filename_convention=self.config.discovery_filename_convention,
+                    time_key_tolerance_sec=self.config.discovery_time_key_tolerance_sec,
                     lm_reference_target_size=self.config.lm_reference_target_size,
                     consolidate_metadata_at_end=self.config.consolidate_metadata_at_end,
                     global_frequency_coord_hz=self.config.global_frequency_coord_hz,

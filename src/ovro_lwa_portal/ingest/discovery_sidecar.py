@@ -50,6 +50,7 @@ def _discovery_config_payload(discovery: IngestDiscoveryConfig) -> dict[str, Any
         "group_metadata_source": discovery.group_metadata_source,
         "time_key_source": discovery.time_key_source,
         "filename_convention": discovery.filename_convention,
+        "time_key_tolerance_sec": float(discovery.time_key_tolerance_sec),
     }
 
 
@@ -59,6 +60,7 @@ def _discovery_config_from_payload(payload: dict[str, Any]) -> IngestDiscoveryCo
         group_metadata_source=payload["group_metadata_source"],
         time_key_source=payload["time_key_source"],
         filename_convention=payload["filename_convention"],
+        time_key_tolerance_sec=float(payload.get("time_key_tolerance_sec", 0.0)),
     )
 
 

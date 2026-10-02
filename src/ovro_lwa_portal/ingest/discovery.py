@@ -61,6 +61,7 @@ class IngestDiscoveryConfig:
     group_metadata_source: Literal["fits", "filename"] = "fits"
     time_key_source: Literal["header", "filename"] = "filename"
     filename_convention: DiscoveryFilenameConvention = "image"
+    time_key_tolerance_sec: float = 0.0
 
 
 DEFAULT_INGEST_DISCOVERY = IngestDiscoveryConfig()
@@ -239,6 +240,7 @@ def discover_time_grouped_fits(
         time_key_source=cfg.time_key_source,
         group_metadata_source=cfg.group_metadata_source,
         filename_convention=cfg.filename_convention,
+        time_key_tolerance_sec=cfg.time_key_tolerance_sec,
         discovery_metadata_out=discovery_metadata_out,
     )
 
@@ -259,6 +261,7 @@ def discover_time_grouped_paths(
         time_key_source=cfg.time_key_source,
         group_metadata_source=cfg.group_metadata_source,
         filename_convention=cfg.filename_convention,
+        time_key_tolerance_sec=cfg.time_key_tolerance_sec,
         discovery_metadata_out=discovery_metadata_out,
     )
 
