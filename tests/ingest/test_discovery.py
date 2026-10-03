@@ -86,6 +86,11 @@ def test_discover_time_grouped_fits_forwards_time_key_source(monkeypatch, tmp_pa
         discovery=IngestDiscoveryConfig(time_key_source="header"),
     )
     assert seen == ["header"]
+    discover_time_grouped_fits(
+        tmp_path,
+        discovery=IngestDiscoveryConfig(time_key_source="directory"),
+    )
+    assert seen == ["header", "directory"]
 
 
 def _image_name(time_key: str, mhz: int) -> str:

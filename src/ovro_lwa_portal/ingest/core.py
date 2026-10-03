@@ -67,9 +67,10 @@ class ConversionConfig:
     resume : bool, optional
         If True, skip discovered FITS time steps that already exist in the output
         Zarr (when not rebuilding). Defaults to True.
-    discovery_time_key_source : {"header", "filename"}, optional
-        How to infer observation time when ``group_metadata_source`` is ``"fits"``.
-        Defaults to ``"filename"`` (basename ``-image-`` stamp, else ``DATE-OBS``).
+    discovery_time_key_source : {"header", "filename", "directory"}, optional
+        How to infer observation time. Defaults to ``"filename"`` (basename
+        ``-image-`` stamp, else ``DATE-OBS``). ``"directory"`` uses a parent
+        directory named ``YYYY-MM-DD`` or ``YYYYMMDD``.
     lm_reference_target_size : int | None, optional
         When building the global LM reference, reproject onto this square grid size.
         Use the same value as dewarp ``target_size`` when combining dewarped FITS.
@@ -121,10 +122,10 @@ class ConversionConfig:
         time_keys_only: Sequence[str] | None = None,
         lm_reference_ds: Any | None = None,
         group_metadata_source: Literal["fits", "filename"] = "fits",
-    discovery_time_key_source: Literal["header", "filename"] = "filename",
-    discovery_filename_convention: Literal["image", "lst-color"] = "image",
-    discovery_time_key_tolerance_sec: float = 0.0,
-    lm_reference_target_size: int | None = None,
+        discovery_time_key_source: Literal["header", "filename", "directory"] = "filename",
+        discovery_filename_convention: Literal["image", "lst-color"] = "image",
+        discovery_time_key_tolerance_sec: float = 0.0,
+        lm_reference_target_size: int | None = None,
         consolidate_metadata_at_end: bool = True,
         global_frequency_coord_hz: Any | None = None,
     ) -> None:

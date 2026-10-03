@@ -66,10 +66,10 @@ def _cli_group_metadata_source(value: str) -> Literal["fits", "filename"]:
     return value  # type: ignore[return-value]
 
 
-def _cli_time_key_source(value: str) -> Literal["header", "filename"]:
-    if value not in ("header", "filename"):
+def _cli_time_key_source(value: str) -> Literal["header", "filename", "directory"]:
+    if value not in ("header", "filename", "directory"):
         raise typer.BadParameter(
-            f'expected "header" or "filename", got {value!r}',
+            f'expected "header", "filename", or "directory", got {value!r}',
             param_hint="--discovery-time-key-source",
         )
     return value  # type: ignore[return-value]
@@ -538,9 +538,11 @@ def convert(
         "filename",
         "--discovery-time-key-source",
         help=(
-            'When --discovery-metadata-source is "fits", how to choose the observation time '
-            'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
-            "DATE-OBS only."
+            'How to choose the observation time key: "filename" prefers '
+            "``-image-YYYYMMDD_HHMMSS`` (default; falls back to DATE-OBS when reading "
+            'FITS); "header" uses DATE-OBS only; "directory" uses the nearest parent '
+            "directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (as ``YYYYMMDD_000000``, "
+            "no DATE-OBS fallback)."
         ),
     ),
     discovery_time_key_tolerance: float = typer.Option(
@@ -918,9 +920,11 @@ def dewarp_convert(
         "filename",
         "--discovery-time-key-source",
         help=(
-            'When --discovery-metadata-source is "fits", how to choose the observation time '
-            'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
-            "DATE-OBS only."
+            'How to choose the observation time key: "filename" prefers '
+            "``-image-YYYYMMDD_HHMMSS`` (default; falls back to DATE-OBS when reading "
+            'FITS); "header" uses DATE-OBS only; "directory" uses the nearest parent '
+            "directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (as ``YYYYMMDD_000000``, "
+            "no DATE-OBS fallback)."
         ),
     ),
     discovery_time_key_tolerance: float = typer.Option(
@@ -1250,8 +1254,8 @@ def audit_metadata(
         "filename",
         "--discovery-time-key-source",
         help=(
-            'When --discovery-metadata-source is "fits", observation time key from '
-            '"filename" (default) or "header" (DATE-OBS only)'
+            'Observation time key from "filename" (default), "header" (DATE-OBS only), '
+            'or "directory" (YYYY-MM-DD / YYYYMMDD parent directory)'
         ),
     ),
     discovery_time_key_tolerance: float = typer.Option(

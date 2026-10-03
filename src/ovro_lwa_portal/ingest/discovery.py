@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Literal
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
     DiscoveryFilenameConvention,
+    DiscoveryTimeKeySource,
     _DiscoveryFileMetadata,
     _discover_groups,
     _discover_groups_from_files,
@@ -59,7 +60,7 @@ class IngestDiscoveryConfig:
 
     freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ
     group_metadata_source: Literal["fits", "filename"] = "fits"
-    time_key_source: Literal["header", "filename"] = "filename"
+    time_key_source: DiscoveryTimeKeySource = "filename"
     filename_convention: DiscoveryFilenameConvention = "image"
     time_key_tolerance_sec: float = 0.0
 

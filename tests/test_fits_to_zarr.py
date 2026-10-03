@@ -1124,6 +1124,102 @@ def test_discover_groups_filename_time_merges_same_image_id(tmp_path: Path) -> N
     assert {p.name for p in by_name["20241221_102109"]} == {a.name, b.name}
 
 
+def test_time_key_from_directory_dashed_and_compact(tmp_path: Path) -> None:
+    """Nearest parent ``YYYY-MM-DD`` / ``YYYYMMDD`` becomes ``YYYYMMDD_000000``."""
+    mod = _import_module()
+    dashed = (
+        tmp_path
+        / "01h"
+        / "2024-12-24"
+        / "Run_x"
+        / "55MHz"
+        / "I"
+        / "deep"
+        / "55MHz_I_deep_coadd.fits"
+    )
+    dashed.parent.mkdir(parents=True)
+    dashed.touch()
+    assert mod._time_key_from_directory(dashed) == "20241224_000000"
+
+    compact = tmp_path / "20241225" / "nested" / "file.fits"
+    compact.parent.mkdir(parents=True)
+    compact.touch()
+    assert mod._time_key_from_directory(compact) == "20241225_000000"
+
+    no_date = tmp_path / "nodate" / "file.fits"
+    no_date.parent.mkdir(parents=True)
+    no_date.touch()
+    assert mod._time_key_from_directory(no_date) is None
+
+
+def test_discover_groups_directory_time_ignores_shared_date_obs(tmp_path: Path) -> None:
+    """Directory dates group coadds separately when DATE-OBS is identical/wrong."""
+    mod = _import_module()
+    shared_hdr = fits.Header({"DATE-OBS": "2024-12-18T03:04:12.100", "RESTFREQ": 55e6})
+    day_a = (
+        tmp_path
+        / "2024-12-20"
+        / "Run_a"
+        / "55MHz"
+        / "I"
+        / "deep"
+        / "55MHz_I_deep_Taper_Robust-0.75_shflux_dewarped_aligned_coadd.fits"
+    )
+    day_b = (
+        tmp_path
+        / "2024-12-24"
+        / "Run_b"
+        / "55MHz"
+        / "V"
+        / "deep"
+        / "55MHz_V_deep_Taper_Robust+0.0_shflux_dewarped_aligned_coadd.fits"
+    )
+    day_a.parent.mkdir(parents=True)
+    day_b.parent.mkdir(parents=True)
+    fits.PrimaryHDU(data=[[1.0]], header=shared_hdr).writeto(day_a)
+    fits.PrimaryHDU(data=[[1.0]], header=shared_hdr).writeto(day_b)
+
+    by_header = mod._discover_groups_from_files(
+        [day_a, day_b],
+        time_key_source="header",
+    )
+    by_dir = mod._discover_groups_from_files(
+        [day_a, day_b],
+        time_key_source="directory",
+    )
+
+    assert list(by_header.keys()) == ["20241218_030412"]
+    assert sorted(by_dir.keys()) == ["20241220_000000", "20241224_000000"]
+    assert by_dir["20241220_000000"] == [day_a]
+    assert by_dir["20241224_000000"] == [day_b]
+
+
+def test_discover_groups_directory_time_with_filename_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Directory time works with filename-only frequency (no DATE-OBS / header I/O)."""
+    mod = _import_module()
+
+    def boom(*_a: object, **_k: object) -> None:
+        pytest.fail("fits.getheader should not be called in filename-only discovery")
+
+    monkeypatch.setattr(mod.fits, "getheader", boom)
+    day = (
+        tmp_path
+        / "2024-12-24"
+        / "55MHz_I_deep_Taper_Robust-0.75_shflux_dewarped_aligned_coadd.fits"
+    )
+    day.parent.mkdir(parents=True)
+    day.touch()
+    groups = mod._discover_groups_from_files(
+        [day],
+        group_metadata_source="filename",
+        time_key_source="directory",
+    )
+    assert list(groups.keys()) == ["20241224_000000"]
+    assert groups["20241224_000000"] == [day]
+
+
 def test_discover_groups_duplicate_without_resolver_keeps_first(tmp_path: Path):
     """Same time + same discovery frequency bin: keep the first file and warn; do not stack duplicates."""
     mod = _import_module()

@@ -309,7 +309,12 @@ _IMAGE_TIME_BEFORE_IMAGE_RE = re.compile(r"(\d{8})_(\d{6})-image", re.IGNORECASE
 # LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
 _LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
 
+# Parent directory calendar dates for discovery (e.g. exopipe ``.../2024-12-24/Run_.../``).
+_DIR_DATE_DASH_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DIR_DATE_COMPACT_RE = re.compile(r"^(\d{8})$")
+
 DiscoveryFilenameConvention = Literal["image", "lst-color"]
+DiscoveryTimeKeySource = Literal["header", "filename", "directory"]
 
 
 class _DiscoveryFileMetadata(NamedTuple):
@@ -333,7 +338,7 @@ def _build_discovery_file_metadata(
     *,
     filename_convention: DiscoveryFilenameConvention = "image",
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> _DiscoveryFileMetadata:
     """Extract discovery metadata with at most one FITS header read per file."""
     if filename_convention == "lst-color":
@@ -358,12 +363,20 @@ def _build_discovery_file_metadata(
 
     if group_metadata_source == "filename":
         time_key, frequency_hz, note_list = _extract_group_metadata_filename_only(fp)
+        notes = list(note_list)
+        if time_key_source == "directory":
+            tk_dir = _time_key_from_directory(fp)
+            if tk_dir is not None:
+                time_key = tk_dir
+                notes.append("time-from-directory")
+            else:
+                time_key = None
         stokes_key = _resolve_stokes_key_for_discovery(fp, None)
         return _DiscoveryFileMetadata(
-            time_key, frequency_hz, tuple(note_list), stokes_key, None
+            time_key, frequency_hz, tuple(notes), stokes_key, None
         )
 
-    notes: list[str] = []
+    notes = []
     time_key: Optional[str] = None
     frequency_hz = None
     header = None
@@ -374,15 +387,21 @@ def _build_discovery_file_metadata(
 
     if header is not None:
         frequency_hz = _frequency_hz_from_header(header)
-        if time_key_source == "header":
-            time_key = _time_key_from_header(header)
 
-    if time_key_source == "filename":
+    if time_key_source == "directory":
+        tk_dir = _time_key_from_directory(fp)
+        if tk_dir is not None:
+            time_key = tk_dir
+            notes.append("time-from-directory")
+    elif time_key_source == "header":
+        if header is not None:
+            time_key = _time_key_from_header(header)
+    else:
         tk_fn = _time_key_from_filename(fp)
         if tk_fn is not None:
             time_key = tk_fn
             notes.append("time-from-filename")
-        elif header is not None and time_key is None:
+        elif header is not None:
             time_key = _time_key_from_header(header)
 
     if frequency_hz is None:
@@ -401,7 +420,7 @@ def _get_discovery_file_metadata(
     cache: Dict[tuple[Path, int, int], _DiscoveryFileMetadata],
     filename_convention: DiscoveryFilenameConvention = "image",
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> _DiscoveryFileMetadata:
     """Return cached discovery metadata for *fp*, building it on first access."""
     key = _discovery_metadata_cache_key(fp)
@@ -524,7 +543,7 @@ def _frequency_hz_from_header(header: fits.Header) -> Optional[float]:
 def _extract_group_metadata(
     fp: Path,
     *,
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> Tuple[Optional[str], Optional[float], List[str]]:
     """Extract grouping metadata from FITS headers and optionally the basename.
 
@@ -541,6 +560,10 @@ def _extract_group_metadata(
         otherwise ``time_key`` comes from ``DATE-OBS`` (see :func:`_time_key_from_header`).
 
         When *time_key_source* is ``"header"``, ``time_key`` comes from ``DATE-OBS`` only.
+
+        When *time_key_source* is ``"directory"``, ``time_key`` comes from a parent
+        directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (see :func:`_time_key_from_directory`);
+        there is no ``DATE-OBS`` fallback.
     """
     time_key: Optional[str] = None
     frequency_hz: Optional[float] = None
@@ -554,15 +577,21 @@ def _extract_group_metadata(
 
     if header is not None:
         frequency_hz = _frequency_hz_from_header(header)
-        if time_key_source == "header":
-            time_key = _time_key_from_header(header)
 
-    if time_key_source == "filename":
+    if time_key_source == "directory":
+        tk_dir = _time_key_from_directory(fp)
+        if tk_dir is not None:
+            time_key = tk_dir
+            notes.append("time-from-directory")
+    elif time_key_source == "header":
+        if header is not None:
+            time_key = _time_key_from_header(header)
+    else:
         tk_fn = _time_key_from_filename(fp)
         if tk_fn is not None:
             time_key = tk_fn
             notes.append("time-from-filename")
-        elif header is not None and time_key is None:
+        elif header is not None:
             time_key = _time_key_from_header(header)
 
     if frequency_hz is None:
@@ -642,13 +671,19 @@ def _extract_group_metadata_for_discovery(
     *,
     filename_convention: DiscoveryFilenameConvention = "image",
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> Tuple[Optional[str], Optional[float], List[str]]:
     """Dispatch discovery metadata extraction by filename convention and source mode."""
     if filename_convention == "lst-color":
         return _extract_group_metadata_lst_color(fp)
     if group_metadata_source == "filename":
-        return _extract_group_metadata_filename_only(fp)
+        time_key, frequency_hz, notes = _extract_group_metadata_filename_only(fp)
+        if time_key_source == "directory":
+            tk_dir = _time_key_from_directory(fp)
+            if tk_dir is not None:
+                return tk_dir, frequency_hz, [*notes, "time-from-directory"]
+            return None, frequency_hz, notes
+        return time_key, frequency_hz, notes
     return _extract_group_metadata(fp, time_key_source=time_key_source)
 
 
@@ -673,7 +708,7 @@ def _canonical_stack_frequency_hz(
     fp: Path,
     *,
     group_metadata_source: Literal["fits", "filename"],
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
     discovery_metadata: Optional[_DiscoveryFileMetadata] = None,
 ) -> Optional[float]:
@@ -705,7 +740,7 @@ def _assign_canonical_frequency_for_stack(
     fp: Path,
     *,
     group_metadata_source: Literal["fits", "filename"],
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
 ) -> xr.Dataset:
     """Replace a length-1 ``frequency`` index with :func:`_canonical_stack_frequency_hz` when known."""
@@ -1854,6 +1889,34 @@ def _time_key_from_filename(fp: Path) -> Optional[str]:
     if obstime is None:
         return None
     return obstime.to_datetime().strftime("%Y%m%d_%H%M%S")
+
+
+def _time_key_from_directory(fp: Path) -> Optional[str]:
+    """Observation date key from a parent directory named ``YYYY-MM-DD`` or ``YYYYMMDD``.
+
+    Walks from the file's parent toward the filesystem root and returns the nearest
+    valid calendar-date directory as ``YYYYMMDD_000000`` (midnight UTC). Returns
+    ``None`` when no such directory is found.
+
+    Used for products whose ``DATE-OBS`` / basename stamps are unreliable (e.g. exopipe
+    deep coadds under ``.../01h/2024-12-24/Run_.../``).
+    """
+    for parent in fp.resolve().parents:
+        name = parent.name
+        dashed = _DIR_DATE_DASH_RE.fullmatch(name)
+        if dashed is not None:
+            ymd = f"{dashed.group(1)}{dashed.group(2)}{dashed.group(3)}"
+        else:
+            compact = _DIR_DATE_COMPACT_RE.fullmatch(name)
+            if compact is None:
+                continue
+            ymd = compact.group(1)
+        try:
+            datetime.strptime(ymd, "%Y%m%d")
+        except ValueError:
+            continue
+        return f"{ymd}_000000"
+    return None
 
 
 def _strip_fits_ctype_cards(hdr: fits.Header) -> None:
@@ -4454,7 +4517,7 @@ def _discover_groups_from_files(
     duplicate_resolver: Optional[Callable[[str, float, List[Path]], Path]] = None,
     *,
     freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
     time_key_tolerance_sec: float = 0.0,
@@ -4502,6 +4565,8 @@ def _discover_groups_from_files(
         if time_key is None:
             if filename_convention == "lst-color":
                 t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
+            elif time_key_source == "directory":
+                t_hint = "YYYY-MM-DD or YYYYMMDD parent directory"
             elif group_metadata_source == "filename":
                 t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
             elif time_key_source == "filename":
@@ -4601,7 +4666,7 @@ def _discover_groups(
     duplicate_resolver: Optional[Callable[[str, float, List[Path]], Path]] = None,
     *,
     freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
     time_key_tolerance_sec: float = 0.0,
@@ -4627,15 +4692,17 @@ def _discover_groups(
         ``int(round(frequency_hz / freq_bin_hz))``. Frequencies in the same bin are treated
         as one subband for grouping (up to ~``freq_bin_hz`` separation at bin edges).
     time_key_source
-        Used only when ``group_metadata_source`` is ``"fits"``. ``"filename"`` (default):
-        prefer the basename ``-image-YYYYMMDD_HHMMSS`` instant when present; otherwise use
-        ``DATE-OBS``. ``"header"``: group by ``DATE-OBS`` time key only.
+        How to choose the observation time key. ``"filename"`` (default): prefer the
+        basename ``-image-YYYYMMDD_HHMMSS`` instant when present; otherwise use
+        ``DATE-OBS`` (when ``group_metadata_source`` is ``"fits"``). ``"header"``: group by
+        ``DATE-OBS`` only. ``"directory"``: nearest parent directory named ``YYYY-MM-DD``
+        or ``YYYYMMDD`` (as ``YYYYMMDD_000000``); no ``DATE-OBS`` fallback. Directory mode
+        also overrides basename time when ``group_metadata_source`` is ``"filename"``.
     group_metadata_source
         ``"fits"`` (default): read FITS headers (and filename fallbacks) via
-        :func:`_extract_group_metadata`. ``"filename"``: derive time and frequency for
-        grouping **only** from the basename (no FITS I/O); requires ``-image-`` time and
-        ``_NNNMHz_`` / ``_NNNMHz-`` tokens when you need frequency-based bins. ``time_key_source``
-        is ignored in ``"filename"`` mode.
+        :func:`_extract_group_metadata`. ``"filename"``: derive frequency for grouping
+        from the basename (no FITS I/O); time from ``-image-`` tokens unless
+        ``time_key_source="directory"``.
     filename_convention
         ``"image"`` (default): standard OVRO ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_``
         basename patterns. ``"lst-color"``: LST color-band products
@@ -5263,7 +5330,7 @@ def convert_fits_dir_to_zarr(
     lm_reference_ds: Optional[xr.Dataset] = None,
     lm_reference_target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
     time_key_tolerance_sec: float = 0.0,
     consolidate_metadata_at_end: bool = True,
@@ -5320,9 +5387,10 @@ def convert_fits_dir_to_zarr(
         and order files using only basename ``-image-`` time and ``_NNNMHz_`` tokens,
         avoiding ``fits.getheader`` during discovery and frequency sorting.
     time_key_source
-        Used when ``group_metadata_source`` is ``"fits"``. ``"filename"`` (default):
-        prefer ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS``.
-        ``"header"``: use ``DATE-OBS`` only.
+        How to choose the observation time key. ``"filename"`` (default): prefer
+        ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS`` (when reading
+        FITS). ``"header"``: use ``DATE-OBS`` only. ``"directory"``: nearest parent
+        directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (as ``YYYYMMDD_000000``).
     consolidate_metadata_at_end
         When True (default), write a consolidated ``.zmetadata`` file after all
         pending time steps in this run are written (or when resume finds nothing

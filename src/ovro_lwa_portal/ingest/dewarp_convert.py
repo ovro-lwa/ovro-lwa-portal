@@ -243,7 +243,7 @@ def run_cascade_per_time_group(
     target_size: int | None = None,
     clear_staging: bool = True,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: Literal["header", "filename", "directory"] = "filename",
     time_key_tolerance_sec: float = 0.0,
     out_zarr: Path | None = None,
     rebuild: bool = False,
@@ -441,7 +441,7 @@ def dewarp_and_convert_append_each_time(
     verbose: bool = False,
     progress_callback: Callable[[str, int, int, str], None] | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: Literal["header", "filename", "directory"] = "filename",
     time_key_tolerance_sec: float = 0.0,
     resume: bool = True,
 ) -> tuple[int, list[str]]:
