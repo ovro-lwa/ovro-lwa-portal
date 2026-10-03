@@ -309,9 +309,12 @@ _IMAGE_TIME_BEFORE_IMAGE_RE = re.compile(r"(\d{8})_(\d{6})-image", re.IGNORECASE
 # LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
 _LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
 
-# Parent directory calendar dates for discovery (e.g. exopipe ``.../2024-12-24/Run_.../``).
+# Parent directory calendar dates / LST hours for discovery
+# (e.g. exopipe ``.../01h/2024-12-24/Run_.../``).
 _DIR_DATE_DASH_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _DIR_DATE_COMPACT_RE = re.compile(r"^(\d{8})$")
+_DIR_LST_HOUR_RE = re.compile(r"^(\d{1,2})h$")
+_DIR_TIME_KEY_LST_RE = re.compile(r"^(\d{8})_LST(\d+)h(?:_(t\d+))?$")
 
 DiscoveryFilenameConvention = Literal["image", "lst-color"]
 DiscoveryTimeKeySource = Literal["header", "filename", "directory"]
@@ -561,9 +564,9 @@ def _extract_group_metadata(
 
         When *time_key_source* is ``"header"``, ``time_key`` comes from ``DATE-OBS`` only.
 
-        When *time_key_source* is ``"directory"``, ``time_key`` comes from a parent
-        directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (see :func:`_time_key_from_directory`);
-        there is no ``DATE-OBS`` fallback.
+        When *time_key_source* is ``"directory"``, ``time_key`` comes from parent
+        directories ``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST hour when present
+        (see :func:`_time_key_from_directory`); there is no ``DATE-OBS`` fallback.
     """
     time_key: Optional[str] = None
     frequency_hz: Optional[float] = None
@@ -1892,31 +1895,50 @@ def _time_key_from_filename(fp: Path) -> Optional[str]:
 
 
 def _time_key_from_directory(fp: Path) -> Optional[str]:
-    """Observation date key from a parent directory named ``YYYY-MM-DD`` or ``YYYYMMDD``.
+    """Observation key from parent date and LST-hour directories.
 
-    Walks from the file's parent toward the filesystem root and returns the nearest
-    valid calendar-date directory as ``YYYYMMDD_000000`` (midnight UTC). Returns
-    ``None`` when no such directory is found.
+    Walks from the file's parent toward the filesystem root and collects:
 
-    Used for products whose ``DATE-OBS`` / basename stamps are unreliable (e.g. exopipe
-    deep coadds under ``.../01h/2024-12-24/Run_.../``).
+    * nearest calendar-date directory ``YYYY-MM-DD`` or ``YYYYMMDD``
+    * nearest LST-hour directory ``NNh`` / ``Nh`` (0–23), e.g. ``01h``
+
+    Returns ``YYYYMMDD_LST{HH}h`` when both are present (exopipe layout
+    ``.../01h/2024-12-24/...``), ``YYYYMMDD_000000`` when only the date is found, or
+    ``None`` when no date directory exists.
+
+    Used for products whose ``DATE-OBS`` / basename stamps are unreliable.
     """
+    ymd: Optional[str] = None
+    lst_hour: Optional[int] = None
     for parent in fp.resolve().parents:
         name = parent.name
-        dashed = _DIR_DATE_DASH_RE.fullmatch(name)
-        if dashed is not None:
-            ymd = f"{dashed.group(1)}{dashed.group(2)}{dashed.group(3)}"
-        else:
-            compact = _DIR_DATE_COMPACT_RE.fullmatch(name)
-            if compact is None:
-                continue
-            ymd = compact.group(1)
-        try:
-            datetime.strptime(ymd, "%Y%m%d")
-        except ValueError:
-            continue
-        return f"{ymd}_000000"
-    return None
+        if ymd is None:
+            dashed = _DIR_DATE_DASH_RE.fullmatch(name)
+            if dashed is not None:
+                candidate = f"{dashed.group(1)}{dashed.group(2)}{dashed.group(3)}"
+            else:
+                compact = _DIR_DATE_COMPACT_RE.fullmatch(name)
+                candidate = compact.group(1) if compact is not None else None
+            if candidate is not None:
+                try:
+                    datetime.strptime(candidate, "%Y%m%d")
+                except ValueError:
+                    pass
+                else:
+                    ymd = candidate
+        if lst_hour is None:
+            lst_match = _DIR_LST_HOUR_RE.fullmatch(name)
+            if lst_match is not None:
+                hour = int(lst_match.group(1))
+                if 0 <= hour <= 23:
+                    lst_hour = hour
+        if ymd is not None and lst_hour is not None:
+            break
+    if ymd is None:
+        return None
+    if lst_hour is not None:
+        return f"{ymd}_LST{lst_hour:02d}h"
+    return f"{ymd}_000000"
 
 
 def _strip_fits_ctype_cards(hdr: fits.Header) -> None:
@@ -3851,8 +3873,20 @@ def _harmonize_celestial_coords_independent_of_frequency(
 
 
 def _parse_discovery_time_key(time_key: str) -> datetime:
-    """Parse ``YYYYMMDD_HHMMSS`` observation keys for temporal distance."""
-    return datetime.strptime(time_key, "%Y%m%d_%H%M%S")
+    """Parse discovery time keys for temporal distance / ordering.
+
+    Accepts ``YYYYMMDD_HHMMSS`` and LST-style keys ``YYYYMMDD_LSTNNh`` /
+    ``YYYYMMDD_LSTNNh_tXXXX`` (LST hour mapped to the clock-hour field for ordering).
+    """
+    try:
+        return datetime.strptime(time_key, "%Y%m%d_%H%M%S")
+    except ValueError:
+        match = _DIR_TIME_KEY_LST_RE.fullmatch(time_key)
+        if match is None:
+            raise
+        ymd = match.group(1)
+        lst_h = int(match.group(2))
+        return datetime.strptime(f"{ymd}{lst_h:02d}0000", "%Y%m%d%H%M%S")
 
 
 def _discovery_subband_stokes_key(fp: Path) -> tuple[int, int] | None:
@@ -4566,7 +4600,7 @@ def _discover_groups_from_files(
             if filename_convention == "lst-color":
                 t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
             elif time_key_source == "directory":
-                t_hint = "YYYY-MM-DD or YYYYMMDD parent directory"
+                t_hint = "YYYY-MM-DD/YYYYMMDD parent directory (optional NNh LST hour dir)"
             elif group_metadata_source == "filename":
                 t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
             elif time_key_source == "filename":
@@ -4695,9 +4729,10 @@ def _discover_groups(
         How to choose the observation time key. ``"filename"`` (default): prefer the
         basename ``-image-YYYYMMDD_HHMMSS`` instant when present; otherwise use
         ``DATE-OBS`` (when ``group_metadata_source`` is ``"fits"``). ``"header"``: group by
-        ``DATE-OBS`` only. ``"directory"``: nearest parent directory named ``YYYY-MM-DD``
-        or ``YYYYMMDD`` (as ``YYYYMMDD_000000``); no ``DATE-OBS`` fallback. Directory mode
-        also overrides basename time when ``group_metadata_source`` is ``"filename"``.
+        ``DATE-OBS`` only. ``"directory"``: nearest parent ``YYYY-MM-DD``/``YYYYMMDD`` plus
+        ``NNh`` LST-hour directory when present (``YYYYMMDD_LST{HH}h``, else
+        ``YYYYMMDD_000000``); no ``DATE-OBS`` fallback. Directory mode also overrides
+        basename time when ``group_metadata_source`` is ``"filename"``.
     group_metadata_source
         ``"fits"`` (default): read FITS headers (and filename fallbacks) via
         :func:`_extract_group_metadata`. ``"filename"``: derive frequency for grouping
@@ -5390,7 +5425,8 @@ def convert_fits_dir_to_zarr(
         How to choose the observation time key. ``"filename"`` (default): prefer
         ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS`` (when reading
         FITS). ``"header"``: use ``DATE-OBS`` only. ``"directory"``: nearest parent
-        directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (as ``YYYYMMDD_000000``).
+        directories ``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST hour when present
+        (``YYYYMMDD_LST{HH}h``, else ``YYYYMMDD_000000``).
     consolidate_metadata_at_end
         When True (default), write a consolidated ``.zmetadata`` file after all
         pending time steps in this run are written (or when resume finds nothing

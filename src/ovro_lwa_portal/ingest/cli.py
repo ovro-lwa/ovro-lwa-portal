@@ -540,9 +540,9 @@ def convert(
         help=(
             'How to choose the observation time key: "filename" prefers '
             "``-image-YYYYMMDD_HHMMSS`` (default; falls back to DATE-OBS when reading "
-            'FITS); "header" uses DATE-OBS only; "directory" uses the nearest parent '
-            "directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (as ``YYYYMMDD_000000``, "
-            "no DATE-OBS fallback)."
+            'FITS); "header" uses DATE-OBS only; "directory" uses parent '
+            "``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST-hour directory when present "
+            "(``YYYYMMDD_LST{HH}h``, else ``YYYYMMDD_000000``; no DATE-OBS fallback)."
         ),
     ),
     discovery_time_key_tolerance: float = typer.Option(
@@ -922,9 +922,9 @@ def dewarp_convert(
         help=(
             'How to choose the observation time key: "filename" prefers '
             "``-image-YYYYMMDD_HHMMSS`` (default; falls back to DATE-OBS when reading "
-            'FITS); "header" uses DATE-OBS only; "directory" uses the nearest parent '
-            "directory named ``YYYY-MM-DD`` or ``YYYYMMDD`` (as ``YYYYMMDD_000000``, "
-            "no DATE-OBS fallback)."
+            'FITS); "header" uses DATE-OBS only; "directory" uses parent '
+            "``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST-hour directory when present "
+            "(``YYYYMMDD_LST{HH}h``, else ``YYYYMMDD_000000``; no DATE-OBS fallback)."
         ),
     ),
     discovery_time_key_tolerance: float = typer.Option(
@@ -1255,7 +1255,7 @@ def audit_metadata(
         "--discovery-time-key-source",
         help=(
             'Observation time key from "filename" (default), "header" (DATE-OBS only), '
-            'or "directory" (YYYY-MM-DD / YYYYMMDD parent directory)'
+            'or "directory" (YYYY-MM-DD/YYYYMMDD + optional NNh LST-hour parent dirs)'
         ),
     ),
     discovery_time_key_tolerance: float = typer.Option(

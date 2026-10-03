@@ -70,7 +70,7 @@ class ConversionConfig:
     discovery_time_key_source : {"header", "filename", "directory"}, optional
         How to infer observation time. Defaults to ``"filename"`` (basename
         ``-image-`` stamp, else ``DATE-OBS``). ``"directory"`` uses a parent
-        directory named ``YYYY-MM-DD`` or ``YYYYMMDD``.
+        directories ``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST hour when present.
     lm_reference_target_size : int | None, optional
         When building the global LM reference, reproject onto this square grid size.
         Use the same value as dewarp ``target_size`` when combining dewarped FITS.
