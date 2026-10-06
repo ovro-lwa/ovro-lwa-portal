@@ -2553,15 +2553,12 @@ class RadportAccessor:
             return float(np.asarray(self._lst_cache[single_key], dtype=np.float64).ravel()[0])
 
         from astropy.time import Time
-        from astropy.utils.iers import conf as iers_conf
 
-        orig = iers_conf.auto_download
-        try:
-            iers_conf.auto_download = False
+        from ovro_lwa_portal._iers import offline_iers
+
+        with offline_iers():
             t = Time(mjd, format="mjd", scale="utc")
             lst_deg = float(t.sidereal_time("mean", longitude=observatory.lon).deg)
-        finally:
-            iers_conf.auto_download = orig
         self._lst_cache[single_key] = np.atleast_1d(np.asarray(lst_deg, dtype=np.float64))
         return float(np.asarray(lst_deg, dtype=np.float64).ravel()[0])
 
@@ -2575,7 +2572,8 @@ class RadportAccessor:
         """
         from astropy.coordinates import EarthLocation
         from astropy.time import Time
-        from astropy.utils.iers import conf as iers_conf
+
+        from ovro_lwa_portal._iers import offline_iers
 
         if observatory is None:
             from astropy import units as u
@@ -2591,14 +2589,10 @@ class RadportAccessor:
         if full_key in self._lst_cache:
             return
 
-        orig = iers_conf.auto_download
-        try:
-            iers_conf.auto_download = False
+        with offline_iers():
             t = Time(all_mjd, format="mjd", scale="utc")
             lst_vec = t.sidereal_time("mean", longitude=observatory.lon).deg
             lst_arr = np.atleast_1d(np.asarray(lst_vec, dtype=np.float64)).ravel()
-        finally:
-            iers_conf.auto_download = orig
         self._lst_cache[full_key] = lst_arr
 
     def _pixel_track_can_batch_time_radec_grids(self) -> bool:

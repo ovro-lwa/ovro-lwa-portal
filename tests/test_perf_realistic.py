@@ -115,17 +115,14 @@ def _compute_lm_track(
     """
     from astropy import units as u
     from astropy.time import Time
-    from astropy.utils.iers import conf as iers_conf
 
-    # Use bundled IERS-B table; avoids network calls and speed difference vs
-    # IERS-A is negligible at OVRO-LWA's ~6-arcmin beam.
-    orig = iers_conf.auto_download
-    try:
-        iers_conf.auto_download = False
+    from ovro_lwa_portal._iers import offline_iers
+
+    # Bundled/cached IERS; download off. Accuracy vs fresh IERS-A is negligible
+    # at OVRO-LWA's ~6-arcmin beam.
+    with offline_iers():
         t = Time(mjd_times, format="mjd", scale="utc")
         lst_deg = t.sidereal_time("mean", longitude=lon_deg * u.deg).deg
-    finally:
-        iers_conf.auto_download = orig
 
     ha_rad = np.deg2rad(lst_deg - ra_deg)
     dec_rad = np.deg2rad(dec_deg)
@@ -205,7 +202,8 @@ def production_dataset() -> xr.Dataset:
     """
     from astropy import units as u
     from astropy.time import Time
-    from astropy.utils.iers import conf as iers_conf
+
+    from ovro_lwa_portal._iers import offline_iers
 
     mjd_times = MJD_START + np.arange(N_TIME) * MJD_STEP
     freq_hz = np.linspace(FREQ_START_HZ, FREQ_STOP_HZ, N_FREQ)
@@ -297,15 +295,11 @@ def production_dataset() -> xr.Dataset:
     # The phase centre RA is set to the mean LST across the observation so
     # the source tracking is reasonably centred in the image.
     # ------------------------------------------------------------------ #
-    orig = iers_conf.auto_download
-    try:
-        iers_conf.auto_download = False
+    with offline_iers():
         t0 = Time(MJD_START, format="mjd", scale="utc")
         lst0_deg = float(
             t0.sidereal_time("mean", longitude=OVRO_LON_DEG * u.deg).deg
         )
-    finally:
-        iers_conf.auto_download = orig
 
     wcs_header_str = _build_wcs_header(
         crval1_deg=lst0_deg,
