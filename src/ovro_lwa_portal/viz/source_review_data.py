@@ -117,17 +117,14 @@ def lst_hours_for_dataset(ds: xr.Dataset) -> np.ndarray:
     """Mean local sidereal time (hours) for each dataset time sample."""
     from astropy.coordinates import EarthLocation
     from astropy.time import Time
-    from astropy.utils.iers import conf as iers_conf
+
+    from ovro_lwa_portal._iers import offline_iers
 
     observatory = EarthLocation.of_site("ovro")
     mjd = np.asarray(ds.coords["time"].values, dtype=np.float64)
-    orig = iers_conf.auto_download
-    try:
-        iers_conf.auto_download = False
+    with offline_iers():
         times = Time(mjd, format="mjd", scale="utc")
         lst_deg = np.asarray(times.sidereal_time("mean", longitude=observatory.lon).deg)
-    finally:
-        iers_conf.auto_download = orig
     return np.mod(lst_deg / 15.0, 24.0)
 
 

@@ -1060,22 +1060,19 @@ def _zenith_heatmap_lst_hours(dataset: xr.Dataset) -> np.ndarray:
     from astropy import units as u
     from astropy.coordinates import EarthLocation
     from astropy.time import Time
-    from astropy.utils.iers import conf as iers_conf
+
+    from ovro_lwa_portal._iers import offline_iers
 
     observatory = EarthLocation(
         lat=37.2339 * u.deg, lon=-118.2817 * u.deg, height=1222 * u.m
     )
     mjd = np.asarray(dataset.coords["time"].values, dtype=np.float64)
-    orig = iers_conf.auto_download
-    try:
-        iers_conf.auto_download = False
+    with offline_iers():
         times = Time(mjd, format="mjd", scale="utc")
         lst_deg = np.asarray(
             times.sidereal_time("mean", longitude=observatory.lon).deg,
             dtype=np.float64,
         )
-    finally:
-        iers_conf.auto_download = orig
     return np.mod(lst_deg / 15.0, 24.0)
 
 

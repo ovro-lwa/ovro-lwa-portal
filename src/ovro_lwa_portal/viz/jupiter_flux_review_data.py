@@ -10,10 +10,10 @@ import numpy as np
 import xarray as xr
 from astropy.coordinates import SkyCoord, get_body
 from astropy.time import Time
-from astropy.utils.iers import conf as iers_conf
 from bokeh.models import LinearColorMapper
 from bokeh.palettes import Inferno256
 
+from ovro_lwa_portal._iers import offline_iers
 from ovro_lwa_portal.viz.pipeline_qa import PipelineQAConfig
 from ovro_lwa_portal.viz.source_review_data import (
     _PROGRESS_STAGE_LABELS,
@@ -60,13 +60,9 @@ def zarr_path_to_day(path: Path, *, stem: str) -> str:
 def jupiter_at_observation_start(ds: xr.Dataset) -> SkyCoord:
     """Jupiter FK5 coordinates at the first time sample in the dataset."""
     mjd = float(np.asarray(ds.coords["time"].values, dtype=np.float64)[0])
-    orig = iers_conf.auto_download
-    try:
-        iers_conf.auto_download = False
+    with offline_iers():
         t0 = Time(mjd, format="mjd", scale="utc")
         return get_body("jupiter", t0)
-    finally:
-        iers_conf.auto_download = orig
 
 
 def jupiter_flux_map(
