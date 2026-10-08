@@ -686,6 +686,7 @@ def convert(
         console.print(f"  Zarr store name:  {zarr_name}")
         console.print(f"  Fixed FITS dir:   {fixed_dir_resolved}")
         console.print(f"  Work root:        {work_root or input_dir / '.work'}")
+        console.print("  Clear staging/fixed: YES (start + end of run)")
         console.print(f"  Chunk size (l,m): {chunk_lm}")
         console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
         console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")

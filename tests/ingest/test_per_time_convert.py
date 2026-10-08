@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from ovro_lwa_portal.ingest.dewarp_convert import clear_ingest_directory
 from ovro_lwa_portal.ingest.discovery import discover_time_grouped_paths
 from ovro_lwa_portal.ingest.per_time_convert import (
     PerTimeGlobConvertConfig,
@@ -18,6 +19,32 @@ from ovro_lwa_portal.ingest.per_time_convert import (
 def _image_name(time_key: str, mhz: int, run: str = "RunA") -> str:
     date, hms = time_key.split("_")
     return f"{date}_{hms}_{mhz}MHz_averaged_{run}-I-image-{date}_{hms}.fits"
+
+
+class TestClearIngestDirectory:
+    def test_removes_files_dirs_and_symlinks(self, tmp_path: Path) -> None:
+        work = tmp_path / "staging"
+        work.mkdir()
+        (work / "keep_me_not.fits").write_bytes(b"x")
+        sub = work / "subdir"
+        sub.mkdir()
+        (sub / "nested.txt").write_bytes(b"y")
+        target = tmp_path / "target.fits"
+        target.write_bytes(b"z")
+        link = work / "link.fits"
+        link.symlink_to(target)
+
+        n = clear_ingest_directory(work, label="staging dir")
+        assert n == 3
+        assert work.is_dir()
+        assert list(work.iterdir()) == []
+        assert target.exists()  # clearing must not follow/delete symlink targets
+
+    def test_creates_missing_directory(self, tmp_path: Path) -> None:
+        work = tmp_path / "new_staging"
+        assert not work.exists()
+        assert clear_ingest_directory(work) == 0
+        assert work.is_dir()
 
 
 class TestStageTimeGroupSymlinks:
@@ -87,9 +114,19 @@ class TestRunPerTimeGlobConvert:
             fits_paths.append(p)
 
         staging = tmp_path / "staging"
+        staging.mkdir()
+        # Leftovers from a prior product (must be cleared before/after this run).
+        leftover = staging / (
+            "20241221_LST02h__50MHz_V_deep_Taper_Robust+0.0_"
+            "dewarped_aligned_msub_ssub_LST02h_20241221T035212.fits"
+        )
+        leftover.write_bytes(b"stale")
         output = tmp_path / "out"
         fixed = tmp_path / "fixed"
+        fixed.mkdir()
+        (fixed / "stale_fixed.fits").write_bytes(b"stale")
         convert_calls: list[str] = []
+        staging_during_convert: list[list[str]] = []
 
         def fake_glob(pattern: str) -> list[Path]:
             assert pattern == str(src_root / "*.fits")
@@ -97,6 +134,8 @@ class TestRunPerTimeGlobConvert:
 
         def fake_convert(self, progress_callback=None):  # noqa: ANN001
             convert_calls.append("called")
+            staging_during_convert.append(sorted(p.name for p in staging.glob("*.fits")))
+            assert leftover.name not in staging_during_convert[-1]
             return output / "store.zarr"
 
         monkeypatch.setattr(
@@ -135,4 +174,7 @@ class TestRunPerTimeGlobConvert:
         run_per_time_glob_convert(config)
 
         assert len(convert_calls) == 1
-        assert list(staging.glob(f"{tkey}__*.fits")) == []
+        assert list(staging.glob("*.fits")) == []
+        assert list(fixed.iterdir()) == []
+        assert leftover.name not in staging_during_convert[0]
+        assert all(name.startswith(f"{tkey}__") for name in staging_during_convert[0])
