@@ -91,8 +91,9 @@ class ConversionConfig:
     group_metadata_source : {"fits", "filename"}, optional
         How to discover observation time / subband for grouping and frequency ordering.
         ``"fits"`` (default) reads FITS headers (with filename fallbacks).
-        ``"filename"`` uses only basename ``-image-`` and ``_NNNMHz_`` tokens (no header
-        reads during discovery). Match the value used when building ``lm_reference_ds``.
+        ``"filename"`` groups by basename ``-image-`` and ``_NNNMHz_`` tokens, while
+        still caching each image HDU once for beam/LM keywords. Match the value used
+        when building ``lm_reference_ds``.
     discovery_filename_convention : {"image", "lst-color"}, optional
         Basename pattern for observation-time grouping. ``"image"`` (default) uses
         ``-image-YYYYMMDD_HHMMSS``. ``"lst-color"`` uses

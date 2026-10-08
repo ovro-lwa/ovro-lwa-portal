@@ -365,6 +365,10 @@ def _build_discovery_file_metadata(
         )
 
     if group_metadata_source == "filename":
+        # Grouping keys come from the basename / directory; still read the image
+        # HDU once so beam, LM shape, and other ingest keywords are cached for
+        # the beam filter, LM-reference scan, and discovery sidecar (one Lustre
+        # header open instead of re-reading later).
         time_key, frequency_hz, note_list = _extract_group_metadata_filename_only(fp)
         notes = list(note_list)
         if time_key_source == "directory":
@@ -374,9 +378,15 @@ def _build_discovery_file_metadata(
                 notes.append("time-from-directory")
             else:
                 time_key = None
-        stokes_key = _resolve_stokes_key_for_discovery(fp, None)
+        header: Optional[fits.Header] = None
+        try:
+            header = _getheader_for_ingest(fp)
+            notes.append("header-cached-for-ingest")
+        except Exception as exc:
+            logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+        stokes_key = _resolve_stokes_key_for_discovery(fp, header)
         return _DiscoveryFileMetadata(
-            time_key, frequency_hz, tuple(notes), stokes_key, None
+            time_key, frequency_hz, tuple(notes), stokes_key, header
         )
 
     notes = []
@@ -2489,6 +2499,23 @@ def _getheader_for_ingest(fp: Path) -> fits.Header:
     return fits.getheader(fp, ext=_image_hdu_index_for_header(fp))
 
 
+def _header_for_beam_check(
+    fp: Path,
+    meta: Optional[_DiscoveryFileMetadata],
+) -> fits.Header:
+    """Return a FITS header suitable for :func:`_invalid_beam_reason`.
+
+    Discovery sidecars from ``group_metadata_source="filename"`` may rebuild a
+    shape-only stub header (``NAXIS``/``NAXIS1``/``NAXIS2`` only) with no
+    ``BMAJ``/``BMIN``. Treat that as a cache miss and re-read the on-disk image
+    HDU so beam checks do not falsely reject valid products.
+    """
+    hdr = meta.ingest_header if meta is not None else None
+    if hdr is not None and "BMAJ" in hdr and "BMIN" in hdr:
+        return hdr
+    return _getheader_for_ingest(fp)
+
+
 def _lm_shape_from_header(header: fits.Header) -> Tuple[int, int]:
     """Return LM shape ``(l, m)`` from a FITS image header (``NAXIS1`` × ``NAXIS2``)."""
     naxis = int(header.get("NAXIS", 0))
@@ -3313,9 +3340,7 @@ def _load_global_lm_reference_dataset(
                 discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
             )
             if fix_headers_on_demand:
-                hdr = meta.ingest_header if meta is not None else None
-                if hdr is None:
-                    hdr = _getheader_for_ingest(fp)
+                hdr = _header_for_beam_check(fp, meta)
                 if _invalid_beam_reason(hdr) is not None:
                     continue
                 shape = _lm_shape_from_header(hdr)
@@ -4202,20 +4227,18 @@ def _filter_invalid_beam_files(
         cached = (
             discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
         )
-        hdr = cached.ingest_header if cached is not None else None
-        if hdr is None:
-            try:
-                hdr = _getheader_for_ingest(fp)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping %s: could not read image HDU header to check beam (%s); "
-                    "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
-                    fp.name,
-                    exc,
-                    tkey,
-                )
-                n_dropped_files += 1
-                continue
+        try:
+            hdr = _header_for_beam_check(fp, cached)
+        except Exception as exc:
+            logger.warning(
+                "Skipping %s: could not read image HDU header to check beam (%s); "
+                "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
+                fp.name,
+                exc,
+                tkey,
+            )
+            n_dropped_files += 1
+            continue
         reason = _invalid_beam_reason(hdr)
         if reason is None:
             kept_by_time.setdefault(tkey, []).append(fp)
@@ -4735,9 +4758,10 @@ def _discover_groups(
         basename time when ``group_metadata_source`` is ``"filename"``.
     group_metadata_source
         ``"fits"`` (default): read FITS headers (and filename fallbacks) via
-        :func:`_extract_group_metadata`. ``"filename"``: derive frequency for grouping
-        from the basename (no FITS I/O); time from ``-image-`` tokens unless
-        ``time_key_source="directory"``.
+        :func:`_extract_group_metadata`. ``"filename"``: derive time/frequency
+        grouping keys from the basename (or directory when
+        ``time_key_source="directory"``), while still reading each image HDU
+        once to cache beam/LM keywords for convert and the discovery sidecar.
     filename_convention
         ``"image"`` (default): standard OVRO ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_``
         basename patterns. ``"lst-color"``: LST color-band products

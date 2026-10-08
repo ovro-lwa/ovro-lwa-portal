@@ -529,9 +529,9 @@ def convert(
         "--discovery-metadata-source",
         help=(
             'How to infer observation time and subband when grouping: "fits" reads FITS '
-            'headers (with filename fallbacks; default). "filename" uses only basename '
-            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, avoiding FITS header reads "
-            "during discovery and frequency ordering."
+            'headers (with filename fallbacks; default). "filename" groups by basename '
+            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, but still reads each image "
+            "HDU once to cache beam/LM keywords for convert and the discovery sidecar."
         ),
     ),
     discovery_time_key_source: str = typer.Option(
@@ -912,9 +912,9 @@ def dewarp_convert(
         "--discovery-metadata-source",
         help=(
             'How to infer observation time and subband when grouping raw FITS: "fits" reads '
-            'FITS headers (with filename fallbacks; default). "filename" uses only basename '
-            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, avoiding FITS header reads "
-            "during discovery and frequency ordering."
+            'FITS headers (with filename fallbacks; default). "filename" groups by basename '
+            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, but still reads each image "
+            "HDU once to cache beam/LM keywords for convert and the discovery sidecar."
         ),
     ),
     discovery_time_key_source: str = typer.Option(

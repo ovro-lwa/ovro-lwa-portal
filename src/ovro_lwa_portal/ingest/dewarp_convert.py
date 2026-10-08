@@ -299,9 +299,9 @@ def run_cascade_per_time_group(
     ``-image-YYYYMMDD_HHMMSS`` stamp when present (so multi-band images that share a pipeline
     image id stay in one group even if ``DATE-OBS`` differs between symlink targets). If that
     pattern is missing, grouping falls back to ``DATE-OBS`` like the Zarr ingest path.
-    Pass ``group_metadata_source="filename"`` to infer time and subband **only** from the
-    basename (no FITS header reads during discovery); that requires the ``-image-`` stamp and
-    ``_NNNMHz_`` tokens when frequency bins matter.
+    Pass ``group_metadata_source="filename"`` to infer time and subband grouping keys from
+    the basename (``-image-`` stamp and ``_NNNMHz_`` tokens); each image HDU is still read
+    once to cache beam/LM keywords for convert.
 
     For each time key, all subband files in that group are passed as ``image_filenames`` to
     ``image_plane_correction.flow.flow_cascade73MHz`` with ``outroot=cascade_parent / time_key``.
@@ -496,7 +496,7 @@ def dewarp_and_convert_append_each_time(
 
     Pass ``group_metadata_source="filename"`` to align with
     :func:`run_cascade_per_time_group` when raw OVRO basenames carry ``-image-`` and
-    ``_NNNMHz_`` tags so discovery avoids FITS header reads.
+    ``_NNNMHz_`` tags (basename grouping keys; headers still cached once for beam/LM).
 
     Raw inputs are passed through
     :func:`ovro_lwa_portal.fits_to_zarr_xradio._filter_invalid_beam_files` before the

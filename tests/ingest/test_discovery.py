@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
     discover_time_grouped_fits,
@@ -343,6 +345,45 @@ def test_resolve_glob_convert_discovery_uses_sidecar_on_rerun(
     assert discover_calls == 1
     assert plan2.discovered.input_files == plan1.discovered.input_files
     assert len(plan2.discovery_metadata) == len(plan1.discovery_metadata)
+
+
+def test_filename_discovery_sidecar_persists_beam_header(tmp_path: Path) -> None:
+    """Filename-mode discovery caches BMAJ/BMIN into the sidecar for convert reuse."""
+    import json
+
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    path = tmp_path / _image_name(tkey, 55)
+    fits.PrimaryHDU(
+        data=[[1.0, 2.0], [3.0, 4.0]],
+        header=fits.Header(
+            {"RESTFREQ": 99e6, "BMAJ": 0.18, "BMIN": 0.14, "BPA": 33.0}
+        ),
+    ).writeto(path)
+
+    plan = resolve_glob_convert_discovery(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+        out_zarr=tmp_path / "store.zarr",
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    meta = plan.discovery_metadata[path.resolve()]
+    assert meta.ingest_header is not None
+    assert float(meta.ingest_header["BMAJ"]) == pytest.approx(0.18)
+    assert meta.frequency_hz == pytest.approx(55e6)
+
+    payload = json.loads((tmp_path / "store_metadata.json").read_text())
+    entry = payload["files"][str(path.resolve())]
+    assert "ingest_header_text" in entry
+    assert "BMAJ" in entry["ingest_header_text"]
 
 
 def test_discovery_sidecar_invalidates_on_mtime_change(tmp_path: Path) -> None:

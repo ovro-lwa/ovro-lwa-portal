@@ -1044,32 +1044,54 @@ def test_harmonize_subband_time_coords_collapses_mjd_spread() -> None:
     assert float(harmonized[1]["time"].values[0]) == pytest.approx(mjd_a)
 
 
-def test_discover_groups_filename_only_skips_getheader(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_discover_groups_filename_groups_by_basename_and_caches_header(
+    tmp_path: Path,
 ) -> None:
-    """Filename-only discovery uses basename time and ``_NNNMHz_`` without ``getheader``."""
+    """Filename discovery groups by basename time/MHz but caches beam headers once."""
     mod = _import_module()
-
-    def boom(*_a: object, **_k: object) -> None:
-        pytest.fail("fits.getheader should not be called in filename-only discovery")
-
-    monkeypatch.setattr(mod.fits, "getheader", boom)
 
     a = tmp_path / "18MHz-I-Deep-Taper-Robust-0-image-20241221_102109_a.fits"
     b = tmp_path / "73MHz-I-Deep-Taper-Robust-0-image-20241221_102109_b.fits"
     fits.PrimaryHDU(
         data=[[1.0]],
-        header=fits.Header({"DATE-OBS": "2024-12-21T01:00:00", "RESTFREQ": 99e6}),
+        header=fits.Header(
+            {
+                "DATE-OBS": "2024-12-21T01:00:00",
+                "RESTFREQ": 99e6,
+                "BMAJ": 0.2,
+                "BMIN": 0.1,
+                "BPA": 10.0,
+            }
+        ),
     ).writeto(a)
     fits.PrimaryHDU(
         data=[[1.0]],
-        header=fits.Header({"DATE-OBS": "2024-12-22T23:00:00", "RESTFREQ": 1e6}),
+        header=fits.Header(
+            {
+                "DATE-OBS": "2024-12-22T23:00:00",
+                "RESTFREQ": 1e6,
+                "BMAJ": 0.3,
+                "BMIN": 0.2,
+                "BPA": 20.0,
+            }
+        ),
     ).writeto(b)
 
-    groups = mod._discover_groups(tmp_path, group_metadata_source="filename")
+    discovery_metadata: dict = {}
+    groups = mod._discover_groups(
+        tmp_path,
+        group_metadata_source="filename",
+        discovery_metadata_out=discovery_metadata,
+    )
 
+    # Grouping ignores conflicting DATE-OBS / RESTFREQ; uses basename stamp + MHz.
     assert list(groups.keys()) == ["20241221_102109"]
     assert [p.name for p in groups["20241221_102109"]] == [a.name, b.name]
+    meta_a = discovery_metadata[a.resolve()]
+    assert meta_a.ingest_header is not None
+    assert float(meta_a.ingest_header["BMAJ"]) == 0.2
+    assert "header-cached-for-ingest" in meta_a.notes
+    assert meta_a.frequency_hz == pytest.approx(18e6)
 
 
 def test_extract_group_metadata_requires_date_obs(tmp_path: Path):
@@ -1736,6 +1758,67 @@ def test_filter_invalid_beam_files_drops_zero_and_missing(tmp_path: Path, caplog
     assert "bad_zero.fits" in caplog.text
     assert "missing BMAJ/BMIN" in caplog.text
     assert "BMAJ=0.0" in caplog.text
+
+
+def test_header_for_beam_check_rereads_shape_only_stub(tmp_path: Path) -> None:
+    """Filename-discovery sidecar stubs (NAXIS only) must not hide real BMAJ/BMIN."""
+    mod = _import_module()
+
+    fp = tmp_path / "coadd.fits"
+    fits.PrimaryHDU(
+        data=[[1.0, 2.0], [3.0, 4.0]],
+        header=fits.Header({"BMAJ": 0.2, "BMIN": 0.1, "BPA": 12.0}),
+    ).writeto(fp)
+
+    stub = fits.Header({"NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2})
+    meta = mod._DiscoveryFileMetadata(
+        "20250106_051855",
+        55e6,
+        ("time-from-directory",),
+        1,
+        stub,
+    )
+    hdr = mod._header_for_beam_check(fp, meta)
+    assert float(hdr["BMAJ"]) == 0.2
+    assert float(hdr["BMIN"]) == 0.1
+    assert mod._invalid_beam_reason(hdr) is None
+
+    filtered = mod._filter_invalid_beam_files(
+        {"20250106_051855": [fp]},
+        discovery_metadata={fp.resolve(): meta},
+    )
+    assert filtered == {"20250106_051855": [fp]}
+
+
+def test_load_global_lm_reference_accepts_shape_only_discovery_stub(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """LM reference build must reread FITS when discovery metadata lacks beam cards."""
+    mod = _import_module()
+
+    fp = tmp_path / "ref.fits"
+    fits.PrimaryHDU(
+        data=[[1.0, 2.0], [3.0, 4.0]],
+        header=fits.Header({"BMAJ": 0.15, "BMIN": 0.12, "BPA": 5.0}),
+    ).writeto(fp)
+
+    stub = fits.Header({"NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2})
+    meta = mod._DiscoveryFileMetadata("t0", 64e6, (), 1, stub)
+    fixed_dir = tmp_path / "fixed"
+    fixed_dir.mkdir()
+
+    sentinel = object()
+    monkeypatch.setattr(mod, "fix_fits_headers", lambda files, *_a, **_k: list(files))
+    monkeypatch.setattr(mod, "_load_for_combine", lambda *_a, **_k: sentinel)
+
+    out = mod._load_global_lm_reference_dataset(
+        {"t0": [fp]},
+        fixed_dir,
+        chunk_lm=0,
+        fix_headers_on_demand=True,
+        discovery_metadata={fp.resolve(): meta},
+    )
+    assert out is sentinel
 
 
 def test_filter_invalid_beam_files_drops_empty_time_keys(tmp_path: Path, caplog):

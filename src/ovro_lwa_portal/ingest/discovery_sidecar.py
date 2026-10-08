@@ -92,6 +92,9 @@ def _metadata_from_sidecar_entry(
     if header_text:
         hdr = fits.Header.fromstring(str(header_text), sep="\n")
     elif entry.get("lm_naxis1") is not None and entry.get("lm_naxis2") is not None:
+        # Shape-only stub for LM grid selection. Do not invent beam cards:
+        # beam checks must re-read the on-disk FITS when BMAJ/BMIN are absent
+        # (see ``_header_for_beam_check``).
         hdr = fits.Header(
             {
                 "NAXIS": 2,
