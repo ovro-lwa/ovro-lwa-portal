@@ -211,6 +211,7 @@ def plan_convert_discovery(
         require_73mhz=False,
         context="convert",
         filter_invalid_beam=False,
+        time_key_source=discovery.time_key_source,
     )
     to_process = summarize_time_grouped_fits(
         to_process_groups,
@@ -339,6 +340,7 @@ def resolve_glob_convert_discovery(
         require_73mhz=False,
         context="convert",
         filter_invalid_beam=False,
+        time_key_source=discovery.time_key_source,
     )
     to_process_summary = summarize_time_grouped_fits(
         to_process,
@@ -375,11 +377,15 @@ def prepare_ingest_time_groups(
     require_73mhz: bool = False,
     context: str = "convert",
     filter_invalid_beam: bool = True,
+    time_key_source: Literal["header", "filename", "directory"] = "filename",
 ) -> Dict[str, List[Path]]:
     """Apply truncation/beam validity, optional 73 MHz, and optional resume filters.
 
     Set ``filter_invalid_beam=False`` when a downstream step repairs placeholder
     ``BMAJ``/``BMIN`` (e.g. per-time funpack + nearby-time beam copy) before convert.
+
+    Pass ``time_key_source="directory"`` so resume matches directory discovery keys
+    (and their synthetic MJDs) without treating shared LOO ``DATE-OBS`` as complete.
     """
     if filter_invalid_beam:
         filtered = _filter_invalid_beam_files(by_time)
@@ -393,6 +399,10 @@ def prepare_ingest_time_groups(
         filtered = _filter_time_groups_without_cascade_reference(filtered)
     if resume and out_zarr is not None and not rebuild:
         filtered = _filter_completed_time_keys(
-            filtered, out_zarr, rebuild=False, context=context
+            filtered,
+            out_zarr,
+            rebuild=False,
+            context=context,
+            time_key_source=time_key_source,
         )
     return filtered

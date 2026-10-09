@@ -3914,6 +3914,32 @@ def _parse_discovery_time_key(time_key: str) -> datetime:
         return datetime.strptime(f"{ymd}{lst_h:02d}0000", "%Y%m%d%H%M%S")
 
 
+def _mjd_from_discovery_time_key(time_key: str) -> float:
+    """Return a synthetic UTC MJD for a discovery time key (directory / filename).
+
+    Directory keys ``YYYYMMDD_LST{HH}h`` map the calendar night plus LST hour onto
+    ``YYYY-MM-DDTHH:00:00`` UTC so LOO coadd nights that share FITS ``DATE-OBS`` still
+    get distinct Zarr ``time`` rows. This is an ingest identity stamp, not a physical
+    LST→UTC conversion.
+    """
+    dt = _parse_discovery_time_key(time_key)
+    return float(Time(dt, scale="utc").mjd)
+
+
+def _assign_time_coord_from_discovery_key(xds: xr.Dataset, time_key: str) -> xr.Dataset:
+    """Overwrite the dataset ``time`` coordinate with the discovery-key MJD."""
+    if "time" not in xds.coords:
+        return xds
+    mjd = _mjd_from_discovery_time_key(time_key)
+    attrs = dict(xds["time"].attrs)
+    new_time = xr.DataArray(
+        np.asarray([mjd], dtype=np.float64),
+        dims=("time",),
+        attrs=attrs,
+    )
+    return xds.assign_coords(time=new_time)
+
+
 def _discovery_subband_stokes_key(fp: Path) -> tuple[int, int] | None:
     """Return ``(mhz_token, stokes)`` for deduplicating merged discovery groups."""
     mhz = _mhz_from_name(fp)
@@ -4314,7 +4340,11 @@ def _completed_times_in_zarr(
         mjds.append(mjd)
         try:
             t = Time(mjd, format="mjd", scale="utc")
-            keys.add(t.to_datetime().strftime("%Y%m%d_%H%M%S"))
+            dt = t.to_datetime()
+            keys.add(dt.strftime("%Y%m%d_%H%M%S"))
+            # Directory-mode writes stamp HH:00:00 UTC from YYYYMMDD_LST{HH}h.
+            if dt.minute == 0 and dt.second == 0 and getattr(dt, "microsecond", 0) == 0:
+                keys.add(f"{dt.strftime('%Y%m%d')}_LST{dt.hour:02d}h")
         except Exception as exc:
             logger.debug(
                 "Could not convert existing Zarr time=%r to a time key (%s); ignoring.",
@@ -4460,6 +4490,8 @@ def _discovery_time_key_completed_in_zarr(
     files: Sequence[Path],
     completed_keys: set[str],
     completed_mjds: np.ndarray,
+    *,
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> bool:
     """Return whether a discovered time key is already represented in the Zarr store.
 
@@ -4467,9 +4499,20 @@ def _discovery_time_key_completed_in_zarr(
     ``xradio`` writes the Zarr ``time`` coordinate from ``DATE-OBS`` in the FITS
     header. Those strings can differ on OVRO-LWA products, so resume also matches
     ``DATE-OBS`` keys and MJDs from the image HDU (not the empty fpacked primary).
+
+    When *time_key_source* is ``"directory"``, LOO coadds share ``DATE-OBS`` across
+    nights while discovery keys encode the calendar night + LST hour. Resume then
+    matches only the discovery key (or its synthetic MJD from
+    :func:`_mjd_from_discovery_time_key`) — never header ``DATE-OBS`` / MJD aliases.
     """
     if discovery_key in completed_keys:
         return True
+    if time_key_source == "directory":
+        try:
+            synth_mjd = _mjd_from_discovery_time_key(discovery_key)
+        except ValueError:
+            return False
+        return _mjd_matches_completed(synth_mjd, completed_mjds)
     header_key = _header_time_key_for_files(files)
     if header_key and header_key in completed_keys:
         return True
@@ -4483,6 +4526,7 @@ def _filter_completed_time_keys(
     *,
     rebuild: bool,
     context: str,
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> Dict[str, List[Path]]:
     """Drop time keys already present in *out_zarr* to make re-runs resumable.
 
@@ -4493,7 +4537,8 @@ def _filter_completed_time_keys(
     When discovery keys come from filenames but the Zarr ``time`` coordinate was
     written from FITS ``DATE-OBS`` (the usual ``xradio`` path), a group is also
     treated as complete when :func:`_header_time_key_for_files` matches a key
-    already in the store.
+    already in the store. Directory discovery keys skip that DATE-OBS aliasing (see
+    :func:`_discovery_time_key_completed_in_zarr`).
 
     Parameters
     ----------
@@ -4507,6 +4552,8 @@ def _filter_completed_time_keys(
     context
         Short label for log lines (e.g. ``"convert"``, ``"dewarp-convert"``); helps
         operators distinguish which subcommand reported the resume.
+    time_key_source
+        Discovery time-key mode; ``"directory"`` disables DATE-OBS/MJD alias resume.
 
     Returns
     -------
@@ -4522,12 +4569,18 @@ def _filter_completed_time_keys(
     remaining: Dict[str, List[Path]] = {}
     for discovery_key, files in by_time.items():
         if not _discovery_time_key_completed_in_zarr(
-            discovery_key, files, completed_keys, completed_mjds
+            discovery_key,
+            files,
+            completed_keys,
+            completed_mjds,
+            time_key_source=time_key_source,
         ):
             remaining[discovery_key] = files
             continue
         if discovery_key in completed_keys:
             skipped_exact.append(discovery_key)
+        elif time_key_source == "directory":
+            skipped_mjd.append(discovery_key)
         else:
             header_key = _header_time_key_for_files(files)
             if header_key and header_key in completed_keys:
@@ -5584,7 +5637,11 @@ def convert_fits_dir_to_zarr(
 
     if resume and not rebuild:
         by_time = _filter_completed_time_keys(
-            by_time, out_zarr, rebuild=False, context="convert"
+            by_time,
+            out_zarr,
+            rebuild=False,
+            context="convert",
+            time_key_source=time_key_source,
         )
         if not by_time:
             logger.info(
@@ -5697,6 +5754,15 @@ def convert_fits_dir_to_zarr(
                     int(incoming_pol.size),
                 )
             xds_t = _align_time_step_to_polarization_grid(xds_t, store_pol)
+        if time_key_source == "directory":
+            # LOO coadds share DATE-OBS across nights; stamp Zarr time from the
+            # directory discovery key so each night+LST appends as a distinct row.
+            xds_t = _assign_time_coord_from_discovery_key(xds_t, tkey)
+            logger.info(
+                "  stamped time coord from directory key %s → MJD %.8f",
+                tkey,
+                float(np.asarray(xds_t["time"].values).ravel()[0]),
+            )
         logger.info(f"  combined dims: {dict(xds_t.sizes)}")
         logger.info(f"  combined freqs (Hz): {freqs[:8]}{' ...' if len(freqs) > 8 else ''}")
 

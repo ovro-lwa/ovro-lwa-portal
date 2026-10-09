@@ -262,6 +262,7 @@ def load_glob_discovery_sidecar(
         require_73mhz=False,
         context="convert",
         filter_invalid_beam=False,
+        time_key_source=discovery.time_key_source,
     )
     to_process_summary = summarize_time_grouped_fits(
         to_process,

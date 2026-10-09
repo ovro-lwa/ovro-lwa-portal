@@ -2465,6 +2465,103 @@ def test_discovery_completed_matches_mjd_when_filename_differs(tmp_path: Path) -
     )
 
 
+def test_directory_resume_ignores_shared_date_obs_alias(tmp_path: Path) -> None:
+    """Directory LOO nights sharing DATE-OBS must not be skipped by DATE-OBS resume."""
+    import numpy as np
+    import xarray as xr
+    from astropy.time import Time
+
+    mod = _import_module()
+    # Store already has one DATE-OBS-stamped row (legacy directory ingest).
+    date_obs = Time("2024-12-18T05:03:54.300", scale="utc")
+    out_zarr = tmp_path / "loo.zarr"
+    xr.Dataset(
+        {"SKY": (("time",), np.array([0.0]))},
+        coords={"time": ("time", np.array([float(date_obs.mjd)], dtype=np.float64))},
+    ).to_zarr(out_zarr, mode="w")
+
+    data = np.zeros((4, 4), dtype=np.float32)
+    img_hdr = fits.Header(
+        {
+            "NAXIS": 2,
+            "NAXIS1": 4,
+            "NAXIS2": 4,
+            "DATE-OBS": "2024-12-18T05:03:54.300",
+            "BMAJ": 0.1,
+            "BMIN": 0.1,
+        }
+    )
+    primary = fits.PrimaryHDU(header=fits.Header({"SIMPLE": True, "BITPIX": -32, "NAXIS": 0}))
+    image = fits.ImageHDU(data=data, header=img_hdr)
+    night_a = (
+        tmp_path
+        / "05h"
+        / "2024-12-18"
+        / "50MHz_I_deep_loo-20241218_shflux_dewarped_aligned_coadd.fits"
+    )
+    night_b = (
+        tmp_path
+        / "05h"
+        / "2024-12-27"
+        / "50MHz_I_deep_loo-20241227_shflux_dewarped_aligned_coadd.fits"
+    )
+    night_a.parent.mkdir(parents=True)
+    night_b.parent.mkdir(parents=True)
+    fits.HDUList([primary, image]).writeto(night_a, overwrite=True)
+    fits.HDUList([primary, image]).writeto(night_b, overwrite=True)
+
+    by_time = {
+        "20241218_LST05h": [night_a],
+        "20241227_LST05h": [night_b],
+    }
+    remaining = mod._filter_completed_time_keys(
+        by_time,
+        out_zarr,
+        rebuild=False,
+        context="test",
+        time_key_source="directory",
+    )
+    assert set(remaining) == {"20241218_LST05h", "20241227_LST05h"}
+
+    # After stamping directory-key MJD into the store, that night resumes as done.
+    stamped = mod._mjd_from_discovery_time_key("20241218_LST05h")
+    xr.Dataset(
+        {"SKY": (("time",), np.array([0.0, 1.0]))},
+        coords={
+            "time": (
+                "time",
+                np.array([float(date_obs.mjd), stamped], dtype=np.float64),
+            )
+        },
+    ).to_zarr(out_zarr, mode="w")
+    remaining2 = mod._filter_completed_time_keys(
+        by_time,
+        out_zarr,
+        rebuild=False,
+        context="test",
+        time_key_source="directory",
+    )
+    assert set(remaining2) == {"20241227_LST05h"}
+
+
+def test_assign_time_coord_from_directory_discovery_key() -> None:
+    """Directory keys overwrite xradio DATE-OBS time with a unique synthetic MJD."""
+    import numpy as np
+    import xarray as xr
+
+    mod = _import_module()
+    shared_mjd = 60660.21
+    xds = xr.Dataset(
+        {"SKY": (("time", "l"), np.ones((1, 2), dtype=np.float32))},
+        coords={"time": ("time", np.array([shared_mjd], dtype=np.float64))},
+    )
+    out = mod._assign_time_coord_from_discovery_key(xds, "20241227_LST05h")
+    assert float(out["time"].values[0]) == pytest.approx(
+        mod._mjd_from_discovery_time_key("20241227_LST05h")
+    )
+    assert float(out["time"].values[0]) != pytest.approx(shared_mjd)
+
+
 def test_write_or_append_omits_fits_wcs_header_when_fits_header_str_present(
     tmp_path: Path,
 ) -> None:

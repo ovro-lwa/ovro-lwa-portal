@@ -263,6 +263,7 @@ def run_per_time_glob_convert(
                 require_73mhz=False,
                 context="convert",
                 filter_invalid_beam=not repair_zero_beam,
+                time_key_source=discovery.time_key_source,
             )
         )
         if not by_time:

@@ -30,7 +30,12 @@ def test_prepare_ingest_time_groups_resume_uses_completed_filter(
     )
 
     def fake_filter(
-        groups: dict[str, list[Path]], path: Path, *, rebuild: bool, context: str
+        groups: dict[str, list[Path]],
+        path: Path,
+        *,
+        rebuild: bool,
+        context: str,
+        **_kwargs: object,
     ) -> dict[str, list[Path]]:
         assert path == out_zarr
         assert context == "convert"
@@ -146,7 +151,7 @@ def test_plan_convert_discovery_splits_discovered_and_to_process(
     )
     monkeypatch.setattr(
         "ovro_lwa_portal.ingest.discovery._filter_completed_time_keys",
-        lambda groups, path, *, rebuild, context: {tkey_b: groups[tkey_b]},
+        lambda groups, path, *, rebuild, context, **_kwargs: {tkey_b: groups[tkey_b]},
     )
 
     discovery = IngestDiscoveryConfig(group_metadata_source="filename")

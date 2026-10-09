@@ -428,6 +428,7 @@ def run_cascade_per_time_group(
         resume=resume,
         require_73mhz=False,
         context="dewarp-convert",
+        time_key_source=time_key_source,
     )
     if not by_time:
         logger.info(
@@ -582,6 +583,7 @@ def dewarp_and_convert_append_each_time(
             resume=resume,
             require_73mhz=False,
             context="dewarp-convert",
+            time_key_source=time_key_source,
         )
         if not by_time:
             logger.info(
