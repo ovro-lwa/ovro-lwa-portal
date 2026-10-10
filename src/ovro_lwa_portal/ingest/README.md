@@ -55,6 +55,9 @@ ovro-ingest convert /path/to/fits /path/to/output \
     --zarr-name my_data.zarr \
     --chunk-lm 2048
 
+# Force float32 SKY on disk (smaller stores; default is preserve)
+ovro-ingest convert /path/to/fits /path/to/output --sky-dtype float32
+
 # Show help
 ovro-ingest convert --help
 
@@ -77,6 +80,7 @@ config = ConversionConfig(
     output_dir=Path("/path/to/output"),
     zarr_name="ovro_lwa_data.zarr",
     chunk_lm=1024,
+    sky_dtype="preserve",  # or "float32" / "float64"
     rebuild=False,
     verbose=True,
 )
@@ -116,8 +120,24 @@ result = fits_to_zarr_flow(
 | `--zarr-name`, `-z` | str    | `ovro_lwa_full_lm_only.zarr` | Name of output Zarr store                   |
 | `--fixed-dir`, `-f` | Path   | `OUTPUT_DIR/fixed_fits`      | Directory for fixed FITS files              |
 | `--chunk-lm`, `-c`  | int    | 1024                         | Chunk size for l,m dimensions (0=disable)   |
+| `--sky-dtype`       | choice | `preserve`                   | On-disk `SKY` dtype: `preserve`, `float32`, or `float64` |
 | `--rebuild`, `-r`   | flag   | False                        | Overwrite existing Zarr store               |
 | `--log-level`, `-l` | choice | info                         | Logging level (debug, info, warning, error) |
+
+### On-disk `SKY` dtype
+
+Conversion writes floating-point `SKY` only. Scaled-integer FITS
+(`BITPIX` + `BSCALE`/`BZERO`) are expanded to float at header-fix time;
+integer pixels are **not** stored in Zarr.
+
+- **`preserve` (default):** keep the post-combine floating kind
+  (`float32` or `float64`), normalized to native little-endian on write.
+- **`float32` / `float64`:** cast `SKY` before each Zarr write.
+- **Append:** if the incoming step dtype differs from the existing store
+  `SKY` dtype, the step is cast to the store dtype and a warning is logged.
+
+Use `--sky-dtype float32` when store size matters; `preserve` can still
+write float64 if combine/regrid promotes intermediates.
 
 ## File Naming Convention
 

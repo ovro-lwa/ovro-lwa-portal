@@ -70,6 +70,10 @@ class TestCLI:
         assert "discovery-time" in plain_output
         assert "discovery-filename-convention" in plain_output
         assert "--target-size" in plain_output
+        assert "--sky-dtype" in plain_output
+        assert "preserve" in plain_output
+        assert "float32" in plain_output
+        assert "float64" in plain_output
 
     def test_convert_help_documents_glob_pattern(self) -> None:
         """convert --help documents per-time glob ingest."""
@@ -213,6 +217,7 @@ class TestCLI:
         assert "--cascade-parent" in plain
         assert "--target-size" in plain
         assert "--append-after-each-time" in plain
+        assert "--sky-dtype" in plain
         assert "--cleanup-dewarp-staging" not in plain
 
     def test_audit_metadata_help(self) -> None:
@@ -391,6 +396,56 @@ class TestCLI:
         assert result.exit_code != 0
         combined = click.unstyle(result.stdout + result.stderr).lower()
         assert "allow-small-lm-chunks" in combined
+
+    def test_convert_rejects_invalid_sky_dtype(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        result = runner.invoke(
+            app,
+            ["convert", str(inp), str(out), "--sky-dtype", "float16"],
+            color=False,
+            env=_CI_PLAIN_ENV,
+        )
+        assert result.exit_code != 0
+        combined = click.unstyle(result.stdout + result.stderr).lower()
+        assert "sky-dtype" in combined
+        assert "float32" in combined
+
+    def test_convert_prints_sky_dtype_mode_in_summary(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        summary = _mock_discovery_summary()
+        captured: list[object] = []
+
+        def fake_execute(config, *, log_level):  # noqa: ANN001
+            captured.append(config)
+            return out / "dummy.zarr"
+
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                side_effect=fake_execute,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["convert", str(inp), str(out), "--sky-dtype", "FLOAT32"],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        plain = click.unstyle(result.stdout)
+        assert "SKY dtype mode:   float32" in plain
+        assert len(captured) == 1
+        assert captured[0].sky_dtype == "float32"  # type: ignore[union-attr]
 
     def test_convert_allows_small_chunk_lm_with_flag(self, tmp_path: Path) -> None:
         inp = tmp_path / "in"

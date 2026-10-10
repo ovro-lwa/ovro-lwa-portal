@@ -485,6 +485,7 @@ def dewarp_and_convert_append_each_time(
     time_key_source: Literal["header", "filename", "directory"] = "filename",
     time_key_tolerance_sec: float = 0.0,
     resume: bool = True,
+    sky_dtype: Literal["preserve", "float32", "float64"] = "preserve",
 ) -> tuple[int, list[str]]:
     """Dewarp each time group, append its Zarr slice, then clean staging/cascade for that time.
 
@@ -620,6 +621,7 @@ def dewarp_and_convert_append_each_time(
                 zarr_name=zarr_name,
                 fixed_dir=fixed_dir,
                 chunk_lm=chunk_lm,
+                sky_dtype=sky_dtype,
                 rebuild=first_zarr_write,
                 resume=False,
                 fix_headers_on_demand=fix_headers_on_demand,

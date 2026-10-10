@@ -8,6 +8,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _clear_sky_coord_cache,
@@ -164,6 +165,7 @@ class PerTimeGlobConvertConfig:
     zarr_name: str = "ovro_lwa_full_lm_only.zarr"
     work_root: Path | None = None
     chunk_lm: int = 1024
+    sky_dtype: Literal["preserve", "float32", "float64"] = "preserve"
     rebuild: bool = False
     resume: bool = True
     fix_headers_on_demand: bool = True
@@ -390,6 +392,7 @@ def run_per_time_glob_convert(
                 zarr_name=config.zarr_name,
                 fixed_dir=config.fixed_dir,
                 chunk_lm=config.chunk_lm,
+                sky_dtype=config.sky_dtype,
                 rebuild=first_zarr_write,
                 resume=False,
                 fix_headers_on_demand=config.fix_headers_on_demand,

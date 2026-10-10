@@ -147,6 +147,7 @@ def _configure_logging(level: LogLevel) -> None:
 
 
 _MIN_RECOMMENDED_LM_CHUNK = 512
+_SKY_DTYPE_CHOICES = ("preserve", "float32", "float64")
 
 
 def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> None:
@@ -161,6 +162,17 @@ def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> N
         "Pass --allow-small-lm-chunks to override, or use 512 or higher.",
         param_hint="--chunk-lm",
     )
+
+
+def _cli_sky_dtype(sky_dtype: str) -> Literal["preserve", "float32", "float64"]:
+    """Normalize ``--sky-dtype`` to ``preserve`` / ``float32`` / ``float64``."""
+    mode = str(sky_dtype).strip().lower()
+    if mode not in _SKY_DTYPE_CHOICES:
+        raise typer.BadParameter(
+            f"expected one of {', '.join(_SKY_DTYPE_CHOICES)}; got {sky_dtype!r}",
+            param_hint="--sky-dtype",
+        )
+    return mode  # type: ignore[return-value]
 
 
 def _print_convert_discovery_summary(
@@ -491,6 +503,16 @@ def convert(
             "overlay performance)"
         ),
     ),
+    sky_dtype: str = typer.Option(
+        "preserve",
+        "--sky-dtype",
+        help=(
+            "On-disk SKY floating dtype: preserve (default; keep post-combine "
+            "float32/float64 kind), float32, or float64. Appends cast to the store "
+            "dtype on mismatch."
+        ),
+        case_sensitive=False,
+    ),
     rebuild: bool = typer.Option(
         False,
         "--rebuild",
@@ -668,6 +690,7 @@ def convert(
     """
     _configure_logging(log_level)
     _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
+    sky_dtype_mode = _cli_sky_dtype(sky_dtype)
 
     verbose = log_level == LogLevel.DEBUG
 
@@ -701,6 +724,7 @@ def convert(
         console.print(f"  Work root:        {work_root or input_dir / '.work'}")
         console.print("  Clear staging/fixed: YES (start + end of run)")
         console.print(f"  Chunk size (l,m): {chunk_lm}")
+        console.print(f"  SKY dtype mode:   {sky_dtype_mode}")
         console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
         console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
         console.print(f"  Funpack:          {funpack if funpack is not None else 'auto'}")
@@ -745,6 +769,7 @@ def convert(
             zarr_name=zarr_name,
             work_root=work_root,
             chunk_lm=chunk_lm,
+            sky_dtype=sky_dtype_mode,
             rebuild=rebuild,
             resume=not no_resume,
             fix_headers_on_demand=not skip_header_fixing,
@@ -785,6 +810,7 @@ def convert(
         discovery_filename_convention=filename_convention,
         discovery_time_key_tolerance_sec=discovery_time_key_tolerance,
         lm_reference_target_size=target_size,
+        sky_dtype=sky_dtype_mode,
     )
 
     # Display configuration
@@ -794,6 +820,7 @@ def convert(
     console.print(f"  Zarr store name:  {zarr_name}")
     console.print(f"  Fixed FITS dir:   {config.fixed_dir}")
     console.print(f"  Chunk size (l,m): {chunk_lm}")
+    console.print(f"  SKY dtype mode:   {sky_dtype_mode}")
     console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
     console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
     if target_size is not None:
@@ -873,6 +900,16 @@ def dewarp_convert(
             "Allow --chunk-lm values below 512 (not recommended for source_review "
             "overlay performance)"
         ),
+    ),
+    sky_dtype: str = typer.Option(
+        "preserve",
+        "--sky-dtype",
+        help=(
+            "On-disk SKY floating dtype: preserve (default; keep post-combine "
+            "float32/float64 kind), float32, or float64. Appends cast to the store "
+            "dtype on mismatch."
+        ),
+        case_sensitive=False,
     ),
     rebuild: bool = typer.Option(
         False,
@@ -1044,6 +1081,7 @@ def dewarp_convert(
     """
     _configure_logging(log_level)
     _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
+    sky_dtype_mode = _cli_sky_dtype(sky_dtype)
     verbose = log_level == LogLevel.DEBUG
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
     time_key_source = _cli_time_key_source(discovery_time_key_source)
@@ -1059,6 +1097,7 @@ def dewarp_convert(
     console.print(f"  Cascade parent:      {cascade_root}")
     console.print(f"  Staging (→ Zarr):    {staging}")
     console.print(f"  Zarr store name:     {zarr_name}")
+    console.print(f"  SKY dtype mode:      {sky_dtype_mode}")
     if target_size is not None:
         console.print(f"  Target size (px):  {target_size}")
     if append_after_each_time:
@@ -1080,6 +1119,7 @@ def dewarp_convert(
                 fixed_resolved,
                 zarr_name=zarr_name,
                 chunk_lm=chunk_lm,
+                sky_dtype=sky_dtype_mode,
                 rebuild=rebuild,
                 fix_headers_on_demand=not skip_header_fixing,
                 cleanup_fixed_fits=cleanup_fixed_fits,
@@ -1185,6 +1225,7 @@ def dewarp_convert(
         discovery_time_key_tolerance_sec=discovery_time_key_tolerance,
         lm_reference_ds=lm_ref_ds,
         lm_reference_target_size=target_size,
+        sky_dtype=sky_dtype_mode,
     )
 
     console.print("[bold cyan]OVRO-LWA FITS → Zarr Conversion[/bold cyan]")
@@ -1193,6 +1234,7 @@ def dewarp_convert(
     console.print(f"  Zarr store name:  {zarr_name}")
     console.print(f"  Fixed FITS dir:   {config.fixed_dir}")
     console.print(f"  Chunk size (l,m): {chunk_lm}")
+    console.print(f"  SKY dtype mode:   {sky_dtype_mode}")
     console.print(f"  Mode:             {'REBUILD' if convert_rebuild else 'APPEND'}")
     console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
     console.print(f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}")

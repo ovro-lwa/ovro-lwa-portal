@@ -762,6 +762,7 @@ def convert_missing_zarr(
                 chunk_lm=1024,
                 rebuild=True,
                 lm_reference_target_size=target_size,
+                sky_dtype="preserve",
                 progress_callback=progress,
             )
             log(f"Wrote {zarr_paths['I']}")
@@ -796,6 +797,7 @@ def convert_missing_zarr(
                 chunk_lm=1024,
                 rebuild=True,
                 lm_reference_ds=lm_ref_ds,
+                sky_dtype="preserve",
                 progress_callback=progress,
             )
             log(f"Wrote {zarr_paths['V']}")
@@ -853,6 +855,7 @@ def _convert_missing_combined_zarr(
             chunk_lm=1024,
             rebuild=True,
             lm_reference_target_size=target_size,
+            sky_dtype="preserve",
             progress_callback=progress,
         )
         log(f"Wrote combined QA Zarr: {zarr_path}")
