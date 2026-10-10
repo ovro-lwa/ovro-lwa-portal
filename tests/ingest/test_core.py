@@ -28,6 +28,7 @@ class TestConversionConfig:
         assert config.rebuild is False
         assert config.verbose is False
         assert config.discovery_freq_bin_hz == _DISCOVERY_FREQ_BIN_HZ
+        assert config.sky_dtype == "preserve"
 
     def test_custom_initialization(self, tmp_path: Path) -> None:
         """Test custom configuration initialization."""
@@ -121,6 +122,34 @@ class TestConversionConfig:
 
         # Should not raise
         config.validate()
+
+    def test_validate_invalid_sky_dtype(self, tmp_path: Path) -> None:
+        """sky_dtype must be preserve / float32 / float64."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        output_dir = tmp_path / "output"
+
+        config = ConversionConfig(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            sky_dtype="float16",  # type: ignore[arg-type]
+        )
+
+        with pytest.raises(ValueError, match="sky_dtype must be one of"):
+            config.validate()
+
+    def test_sky_dtype_float32_validates(self, tmp_path: Path) -> None:
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        output_dir = tmp_path / "output"
+
+        config = ConversionConfig(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            sky_dtype="float32",
+        )
+        config.validate()
+        assert config.sky_dtype == "float32"
 
 
 class TestFileLock:

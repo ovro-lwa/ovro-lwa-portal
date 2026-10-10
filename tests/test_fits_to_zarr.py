@@ -1247,13 +1247,14 @@ def test_discover_groups_directory_time_ignores_shared_date_obs(tmp_path: Path) 
 def test_discover_groups_directory_time_with_filename_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Directory time works with filename-only frequency (no DATE-OBS / header I/O)."""
+    """Directory time + filename frequency; DATE-OBS is not required for grouping keys.
+
+    Filename discovery still reads each image HDU once to cache beam/LM keywords for
+    convert (see AGENTS.md); only the grouping keys come from path/basename tokens.
+    """
+    import numpy as np
+
     mod = _import_module()
-
-    def boom(*_a: object, **_k: object) -> None:
-        pytest.fail("fits.getheader should not be called in filename-only discovery")
-
-    monkeypatch.setattr(mod.fits, "getheader", boom)
     day = (
         tmp_path
         / "01h"
@@ -1261,7 +1262,22 @@ def test_discover_groups_directory_time_with_filename_metadata(
         / "55MHz_I_deep_Taper_Robust-0.75_shflux_dewarped_aligned_coadd.fits"
     )
     day.parent.mkdir(parents=True)
-    day.touch()
+    # Minimal readable FITS so ingest-header cache can run; omit DATE-OBS.
+    fits.PrimaryHDU(
+        data=np.zeros((4, 4), dtype=np.float32),
+        header=fits.Header(
+            {
+                "SIMPLE": True,
+                "BITPIX": -32,
+                "NAXIS": 2,
+                "NAXIS1": 4,
+                "NAXIS2": 4,
+                "BMAJ": 0.1,
+                "BMIN": 0.1,
+                "BPA": 0.0,
+            }
+        ),
+    ).writeto(day)
     groups = mod._discover_groups_from_files(
         [day],
         group_metadata_source="filename",
@@ -2735,7 +2751,15 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
     monkeypatch.setattr(
         mod,
         "_write_or_append_zarr",
-        lambda _xds, _out, *, first_write, chunk_lm: write_calls.append(first_write),
+        lambda _xds, _out, *, first_write, chunk_lm, sky_dtype="preserve": write_calls.append(
+            first_write
+        ),
+    )
+    # Empty out_zarr dir only signals "store exists" for resume; skip real pol read.
+    monkeypatch.setattr(
+        mod,
+        "_polarization_coord_from_zarr",
+        lambda _out: np.asarray([1.0], dtype=np.float64),
     )
 
     consolidate_calls: list[Path] = []
@@ -4237,6 +4261,16 @@ class TestSkyDtypeHelpers:
         assert resolved == np.dtype(np.float32)
         assert out["SKY"].dtype == np.dtype(np.float32)
 
+    def test_apply_sky_dtype_force_cast_float64(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        ds = xr.Dataset({"SKY": (("l", "m"), np.ones((2, 2), dtype=np.float32))})
+        out, resolved = mod._apply_sky_dtype(ds, "float64")
+        assert resolved == np.dtype(np.float64)
+        assert out["SKY"].dtype == np.dtype(np.float64)
+
     def test_apply_sky_dtype_preserve_noop_when_native(self) -> None:
         import numpy as np
         import xarray as xr
@@ -4414,3 +4448,121 @@ class TestSkyDtypeHelpers:
         with xr.open_zarr(store, consolidated=False) as ds1:
             assert ds1["SKY"].dtype == np.dtype(np.float32)
             assert int(ds1.sizes["time"]) == 2
+
+    def test_write_or_append_float64_store_casts_float32_append(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Append with ``sky_dtype=float32`` into a float64 store keeps store dtype."""
+        import logging
+
+        import numpy as np
+        import xarray as xr
+        import zarr
+        from astropy.io import fits as afits
+
+        mod = _import_module()
+        store = tmp_path / "dtype_f8.zarr"
+        post_wcs = _make_sin_wcs_header_str(nx=2, ny=2, crval1=180.0, crval2=40.0)
+        primary = afits.Header(
+            {
+                "SIMPLE": True,
+                "BITPIX": -64,
+                "NAXIS": 2,
+                "NAXIS1": 2,
+                "NAXIS2": 2,
+                "BMAJ": 0.1,
+                "BMIN": 0.1,
+                "TELESCOP": "OVRO-LWA",
+            }
+        )
+        payload = mod._fits_header_bytes_for_slice(
+            primary,
+            post_regrid_wcs_hdr=post_wcs,
+            nl=2,
+            nm=2,
+            sky_numpy_dtype=np.float64,
+        )
+
+        def _step(mjd: float, sky_dtype: np.dtype) -> xr.Dataset:
+            return xr.Dataset(
+                {
+                    "SKY": (
+                        ("time", "frequency", "polarization", "l", "m"),
+                        np.ones((1, 1, 1, 2, 2), dtype=sky_dtype),
+                    ),
+                    "fits_header_str": (
+                        ("time", "frequency", "polarization"),
+                        np.array([[[np.bytes_(payload)]]], dtype=object),
+                    ),
+                },
+                coords={
+                    "time": ("time", np.array([mjd], dtype=np.float64)),
+                    "frequency": ("frequency", np.array([55e6], dtype=np.float64)),
+                    "polarization": ("polarization", np.array([1.0], dtype=np.float64)),
+                    "l": ("l", np.arange(2, dtype=np.float64)),
+                    "m": ("m", np.arange(2, dtype=np.float64)),
+                },
+            )
+
+        mod._write_or_append_zarr(
+            _step(60000.0, np.float32),
+            store,
+            first_write=True,
+            chunk_lm=2,
+            sky_dtype="float64",
+        )
+        assert mod._sky_dtype_from_zarr(store) == np.dtype(np.float64)
+        zarr_dtype = zarr.open(store / "SKY", mode="r").dtype
+        assert np.dtype(zarr_dtype) == np.dtype(np.float64)
+
+        with caplog.at_level(logging.WARNING):
+            mod._write_or_append_zarr(
+                _step(60001.0, np.float32),
+                store,
+                first_write=False,
+                chunk_lm=2,
+                sky_dtype="float32",
+            )
+        assert any("SKY dtype mismatch" in r.message for r in caplog.records)
+        assert mod._sky_dtype_from_zarr(store) == np.dtype(np.float64)
+        with xr.open_zarr(store, consolidated=False) as ds1:
+            assert ds1["SKY"].dtype == np.dtype(np.float64)
+            hdr1 = afits.Header.fromstring(
+                mod._decode_wcs_header_payload(
+                    ds1["fits_header_str"].isel(time=1, frequency=0, polarization=0).values
+                ),
+                sep="\n",
+            )
+            assert int(hdr1["BITPIX"]) == -64
+
+
+def test_convert_fits_dir_to_zarr_sky_dtype_float32(tmp_path: Path) -> None:
+    """End-to-end convert with ``sky_dtype='float32'`` writes little-endian float32 SKY."""
+    import numpy as np
+    import xarray as xr
+    import zarr
+
+    mod = _import_module()
+    time_key = "20240817_120000"
+    f_i = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-I.fits"
+    _write_ovro_stokes_fits(f_i, stokes=1, pixel_value=1.0)
+    out_dir = tmp_path / "zarr_out"
+    fixed_dir = tmp_path / "fixed"
+
+    out_zarr = mod.convert_fits_dir_to_zarr(
+        input_dir=tmp_path,
+        out_dir=out_dir,
+        zarr_name="sky_f4.zarr",
+        fixed_dir=fixed_dir,
+        chunk_lm=4,
+        rebuild=True,
+        sky_dtype="float32",
+        consolidate_metadata_at_end=False,
+    )
+
+    assert mod._sky_dtype_from_zarr(out_zarr) == np.dtype(np.float32)
+    zarr_dtype = zarr.open(out_zarr / "SKY", mode="r").dtype
+    assert np.dtype(zarr_dtype) == np.dtype(np.float32)
+    with xr.open_zarr(out_zarr, consolidated=False) as ds:
+        assert ds["SKY"].dtype == np.dtype(np.float32)
+        assert ds.attrs.get("ovro_lwa_portal_sky_dtype") == str(np.dtype(np.float32))

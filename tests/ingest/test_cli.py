@@ -447,6 +447,41 @@ class TestCLI:
         assert len(captured) == 1
         assert captured[0].sky_dtype == "float32"  # type: ignore[union-attr]
 
+    def test_convert_default_sky_dtype_is_preserve(self, tmp_path: Path) -> None:
+        """Omitting ``--sky-dtype`` keeps preserve and prints it in the summary."""
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        summary = _mock_discovery_summary()
+        captured: list[object] = []
+
+        def fake_execute(config, *, log_level):  # noqa: ANN001
+            captured.append(config)
+            return out / "dummy.zarr"
+
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                side_effect=fake_execute,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["convert", str(inp), str(out)],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        plain = click.unstyle(result.stdout)
+        assert "SKY dtype mode:   preserve" in plain
+        assert len(captured) == 1
+        assert captured[0].sky_dtype == "preserve"  # type: ignore[union-attr]
+
     def test_convert_allows_small_chunk_lm_with_flag(self, tmp_path: Path) -> None:
         inp = tmp_path / "in"
         out = tmp_path / "out"
