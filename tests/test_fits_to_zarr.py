@@ -838,6 +838,18 @@ def test_estimate_zarr_store_bytes_uses_largest_subband_in_time_group(tmp_path: 
     assert nbytes == 2 * 200 * 200 * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
 
 
+def test_estimate_zarr_store_bytes_honors_target_size(tmp_path: Path) -> None:
+    """--target-size overrides peeked NAXIS for the uncompressed size estimate."""
+    mod = _import_module()
+    f1 = tmp_path / "82MHz-I-Taper-602s-Robust-0-20260419_071829-image.pbcorr_dewarped.fits"
+    f1.write_bytes(b"")
+    by_time = {"t1": [f1], "t2": [f1]}
+
+    nbytes = mod.estimate_zarr_store_bytes(by_time, target_size=64)
+    assert nbytes == 2 * 64 * 64 * mod._ZARR_ESTIMATE_BYTES_PER_PIXEL
+    assert mod.reference_lm_shape_for_zarr_estimate(by_time, target_size=64) == (64, 64)
+
+
 def test_stokes_label_from_dewarped_basename() -> None:
     mod = _import_module()
     assert (

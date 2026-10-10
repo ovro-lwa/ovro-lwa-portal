@@ -342,8 +342,15 @@ def _build_discovery_file_metadata(
     filename_convention: DiscoveryFilenameConvention = "image",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: DiscoveryTimeKeySource = "filename",
+    cache_ingest_headers: bool = True,
 ) -> _DiscoveryFileMetadata:
-    """Extract discovery metadata with at most one FITS header read per file."""
+    """Extract discovery metadata with at most one FITS header read per file.
+
+    When ``group_metadata_source="filename"`` and ``cache_ingest_headers=False``,
+    skip the image-HDU open entirely (estimate-size / dry-run paths). Convert still
+    defaults to caching headers so beam/LM keywords are available without a second
+    Lustre open.
+    """
     if filename_convention == "lst-color":
         notes: list[str] = []
         time_key = _time_key_from_lst_color_filename(fp)
@@ -365,10 +372,8 @@ def _build_discovery_file_metadata(
         )
 
     if group_metadata_source == "filename":
-        # Grouping keys come from the basename / directory; still read the image
-        # HDU once so beam, LM shape, and other ingest keywords are cached for
-        # the beam filter, LM-reference scan, and discovery sidecar (one Lustre
-        # header open instead of re-reading later).
+        # Grouping keys come from the basename / directory. Convert caches the
+        # image HDU once for beam/LM/sidecar reuse; estimate-size can skip that.
         time_key, frequency_hz, note_list = _extract_group_metadata_filename_only(fp)
         notes = list(note_list)
         if time_key_source == "directory":
@@ -379,11 +384,14 @@ def _build_discovery_file_metadata(
             else:
                 time_key = None
         header: Optional[fits.Header] = None
-        try:
-            header = _getheader_for_ingest(fp)
-            notes.append("header-cached-for-ingest")
-        except Exception as exc:
-            logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+        if cache_ingest_headers:
+            try:
+                header = _getheader_for_ingest(fp)
+                notes.append("header-cached-for-ingest")
+            except Exception as exc:
+                logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+        else:
+            notes.append("header-cache-skipped")
         stokes_key = _resolve_stokes_key_for_discovery(fp, header)
         return _DiscoveryFileMetadata(
             time_key, frequency_hz, tuple(notes), stokes_key, header
@@ -434,6 +442,7 @@ def _get_discovery_file_metadata(
     filename_convention: DiscoveryFilenameConvention = "image",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     time_key_source: DiscoveryTimeKeySource = "filename",
+    cache_ingest_headers: bool = True,
 ) -> _DiscoveryFileMetadata:
     """Return cached discovery metadata for *fp*, building it on first access."""
     key = _discovery_metadata_cache_key(fp)
@@ -444,6 +453,7 @@ def _get_discovery_file_metadata(
             filename_convention=filename_convention,
             group_metadata_source=group_metadata_source,
             time_key_source=time_key_source,
+            cache_ingest_headers=cache_ingest_headers,
         )
         cache[key] = meta
     return meta
@@ -2554,13 +2564,15 @@ def estimate_zarr_store_bytes(
     discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
     group_metadata_source: Literal["fits", "filename"] = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
+    target_size: int | None = None,
 ) -> int | None:
     """Estimate Zarr store size from the global LM reference scale and file count.
 
     Every slice is regridded onto the same ``(l, m)`` grid before write. The
     reference pixel count is taken from Stokes-I subbands in the first time
     group (same rule as :func:`_load_global_lm_reference_dataset`: largest
-    ``l×m`` among subbands, typically the highest-frequency image).
+    ``l×m`` among subbands, typically the highest-frequency image), unless
+    *target_size* is set (square ``target_size × target_size`` grid).
     """
     if not by_time:
         return None
@@ -2569,15 +2581,16 @@ def estimate_zarr_store_bytes(
     if n_files <= 0:
         return None
 
-    pixels_per_file = _reference_pixels_per_zarr_slice(
+    ref_shape = reference_lm_shape_for_zarr_estimate(
         by_time,
         discovery_metadata=discovery_metadata,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        target_size=target_size,
     )
-    if pixels_per_file is None:
+    if ref_shape is None:
         return None
-    return n_files * pixels_per_file * _ZARR_ESTIMATE_BYTES_PER_PIXEL
+    return n_files * ref_shape[0] * ref_shape[1] * _ZARR_ESTIMATE_BYTES_PER_PIXEL
 
 
 def _lm_shape_from_discovery_metadata(
@@ -2593,14 +2606,37 @@ def _lm_shape_from_discovery_metadata(
     return None
 
 
-def _reference_pixels_per_zarr_slice(
+def reference_lm_shape_for_zarr_estimate(
     by_time: Dict[str, List[Path]],
     *,
     discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
     group_metadata_source: Literal["fits", "filename"] = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
-) -> int | None:
-    """Infer per-slice pixel count from Stokes-I subbands in the first time group."""
+    target_size: int | None = None,
+) -> Tuple[int, int] | None:
+    """Return the ``(l, m)`` grid used for :func:`estimate_zarr_store_bytes`."""
+    if target_size is not None:
+        size = int(target_size)
+        if size <= 0:
+            msg = f"target_size must be positive, got {target_size}"
+            raise ValueError(msg)
+        return size, size
+    return _reference_lm_shape_for_zarr_estimate(
+        by_time,
+        discovery_metadata=discovery_metadata,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+
+
+def _reference_lm_shape_for_zarr_estimate(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
+) -> Tuple[int, int] | None:
+    """Infer reference ``(l, m)`` from Stokes-I subbands in the first time group."""
     if not by_time:
         return None
 
@@ -2651,6 +2687,25 @@ def _reference_pixels_per_zarr_slice(
         unique_shapes,
         sum(len(files) for files in by_time.values()),
     )
+    return ref_shape
+
+
+def _reference_pixels_per_zarr_slice(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
+) -> int | None:
+    """Infer per-slice pixel count from Stokes-I subbands in the first time group."""
+    ref_shape = _reference_lm_shape_for_zarr_estimate(
+        by_time,
+        discovery_metadata=discovery_metadata,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+    if ref_shape is None:
+        return None
     return ref_shape[0] * ref_shape[1]
 
 
@@ -4632,6 +4687,7 @@ def _discover_groups_from_files(
     filename_convention: DiscoveryFilenameConvention = "image",
     time_key_tolerance_sec: float = 0.0,
     discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    cache_ingest_headers: bool = True,
 ) -> Dict[str, List[Path]]:
     """Group *fits_files* by observation time and frequency.
 
@@ -4640,6 +4696,10 @@ def _discover_groups_from_files(
     When *discovery_metadata_out* is provided, it is filled with per-file metadata
     keyed by ``Path.resolve()`` so callers can reuse discovery results without
     re-reading FITS headers.
+
+    When ``group_metadata_source="filename"`` and *cache_ingest_headers* is False,
+    grouping uses basename/directory keys only (no per-file HDU open). Use that for
+    estimate-size; convert keeps the default True so beam/LM keywords are cached.
     """
     if freq_bin_hz <= 0.0:
         msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
@@ -4666,6 +4726,7 @@ def _discover_groups_from_files(
             filename_convention=filename_convention,
             group_metadata_source=group_metadata_source,
             time_key_source=time_key_source,
+            cache_ingest_headers=cache_ingest_headers,
         )
         if discovery_metadata_out is not None:
             discovery_metadata_out[f.resolve()] = meta
@@ -4724,6 +4785,7 @@ def _discover_groups_from_files(
                 filename_convention=filename_convention,
                 group_metadata_source=group_metadata_source,
                 time_key_source=time_key_source,
+                cache_ingest_headers=cache_ingest_headers,
             )
             rep_hz = rep_meta.frequency_hz
             resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
@@ -4764,6 +4826,7 @@ def _discover_groups_from_files(
                     filename_convention=filename_convention,
                     group_metadata_source=group_metadata_source,
                     time_key_source=time_key_source,
+                    cache_ingest_headers=cache_ingest_headers,
                 ),
                 p.name,
             ),
@@ -4780,6 +4843,7 @@ def _discover_groups(
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
     time_key_tolerance_sec: float = 0.0,
+    cache_ingest_headers: bool = True,
     discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Group input FITS by observation time and frequency (filename time stamp, header fallback).
@@ -4835,6 +4899,7 @@ def _discover_groups(
         filename_convention=filename_convention,
         time_key_tolerance_sec=time_key_tolerance_sec,
         discovery_metadata_out=discovery_metadata_out,
+        cache_ingest_headers=cache_ingest_headers,
     )
 
 

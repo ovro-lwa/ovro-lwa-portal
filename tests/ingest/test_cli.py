@@ -424,3 +424,69 @@ class TestCLI:
         assert result.exit_code == 0, result.stdout + result.stderr
         combined = click.unstyle(result.stdout + result.stderr).lower()
         assert "below the recommended minimum" not in combined
+
+    def test_estimate_size_help(self) -> None:
+        """estimate-size --help documents glob and discovery options."""
+        result = runner.invoke(
+            app,
+            ["estimate-size", "--help"],
+            color=False,
+            terminal_width=120,
+            env=_CI_PLAIN_ENV,
+        )
+        plain = click.unstyle(result.stdout)
+        assert result.exit_code == 0
+        assert "Estimate final Zarr size" in plain
+        assert "--glob-pattern" in plain
+        assert "--target-size" in plain
+        assert "discovery-metadata-source" in plain
+        assert "sidecar" in plain.lower()
+
+    def test_estimate_size_prints_summary(self, tmp_path: Path) -> None:
+        """estimate-size prints counts and byte estimate without converting."""
+        from ovro_lwa_portal.ingest.discovery import (
+            GlobSizeEstimate,
+            IngestDiscoverySummary,
+        )
+
+        summary = IngestDiscoverySummary(
+            input_files=12,
+            time_groups=3,
+            frequency_groups=4,
+            polarization_groups=1,
+            polarization_labels=("I",),
+            time_frequency_polarization_cells=12,
+            estimated_zarr_bytes=1_073_741_824,
+        )
+        estimate = GlobSizeEstimate(
+            source_paths=tuple(),
+            by_time={},
+            summary=summary,
+            reference_lm_shape=(2048, 2048),
+            target_size=2048,
+            grouped_without_headers=True,
+            peeked_headers_for_lm=False,
+        )
+        with patch(
+            "ovro_lwa_portal.ingest.cli.estimate_glob_convert_size",
+            return_value=estimate,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "estimate-size",
+                    "--glob-pattern",
+                    str(tmp_path / "**/*.fits"),
+                    "--target-size",
+                    "2048",
+                ],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        plain = click.unstyle(result.stdout)
+        assert "Size estimate" in plain
+        assert "Estimated final Zarr size:" in plain
+        assert "Header I/O:" in plain
+        assert "none" in plain
+        assert "no discovery sidecar" in plain

@@ -10,6 +10,7 @@ from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
     discover_time_grouped_fits,
     discover_time_grouped_paths,
+    estimate_glob_convert_size,
     plan_convert_discovery,
     prepare_ingest_time_groups,
     summarize_time_grouped_fits,
@@ -435,3 +436,108 @@ def test_discovery_sidecar_invalidates_on_mtime_change(tmp_path: Path) -> None:
         funpack=False,
     )
     assert loaded is None
+
+
+def test_estimate_glob_convert_size_filename_skips_header_cache(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Filename estimate-size groups without caching every image HDU."""
+    from astropy.io import fits
+
+    tkey_a = "20250106_051855"
+    tkey_b = "20250106_052955"
+    paths = [
+        tmp_path / _image_name(tkey_a, 41),
+        tmp_path / _image_name(tkey_a, 55),
+        tmp_path / _image_name(tkey_b, 41),
+    ]
+    for path in paths:
+        fits.PrimaryHDU(
+            data=[[1.0, 2.0], [3.0, 4.0]],
+            header=fits.Header(
+                {
+                    "NAXIS": 2,
+                    "NAXIS1": 2,
+                    "NAXIS2": 2,
+                    "RESTFREQ": 41e6,
+                    "BMAJ": 0.25,
+                    "BMIN": 0.25,
+                }
+            ),
+        ).writeto(path)
+
+    import ovro_lwa_portal.fits_to_zarr_xradio as ftz
+
+    header_opens = 0
+    real_ingest_header = ftz._getheader_for_ingest
+
+    def counting_ingest_header(fp):  # noqa: ANN001
+        nonlocal header_opens
+        header_opens += 1
+        return real_ingest_header(fp)
+
+    monkeypatch.setattr(ftz, "_getheader_for_ingest", counting_ingest_header)
+
+    estimate = estimate_glob_convert_size(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+        target_size=128,
+    )
+    assert estimate.grouped_without_headers is True
+    assert estimate.peeked_headers_for_lm is False
+    assert estimate.reference_lm_shape == (128, 128)
+    assert estimate.summary.input_files == 3
+    assert estimate.summary.time_groups == 2
+    assert estimate.summary.estimated_zarr_bytes == 3 * 128 * 128 * 4
+    assert header_opens == 0
+    assert not list(tmp_path.glob("*_metadata.json"))
+
+
+def test_estimate_glob_convert_size_peeks_lm_without_full_tree_cache(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Without --target-size, only LM peeks run (not per-file header cache)."""
+    from astropy.io import fits
+
+    tkey = "20250106_051855"
+    paths = [
+        tmp_path / _image_name(tkey, 41),
+        tmp_path / _image_name(tkey, 55),
+    ]
+    for mhz, path in zip((41, 55), paths, strict=True):
+        fits.PrimaryHDU(
+            data=[[1.0] * 4] * 4,
+            header=fits.Header(
+                {
+                    "NAXIS": 2,
+                    "NAXIS1": 4,
+                    "NAXIS2": 4,
+                    "RESTFREQ": float(mhz * 1e6),
+                    "BMAJ": 0.25,
+                    "BMIN": 0.25,
+                }
+            ),
+        ).writeto(path)
+
+    import ovro_lwa_portal.fits_to_zarr_xradio as ftz
+
+    cache_notes: list[str] = []
+    real_build = ftz._build_discovery_file_metadata
+
+    def tracking_build(fp, **kwargs):  # noqa: ANN001, ANN003
+        meta = real_build(fp, **kwargs)
+        cache_notes.extend(meta.notes)
+        return meta
+
+    monkeypatch.setattr(ftz, "_build_discovery_file_metadata", tracking_build)
+
+    estimate = estimate_glob_convert_size(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+    )
+    assert estimate.grouped_without_headers is True
+    assert estimate.peeked_headers_for_lm is True
+    assert estimate.reference_lm_shape == (4, 4)
+    assert estimate.summary.estimated_zarr_bytes == 2 * 4 * 4 * 4
+    assert "header-cache-skipped" in cache_notes
+    assert "header-cached-for-ingest" not in cache_notes

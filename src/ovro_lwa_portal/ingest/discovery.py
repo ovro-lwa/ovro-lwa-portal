@@ -23,6 +23,7 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     _stokes_key_for_discovery,
     estimate_zarr_store_bytes,
     format_data_size,
+    reference_lm_shape_for_zarr_estimate,
 )
 
 logger = logging.getLogger(__name__)
@@ -30,11 +31,13 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_INGEST_DISCOVERY",
     "GlobConvertDiscoveryPlan",
+    "GlobSizeEstimate",
     "IngestDiscoveryConfig",
     "IngestDiscoverySummary",
     "collect_glob_sources",
     "discover_time_grouped_fits",
     "discover_time_grouped_paths",
+    "estimate_glob_convert_size",
     "format_data_size",
     "plan_convert_discovery",
     "prepare_ingest_time_groups",
@@ -84,6 +87,19 @@ class GlobConvertDiscoveryPlan:
 
 
 @dataclass(frozen=True)
+class GlobSizeEstimate:
+    """Lightweight glob size estimate (no discovery sidecar, optional header peeks)."""
+
+    source_paths: tuple[Path, ...]
+    by_time: dict[str, list[Path]]
+    summary: IngestDiscoverySummary
+    reference_lm_shape: tuple[int, int] | None
+    target_size: int | None
+    grouped_without_headers: bool
+    peeked_headers_for_lm: bool
+
+
+@dataclass(frozen=True)
 class IngestDiscoverySummary:
     """Counts of FITS inputs and (time, frequency, polarization) groups."""
 
@@ -115,6 +131,7 @@ def summarize_time_grouped_fits(
     *,
     discovery: IngestDiscoveryConfig | None = None,
     discovery_metadata: dict[Path, _DiscoveryFileMetadata] | None = None,
+    target_size: int | None = None,
 ) -> IngestDiscoverySummary:
     """Summarize grouped FITS paths by time, frequency subband, and polarization."""
     cfg = discovery or DEFAULT_INGEST_DISCOVERY
@@ -160,6 +177,7 @@ def summarize_time_grouped_fits(
             discovery_metadata=discovery_metadata,
             group_metadata_source=cfg.group_metadata_source,
             filename_convention=cfg.filename_convention,
+            target_size=target_size,
         ),
     )
 
@@ -253,6 +271,7 @@ def discover_time_grouped_paths(
     duplicate_resolver: Callable[[str, float, List[Path]], Path] | None = None,
     discovery: IngestDiscoveryConfig | None = None,
     discovery_metadata_out: dict[Path, _DiscoveryFileMetadata] | None = None,
+    cache_ingest_headers: bool = True,
 ) -> Dict[str, List[Path]]:
     """Group explicit FITS paths by observation time and frequency bin."""
     cfg = discovery or DEFAULT_INGEST_DISCOVERY
@@ -265,6 +284,76 @@ def discover_time_grouped_paths(
         filename_convention=cfg.filename_convention,
         time_key_tolerance_sec=cfg.time_key_tolerance_sec,
         discovery_metadata_out=discovery_metadata_out,
+        cache_ingest_headers=cache_ingest_headers,
+    )
+
+
+def estimate_glob_convert_size(
+    glob_pattern: str,
+    *,
+    discovery: IngestDiscoveryConfig | None = None,
+    target_size: int | None = None,
+) -> GlobSizeEstimate:
+    """Estimate final Zarr size for a glob without writing a discovery sidecar.
+
+    With ``discovery.group_metadata_source="filename"`` and the ``image`` filename
+    convention, grouping uses basename/directory keys only (no per-file header
+    cache). LM shape is taken from ``target_size`` when set; otherwise Stokes-I
+    headers in the first time group are peeked (same rule as convert).
+
+    ``fits`` / ``lst-color`` modes still read headers for grouping. Never writes a
+    discovery sidecar beside an output Zarr.
+    """
+    cfg = discovery or DEFAULT_INGEST_DISCOVERY
+    if cfg.filename_convention == "lst-color" and cfg.group_metadata_source == "filename":
+        msg = (
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            'use group_metadata_source="fits".'
+        )
+        raise ValueError(msg)
+
+    source_paths = tuple(collect_glob_sources(glob_pattern))
+    if not source_paths:
+        msg = f"Glob matched no files: {glob_pattern}"
+        raise FileNotFoundError(msg)
+
+    # Skip per-file header caching when basename grouping is sufficient.
+    grouped_without_headers = (
+        cfg.group_metadata_source == "filename" and cfg.filename_convention == "image"
+    )
+    discovery_metadata: dict[Path, _DiscoveryFileMetadata] = {}
+    by_time = discover_time_grouped_paths(
+        source_paths,
+        discovery=cfg,
+        discovery_metadata_out=discovery_metadata,
+        cache_ingest_headers=not grouped_without_headers,
+    )
+    if not by_time:
+        msg = f"No groupable FITS found for glob: {glob_pattern}"
+        raise FileNotFoundError(msg)
+
+    peeked_headers_for_lm = target_size is None
+    reference_lm = reference_lm_shape_for_zarr_estimate(
+        by_time,
+        discovery_metadata=discovery_metadata,
+        group_metadata_source=cfg.group_metadata_source,
+        filename_convention=cfg.filename_convention,
+        target_size=target_size,
+    )
+    summary = summarize_time_grouped_fits(
+        by_time,
+        discovery=cfg,
+        discovery_metadata=discovery_metadata,
+        target_size=target_size,
+    )
+    return GlobSizeEstimate(
+        source_paths=source_paths,
+        by_time=by_time,
+        summary=summary,
+        reference_lm_shape=reference_lm,
+        target_size=target_size,
+        grouped_without_headers=grouped_without_headers,
+        peeked_headers_for_lm=peeked_headers_for_lm and reference_lm is not None,
     )
 
 

@@ -36,9 +36,11 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
 )
 from ovro_lwa_portal.ingest.discovery import (
     GlobConvertDiscoveryPlan,
+    GlobSizeEstimate,
     IngestDiscoveryConfig,
     IngestDiscoverySummary,
     discover_time_grouped_fits,
+    estimate_glob_convert_size,
     plan_convert_discovery,
     resolve_glob_convert_discovery,
 )
@@ -1200,6 +1202,196 @@ def dewarp_convert(
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
+
+
+def _print_glob_size_estimate(
+    estimate: GlobSizeEstimate,
+    *,
+    glob_pattern: str,
+    discovery: IngestDiscoveryConfig,
+) -> None:
+    """Print discovery counts and estimated Zarr size for estimate-size."""
+    summary = estimate.summary
+    pol = ", ".join(summary.polarization_labels) or "—"
+
+    console.print("[bold]Size estimate[/bold] (no convert, no discovery sidecar)")
+    console.print(f"  Glob pattern:                     {glob_pattern}")
+    console.print(f"  Discovery meta:                   {discovery.group_metadata_source}")
+    console.print(f"  Time key source:                  {discovery.time_key_source}")
+    console.print(f"  Filename convention:              {discovery.filename_convention}")
+    if discovery.time_key_tolerance_sec > 0.0:
+        console.print(
+            f"  Time key tolerance:               {discovery.time_key_tolerance_sec:g} s"
+        )
+    console.print(f"  Glob-matched files:               {len(estimate.source_paths)}")
+    console.print(f"  Groupable input FITS:             {summary.input_files}")
+    console.print(f"  Time groups:                      {summary.time_groups}")
+    console.print(f"  Frequency subbands:               {summary.frequency_groups}")
+    console.print(
+        f"  Polarization products:            {summary.polarization_groups} ({pol})"
+    )
+    console.print(
+        f"  Time×frequency×polarization cells: "
+        f"{summary.time_frequency_polarization_cells} "
+        f"(Zarr hint {summary.zarr_shape_hint})"
+    )
+    if estimate.reference_lm_shape is not None:
+        n_l, n_m = estimate.reference_lm_shape
+        if estimate.target_size is not None:
+            grid_note = f"from --target-size {estimate.target_size}"
+        else:
+            grid_note = "from Stokes-I peek in first time group"
+        console.print(f"  Reference LM grid:                {n_l}×{n_m} ({grid_note})")
+    if summary.estimated_zarr_size is not None:
+        console.print(
+            f"  Estimated final Zarr size:        {summary.estimated_zarr_size} "
+            "(≈4 B/pixel, uncompressed SKY)"
+        )
+    else:
+        console.print(
+            "  Estimated final Zarr size:        unavailable "
+            "(pass --target-size or ensure Stokes-I NAXIS is readable)"
+        )
+
+    if estimate.grouped_without_headers and not estimate.peeked_headers_for_lm:
+        console.print("  Header I/O:                       none")
+    elif estimate.grouped_without_headers and estimate.peeked_headers_for_lm:
+        console.print(
+            "  Header I/O:                       LM peek on Stokes-I files in "
+            "first time group only (no full-tree header pass, no sidecar)"
+        )
+    else:
+        console.print(
+            "  Header I/O:                       per-file headers for grouping "
+            "(fits / lst-color); no sidecar written"
+        )
+    console.print()
+
+
+@app.command("estimate-size")
+def estimate_size(
+    glob_pattern: str = typer.Option(
+        ...,
+        "--glob-pattern",
+        "-g",
+        help="Python glob of FITS inputs (same semantics as convert --glob-pattern)",
+    ),
+    target_size: Optional[int] = typer.Option(
+        None,
+        "--target-size",
+        help=(
+            "Assume the Zarr LM grid is this square size (pixels). When set, no FITS "
+            "headers are read for LM shape (use the same value as convert/dewarp "
+            "--target-size when applicable)."
+        ),
+        min=1,
+    ),
+    discovery_freq_bin_hz: float = typer.Option(
+        _DISCOVERY_FREQ_BIN_HZ,
+        "--discovery-freq-bin-hz",
+        help=(
+            "Treat frequencies within this bin width (Hz) as one subband when grouping "
+            "(default: library default, 23 kHz)"
+        ),
+        min=1e-6,
+    ),
+    discovery_metadata_source: str = typer.Option(
+        "filename",
+        "--discovery-metadata-source",
+        help=(
+            'How to infer observation time and subband when grouping: "filename" '
+            "(default for estimate-size) uses basename ``-image-YYYYMMDD_HHMMSS`` and "
+            "``_NNNMHz_`` without caching every HDU; \"fits\" reads headers for grouping."
+        ),
+    ),
+    discovery_time_key_source: str = typer.Option(
+        "filename",
+        "--discovery-time-key-source",
+        help=(
+            'How to choose the observation time key: "filename" (default), "header" '
+            '(DATE-OBS; requires --discovery-metadata-source fits), or "directory".'
+        ),
+    ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging)."
+        ),
+        min=0.0,
+    ),
+    discovery_filename_convention: str = typer.Option(
+        "image",
+        "--discovery-filename-convention",
+        help=(
+            'Basename convention: "image" (default) or "lst-color" (requires '
+            "--discovery-metadata-source fits for subband frequency)."
+        ),
+    ),
+    log_level: LogLevel = typer.Option(
+        LogLevel.WARNING,
+        "--log-level",
+        "-l",
+        help="Logging verbosity level",
+        case_sensitive=False,
+    ),
+) -> None:
+    """Estimate final Zarr size for a glob without converting or writing a sidecar.
+
+    Uses the same discovery key options as ``convert``. With the default
+    ``--discovery-metadata-source filename``, grouping does not open every FITS
+    header; LM scale comes from ``--target-size`` or a small Stokes-I header peek
+    in the first time group. Does **not** write a discovery sidecar.
+
+    \b
+    Examples:
+        ovro-ingest estimate-size -g '/lustre/data/**/*-image-*.fits' \\
+            --discovery-metadata-source filename
+
+        ovro-ingest estimate-size -g '/data/**/*.fits' --target-size 4096
+    """
+    _configure_logging(log_level)
+    group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
+    time_key_source = _cli_time_key_source(discovery_time_key_source)
+    filename_convention = _cli_filename_convention(discovery_filename_convention)
+
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        raise typer.BadParameter(
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            "use --discovery-metadata-source fits.",
+            param_hint="--discovery-filename-convention",
+        )
+    if time_key_source == "header" and group_metadata_source == "filename":
+        raise typer.BadParameter(
+            '"header" time keys require FITS DATE-OBS; use '
+            "--discovery-metadata-source fits.",
+            param_hint="--discovery-time-key-source",
+        )
+
+    discovery = IngestDiscoveryConfig(
+        freq_bin_hz=discovery_freq_bin_hz,
+        group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
+        filename_convention=filename_convention,
+        time_key_tolerance_sec=discovery_time_key_tolerance,
+    )
+
+    console.print("\n[bold cyan]OVRO-LWA Zarr size estimate[/bold cyan]\n")
+    try:
+        estimate = estimate_glob_convert_size(
+            glob_pattern,
+            discovery=discovery,
+            target_size=target_size,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+        raise typer.Exit(code=1) from exc
+
+    _print_glob_size_estimate(estimate, glob_pattern=glob_pattern, discovery=discovery)
 
 
 @app.command("audit-metadata")
