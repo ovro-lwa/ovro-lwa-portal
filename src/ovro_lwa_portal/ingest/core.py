@@ -104,6 +104,10 @@ class ConversionConfig:
     global_frequency_coord_hz : numpy.ndarray | None, optional
         Precomputed full-store ``frequency`` coordinate in Hz for the first Zarr
         write when converting one time group at a time.
+    sky_dtype : {"preserve", "float32", "float64"}, optional
+        On-disk ``SKY`` floating dtype policy. ``"preserve"`` (default) keeps the
+        post-combine float kind; ``"float32"`` / ``"float64"`` force a cast before
+        Zarr write. Appends cast to the existing store dtype on mismatch.
     """
 
     def __init__(
@@ -129,6 +133,7 @@ class ConversionConfig:
         lm_reference_target_size: int | None = None,
         consolidate_metadata_at_end: bool = True,
         global_frequency_coord_hz: Any | None = None,
+        sky_dtype: Literal["preserve", "float32", "float64"] = "preserve",
     ) -> None:
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -151,6 +156,7 @@ class ConversionConfig:
         self.lm_reference_target_size = lm_reference_target_size
         self.consolidate_metadata_at_end = consolidate_metadata_at_end
         self.global_frequency_coord_hz = global_frequency_coord_hz
+        self.sky_dtype = sky_dtype
 
     @property
     def zarr_path(self) -> Path:
@@ -181,6 +187,11 @@ class ConversionConfig:
 
         if self.discovery_freq_bin_hz <= 0.0:
             msg = f"discovery_freq_bin_hz must be positive, got {self.discovery_freq_bin_hz}"
+            raise ValueError(msg)
+
+        allowed_sky = {"preserve", "float32", "float64"}
+        if self.sky_dtype not in allowed_sky:
+            msg = f"sky_dtype must be one of {sorted(allowed_sky)}, got {self.sky_dtype!r}"
             raise ValueError(msg)
 
 
@@ -283,6 +294,7 @@ class FITSToZarrConverter:
             logger.info(f"  Input: {self.config.input_dir}")
             logger.info(f"  Output: {self.config.zarr_path}")
             logger.info(f"  Mode: {'rebuild' if self.config.rebuild else 'append'}")
+            logger.info(f"  SKY dtype mode: {self.config.sky_dtype}")
 
             try:
                 result = convert_fits_dir_to_zarr(
@@ -307,6 +319,7 @@ class FITSToZarrConverter:
                     lm_reference_target_size=self.config.lm_reference_target_size,
                     consolidate_metadata_at_end=self.config.consolidate_metadata_at_end,
                     global_frequency_coord_hz=self.config.global_frequency_coord_hz,
+                    sky_dtype=self.config.sky_dtype,
                 )
 
                 logger.info(f"Conversion successful: {result}")

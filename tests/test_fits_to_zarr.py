@@ -4328,3 +4328,89 @@ class TestSkyDtypeHelpers:
             mod._decode_wcs_header_payload(synced["fits_header_str"].values), sep="\n"
         )
         assert int(hdr["BITPIX"]) == -64
+
+    def test_write_or_append_respects_sky_dtype_and_append_cast(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Phase 2: first write honors sky_dtype; append casts to store dtype."""
+        import logging
+
+        import numpy as np
+        import xarray as xr
+        from astropy.io import fits as afits
+
+        mod = _import_module()
+        store = tmp_path / "dtype_policy.zarr"
+        post_wcs = _make_sin_wcs_header_str(nx=2, ny=2, crval1=180.0, crval2=40.0)
+        primary = afits.Header(
+            {
+                "SIMPLE": True,
+                "BITPIX": -32,
+                "NAXIS": 2,
+                "NAXIS1": 2,
+                "NAXIS2": 2,
+                "BMAJ": 0.1,
+                "BMIN": 0.1,
+                "TELESCOP": "OVRO-LWA",
+            }
+        )
+        payload = mod._fits_header_bytes_for_slice(
+            primary,
+            post_regrid_wcs_hdr=post_wcs,
+            nl=2,
+            nm=2,
+            sky_numpy_dtype=np.float64,
+        )
+
+        def _step(mjd: float, sky_dtype: np.dtype) -> xr.Dataset:
+            return xr.Dataset(
+                {
+                    "SKY": (
+                        ("time", "frequency", "polarization", "l", "m"),
+                        np.ones((1, 1, 1, 2, 2), dtype=sky_dtype),
+                    ),
+                    "fits_header_str": (
+                        ("time", "frequency", "polarization"),
+                        np.array([[[np.bytes_(payload)]]], dtype=object),
+                    ),
+                },
+                coords={
+                    "time": ("time", np.array([mjd], dtype=np.float64)),
+                    "frequency": ("frequency", np.array([55e6], dtype=np.float64)),
+                    "polarization": ("polarization", np.array([1.0], dtype=np.float64)),
+                    "l": ("l", np.arange(2, dtype=np.float64)),
+                    "m": ("m", np.arange(2, dtype=np.float64)),
+                },
+            )
+
+        mod._write_or_append_zarr(
+            _step(60000.0, np.float64),
+            store,
+            first_write=True,
+            chunk_lm=2,
+            sky_dtype="float32",
+        )
+        assert mod._sky_dtype_from_zarr(store) == np.dtype(np.float32)
+        with xr.open_zarr(store, consolidated=False) as ds0:
+            assert ds0.attrs.get("ovro_lwa_portal_sky_dtype") == str(np.dtype(np.float32))
+            hdr0 = afits.Header.fromstring(
+                mod._decode_wcs_header_payload(
+                    ds0["fits_header_str"].isel(time=0, frequency=0, polarization=0).values
+                ),
+                sep="\n",
+            )
+            assert int(hdr0["BITPIX"]) == -32
+
+        with caplog.at_level(logging.WARNING):
+            mod._write_or_append_zarr(
+                _step(60001.0, np.float64),
+                store,
+                first_write=False,
+                chunk_lm=2,
+                sky_dtype="float64",
+            )
+        assert any("SKY dtype mismatch" in r.message for r in caplog.records)
+        assert mod._sky_dtype_from_zarr(store) == np.dtype(np.float32)
+        with xr.open_zarr(store, consolidated=False) as ds1:
+            assert ds1["SKY"].dtype == np.dtype(np.float32)
+            assert int(ds1.sizes["time"]) == 2

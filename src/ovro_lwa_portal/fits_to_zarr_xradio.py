@@ -5533,6 +5533,65 @@ def _prepare_time_only_vars_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
     return out
 
 
+def _apply_sky_dtype_policy_for_zarr_write(
+    to_write: xr.Dataset,
+    out_zarr: Path,
+    *,
+    sky_dtype: SkyDtypeMode | str,
+    is_first_write: bool,
+) -> xr.Dataset:
+    """Cast ``SKY``, sync ``fits_header_str`` BITPIX, and set audit attrs/encoding.
+
+    On append, if the store ``SKY`` dtype differs from the resolved incoming dtype,
+    cast to the store dtype and log a warning (homogeneous Zarr array dtype).
+    """
+    mode = _normalize_sky_dtype_mode(sky_dtype)
+    store_dt: np.dtype | None = None
+    if not is_first_write:
+        store_dt = _sky_dtype_from_zarr(out_zarr)
+
+    target: np.dtype | None = None
+    if store_dt is not None and "SKY" in to_write.data_vars:
+        incoming = _resolve_sky_numpy_dtype(to_write["SKY"], mode)
+        if incoming != store_dt:
+            logger.warning(
+                "SKY dtype mismatch on append to %s (store=%s, incoming resolved=%s "
+                "from mode=%s); casting incoming to store dtype.",
+                out_zarr,
+                store_dt,
+                incoming,
+                mode,
+            )
+            target = store_dt
+
+    to_write, resolved = _apply_sky_dtype(to_write, mode, target_dtype=target)
+    to_write = _sync_fits_header_str_bitpix(to_write, resolved)
+    to_write.attrs["ovro_lwa_portal_sky_dtype"] = str(resolved)
+    if "SKY" in to_write.data_vars:
+        enc = dict(to_write["SKY"].encoding)
+        enc["dtype"] = resolved.str
+        to_write["SKY"].encoding = enc
+    logger.info(
+        "SKY dtype mode=%s resolved=%s for %s to %s",
+        mode,
+        resolved,
+        "first write" if is_first_write else "append",
+        out_zarr,
+    )
+    if not is_first_write and out_zarr.exists():
+        try:
+            root = zarr.open_group(str(out_zarr), mode="a")
+            if "ovro_lwa_portal_sky_dtype" not in root.attrs:
+                root.attrs["ovro_lwa_portal_sky_dtype"] = str(resolved)
+        except Exception:
+            logger.debug(
+                "Could not refresh ovro_lwa_portal_sky_dtype on %s",
+                out_zarr,
+                exc_info=True,
+            )
+    return to_write
+
+
 def _write_or_append_zarr(
     xds_t: xr.Dataset,
     out_zarr: Path,
@@ -5540,6 +5599,7 @@ def _write_or_append_zarr(
     *,
     chunk_lm: int,
     overwrite_existing_time: bool = False,
+    sky_dtype: SkyDtypeMode | str = "preserve",
 ) -> None:
     """Write or append one time step to a Zarr store without re-writing existing times.
 
@@ -5547,6 +5607,10 @@ def _write_or_append_zarr(
     Append uses ``to_zarr(..., mode='a', append_dim='time')``. If the new step's
     ``time`` already exists in the store, the write is skipped unless
     *overwrite_existing_time* is True (in which case that row is replaced in-place).
+
+    ``sky_dtype`` selects the on-disk ``SKY`` floating dtype (``preserve``,
+    ``float32``, or ``float64``). On append, a mismatch with the store casts the
+    incoming step to the store dtype.
     """
     from shutil import rmtree
 
@@ -5554,6 +5618,7 @@ def _write_or_append_zarr(
         to_write = _align_time_dimension_for_zarr_write(xds_t)
         to_write = _canonicalize_polarization_coord(to_write)
         _assert_unique_polarization_coord(to_write)
+        is_first_write = True
     else:
         with xr.open_zarr(str(out_zarr), consolidated=False) as existing:
             to_write = _align_time_dimension_for_zarr_write(xds_t, schema=existing)
@@ -5571,6 +5636,7 @@ def _write_or_append_zarr(
                         incoming_npol,
                     )
                     to_write = _align_time_step_to_polarization_grid(to_write, store_pol)
+        is_first_write = False
 
     _assert_nonempty_fits_header_str_before_zarr_write(to_write)
     to_write = _rechunk_lm_for_zarr(to_write, chunk_lm)
@@ -5585,8 +5651,14 @@ def _write_or_append_zarr(
 
     to_write = strip_redundant_fits_wcs_header_attrs(to_write)
     to_write = _drop_ingest_only_metadata_for_zarr_write(to_write)
+    to_write = _apply_sky_dtype_policy_for_zarr_write(
+        to_write,
+        out_zarr,
+        sky_dtype=sky_dtype,
+        is_first_write=is_first_write,
+    )
 
-    if first_write or not out_zarr.exists():
+    if is_first_write:
         if out_zarr.exists():
             rmtree(out_zarr)
         to_write.to_zarr(str(out_zarr), mode="w", consolidated=False)
@@ -5684,6 +5756,7 @@ def convert_fits_dir_to_zarr(
     time_key_tolerance_sec: float = 0.0,
     consolidate_metadata_at_end: bool = True,
     global_frequency_coord_hz: np.ndarray | None = None,
+    sky_dtype: SkyDtypeMode | str = "preserve",
 ) -> Path:
     """Convert all matching FITS in a directory into a single LM-only Zarr store.
 
@@ -5751,6 +5824,11 @@ def convert_fits_dir_to_zarr(
         on the first write instead of inferring it only from FITS discovered in
         *input_dir*. Use when converting one time group at a time but the axis
         must reflect all subbands across the full observation set.
+    sky_dtype
+        On-disk ``SKY`` floating dtype policy: ``"preserve"`` (default; keep the
+        post-combine float32/float64 kind, native endian), ``"float32"``, or
+        ``"float64"``. On append, a mismatch with the existing store casts the
+        incoming step to the store dtype.
     resume
         When True (default) and *rebuild* is False, skip time keys already present in
         an existing output Zarr via :func:`_filter_completed_time_keys`. Set False to
@@ -5814,6 +5892,11 @@ def convert_fits_dir_to_zarr(
     if lm_reference_target_size is not None and int(lm_reference_target_size) <= 0:
         msg = f"lm_reference_target_size must be positive, got {lm_reference_target_size}"
         raise ValueError(msg)
+    sky_dtype_mode = _normalize_sky_dtype_mode(sky_dtype)
+    logger.info(
+        "SKY dtype mode: %s (resolved per write; append casts to store dtype on mismatch)",
+        sky_dtype_mode,
+    )
 
     discovery_metadata: Dict[Path, _DiscoveryFileMetadata] = {}
     if progress_callback is not None:
@@ -6008,7 +6091,13 @@ def convert_fits_dir_to_zarr(
         logger.info("  l/m grid matches global reference")
 
         logger.info(f"[{'write new' if first_write else 'append'}] {out_zarr}")
-        _write_or_append_zarr(xds_t, out_zarr, first_write=first_write, chunk_lm=chunk_lm)
+        _write_or_append_zarr(
+            xds_t,
+            out_zarr,
+            first_write=first_write,
+            chunk_lm=chunk_lm,
+            sky_dtype=sky_dtype_mode,
+        )
         first_write = False
         if cleanup_fixed_fits and fix_headers_on_demand and created_fixed_paths:
             removed = 0
