@@ -4187,3 +4187,144 @@ def test_repair_zarr_polarization_drops_duplicate_plane(tmp_path: Path) -> None:
         assert int(repaired.sizes["polarization"]) == 2
         assert float(repaired["SKY"].isel(polarization=0).values.item()) == pytest.approx(1.0)
         assert float(repaired["SKY"].isel(polarization=1).values.item()) == pytest.approx(4.0)
+
+
+class TestSkyDtypeHelpers:
+    """Phase 1: explicit SKY write-dtype resolve / cast / BITPIX helpers."""
+
+    def test_normalize_sky_dtype_mode(self) -> None:
+        import numpy as np
+
+        mod = _import_module()
+        assert mod._normalize_sky_dtype_mode("preserve") == "preserve"
+        assert mod._normalize_sky_dtype_mode("FLOAT32") == "float32"
+        assert mod._normalize_sky_dtype_mode(np.float64) == "float64"
+        with pytest.raises(ValueError, match="Unsupported sky_dtype"):
+            mod._normalize_sky_dtype_mode("float16")
+
+    def test_preserve_maps_endian_float32(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        sky = xr.DataArray(np.ones((2, 2), dtype=">f4"), dims=("l", "m"))
+        assert mod._resolve_sky_numpy_dtype(sky, "preserve") == np.dtype(np.float32)
+
+    def test_preserve_maps_float64(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        sky = xr.DataArray(np.ones((2, 2), dtype=np.float64), dims=("l", "m"))
+        assert mod._resolve_sky_numpy_dtype(sky, "preserve") == np.dtype(np.float64)
+
+    def test_preserve_rejects_non_floating(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        sky = xr.DataArray(np.ones((2, 2), dtype=np.int16), dims=("l", "m"))
+        with pytest.raises(ValueError, match="floating"):
+            mod._resolve_sky_numpy_dtype(sky, "preserve")
+
+    def test_apply_sky_dtype_force_cast(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        ds = xr.Dataset({"SKY": (("l", "m"), np.ones((2, 2), dtype=np.float64))})
+        out, resolved = mod._apply_sky_dtype(ds, "float32")
+        assert resolved == np.dtype(np.float32)
+        assert out["SKY"].dtype == np.dtype(np.float32)
+
+    def test_apply_sky_dtype_preserve_noop_when_native(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        ds = xr.Dataset({"SKY": (("l", "m"), np.ones((2, 2), dtype=np.float32))})
+        out, resolved = mod._apply_sky_dtype(ds, "preserve")
+        assert resolved == np.dtype(np.float32)
+        assert out["SKY"].dtype == np.dtype(np.float32)
+
+    def test_apply_sky_dtype_target_dtype_overrides_mode(self) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        ds = xr.Dataset({"SKY": (("l", "m"), np.ones((2, 2), dtype=np.float32))})
+        out, resolved = mod._apply_sky_dtype(
+            ds, "float32", target_dtype=np.float64
+        )
+        assert resolved == np.dtype(np.float64)
+        assert out["SKY"].dtype == np.dtype(np.float64)
+
+    def test_sky_dtype_from_zarr(self, tmp_path: Path) -> None:
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        store = tmp_path / "sky_dtype.zarr"
+        xr.Dataset(
+            {"SKY": (("l", "m"), np.ones((2, 2), dtype=np.float32))}
+        ).to_zarr(store, mode="w", consolidated=False)
+        assert mod._sky_dtype_from_zarr(store) == np.dtype(np.float32)
+        assert mod._sky_dtype_from_zarr(tmp_path / "missing.zarr") is None
+
+    def test_bitpix_for_sky_numpy_dtype(self) -> None:
+        import numpy as np
+
+        mod = _import_module()
+        assert mod._bitpix_for_sky_numpy_dtype(np.float32) == -32
+        assert mod._bitpix_for_sky_numpy_dtype(np.float64) == -64
+        assert mod._bitpix_for_sky_numpy_dtype(">f4") == -32
+
+    def test_fits_header_bytes_bitpix_follows_sky_dtype(self) -> None:
+        from astropy.io import fits as afits
+        import numpy as np
+
+        mod = _import_module()
+        primary = afits.Header({"SIMPLE": True, "BITPIX": -32, "NAXIS": 2, "NAXIS1": 4, "NAXIS2": 4})
+        post_wcs = _make_sin_wcs_header_str(nx=4, ny=4, crval1=180.0, crval2=40.0)
+        payload64 = mod._fits_header_bytes_for_slice(
+            primary,
+            post_regrid_wcs_hdr=post_wcs,
+            nl=4,
+            nm=4,
+            sky_numpy_dtype=np.float64,
+        )
+        out64 = afits.Header.fromstring(payload64.decode("utf-8"), sep="\n")
+        assert int(out64["BITPIX"]) == -64
+
+        payload32 = mod._fits_header_bytes_for_slice(
+            primary,
+            post_regrid_wcs_hdr=post_wcs,
+            nl=4,
+            nm=4,
+            sky_numpy_dtype=np.float32,
+        )
+        out32 = afits.Header.fromstring(payload32.decode("utf-8"), sep="\n")
+        assert int(out32["BITPIX"]) == -32
+
+    def test_sync_fits_header_str_bitpix(self) -> None:
+        from astropy.io import fits as afits
+        import numpy as np
+        import xarray as xr
+
+        mod = _import_module()
+        primary = afits.Header({"SIMPLE": True, "BITPIX": -32, "NAXIS": 2, "NAXIS1": 2, "NAXIS2": 2})
+        post_wcs = _make_sin_wcs_header_str(nx=2, ny=2, crval1=180.0, crval2=40.0)
+        payload = mod._fits_header_bytes_for_slice(
+            primary, post_regrid_wcs_hdr=post_wcs, nl=2, nm=2, sky_numpy_dtype=np.float32
+        )
+        ds = xr.Dataset(
+            {
+                "SKY": (("l", "m"), np.ones((2, 2), dtype=np.float64)),
+                "fits_header_str": ((), np.bytes_(payload)),
+            }
+        )
+        synced = mod._sync_fits_header_str_bitpix(ds, np.float64)
+        hdr = afits.Header.fromstring(
+            mod._decode_wcs_header_payload(synced["fits_header_str"].values), sep="\n"
+        )
+        assert int(hdr["BITPIX"]) == -64

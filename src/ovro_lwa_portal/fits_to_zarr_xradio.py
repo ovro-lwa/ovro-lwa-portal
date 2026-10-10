@@ -318,6 +318,12 @@ _DIR_TIME_KEY_LST_RE = re.compile(r"^(\d{8})_LST(\d+)h(?:_(t\d+))?$")
 
 DiscoveryFilenameConvention = Literal["image", "lst-color"]
 DiscoveryTimeKeySource = Literal["header", "filename", "directory"]
+SkyDtypeMode = Literal["preserve", "float32", "float64"]
+_SKY_DTYPE_MAP: dict[str, type[np.floating]] = {
+    "float32": np.float32,
+    "float64": np.float64,
+}
+_SKY_DTYPE_MODES: frozenset[str] = frozenset({"preserve", "float32", "float64"})
 
 
 class _DiscoveryFileMetadata(NamedTuple):
@@ -2815,6 +2821,161 @@ def _stokes_for_fits_header_slice(
     return _stokes_value_from_header(primary)
 
 
+def _normalize_sky_dtype_mode(sky_dtype: str | np.dtype | type) -> SkyDtypeMode:
+    """Normalize a user/API sky-dtype value to a :data:`SkyDtypeMode` string."""
+    if isinstance(sky_dtype, str):
+        mode = sky_dtype.strip().lower()
+    else:
+        dt = np.dtype(sky_dtype)
+        if dt == np.dtype(np.float32):
+            mode = "float32"
+        elif dt == np.dtype(np.float64):
+            mode = "float64"
+        else:
+            msg = (
+                f"Unsupported sky dtype {sky_dtype!r}; expected preserve, float32, "
+                "float64, or a float32/float64 numpy dtype"
+            )
+            raise ValueError(msg)
+    if mode not in _SKY_DTYPE_MODES:
+        msg = (
+            f"Unsupported sky_dtype {sky_dtype!r}; expected one of "
+            f"{sorted(_SKY_DTYPE_MODES)}"
+        )
+        raise ValueError(msg)
+    return mode  # type: ignore[return-value]
+
+
+def _native_float_dtype(dtype: np.dtype | type[np.floating] | str) -> np.dtype:
+    """Return a native-endian float32/float64 dtype for *dtype* (by itemsize)."""
+    dt = np.dtype(dtype)
+    if not np.issubdtype(dt, np.floating):
+        msg = f"Expected a floating dtype for SKY, got {dt!r}"
+        raise ValueError(msg)
+    if dt.itemsize == 4:
+        return np.dtype(np.float32)
+    if dt.itemsize == 8:
+        return np.dtype(np.float64)
+    msg = f"Unsupported floating SKY itemsize {dt.itemsize} for dtype {dt!r}"
+    raise ValueError(msg)
+
+
+def _bitpix_for_sky_numpy_dtype(dtype: np.dtype | type[np.floating] | str) -> int:
+    """FITS ``BITPIX`` for a floating ``SKY`` numpy dtype (``-32`` or ``-64``)."""
+    native = _native_float_dtype(dtype)
+    if native == np.dtype(np.float32):
+        return -32
+    return -64
+
+
+def _sky_dtype_mode_from_numpy(dtype: np.dtype | type[np.floating] | str) -> Literal["float32", "float64"]:
+    """Map a floating numpy dtype to an explicit cast mode (not ``preserve``)."""
+    native = _native_float_dtype(dtype)
+    if native == np.dtype(np.float32):
+        return "float32"
+    return "float64"
+
+
+def _resolve_sky_numpy_dtype(sky: xr.DataArray, mode: SkyDtypeMode | str) -> np.dtype:
+    """Resolve the native numpy dtype to use for ``SKY`` under *mode*."""
+    resolved_mode = _normalize_sky_dtype_mode(mode)
+    if resolved_mode == "preserve":
+        if not np.issubdtype(sky.dtype, np.floating):
+            msg = (
+                f"Cannot preserve SKY dtype {sky.dtype!r}: expected a floating type. "
+                "Pass sky_dtype='float32' or 'float64' to cast."
+            )
+            raise ValueError(msg)
+        return _native_float_dtype(sky.dtype)
+    return np.dtype(_SKY_DTYPE_MAP[resolved_mode])
+
+
+def _apply_sky_dtype(
+    ds: xr.Dataset,
+    mode: SkyDtypeMode | str,
+    *,
+    target_dtype: np.dtype | type[np.floating] | str | None = None,
+) -> tuple[xr.Dataset, np.dtype]:
+    """Cast ``SKY`` to the resolved dtype; return ``(dataset, resolved_dtype)``.
+
+    When *target_dtype* is set (append path), it overrides *mode* for the cast
+    target. Other variables are left unchanged. Missing ``SKY`` is a no-op that
+    still returns the resolved dtype when *target_dtype* or a floating mode is
+    given; ``preserve`` without ``SKY`` raises.
+    """
+    resolved_mode = _normalize_sky_dtype_mode(mode)
+    if target_dtype is not None:
+        resolved = _native_float_dtype(target_dtype)
+    elif "SKY" not in ds.data_vars:
+        if resolved_mode == "preserve":
+            msg = "Cannot resolve sky_dtype='preserve' because dataset has no SKY variable"
+            raise ValueError(msg)
+        resolved = np.dtype(_SKY_DTYPE_MAP[resolved_mode])
+        return ds, resolved
+    else:
+        resolved = _resolve_sky_numpy_dtype(ds["SKY"], resolved_mode)
+
+    if "SKY" not in ds.data_vars:
+        return ds, resolved
+
+    sky = ds["SKY"]
+    if sky.dtype == resolved:
+        return ds, resolved
+    cast = sky.astype(resolved, copy=False)
+    cast.encoding = dict(sky.encoding)
+    cast.encoding["dtype"] = resolved.str
+    return ds.assign(SKY=cast), resolved
+
+
+def _sky_dtype_from_zarr(out_zarr: Path) -> np.dtype | None:
+    """Return on-disk ``SKY`` dtype from an existing Zarr store, or ``None``."""
+    if not out_zarr.exists():
+        return None
+    try:
+        root = zarr.open_group(str(out_zarr), mode="r")
+    except Exception:
+        return None
+    if "SKY" not in root:
+        return None
+    try:
+        return _native_float_dtype(root["SKY"].dtype)
+    except ValueError:
+        return np.dtype(root["SKY"].dtype)
+
+
+def _sync_fits_header_str_bitpix(
+    ds: xr.Dataset,
+    sky_numpy_dtype: np.dtype | type[np.floating] | str,
+) -> xr.Dataset:
+    """Rewrite ``BITPIX`` on non-empty ``fits_header_str`` cells to match *sky_numpy_dtype*."""
+    if "fits_header_str" not in ds.data_vars:
+        return ds
+    bitpix = _bitpix_for_sky_numpy_dtype(sky_numpy_dtype)
+    fh = ds["fits_header_str"]
+    values = np.asarray(fh.values)
+    flat = values.reshape(-1)
+    out_flat = np.empty(flat.shape, dtype=object)
+    changed = False
+    for i, raw in enumerate(flat):
+        text = _decode_wcs_header_payload(raw)
+        if not text:
+            out_flat[i] = raw
+            continue
+        hdr = fits.Header.fromstring(text, sep="\n")
+        if int(hdr.get("BITPIX", 0)) == bitpix:
+            out_flat[i] = raw
+            continue
+        hdr["BITPIX"] = bitpix
+        out_flat[i] = np.bytes_(hdr.tostring(sep="\n").encode("utf-8"))
+        changed = True
+    if not changed:
+        return ds
+    new_values = out_flat.reshape(values.shape)
+    return ds.assign(
+        fits_header_str=xr.DataArray(new_values, dims=fh.dims, coords=fh.coords)
+    )
+
+
 def _fits_header_bytes_for_slice(
     hdr: fits.Header,
     *,
@@ -2823,6 +2984,7 @@ def _fits_header_bytes_for_slice(
     nm: int,
     freq_hz: float | None = None,
     stokes: float | None = None,
+    sky_numpy_dtype: np.dtype | type[np.floating] | str | None = None,
 ) -> bytes:
     """Build a pixel-faithful 4D singleton-axis primary-header string for one ``SKY`` slice.
 
@@ -2830,6 +2992,9 @@ def _fits_header_bytes_for_slice(
     from the post-regrid WCS; provenance and beam keywords are retained from the
     post-``_fix_headers`` primary header; axes 3–4 are singleton FREQ and Stokes
     (``NAXIS3=NAXIS4=1``) for xradio-compatible export.
+
+    ``BITPIX`` matches *sky_numpy_dtype* when given (``-32`` for float32, ``-64`` for
+    float64); otherwise defaults to ``-32`` (historical fixed-FITS float32).
     """
     out = hdr.copy()
     preserved: dict[str, object] = {}
@@ -2865,7 +3030,10 @@ def _fits_header_bytes_for_slice(
     _promote_singleton_freq_stokes_cards(
         out, freq_hz=resolved_freq, stokes=resolved_stokes
     )
-    out["BITPIX"] = -32
+    if sky_numpy_dtype is None:
+        out["BITPIX"] = -32
+    else:
+        out["BITPIX"] = _bitpix_for_sky_numpy_dtype(sky_numpy_dtype)
     for key in ("BSCALE", "BZERO"):
         if key in out:
             del out[key]
@@ -3079,6 +3247,9 @@ def _assign_pixel_faithful_fits_header_str(
         raise RuntimeError(msg)
     nl, nm = _lm_shape(xds)
     primary = fits.Header.fromstring(str(primary_str), sep="\n")
+    sky_dtype: np.dtype | None = None
+    if "SKY" in xds.data_vars and np.issubdtype(xds["SKY"].dtype, np.floating):
+        sky_dtype = _native_float_dtype(xds["SKY"].dtype)
     payload = _fits_header_bytes_for_slice(
         primary,
         post_regrid_wcs_hdr=post_regrid_wcs_hdr,
@@ -3086,6 +3257,7 @@ def _assign_pixel_faithful_fits_header_str(
         nm=nm,
         freq_hz=_freq_hz_for_fits_header_slice(xds, primary),
         stokes=_stokes_for_fits_header_slice(xds, primary),
+        sky_numpy_dtype=sky_dtype,
     )
     return xds.assign(fits_header_str=((), np.bytes_(payload)))
 
