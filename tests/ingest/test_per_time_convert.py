@@ -10,6 +10,7 @@ from ovro_lwa_portal.ingest.dewarp_convert import clear_ingest_directory
 from ovro_lwa_portal.ingest.discovery import discover_time_grouped_paths
 from ovro_lwa_portal.ingest.per_time_convert import (
     PerTimeGlobConvertConfig,
+    filter_existing_source_paths,
     run_per_time_glob_convert,
     sources_need_funpack,
     stage_time_group_symlinks,
@@ -71,6 +72,26 @@ class TestStageTimeGroupSymlinks:
         assert all(p.is_symlink() for p in staged)
         resolved = {p.resolve() for p in staged}
         assert resolved == {file_a.resolve(), file_b.resolve()}
+
+    def test_skips_missing_sources_without_dangling_symlinks(self, tmp_path: Path) -> None:
+        staging = tmp_path / "staging"
+        present = tmp_path / _image_name("20250309_LST14h", 41)
+        missing = tmp_path / _image_name("20250309_LST14h", 23)
+        present.write_bytes(b"ok")
+        assert not missing.exists()
+
+        kept = filter_existing_source_paths(
+            [present, missing], time_key="20250309_LST14h"
+        )
+        assert kept == [present]
+
+        n = stage_time_group_symlinks(
+            staging, "20250309_LST14h", [present, missing]
+        )
+        assert n == 1
+        staged = list(staging.glob("20250309_LST14h__*.fits"))
+        assert len(staged) == 1
+        assert staged[0].resolve() == present.resolve()
 
 
 class TestDiscoverTimeGroupedPaths:

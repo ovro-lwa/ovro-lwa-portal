@@ -32,6 +32,7 @@ from ovro_lwa_portal.ingest.progress import report_ingest_progress
 
 __all__ = [
     "PerTimeGlobConvertConfig",
+    "filter_existing_source_paths",
     "funpack_time_group",
     "run_per_time_glob_convert",
     "sources_need_funpack",
@@ -102,12 +103,42 @@ def _staged_symlink_name(time_key: str, src: Path, seen: set[str]) -> str:
     return link_name
 
 
+def filter_existing_source_paths(
+    files: Sequence[Path],
+    *,
+    time_key: str | None = None,
+) -> list[Path]:
+    """Drop paths that are missing on disk; log each skip.
+
+    Discovery sidecars and long multi-hour runs can reference FITS that were
+    removed mid-ingest (pipeline cleanup). Staging must not create dangling
+    symlinks that later fail with ``ENOENT`` during convert.
+    """
+    kept: list[Path] = []
+    for src in files:
+        if src.exists():
+            kept.append(src)
+            continue
+        if time_key is None:
+            logger.warning("Skipping missing source FITS: %s", src)
+        else:
+            logger.warning(
+                "Skipping missing source FITS for time %s: %s",
+                time_key,
+                src,
+            )
+    return kept
+
+
 def stage_time_group_symlinks(staging_dir: Path, time_key: str, files: Sequence[Path]) -> int:
-    """Symlink FITS into *staging_dir* as ``{time_key}__{basename}`` to avoid collisions."""
+    """Symlink FITS into *staging_dir* as ``{time_key}__{basename}`` to avoid collisions.
+
+    Missing sources are skipped (see :func:`filter_existing_source_paths`).
+    """
     staging_dir.mkdir(parents=True, exist_ok=True)
     seen_names: set[str] = set()
     n = 0
-    for src in files:
+    for src in filter_existing_source_paths(files, time_key=time_key):
         dest = staging_dir / _staged_symlink_name(time_key, src, seen_names)
         if dest.exists() or dest.is_symlink():
             dest.unlink()
@@ -276,7 +307,7 @@ def run_per_time_glob_convert(
         total = len(time_keys_sorted)
 
         for idx, tkey in enumerate(time_keys_sorted):
-            sources = list(by_time[tkey])
+            sources = filter_existing_source_paths(list(by_time[tkey]), time_key=tkey)
             work_dir = work_root / tkey
             _cleanup_time_work(work_dir, config.staging_dir, tkey)
 
@@ -287,6 +318,25 @@ def run_per_time_glob_convert(
                 total,
                 f"Time step {idx + 1}/{total}: preparing {tkey}",
             )
+
+            if not sources:
+                logger.warning(
+                    "Time %s (%d/%d): all %d source file(s) are missing on disk; "
+                    "skipping this time key (re-run with --refresh-discovery after "
+                    "pipeline cleanup, or restore the FITS).",
+                    tkey,
+                    idx + 1,
+                    total,
+                    len(by_time[tkey]),
+                )
+                report_ingest_progress(
+                    progress_callback,
+                    "converting",
+                    idx + 1,
+                    total,
+                    f"Time step {idx + 1}/{total}: skipped missing {tkey}",
+                )
+                continue
 
             logger.info(
                 "Time %s (%d/%d): preparing %d source(s)",
@@ -318,6 +368,21 @@ def run_per_time_glob_convert(
 
             n_staged = stage_time_group_symlinks(config.staging_dir, tkey, prepared)
             logger.info("Staged %d FITS for convert", n_staged)
+            if n_staged == 0:
+                logger.warning(
+                    "Time %s (%d/%d): nothing staged after filtering missing sources; skipping.",
+                    tkey,
+                    idx + 1,
+                    total,
+                )
+                report_ingest_progress(
+                    progress_callback,
+                    "converting",
+                    idx + 1,
+                    total,
+                    f"Time step {idx + 1}/{total}: skipped empty stage {tkey}",
+                )
+                continue
 
             convert_config = ConversionConfig(
                 input_dir=config.staging_dir,

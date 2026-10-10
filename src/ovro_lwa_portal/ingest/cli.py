@@ -403,12 +403,23 @@ def _execute_per_time_glob_conversion(
 
         except FileNotFoundError as e:
             console.print(f"\n[bold red]✗[/bold red] Error: {e}", style="red")
-            console.print(
-                "\nNo matching source files found. Please check:\n"
-                "  • The --glob-pattern matches your FITS or .fits.fs files\n"
-                "  • Basenames include ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tokens\n"
-                "  • Use --discovery-metadata-source filename for large nested trees"
-            )
+            err_text = str(e)
+            if "staging" in err_text or "No such file" in err_text:
+                console.print(
+                    "\nA staged or source FITS path is missing (common after mid-run "
+                    "pipeline cleanup, or a stale discovery sidecar).\n"
+                    "  • Times already written to the Zarr are kept\n"
+                    "  • Re-run the same command without --rebuild to resume\n"
+                    "  • Add --refresh-discovery if Lustre products were removed/renamed\n"
+                    "  • Confirm only one convert process is writing this staging dir"
+                )
+            else:
+                console.print(
+                    "\nNo matching source files found. Please check:\n"
+                    "  • The --glob-pattern matches your FITS or .fits.fs files\n"
+                    "  • Basenames include ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tokens\n"
+                    "  • Use --discovery-metadata-source filename for large nested trees"
+                )
             raise typer.Exit(code=1) from e
 
         except (RuntimeError, ValueError, subprocess.CalledProcessError) as e:
