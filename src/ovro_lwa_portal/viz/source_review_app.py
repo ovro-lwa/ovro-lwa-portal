@@ -1525,6 +1525,21 @@ class SourceReview(param.Parameterized):
             )
             if self._config.polarization_isel is not None and "polarization" in ds.dims:
                 pol_sel = tuple(int(i) for i in self._config.polarization_isel)
+                n_pol = int(ds.sizes["polarization"])
+                bad = [i for i in pol_sel if i < 0 or i >= n_pol]
+                if bad:
+                    stokes = (
+                        list(ds.coords["polarization"].values)
+                        if "polarization" in ds.coords
+                        else []
+                    )
+                    msg = (
+                        f"polarization_isel={pol_sel} is out of range for this store "
+                        f"(polarization size={n_pol}, Stokes={stokes}). "
+                        f"Use None or indices in 0..{max(n_pol - 1, 0)} "
+                        "(Stokes-I-only stores cannot use (0, 1))."
+                    )
+                    raise IndexError(msg)
                 report(f"Selecting polarization indices {pol_sel} (isel)")
                 ds = ds.isel(polarization=list(pol_sel))
             report(f"Zarr opened ({time.perf_counter() - t_meta:.1f} s)")
