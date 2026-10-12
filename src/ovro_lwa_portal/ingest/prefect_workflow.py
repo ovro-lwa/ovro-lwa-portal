@@ -192,7 +192,8 @@ if PREFECT_AVAILABLE:
         group_metadata_source : {"fits", "filename"}, optional
             Forwarded to :class:`~ovro_lwa_portal.ingest.core.ConversionConfig`.
         sky_dtype : {"preserve", "float32", "float64"}, optional
-            On-disk ``SKY`` floating dtype policy. Defaults to ``preserve``.
+            On-disk ``SKY`` floating dtype policy. ``preserve`` (default) follows
+            input FITS ``BITPIX`` (``-32``→float32, ``-64``→float64).
 
         Returns
         -------
@@ -278,7 +279,8 @@ def run_conversion_flow(
     verbose : bool, optional
         Enable verbose logging.
     sky_dtype : {"preserve", "float32", "float64"}, optional
-        On-disk ``SKY`` floating dtype policy. Defaults to ``preserve``.
+        On-disk ``SKY`` floating dtype policy. ``preserve`` (default) follows
+        input FITS ``BITPIX`` (``-32``→float32, ``-64``→float64).
 
     Returns
     -------

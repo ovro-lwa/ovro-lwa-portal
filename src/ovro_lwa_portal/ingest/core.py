@@ -105,8 +105,9 @@ class ConversionConfig:
         Precomputed full-store ``frequency`` coordinate in Hz for the first Zarr
         write when converting one time group at a time.
     sky_dtype : {"preserve", "float32", "float64"}, optional
-        On-disk ``SKY`` floating dtype policy. ``"preserve"`` (default) keeps the
-        post-combine float kind; ``"float32"`` / ``"float64"`` force a cast before
+        On-disk ``SKY`` floating dtype policy. ``"preserve"`` (default) uses the
+        float kind implied by input FITS ``BITPIX`` (``-32``→float32,
+        ``-64``→float64); ``"float32"`` / ``"float64"`` force that cast before
         Zarr write. Appends cast to the existing store dtype on mismatch.
     """
 

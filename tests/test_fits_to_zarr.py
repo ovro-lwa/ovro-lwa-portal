@@ -4226,6 +4226,62 @@ class TestSkyDtypeHelpers:
         with pytest.raises(ValueError, match="Unsupported sky_dtype"):
             mod._normalize_sky_dtype_mode("float16")
 
+    def test_sky_numpy_dtype_from_fits_bitpix(self) -> None:
+        import numpy as np
+
+        mod = _import_module()
+        assert mod._sky_numpy_dtype_from_fits_bitpix(-32) == np.dtype(np.float32)
+        assert mod._sky_numpy_dtype_from_fits_bitpix(-64) == np.dtype(np.float64)
+        assert mod._sky_numpy_dtype_from_fits_bitpix(16) == np.dtype(np.float32)
+        with pytest.raises(ValueError, match="BITPIX"):
+            mod._sky_numpy_dtype_from_fits_bitpix(-128)
+
+    def test_resolve_preserve_from_fits_paths_bitpix32(self, tmp_path: Path) -> None:
+        import numpy as np
+
+        mod = _import_module()
+        fp = tmp_path / "bitpix32.fits"
+        fits.PrimaryHDU(
+            data=np.ones((4, 4), dtype=np.float32),
+            header=fits.Header({"BITPIX": -32, "NAXIS": 2, "NAXIS1": 4, "NAXIS2": 4}),
+        ).writeto(fp)
+        assert mod._resolve_preserve_sky_dtype_from_fits_paths([fp]) == np.dtype(np.float32)
+
+    def test_reproject_celestial_plane_casts_back_to_float32(self) -> None:
+        import sys
+        from types import ModuleType
+        from unittest.mock import MagicMock
+
+        import numpy as np
+        from astropy.wcs import WCS
+
+        mod = _import_module()
+        w = WCS(naxis=2)
+        w.wcs.ctype = ["RA---SIN", "DEC--SIN"]
+        w.wcs.crval = [180.0, 45.0]
+        w.wcs.crpix = [2.5, 2.5]
+        w.wcs.cdelt = [-0.1, 0.1]
+        plane = np.ones((4, 4), dtype=np.float32)
+        # reproject is optional in the env; stub the module so import succeeds.
+        fake = ModuleType("reproject")
+        fake.reproject_interp = MagicMock(  # type: ignore[attr-defined]
+            return_value=(np.ones((4, 4), dtype=np.float64), np.ones((4, 4)))
+        )
+        prev = sys.modules.get("reproject")
+        sys.modules["reproject"] = fake
+        try:
+            out = mod._reproject_celestial_plane(plane, w, w, (4, 4))
+            out_explicit = mod._reproject_celestial_plane(
+                plane.astype(np.float64), w, w, (4, 4), out_dtype=np.float32
+            )
+        finally:
+            if prev is None:
+                sys.modules.pop("reproject", None)
+            else:
+                sys.modules["reproject"] = prev
+        assert out.dtype == np.dtype(np.float32)
+        assert out_explicit.dtype == np.dtype(np.float32)
+
     def test_preserve_maps_endian_float32(self) -> None:
         import numpy as np
         import xarray as xr
@@ -4566,3 +4622,29 @@ def test_convert_fits_dir_to_zarr_sky_dtype_float32(tmp_path: Path) -> None:
     with xr.open_zarr(out_zarr, consolidated=False) as ds:
         assert ds["SKY"].dtype == np.dtype(np.float32)
         assert ds.attrs.get("ovro_lwa_portal_sky_dtype") == str(np.dtype(np.float32))
+
+
+def test_convert_preserve_uses_fits_bitpix_float32(tmp_path: Path) -> None:
+    """Default ``preserve`` follows FITS BITPIX=-32 → on-disk float32 SKY."""
+    import numpy as np
+    import zarr
+
+    mod = _import_module()
+    time_key = "20240817_120000"
+    f_i = tmp_path / f"18MHz-Clean-Snapshot-{time_key}-image-I.fits"
+    _write_ovro_stokes_fits(f_i, stokes=1, pixel_value=1.0)
+    # Confirm fixture is float32 FITS.
+    assert int(fits.getheader(f_i)["BITPIX"]) == -32
+
+    out_zarr = mod.convert_fits_dir_to_zarr(
+        input_dir=tmp_path,
+        out_dir=tmp_path / "zarr_out",
+        zarr_name="preserve_f4.zarr",
+        fixed_dir=tmp_path / "fixed",
+        chunk_lm=4,
+        rebuild=True,
+        sky_dtype="preserve",
+        consolidate_metadata_at_end=False,
+    )
+    assert mod._sky_dtype_from_zarr(out_zarr) == np.dtype(np.float32)
+    assert np.dtype(zarr.open(out_zarr / "SKY", mode="r").dtype) == np.dtype(np.float32)

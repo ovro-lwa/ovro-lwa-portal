@@ -2868,6 +2868,79 @@ def _bitpix_for_sky_numpy_dtype(dtype: np.dtype | type[np.floating] | str) -> in
     return -64
 
 
+def _sky_numpy_dtype_from_fits_bitpix(bitpix: int) -> np.dtype:
+    """Map FITS ``BITPIX`` to the on-disk floating ``SKY`` dtype used by convert.
+
+    Floating FITS (``-32`` / ``-64``) map to ``float32`` / ``float64``. Integer
+    ``BITPIX`` (scaled images) maps to ``float32`` because :func:`_fix_headers`
+    expands ``BSCALE``/``BZERO`` into float32 physical pixels.
+    """
+    bp = int(bitpix)
+    if bp == -64:
+        return np.dtype(np.float64)
+    if bp == -32:
+        return np.dtype(np.float32)
+    if bp in (8, 16, 32):
+        return np.dtype(np.float32)
+    msg = (
+        f"Unsupported FITS BITPIX={bp} for sky_dtype='preserve'; "
+        "expected -32, -64, or integer 8/16/32"
+    )
+    raise ValueError(msg)
+
+
+def _sky_numpy_dtype_from_fits_path(fp: Path) -> np.dtype:
+    """Read image-HDU ``BITPIX`` from *fp* and map it to a native float dtype."""
+    hdr = _getheader_for_ingest(fp)
+    if "BITPIX" not in hdr:
+        msg = f"FITS file {fp} has no BITPIX card; cannot resolve sky_dtype='preserve'"
+        raise ValueError(msg)
+    return _sky_numpy_dtype_from_fits_bitpix(int(hdr["BITPIX"]))
+
+
+def _resolve_preserve_sky_dtype_from_fits_paths(
+    paths: Sequence[Path],
+    *,
+    sample_limit: int = 32,
+) -> np.dtype:
+    """Resolve ``sky_dtype='preserve'`` from input FITS ``BITPIX`` values.
+
+    Samples up to *sample_limit* paths (evenly spaced). All sampled files must
+    resolve to the same float kind; mixed float32/float64 raises ``ValueError``.
+    """
+    files = [Path(p) for p in paths]
+    if not files:
+        msg = "Cannot resolve sky_dtype='preserve': no input FITS paths"
+        raise ValueError(msg)
+    if len(files) <= sample_limit:
+        sample = files
+    else:
+        idxs = np.linspace(0, len(files) - 1, num=sample_limit, dtype=int)
+        sample = [files[int(i)] for i in dict.fromkeys(idxs.tolist())]
+
+    resolved: list[np.dtype] = []
+    for fp in sample:
+        resolved.append(_sky_numpy_dtype_from_fits_path(fp))
+    unique = {dt.str for dt in resolved}
+    if len(unique) != 1:
+        msg = (
+            "sky_dtype='preserve' found mixed FITS BITPIX→dtype among sampled inputs: "
+            f"{sorted(unique)}. Pass sky_dtype='float32' or 'float64' explicitly."
+        )
+        raise ValueError(msg)
+    return resolved[0]
+
+
+def _cast_sky_to_dtype(ds: xr.Dataset, dtype: np.dtype | type[np.floating] | str) -> xr.Dataset:
+    """Cast ``SKY`` (only) to *dtype* when present and mismatched."""
+    if "SKY" not in ds.data_vars:
+        return ds
+    target = _native_float_dtype(dtype)
+    if np.dtype(ds["SKY"].dtype) == target:
+        return ds
+    return ds.assign(SKY=ds["SKY"].astype(target, copy=False))
+
+
 def _sky_dtype_mode_from_numpy(dtype: np.dtype | type[np.floating] | str) -> Literal["float32", "float64"]:
     """Map a floating numpy dtype to an explicit cast mode (not ``preserve``)."""
     native = _native_float_dtype(dtype)
@@ -2877,7 +2950,13 @@ def _sky_dtype_mode_from_numpy(dtype: np.dtype | type[np.floating] | str) -> Lit
 
 
 def _resolve_sky_numpy_dtype(sky: xr.DataArray, mode: SkyDtypeMode | str) -> np.dtype:
-    """Resolve the native numpy dtype to use for ``SKY`` under *mode*."""
+    """Resolve the native numpy dtype to use for ``SKY`` under *mode*.
+
+    ``preserve`` without a prior FITS resolution falls back to the in-memory
+    floating kind of *sky* (native endian). Prefer resolving ``preserve`` from
+    input FITS ``BITPIX`` in :func:`convert_fits_dir_to_zarr` so write policy
+    matches the source files.
+    """
     resolved_mode = _normalize_sky_dtype_mode(mode)
     if resolved_mode == "preserve":
         if not np.issubdtype(sky.dtype, np.floating):
@@ -3348,13 +3427,28 @@ def _reproject_celestial_plane(
     w_src: WCS,
     w_tgt: WCS,
     shape_out: tuple[int, int],
+    *,
+    out_dtype: np.dtype | type[np.floating] | str | None = None,
 ) -> NDArray[np.floating]:
+    """Reproject a 2D plane; interpolate in float64 then cast back to *out_dtype*.
+
+    When *out_dtype* is omitted, the output matches the floating kind of *plane*
+    (float32/float64 by itemsize) so accidental float64 promotion does not stick.
+    """
     from reproject import reproject_interp
 
+    src = np.asarray(plane)
+    if out_dtype is None:
+        if np.issubdtype(src.dtype, np.floating):
+            target = _native_float_dtype(src.dtype)
+        else:
+            target = np.dtype(np.float32)
+    else:
+        target = _native_float_dtype(out_dtype)
     rep, _ = reproject_interp(
-        (np.asarray(plane, dtype=np.float64), w_src), w_tgt, shape_out=shape_out
+        (np.asarray(src, dtype=np.float64), w_src), w_tgt, shape_out=shape_out
     )
-    return np.asarray(rep)
+    return np.asarray(rep, dtype=target)
 
 
 def _resample_lm_reference_to_target_size(
@@ -3415,14 +3509,17 @@ def _resample_lm_reference_to_target_size(
             for idx in np.ndindex(lead_shape):
                 plane = np.asarray(arr[idx], dtype=np.float64)
                 plane_ml = plane.T
-                rep_ml = _reproject_celestial_plane(plane_ml, w_src, w_tgt, shape_out)
-                out_lm = np.asarray(rep_ml).T
-                out_arr[idx] = out_lm.astype(out_dtype, copy=False)
+                rep_ml = _reproject_celestial_plane(
+                    plane_ml, w_src, w_tgt, shape_out, out_dtype=out_dtype
+                )
+                out_arr[idx] = np.asarray(rep_ml).T
         else:
             plane = np.asarray(arr, dtype=np.float64)
             plane_ml = plane.T
-            rep_ml = _reproject_celestial_plane(plane_ml, w_src, w_tgt, shape_out)
-            out_arr = np.asarray(rep_ml).T.astype(arr.dtype, copy=False)
+            rep_ml = _reproject_celestial_plane(
+                plane_ml, w_src, w_tgt, shape_out, out_dtype=arr.dtype
+            )
+            out_arr = np.asarray(rep_ml).T
         replaced[name] = xr.DataArray(out_arr, dims=out_dims, attrs=dict(dv.attrs))
 
     if not replaced:
@@ -3740,12 +3837,18 @@ def _regrid_to_reference_lm(
         target_l = ref["l"].load() if hasattr(ref["l"].data, "compute") else ref["l"]
         target_m = ref["m"].load() if hasattr(ref["m"].data, "compute") else ref["m"]
 
+        sky_dtype_before: np.dtype | None = None
+        if "SKY" in xds.data_vars and np.issubdtype(xds["SKY"].dtype, np.floating):
+            sky_dtype_before = _native_float_dtype(xds["SKY"].dtype)
         try:
             regridded = xds.interp(l=target_l, m=target_m, method="linear")
         except Exception as exc:
             who = f"{source_label}: " if source_label else ""
             msg = f"{who}LM regridding onto reference grid failed: {exc}"
             raise RuntimeError(msg) from exc
+        # xarray.interp often promotes float32→float64; restore FITS-native kind.
+        if sky_dtype_before is not None:
+            regridded = _cast_sky_to_dtype(regridded, sky_dtype_before)
 
     # Recompute sky coords on ref's pixel grid using the source's per-time CRVAL so
     # every subband at one time step shares identical RA/Dec regardless of which path
@@ -5825,10 +5928,12 @@ def convert_fits_dir_to_zarr(
         *input_dir*. Use when converting one time group at a time but the axis
         must reflect all subbands across the full observation set.
     sky_dtype
-        On-disk ``SKY`` floating dtype policy: ``"preserve"`` (default; keep the
-        post-combine float32/float64 kind, native endian), ``"float32"``, or
-        ``"float64"``. On append, a mismatch with the existing store casts the
-        incoming step to the store dtype.
+        On-disk ``SKY`` floating dtype policy: ``"preserve"`` (default) reads
+        input FITS ``BITPIX`` and uses that float kind (``-32``→float32,
+        ``-64``→float64; scaled integer BITPIX→float32) for combine/regrid cast
+        and Zarr write; ``"float32"`` / ``"float64"`` force that cast. On append,
+        a mismatch with the existing store casts the incoming step to the store
+        dtype.
     resume
         When True (default) and *rebuild* is False, skip time keys already present in
         an existing output Zarr via :func:`_filter_completed_time_keys`. Set False to
@@ -5893,10 +5998,6 @@ def convert_fits_dir_to_zarr(
         msg = f"lm_reference_target_size must be positive, got {lm_reference_target_size}"
         raise ValueError(msg)
     sky_dtype_mode = _normalize_sky_dtype_mode(sky_dtype)
-    logger.info(
-        "SKY dtype mode: %s (resolved per write; append casts to store dtype on mismatch)",
-        sky_dtype_mode,
-    )
 
     discovery_metadata: Dict[Path, _DiscoveryFileMetadata] = {}
     if progress_callback is not None:
@@ -5926,6 +6027,21 @@ def convert_fits_dir_to_zarr(
         by_time = _filter_lst_color_groups_with_mismatched_header_times(by_time)
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
+
+    if sky_dtype_mode == "preserve":
+        all_paths = [fp for files in by_time.values() for fp in files]
+        fits_dt = _resolve_preserve_sky_dtype_from_fits_paths(all_paths)
+        sky_dtype_mode = _sky_dtype_mode_from_numpy(fits_dt)
+        logger.info(
+            "SKY dtype mode: preserve → %s (from input FITS BITPIX; "
+            "append casts to store dtype on mismatch)",
+            sky_dtype_mode,
+        )
+    else:
+        logger.info(
+            "SKY dtype mode: %s (resolved per write; append casts to store dtype on mismatch)",
+            sky_dtype_mode,
+        )
     if progress_callback is not None:
         progress_callback(
             "setup",

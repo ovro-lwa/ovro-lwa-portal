@@ -507,9 +507,9 @@ def convert(
         "preserve",
         "--sky-dtype",
         help=(
-            "On-disk SKY floating dtype: preserve (default; keep post-combine "
-            "float32/float64 kind), float32, or float64. Appends cast to the store "
-            "dtype on mismatch."
+            "On-disk SKY floating dtype: preserve (default; from input FITS "
+            "BITPIX: -32→float32, -64→float64), float32, or float64. Appends cast "
+            "to the store dtype on mismatch."
         ),
         case_sensitive=False,
     ),
@@ -905,9 +905,9 @@ def dewarp_convert(
         "preserve",
         "--sky-dtype",
         help=(
-            "On-disk SKY floating dtype: preserve (default; keep post-combine "
-            "float32/float64 kind), float32, or float64. Appends cast to the store "
-            "dtype on mismatch."
+            "On-disk SKY floating dtype: preserve (default; from input FITS "
+            "BITPIX: -32→float32, -64→float64), float32, or float64. Appends cast "
+            "to the store dtype on mismatch."
         ),
         case_sensitive=False,
     ),

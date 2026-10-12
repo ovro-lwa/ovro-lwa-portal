@@ -130,14 +130,16 @@ Conversion writes floating-point `SKY` only. Scaled-integer FITS
 (`BITPIX` + `BSCALE`/`BZERO`) are expanded to float at header-fix time;
 integer pixels are **not** stored in Zarr.
 
-- **`preserve` (default):** keep the post-combine floating kind
-  (`float32` or `float64`), normalized to native little-endian on write.
-- **`float32` / `float64`:** cast `SKY` before each Zarr write.
+- **`preserve` (default):** read input FITS `BITPIX` and use that float kind
+  for convert and Zarr write (`-32`→`float32`, `-64`→`float64`; integer
+  BITPIX→`float32` after scale expansion). Regrid/reproject may use float64
+  intermediates but cast `SKY` back to the FITS-resolved kind.
+- **`float32` / `float64`:** force that cast regardless of FITS BITPIX.
 - **Append:** if the incoming step dtype differs from the existing store
   `SKY` dtype, the step is cast to the store dtype and a warning is logged.
 
-Use `--sky-dtype float32` when store size matters; `preserve` can still
-write float64 if combine/regrid promotes intermediates.
+Typical OVRO float32 FITS (`BITPIX=-32`) therefore write `<f4` under the
+default. Pass `--sky-dtype float64` only when you intentionally want double.
 
 ## File Naming Convention
 
