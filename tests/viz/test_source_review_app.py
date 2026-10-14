@@ -28,6 +28,45 @@ def test_astrowidget_update_slice_supports_view_lock() -> None:
     assert "overlay_view_lock" in SkyWidget.class_trait_names()
 
 
+def test_source_review_accepts_remote_zarr_url(tmp_path: Path) -> None:
+    """Remote URLs skip local Path validation and stay as open_dataset strings."""
+    review = SourceReview(
+        "s3://bucket/obs.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=True,
+        storage_options={"anon": True},
+    )
+    assert review._zarr_path == "s3://bucket/obs.zarr"
+    assert review._zarr_source_type == "remote"
+    assert review._storage_options == {"anon": True}
+
+
+def test_source_review_resolves_local_zarr(tmp_path: Path) -> None:
+    import xarray as xr
+
+    zarr_path = tmp_path / "obs.zarr"
+    xr.Dataset({"SKY": (["time"], [1.0])}, coords={"time": [0]}).to_zarr(zarr_path)
+    review = SourceReview(
+        zarr_path,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=True,
+    )
+    assert Path(review._zarr_path) == zarr_path.resolve()
+    assert review._zarr_source_type == "local"
+
+
 def test_serve_sky_widget_coerces_null_background_cuts() -> None:
     """JSON null from ipywidgets_bokeh must not raise on Float HiPS cut traits."""
     import math

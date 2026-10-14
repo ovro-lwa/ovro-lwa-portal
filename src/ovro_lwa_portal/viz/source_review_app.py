@@ -230,7 +230,7 @@ class SourceReview(param.Parameterized):
 
     def __init__(
         self,
-        zarr_path: Path,
+        zarr_path: str | Path,
         *,
         coordinate_string: str = "",
         known_sources_path: Path | None = None,
@@ -239,11 +239,20 @@ class SourceReview(param.Parameterized):
         patch_fit_max_reduced_chi_squared: float,
         config: SourceReviewConfig | None = None,
         validate_zarr: bool = True,
+        storage_options: dict[str, Any] | None = None,
         dispatch_override: Callable[[Callable[[], None]], None] | None = None,
         ui_session: PanelUISession | None = None,
         **params,
     ) -> None:
-        self._zarr_path = Path(zarr_path)
+        # Keep the caller value until widgets exist so local validation errors can
+        # land in the activity log. Do not wrap remote URLs in Path (s3:// mangling).
+        self._zarr_path_input: str | Path = zarr_path
+        self._zarr_path = (
+            str(zarr_path.expanduser()) if isinstance(zarr_path, Path) else str(zarr_path)
+        )
+        self._zarr_source_type = "local"
+        self._storage_options = dict(storage_options) if storage_options else None
+        self._validate_zarr = bool(validate_zarr)
         self._known_sources_path = Path(known_sources_path) if known_sources_path else None
         if self._known_sources_path is not None:
             self._known_source_names = load_known_sources(self._known_sources_path)
@@ -467,24 +476,32 @@ class SourceReview(param.Parameterized):
             "**Enter a coordinate** (`RA°, Dec°` or source name), then click "
             "**Center** or **Generate heatmap**."
         )
-        if validate_zarr:
-            try:
-                resolved = ovro.validate_local_zarr_store(self._zarr_path)
-                if resolved != self._zarr_path.resolve():
-                    self._log(f"Resolved Zarr path: {resolved}")
-                    self._zarr_path = resolved
-            except (FileNotFoundError, DataSourceError) as exc:
-                self.loading = False
-                self._refresh_loading_widget(False)
-                self._log(f"ERROR: {exc}")
-                self._set_status(
-                    "**Invalid Zarr path** — correct `ZARR_PATH` in the config cell "
-                    "and re-run the launch cell."
-                )
-                return
+        self._open_scheduled = False
+        try:
+            resolved = ovro.resolve_zarr_source(
+                self._zarr_path_input,
+                storage_options=self._storage_options,
+                validate_local=self._validate_zarr,
+            )
+        except (FileNotFoundError, DataSourceError) as exc:
+            self.loading = False
+            self._refresh_loading_widget(False)
+            self._log(f"ERROR: {exc}")
+            self._set_status(
+                "**Invalid Zarr path** — correct `ZARR_PATH` in the config cell "
+                "and re-run the launch cell."
+            )
+            self._refresh_log_widget()
+            return
+        self._zarr_path = resolved.open_source
+        self._zarr_source_type = resolved.source_type
+        self._storage_options = resolved.storage_options
+        if resolved.open_source != resolved.original_source:
+            self._log(f"Resolved Zarr path: {resolved.open_source}")
+        if resolved.source_type != "local":
+            self._log(f"Zarr source type: {resolved.source_type}")
         self._log_dask_dashboard()
         self._refresh_log_widget()
-        self._open_scheduled = False
 
     @property
     def panel(self) -> pn.Column:
@@ -1520,7 +1537,11 @@ class SourceReview(param.Parameterized):
             t_open = time.perf_counter()
 
             t_meta = time.perf_counter()
-            ds = ovro.open_dataset(self._zarr_path, chunks="auto").chunk(
+            ds = ovro.open_dataset(
+                self._zarr_path,
+                chunks="auto",
+                storage_options=self._storage_options,
+            ).chunk(
                 {"l": self._config.zarr_lm_chunk, "m": self._config.zarr_lm_chunk}
             )
             if self._config.polarization_isel is not None and "polarization" in ds.dims:

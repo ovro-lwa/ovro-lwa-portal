@@ -10,8 +10,9 @@ import difflib
 import json
 import re
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
 import xarray as xr
@@ -19,8 +20,10 @@ import xarray as xr
 __all__ = [
     "DataSourceError",
     "LmChunkSummary",
+    "ResolvedZarrSource",
     "open_dataset",
     "resolve_source",
+    "resolve_zarr_source",
     "summarize_lm_chunks",
     "validate_local_zarr_store",
     "warn_if_suboptimal_lm_chunks",
@@ -377,6 +380,113 @@ def validate_local_zarr_store(source: str | Path) -> Path:
         raise DataSourceError("\n".join(lines))
 
     return resolved
+
+
+@dataclass(frozen=True)
+class ResolvedZarrSource:
+    """Normalized Zarr source ready for :func:`open_dataset`.
+
+    Attributes
+    ----------
+    source_type
+        ``"local"``, ``"remote"``, or ``"doi"``.
+    open_source
+        String to pass as the ``source`` argument of :func:`open_dataset`.
+        Local stores are absolute paths when ``validate_local`` was True.
+    original_source
+        Caller-supplied source string (before local path resolution).
+    storage_options
+        Optional filesystem options to forward to :func:`open_dataset`
+        (e.g. S3 credentials). Unchanged by this helper except for a shallow
+        copy when provided.
+    """
+
+    source_type: Literal["local", "remote", "doi"]
+    open_source: str
+    original_source: str
+    storage_options: dict[str, Any] | None = None
+
+
+def _source_input_as_string(source: str | Path) -> str:
+    """Convert *source* to a string without mangling remote URL schemes.
+
+    ``pathlib.Path`` collapses ``s3://bucket/key`` to ``s3:/bucket/key`` on
+    POSIX. Remote / DOI identifiers must therefore be passed as ``str``.
+    """
+    if isinstance(source, Path):
+        return str(source.expanduser())
+    return str(source)
+
+
+def resolve_zarr_source(
+    source: str | Path,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    validate_local: bool = True,
+) -> ResolvedZarrSource:
+    """Normalize a Zarr path/URL/DOI for :func:`open_dataset`.
+
+    Local paths are optionally checked with :func:`validate_local_zarr_store`
+    so typos fail before an expensive open. Remote URLs (``s3://``, ``https://``,
+    …) and DOI strings are returned as-is for :func:`open_dataset` to load
+    (DOI resolution still happens inside ``open_dataset``).
+
+    Parameters
+    ----------
+    source
+        Local filesystem path, remote URL, or DOI. Use a plain ``str`` for
+        ``s3://`` / ``https://`` / DOI values — do not wrap them in
+        ``pathlib.Path``.
+    storage_options
+        Optional credentials / filesystem options forwarded to
+        :func:`open_dataset`.
+    validate_local
+        If True (default), require a readable local Zarr group when the source
+        is local. Ignored for remote and DOI sources.
+
+    Returns
+    -------
+    ResolvedZarrSource
+        ``open_source`` is safe to pass to :func:`open_dataset`.
+
+    Raises
+    ------
+    FileNotFoundError, DataSourceError
+        From :func:`validate_local_zarr_store` when ``validate_local`` is True
+        and the local path is missing or not a Zarr store.
+
+    Examples
+    --------
+    >>> info = resolve_zarr_source("/data/obs.zarr")
+    >>> info.source_type
+    'local'
+    >>> info = resolve_zarr_source("s3://bucket/obs.zarr", validate_local=False)
+    >>> info.open_source
+    's3://bucket/obs.zarr'
+    """
+    original = _source_input_as_string(source)
+    source_type, normalized = _detect_source_type(original)
+    opts = dict(storage_options) if storage_options else None
+
+    if source_type == "local":
+        if validate_local:
+            open_source = str(validate_local_zarr_store(normalized))
+        else:
+            open_source = str(Path(normalized).expanduser())
+    else:
+        # remote / doi — keep the string open_dataset understands (no Path)
+        open_source = normalized
+
+    if source_type not in ("local", "remote", "doi"):
+        msg = f"Unexpected source type from detector: {source_type!r}"
+        raise DataSourceError(msg)
+
+    return ResolvedZarrSource(
+        source_type=source_type,
+        open_source=open_source,
+        original_source=original,
+        storage_options=opts,
+    )
 
 
 def _chunk_sizes_on_axis(chunk_size: int, axis_length: int) -> tuple[int, ...]:
