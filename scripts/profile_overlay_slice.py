@@ -45,6 +45,14 @@ from astrowidget import SkyWidget
 from astrowidget.cube import PreloadedCube
 from astrowidget.wcs import get_wcs, reproject_for_shader_display
 
+from ovro_lwa_portal import open_dataset
+from ovro_lwa_portal.io import cap_lm_chunks
+
+
+def _open_review(path: Path, lm_cap: int = 512) -> xr.Dataset:
+    """Open with native chunks, splitting l/m only where they exceed ``lm_cap``."""
+    return cap_lm_chunks(open_dataset(path, chunks={}), lm_cap)
+
 
 def _make_wcs_header(ra: float = 350.85, dec: float = 58.815) -> str:
     w = WCS(naxis=2)
@@ -145,14 +153,17 @@ def _profile_cube_stages(
     label: str,
     repeats: int,
 ) -> dict[str, list[float]]:
-    timings: dict[str, list[float]] = {k: [] for k in (
-        "get_wcs",
-        "zarr_slice_load",
-        "reproject_shader",
-        "percentile_scale",
-        "trait_bytes",
-        "total_push_frame",
-    )}
+    timings: dict[str, list[float]] = {
+        k: []
+        for k in (
+            "get_wcs",
+            "zarr_slice_load",
+            "reproject_shader",
+            "percentile_scale",
+            "trait_bytes",
+            "total_push_frame",
+        )
+    }
 
     from astrowidget.wcs import adjust_wcs_for_array_stride, wcs_projection_matches_naive_shader
 
@@ -161,9 +172,7 @@ def _profile_cube_stages(
 
         with _timer("get_wcs", timings):
             wcs = get_wcs(ds, time_idx=time_idx)
-            display_wcs = adjust_wcs_for_array_stride(
-                wcs, cube.stride_l, cube.stride_m
-            )
+            display_wcs = adjust_wcs_for_array_stride(wcs, cube.stride_l, cube.stride_m)
 
         with _timer("zarr_slice_load", timings):
             data = cube.image(time_idx, freq_idx)
@@ -338,8 +347,10 @@ def _benchmark_send_state_gating(
     gated_ms = (time.perf_counter() - t0) * 1000.0
     gated_sends = send_calls["count"]
 
-    print(f"\n=== send_state comm simulation ({n_rapid} rapid update_slice, "
-          f"{comm_delay_s * 1000:.0f} ms/send) ===")
+    print(
+        f"\n=== send_state comm simulation ({n_rapid} rapid update_slice, "
+        f"{comm_delay_s * 1000:.0f} ms/send) ==="
+    )
     print(f"  always send_state: {always_ms:.0f} ms total, {always_sends} sends")
     print(f"  revision-gated:    {gated_ms:.0f} ms total, {gated_sends} sends")
 
@@ -367,7 +378,6 @@ def main(argv: list[str] | None = None) -> int:
     center = SkyCoord(ra=350.85 * u.deg, dec=58.815 * u.deg, frame="icrs")
 
     if args.zarr_path:
-        from ovro_lwa_portal import open_dataset
         from ovro_lwa_portal.io import summarize_lm_chunks
 
         zarr_path = Path(args.zarr_path)
@@ -380,9 +390,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         except Exception as exc:
             print(f"  on-disk chunk summary unavailable: {exc}")
-        print(f"Loading {zarr_path} (chunks auto + l/m=512)…")
+        print(f"Loading {zarr_path} (native chunks, l/m ≤ 512)…")
         t0 = time.perf_counter()
-        ds = open_dataset(zarr_path, chunks="auto").chunk({"l": 512, "m": 512})
+        ds = _open_review(zarr_path)
         print(f"  open_dataset ready in {(time.perf_counter() - t0):.2f} s")
         print(f"  shape: {dict(ds.sizes)}  SKY chunks: {ds['SKY'].chunks}")
     else:
@@ -392,9 +402,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Building synthetic Zarr at {tmp} …")
         ds_mem = _build_dataset(n_time=args.n_time, n_freq=args.n_freq, n_l=n_l, n_m=n_l)
         _write_zarr(ds_mem, tmp, lm_chunk=512)
-        from ovro_lwa_portal import open_dataset
-
-        ds = open_dataset(tmp, chunks="auto").chunk({"l": 512, "m": 512})
+        ds = _open_review(tmp)
         print(f"  shape: {dict(ds.sizes)}  SKY chunks: {ds['SKY'].chunks}")
 
     cube = PreloadedCube(ds, max_size=max_size)
@@ -478,13 +486,15 @@ def main(argv: list[str] | None = None) -> int:
         for lm_chunk in (n_l, 512, 128):
             p = Path(tempfile.gettempdir()) / f"overlay_profile_c{lm_chunk}_{uuid.uuid4().hex}.zarr"
             _write_zarr(ds_mem, p, lm_chunk=lm_chunk)
-            ds_c = open_dataset(p, chunks="auto").chunk({"l": 512, "m": 512})
+            ds_c = _open_review(p)
             c = PreloadedCube(ds_c, max_size=max_size)
             c._load_slice.cache_clear()
             t0 = time.perf_counter()
             _ = c.image(t_mid, f_mid)
             dt = time.perf_counter() - t0
-            print(f"  lm_chunk={lm_chunk:4d}  cold load={dt * 1000:7.1f} ms  SKY chunks={ds_c['SKY'].chunks}")
+            print(
+                f"  lm_chunk={lm_chunk:4d}  cold load={dt * 1000:7.1f} ms  SKY chunks={ds_c['SKY'].chunks}"
+            )
 
     return 0
 

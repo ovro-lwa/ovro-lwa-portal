@@ -19,6 +19,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -27,6 +28,9 @@ import numpy as np
 import xarray as xr
 from scipy import interpolate
 from scipy.optimize import least_squares
+
+from ovro_lwa_portal.dynspec_fill import TrackedPixelReader, plan_fill_units
+from ovro_lwa_portal.zarr_direct import DirectZarrArray, direct_zarr_array, read_workers
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -240,6 +244,42 @@ def _maybe_load(da: xr.DataArray) -> xr.DataArray:
         if hasattr(da, "load"):
             da = da.load()
     return da
+
+
+def _read_spectrum_direct(
+    direct: DirectZarrArray,
+    sky: xr.DataArray,
+    *,
+    pol: int,
+    l_indices: np.ndarray,
+    m_indices: np.ndarray,
+    visible: np.ndarray,
+    progress_callback: RadportProgressCallback | None,
+    message: str,
+) -> np.ndarray:
+    """``(time, frequency)`` values at per-time pixels, one thread per on-disk chunk."""
+    n_t, n_f = int(direct.shape[0]), int(direct.shape[1])
+    units = plan_fill_units(n_t, n_f, int(direct.chunks[0]), int(direct.chunks[1]))
+    reader = TrackedPixelReader(
+        sky,
+        pol_idx=pol,
+        l_indices=l_indices,
+        m_indices=m_indices,
+        visible=visible,
+        direct=direct,
+    )
+    out = np.full((n_t, n_f), np.nan, dtype=np.float32)
+    total = len(units)
+    step = max(1, total // 20)
+    _emit_radport_progress(progress_callback, "extract", 0, total, message)
+    with ThreadPoolExecutor(max_workers=read_workers(direct.chunk_nbytes)) as pool:
+        futures = {pool.submit(reader, unit): unit for unit in units}
+        for done, fut in enumerate(as_completed(futures), start=1):
+            unit = futures[fut]
+            out[unit.t0 : unit.t1, unit.f0 : unit.f1] = fut.result()
+            if done == total or done % step == 0:
+                _emit_radport_progress(progress_callback, "extract", done, total, message)
+    return out
 
 
 @contextlib.contextmanager
@@ -4030,23 +4070,26 @@ class RadportAccessor:
             # Fixed pixel path (l/m) — single pixel across all times/freqs.
             # Eagerly load small results to avoid dask graph overhead.
             l_idx, m_idx = result
-            _emit_radport_progress(
-                progress_callback,
-                "extract",
-                0,
-                1,
-                "Reading tracked pixel (all times and frequencies)",
-            )
-            da = _maybe_load(
-                self._obj[var].isel(l=l_idx, m=m_idx, polarization=pol)
-            )
-            _emit_radport_progress(
-                progress_callback,
-                "extract",
-                1,
-                1,
-                "Reading tracked pixel (all times and frequencies)",
-            )
+            message = "Reading tracked pixel (all times and frequencies)"
+            template = self._obj[var].isel(l=l_idx, m=m_idx, polarization=pol)
+            direct = direct_zarr_array(self._obj, var)
+            if direct is not None:
+                n_t = int(self._obj.sizes["time"])
+                values = _read_spectrum_direct(
+                    direct,
+                    self._obj[var],
+                    pol=pol,
+                    l_indices=np.full(n_t, int(l_idx)),
+                    m_indices=np.full(n_t, int(m_idx)),
+                    visible=np.ones(n_t, dtype=bool),
+                    progress_callback=progress_callback,
+                    message=message,
+                )
+                da = template.copy(data=values.astype(template.dtype, copy=False))
+            else:
+                _emit_radport_progress(progress_callback, "extract", 0, 1, message)
+                da = _maybe_load(template)
+                _emit_radport_progress(progress_callback, "extract", 1, 1, message)
 
             if "time" in da.dims:
                 da = da.sortby("time")
@@ -4073,18 +4116,29 @@ class RadportAccessor:
         time_coords = self._obj.coords["time"].values
         freq_coords = self._obj.coords["frequency"].values
 
-        # Build output array, NaN-filled
-        out = np.full((n_times, n_freqs), np.nan)
-
-        vis_times, pixel_rows = self._extract_tracked_pixel_vectors(
-            data_var,
-            l_indices=l_indices,
-            m_indices=m_indices,
-            visible=visible,
-            progress_callback=progress_callback,
-        )
-        for ti, row in zip(vis_times, pixel_rows, strict=True):
-            out[int(ti)] = np.asarray(row)
+        direct = direct_zarr_array(self._obj, var)
+        if direct is not None:
+            out = _read_spectrum_direct(
+                direct,
+                self._obj[var],
+                pol=pol,
+                l_indices=np.asarray(l_indices, dtype=int),
+                m_indices=np.asarray(m_indices, dtype=int),
+                visible=np.asarray(visible, dtype=bool),
+                progress_callback=progress_callback,
+                message=f"Extracting {int(np.count_nonzero(visible))} tracked pixels",
+            ).astype(np.float64)
+        else:
+            out = np.full((n_times, n_freqs), np.nan)
+            vis_times, pixel_rows = self._extract_tracked_pixel_vectors(
+                data_var,
+                l_indices=l_indices,
+                m_indices=m_indices,
+                visible=visible,
+                progress_callback=progress_callback,
+            )
+            for ti, row in zip(vis_times, pixel_rows, strict=True):
+                out[int(ti)] = np.asarray(row)
 
         da = xr.DataArray(
             out,

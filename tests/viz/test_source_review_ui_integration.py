@@ -12,15 +12,18 @@ import numpy as np
 import pytest
 import xarray as xr
 from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
 
 pn = pytest.importorskip("panel")
 pytest.importorskip("astrowidget")
 
+from ovro_lwa_portal import fov_overlay, open_dataset
 from ovro_lwa_portal.viz import pipeline_qa_app as pqa
 from ovro_lwa_portal.viz import source_review_app as sra
 from ovro_lwa_portal.viz.source_review import DatasetLoad, run_dataset_load
 from ovro_lwa_portal.viz.source_review_app import SourceReview, SourceReviewConfig
 from ovro_lwa_portal.viz.source_review_data import HeatmapLoad, build_source_from_coordinate
+from ovro_lwa_portal.zarr_direct import DirectZarrArray
 from tests.viz.panel_ui_testkit import PanelUITestHarness, QueuedIOLoop
 
 CAS_A = SkyCoord(ra=350.85 * u.deg, dec=58.815 * u.deg, frame="icrs")
@@ -1546,6 +1549,98 @@ def test_dynamic_spectrum_generate_paints_click_without_moving_overlay(
     assert mutation_calls
     assert publish_calls == []
     _assert_heatmap_bokeh_model_live(harness, review)
+
+
+def _zarr_backed_dataset(review: SourceReview, tmp_path: Path) -> xr.Dataset:
+    """Reopen the seeded dataset from a 5-D Zarr store so reads can go direct."""
+    seeded = review._dataset
+    assert seeded is not None
+    sky = np.zeros((6, 4, 1, 8, 8), dtype=np.float32)
+    sky[:, :, 0, 2, 3] = 12.5
+    ds = xr.Dataset(
+        {"SKY": (("time", "frequency", "polarization", "l", "m"), sky)},
+        coords={**{k: seeded.coords[k] for k in ("time", "frequency", "l", "m")}, "polarization": [1]},
+    )
+    path = tmp_path / "direct.zarr"
+    ds.to_zarr(path, mode="w", consolidated=True, encoding={"SKY": {"chunks": (2, 4, 1, 4, 4)}})
+    opened = open_dataset(path, chunks={}, validate=False)
+    review._dataset = opened
+    return opened
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore:Zarr store .* has small on-disk l/m chunks:UserWarning")
+def test_zarr_backed_store_reads_spectrum_and_cutout_direct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generate and heatmap taps read on-disk chunks directly, not through Dask."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    _zarr_backed_dataset(review, tmp_path)
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    direct_reads: list[str] = []
+    real_column = DirectZarrArray.column
+    real_getitem = DirectZarrArray.__getitem__
+
+    def _column(self: DirectZarrArray, *args: object, **kwargs: object) -> np.ndarray:
+        direct_reads.append("column")
+        return real_column(self, *args, **kwargs)
+
+    def _getitem(self: DirectZarrArray, key: tuple) -> np.ndarray:
+        direct_reads.append("plane")
+        return real_getitem(self, key)
+
+    monkeypatch.setattr(DirectZarrArray, "column", _column)
+    monkeypatch.setattr(DirectZarrArray, "__getitem__", _getitem)
+
+    widget = _CutoutSky()
+    widget.clicked_coord = (10.25, -20.5)
+    review._sky_widget = widget
+    review.heatmap_method = "dynamic_spectrum"
+    monkeypatch.setattr(
+        review, "_pixel_track", lambda *_a: (np.full(6, 2), np.full(6, 3), np.ones(6, dtype=bool))
+    )
+    review._on_sky_widget_click(None)
+    _flush_jupyter_io(loop)
+    review._on_generate_heatmap()
+    _wait_until(
+        loop,
+        lambda: review._heatmap_values is not None
+        and float(np.nanmax(review._heatmap_values)) == pytest.approx(12.5)
+        and review.loading is False,
+    )
+    assert "column" in direct_reads
+    assert review._direct_sky_array() is not None
+
+    def _wcs(*_args: object, **_kwargs: object) -> WCS:
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---SIN", "DEC--SIN"]
+        wcs.wcs.crval = [180.0, 40.0]
+        wcs.wcs.cdelt = [-1.0, 1.0]
+        wcs.wcs.crpix = [4.5, 4.5]
+        wcs.wcs.cunit = ["deg", "deg"]
+        return wcs
+
+    monkeypatch.setattr(fov_overlay, "celestial_wcs_for_time", _wcs)
+    monkeypatch.setattr(
+        fov_overlay,
+        "_project_native_sin",
+        lambda data, cut_wcs: (np.asarray(data, dtype=np.float32), cut_wcs, 0.2),
+    )
+    review._coord = CAS_A
+    review._on_heatmap_tap(0, 0)
+    _wait_until(loop, lambda: len(widget.pushes) == 1 and widget.opacity == 1.0)
+
+    session = review._fov_session
+    assert session is not None
+    assert isinstance(session.sky_arr, DirectZarrArray)
+    assert session.tile_executor is review._read_pool()
+    assert session.tile_executor is not session.executor
+    assert "plane" in direct_reads
+    assert float(np.nanmax(widget.pushes[0])) == pytest.approx(12.5)
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")

@@ -16,6 +16,8 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
+from ovro_lwa_portal.zarr_direct import DirectZarrArray
+
 
 @dataclass(frozen=True)
 class FillUnit:
@@ -43,8 +45,12 @@ def plan_fill_units(
     ]
 
 
-def spectrum_chunk_lengths(sky: xr.DataArray) -> tuple[int, int]:
-    """On-disk chunk lengths for time and frequency, or the full axis."""
+def spectrum_chunk_lengths(
+    sky: xr.DataArray, direct: DirectZarrArray | None = None
+) -> tuple[int, int]:
+    """Time and frequency chunk lengths: on-disk when ``direct``, else Dask."""
+    if direct is not None:
+        return int(direct.chunks[0]), int(direct.chunks[1])
     return _axis_chunk(sky, "time"), _axis_chunk(sky, "frequency")
 
 
@@ -67,7 +73,8 @@ class TrackedPixelReader:
 
     ``l_indices``, ``m_indices``, and ``visible`` each have length ``n_time``.
     Invisible times stay NaN. A block whose visible times share one pixel is
-    one slice; otherwise each visible time is read on its own.
+    one slice. With ``direct``, a moving pixel is one Zarr coordinate
+    selection; without it, each visible time is read through xarray.
     """
 
     def __init__(
@@ -78,6 +85,7 @@ class TrackedPixelReader:
         l_indices: np.ndarray,
         m_indices: np.ndarray,
         visible: np.ndarray,
+        direct: DirectZarrArray | None = None,
     ) -> None:
         self._sky = sky
         self._has_pol = "polarization" in sky.dims
@@ -85,6 +93,7 @@ class TrackedPixelReader:
         self.l_indices = np.asarray(l_indices, dtype=int)
         self.m_indices = np.asarray(m_indices, dtype=int)
         self.visible = np.asarray(visible, dtype=bool)
+        self.direct = direct
 
     def __call__(self, unit: FillUnit) -> np.ndarray:
         n_t = unit.t1 - unit.t0
@@ -96,6 +105,17 @@ class TrackedPixelReader:
         ls = self.l_indices[unit.t0 : unit.t1]
         ms = self.m_indices[unit.t0 : unit.t1]
         same_pixel = bool(np.all(ls[vis] == ls[vis][0]) and np.all(ms[vis] == ms[vis][0]))
+        direct = self.direct
+        if direct is not None:
+            freqs = slice(unit.f0, unit.f1)
+            if same_pixel and bool(np.all(vis)):
+                out[:] = direct.column(
+                    slice(unit.t0, unit.t1), freqs, self.pol_idx, int(ls[0]), int(ms[0])
+                )
+            else:
+                rows = np.flatnonzero(vis)
+                out[rows] = direct.points(unit.t0 + rows, freqs, self.pol_idx, ls[rows], ms[rows])
+            return out
         if same_pixel and bool(np.all(vis)):
             out[:] = self._column(slice(unit.t0, unit.t1), slice(unit.f0, unit.f1), int(ls[0]), int(ms[0]))
             return out

@@ -30,7 +30,7 @@ from bokeh.models import ColumnDataSource, FixedTicker, HoverTool
 from bokeh.plotting import figure
 
 from ovro_lwa_portal import resolve_coordinate_string
-from ovro_lwa_portal.io import DataSourceError
+from ovro_lwa_portal.io import DataSourceError, cap_lm_chunks
 from ovro_lwa_portal.name_resolution import format_icrs_degree_pair
 from ovro_lwa_portal.viz.hips import compute_hips_percentile_cuts, hips_background_survey_url
 from ovro_lwa_portal.viz.pipeline_qa_app import (
@@ -71,6 +71,7 @@ from ovro_lwa_portal.dynspec_fill import (
     spectrum_chunk_lengths,
 )
 from ovro_lwa_portal.fov_overlay import FovOverlaySession, SkyPlaneReader, attach_fov_pan_reload
+from ovro_lwa_portal.zarr_direct import DirectZarrArray, direct_zarr_array, read_workers
 from ovro_lwa_portal.viz.source_review_data import (
     HEATMAP_METHOD_OPTIONS,
     HeatmapLoad,
@@ -115,6 +116,7 @@ class _HeatmapBokehHandles:
 class SourceReviewConfig:
     """Runtime paths and tuning knobs normally set in the notebook config cell."""
 
+    # Upper bound on Dask l/m chunks; finer on-disk chunks are left as stored.
     zarr_lm_chunk: int = 512
     polarization_isel: tuple[int, ...] | None = None
     skip_first_valid_sky_scan: bool = True
@@ -293,6 +295,8 @@ class SourceReview(param.Parameterized):
         self._sky_widget: SkyWidget | None = None
         self._fov_session: FovOverlaySession | None = None
         self._fov_executor: ThreadPoolExecutor | None = None
+        self._read_executor: ThreadPoolExecutor | None = None
+        self._direct_sky: tuple[xr.Dataset, DirectZarrArray | None] | None = None
         self._fov_pan_attached = False
         self._spectrum_fill: ProgressiveSpectrumFill | None = None
         self._hips_background_url = hips_background_survey_url(
@@ -1541,7 +1545,7 @@ class SourceReview(param.Parameterized):
             self.loading = True
             self._sync_spinner(True)
             self._log(
-                f"Opening {self._zarr_path} (chunks='auto', l/m={self._config.zarr_lm_chunk})…"
+                f"Opening {self._zarr_path} (native chunks, l/m ≤ {self._config.zarr_lm_chunk})…"
             )
 
         self._dispatch(_start)
@@ -1550,12 +1554,13 @@ class SourceReview(param.Parameterized):
             t_open = time.perf_counter()
 
             t_meta = time.perf_counter()
-            ds = ovro.open_dataset(
-                self._zarr_path,
-                chunks="auto",
-                storage_options=self._storage_options,
-            ).chunk(
-                {"l": self._config.zarr_lm_chunk, "m": self._config.zarr_lm_chunk}
+            ds = cap_lm_chunks(
+                ovro.open_dataset(
+                    self._zarr_path,
+                    chunks={},
+                    storage_options=self._storage_options,
+                ),
+                self._config.zarr_lm_chunk,
             )
             if self._config.polarization_isel is not None and "polarization" in ds.dims:
                 pol_sel = tuple(int(i) for i in self._config.polarization_isel)
@@ -1666,6 +1671,15 @@ class SourceReview(param.Parameterized):
             f"Opened — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs, "
             f"{int(ds.sizes['l'])}×{int(ds.sizes['m'])} px, WCS={ds.radport.has_wcs}."
         )
+        direct = self._direct_sky_array()
+        if direct is not None:
+            self._log(
+                f"Chunk reads: Zarr direct, chunks={direct.chunks} "
+                f"({direct.chunk_nbytes / 1e6:.1f} MB), "
+                f"{read_workers(direct.chunk_nbytes)} workers."
+            )
+        else:
+            self._log("Chunk reads: through xarray (store not resolvable for direct reads).")
 
         def _clear_loading() -> None:
             self.loading = False
@@ -1762,8 +1776,8 @@ class SourceReview(param.Parameterized):
 
     def _spectrum_fill_session(self) -> ProgressiveSpectrumFill:
         fill = self._spectrum_fill
-        if fill is None or fill.executor is not self._fov_pool():
-            fill = ProgressiveSpectrumFill(self._fov_pool(), self._schedule_main)
+        if fill is None or fill.executor is not self._read_pool():
+            fill = ProgressiveSpectrumFill(self._read_pool(), self._schedule_main)
             self._spectrum_fill = fill
         return fill
 
@@ -1835,13 +1849,15 @@ class SourceReview(param.Parameterized):
             return
         l_indices, m_indices, visible = tracked
         sky = self._dataset["SKY"]
-        time_chunk, freq_chunk = spectrum_chunk_lengths(sky)
+        direct = self._direct_sky_array()
+        time_chunk, freq_chunk = spectrum_chunk_lengths(sky, direct)
         reader = TrackedPixelReader(
             sky,
             pol_idx=self._pol_idx(),
             l_indices=l_indices,
             m_indices=m_indices,
             visible=visible,
+            direct=direct,
         )
 
         def _paint(values: np.ndarray, done: bool) -> None:
@@ -2166,10 +2182,34 @@ class SourceReview(param.Parameterized):
         self._schedule_ui_action(lambda: self._log(f"Overlay view lock: gesture revision {rev}"))
 
     def _fov_pool(self) -> ThreadPoolExecutor:
+        """Jobs that wait on reads: one overlay cutout, one pixel track."""
         pool = self._fov_executor
         if pool is None:
             pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fov-overlay")
             self._fov_executor = pool
+        return pool
+
+    def _direct_sky_array(self) -> DirectZarrArray | None:
+        """On-disk SKY for chunk reads, or ``None`` to read through xarray."""
+        dataset = self._dataset
+        if dataset is None:
+            return None
+        cached = self._direct_sky
+        if cached is None or cached[0] is not dataset:
+            cached = (dataset, direct_zarr_array(dataset))
+            self._direct_sky = cached
+        return cached[1]
+
+    def _read_pool(self) -> ThreadPoolExecutor:
+        """One task per on-disk chunk; sized from the chunk bytes."""
+        direct = self._direct_sky_array()
+        workers = read_workers(direct.chunk_nbytes) if direct is not None else 4
+        pool = self._read_executor
+        if pool is None or pool._max_workers != workers:
+            if pool is not None:
+                pool.shutdown(wait=False)
+            pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="zarr-read")
+            self._read_executor = pool
         return pool
 
     def _on_fov_pan(self, center: SkyCoord, fov_deg: float) -> None:
@@ -2192,9 +2232,10 @@ class SourceReview(param.Parameterized):
             session = FovOverlaySession(
                 widget,
                 dataset,
-                SkyPlaneReader(dataset["SKY"]),
+                self._sky_plane_reader(),
                 pol_idx=self._pol_idx(),
                 executor=self._fov_pool(),
+                tile_executor=self._read_pool(),
                 debounce_s=0.3,
                 fade_opacity=0.35,
                 schedule_main=self._ui.schedule,
@@ -2206,8 +2247,16 @@ class SourceReview(param.Parameterized):
                 self._fov_pan_attached = True
         else:
             session.pol_idx = self._pol_idx()
-            session.sky_arr = SkyPlaneReader(dataset["SKY"])
+            session.sky_arr = self._sky_plane_reader()
+            session.tile_executor = self._read_pool()
         return session
+
+    def _sky_plane_reader(self) -> DirectZarrArray | SkyPlaneReader:
+        direct = self._direct_sky_array()
+        if direct is not None:
+            return direct
+        assert self._dataset is not None
+        return SkyPlaneReader(self._dataset["SKY"])
 
     def _finish_fov_overlay(
         self,

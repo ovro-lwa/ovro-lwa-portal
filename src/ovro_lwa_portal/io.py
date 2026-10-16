@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
+import numpy as np
 import xarray as xr
 
 __all__ = [
+    "cap_lm_chunks",
     "DataSourceError",
     "LmChunkSummary",
     "ResolvedZarrSource",
@@ -55,6 +57,7 @@ class LmChunkSummary(TypedDict):
 
 
 _MIN_RECOMMENDED_LM_CHUNK = 512
+_MIN_BLOCKED_CHUNK_BYTES = 4 * 1024**2
 
 
 def _is_doi(source: str) -> bool:
@@ -583,16 +586,55 @@ def warn_if_suboptimal_lm_chunks(
     if smallest >= max_achievable:
         return summary
 
+    # Small l/m chunks that span many times and frequencies (the
+    # ``ovro-ingest rechunk`` layout) keep per-chunk bytes large.
+    nbytes = _chunk_nbytes(zarr_path, var)
+    if nbytes is not None and nbytes >= _MIN_BLOCKED_CHUNK_BYTES:
+        return summary
+
     warnings.warn(
         "Zarr store "
         f"{Path(zarr_path).expanduser()} has small on-disk l/m chunks "
         f"(minimum={smallest}, recommended>={min_chunk}). "
-        "Single-slice overlay reads may be slow. Re-ingest with "
-        f"`ovro-ingest convert ... --chunk-lm {min_chunk}` or higher.",
+        "Overlay and spectrum reads open many small chunks. Run "
+        "`ovro-ingest rechunk SOURCE DEST` for the time-blocked review layout, or "
+        f"re-ingest with `ovro-ingest convert ... --chunk-lm {min_chunk}` or higher.",
         UserWarning,
         stacklevel=2,
     )
     return summary
+
+
+def cap_lm_chunks(ds: xr.Dataset, max_lm_chunk: int | None, *, var: str = "SKY") -> xr.Dataset:
+    """Rechunk ``l``/``m`` to ``max_lm_chunk`` only where ``var``'s chunks are larger.
+
+    Splitting 391- or 128-pixel on-disk chunks into 512 merges partial chunks
+    into every Dask task and slows reads; only coarse layouts (e.g. 4096) gain.
+    """
+    if not max_lm_chunk or var not in ds.data_vars:
+        return ds
+    data = ds[var].data
+    chunks = getattr(data, "chunks", None)
+    if not chunks:
+        return ds
+    target: dict[str, int] = {}
+    for dim in ("l", "m"):
+        if dim not in ds[var].dims:
+            continue
+        sizes = chunks[ds[var].get_axis_num(dim)]
+        if max(sizes) > int(max_lm_chunk):
+            target[dim] = int(max_lm_chunk)
+    return ds.chunk(target) if target else ds
+
+
+def _chunk_nbytes(zarr_path: str | Path, var: str) -> int | None:
+    """Decoded bytes per on-disk chunk of ``var``, or ``None`` if unreadable."""
+    zarray_path = Path(zarr_path).expanduser() / var / ".zarray"
+    try:
+        meta = json.loads(zarray_path.read_text(encoding="utf-8"))
+        return int(np.prod(meta["chunks"])) * int(np.dtype(meta["dtype"]).itemsize)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _validate_dataset(ds: xr.Dataset) -> None:
@@ -1075,5 +1117,6 @@ def open_dataset(
         warn_if_suboptimal_lm_chunks(local_zarr_path)
 
     from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
+    from ovro_lwa_portal.zarr_direct import attach_zarr_store
 
-    return strip_redundant_fits_wcs_header_attrs(ds)
+    return attach_zarr_store(strip_redundant_fits_wcs_header_attrs(ds), store)

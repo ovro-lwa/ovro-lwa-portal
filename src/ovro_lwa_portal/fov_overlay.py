@@ -589,6 +589,9 @@ class FovOverlaySession:
     * **zoom out past the cache** — center is still valid, so no fade; one
       debounced read extends the cutout.
     * Empty results are dropped so a good overlay is never replaced by a blank one.
+
+    ``executor`` runs one read job per cutout. ``tile_executor`` runs that job's
+    per-chunk reads and must be a different pool, since the job waits on them.
     """
 
     def __init__(
@@ -599,6 +602,7 @@ class FovOverlaySession:
         *,
         pol_idx: int = 0,
         executor: Executor | None = None,
+        tile_executor: Executor | None = None,
         pad_frac: float = 0.05,
         pan_pad_frac: float = 0.5,
         debounce_s: float = 0.3,
@@ -611,6 +615,7 @@ class FovOverlaySession:
         self.sky_arr = sky_arr
         self.pol_idx = int(pol_idx)
         self.executor = executor
+        self.tile_executor = tile_executor
         self.pad_frac = float(pad_frac)
         self.pan_pad_frac = float(pan_pad_frac)
         self.debounce_s = float(debounce_s)
@@ -663,7 +668,7 @@ class FovOverlaySession:
             center,
             float(fov_deg),
             pol_idx=self.pol_idx,
-            executor=self.executor,
+            executor=self.tile_executor or self.executor,
             pad_frac=self.pan_pad_frac,
             update_view=update_view,
         )
@@ -834,7 +839,7 @@ class FovOverlaySession:
                 self.pol_idx,
                 spec.l_slice,
                 spec.m_slice,
-                executor=None,
+                executor=self.tile_executor,
             )
             l0 = int(spec.l_slice.start or 0)
             m0 = int(spec.m_slice.start or 0)

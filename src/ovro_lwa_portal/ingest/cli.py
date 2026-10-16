@@ -55,6 +55,12 @@ from ovro_lwa_portal.ingest.per_time_convert import (
     PerTimeGlobConvertConfig,
     run_per_time_glob_convert,
 )
+from ovro_lwa_portal.ingest.rechunk import (
+    DEFAULT_LM_CHUNK,
+    DEFAULT_TIME_CHUNK,
+    RechunkConfig,
+    rechunk_store,
+)
 
 __all__ = ["main", "app"]
 
@@ -1871,6 +1877,91 @@ def repair_polarization(
         console.print(f"  After:  {result.get('polarization_after')}")
     elif not dry_run:
         console.print("\n[bold green]✓[/bold green] No changes needed")
+
+
+@app.command()
+def rechunk(
+    source: Path = typer.Argument(
+        ...,
+        help="Finished Zarr store to read (left unchanged)",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    dest: Path = typer.Argument(
+        ...,
+        help="Path for the rechunked copy",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    time_chunk: int = typer.Option(
+        DEFAULT_TIME_CHUNK, "--chunk-time", help="Time steps per chunk"
+    ),
+    freq_chunk: int = typer.Option(
+        0, "--chunk-freq", help="Frequency channels per chunk (0 = all)"
+    ),
+    lm_chunk: int = typer.Option(DEFAULT_LM_CHUNK, "--chunk-lm", help="l and m pixels per chunk"),
+    workers: int = typer.Option(8, "--workers", help="Parallel block copies"),
+    max_unit_gb: float = typer.Option(
+        4.0,
+        "--max-unit-gb",
+        help="Decoded block size per worker in GB (memory is about workers x this)",
+    ),
+    verify_samples: int = typer.Option(
+        64, "--verify-samples", help="Random pixel spectra compared against the source"
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace DEST after the new copy is verified"
+    ),
+) -> None:
+    """Copy a store with image cubes rechunked for interactive review.
+
+    The default layout is 32 times x all frequencies x 1 Stokes x 128 x 128
+    pixels per chunk. Run it once after incremental ingest finishes.
+    """
+    config = RechunkConfig(
+        time_chunk=time_chunk,
+        freq_chunk=freq_chunk,
+        lm_chunk=lm_chunk,
+        workers=workers,
+        max_unit_bytes=int(max_unit_gb * 1024**3),
+        verify_samples=verify_samples,
+    )
+    console.print("\n[bold cyan]OVRO-LWA Zarr rechunk[/bold cyan]")
+    console.print(f"  Source: {source}")
+    console.print(f"  Dest:   {dest}")
+    freq_label = "all" if freq_chunk == 0 else str(freq_chunk)
+    console.print(
+        f"  Chunks: time={time_chunk} frequency={freq_label} polarization=1 l=m={lm_chunk}"
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total} blocks"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as bar:
+        task = bar.add_task("Rechunking", total=None)
+
+        def _progress(done: int, total: int) -> None:
+            bar.update(task, completed=done, total=total)
+
+        try:
+            report = rechunk_store(source, dest, config, overwrite=overwrite, progress=_progress)
+        except Exception as e:
+            console.print(f"\n[bold red]✗[/bold red] Rechunk failed: {e}", style="red")
+            raise typer.Exit(code=1) from e
+
+    console.print("\n[bold green]✓[/bold green] Rechunk completed")
+    for name, info in report["variables"].items():
+        console.print(f"  {name}: {tuple(info['source_chunks'])} → {tuple(info['chunks'])}")
+    console.print(f"  Verified spectra: {report['verified_samples']}")
+    console.print(f"  Size on disk:     {report['bytes_on_disk'] / 1e9:.1f} GB")
+    console.print(f"  Elapsed:          {report['seconds']:.0f} s")
 
 
 @app.command()
