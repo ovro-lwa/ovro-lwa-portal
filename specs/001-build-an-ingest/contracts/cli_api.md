@@ -131,8 +131,8 @@ def convert(
 - MUST provide sensible defaults (FR-004)
 - MUST support rebuild flag (FR-016)
 - MUST support Prefect toggle (FR-022)
-- MUST accept `--sky-dtype {preserve,float32,float64}` (default `preserve`)
-  and print `SKY dtype mode:` in the pre-run summary
+- MUST accept `--sky-dtype {preserve,float32,float64}` (default `preserve`) and
+  print `SKY dtype mode:` in the pre-run summary
 - MUST configure logging based on verbose/quiet flags (FR-028, FR-029)
 - MUST display help with `--help` flag (FR-031)
 - MUST handle keyboard interrupts gracefully (SIGINT)
