@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 import astropy.units as u
 import numpy as np
+import xarray as xr
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -43,8 +44,6 @@ from ovro_lwa_portal.accessor import _read_wcs_header_str
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import xarray as xr
 
 
 @dataclass(frozen=True)
@@ -281,6 +280,49 @@ def read_sky_tile_parallel(
     return out
 
 
+def _axis_chunk(sky: xr.DataArray, dim: str) -> int:
+    """On-disk chunk length along ``dim``, or the full axis when the array is one piece."""
+    size = int(sky.sizes[dim])
+    chunks = getattr(sky.data, "chunks", None)
+    if not chunks:
+        return size
+    axis = int(sky.get_axis_num(dim))
+    if axis >= len(chunks):
+        return size
+    block = chunks[axis]
+    if isinstance(block, tuple):
+        return max(1, int(block[0])) if block else size
+    return max(1, int(block))
+
+
+class SkyPlaneReader:
+    """5-D ``(time, frequency, pol, l, m)`` view of a SKY DataArray.
+
+    Datasets without a polarization axis are exposed as one Stokes plane so
+    tile reads keep a single index order.
+    """
+
+    def __init__(self, sky: xr.DataArray) -> None:
+        self._sky = sky
+        self._has_pol = "polarization" in sky.dims
+        n_pol = int(sky.sizes["polarization"]) if self._has_pol else 1
+        self.shape = (
+            int(sky.sizes["time"]),
+            int(sky.sizes["frequency"]),
+            n_pol,
+            int(sky.sizes["l"]),
+            int(sky.sizes["m"]),
+        )
+        self.chunks = (1, 1, 1, _axis_chunk(sky, "l"), _axis_chunk(sky, "m"))
+
+    def __getitem__(self, key: tuple[Any, ...]) -> np.ndarray:
+        t, f, p, l_slice, m_slice = key
+        sel: dict[str, Any] = {"time": t, "frequency": f, "l": l_slice, "m": m_slice}
+        if self._has_pol:
+            sel["polarization"] = p
+        return np.asarray(self._sky.isel(sel).values, dtype=np.float32)
+
+
 def extract_fov_cutout(
     array: Any,
     t: int,
@@ -382,6 +424,8 @@ def _push_cutout_frame(
     time_idx: int | None = None,
     freq_idx: int | None = None,
     update_view: bool = True,
+    percentile_low: float = 1.0,
+    percentile_high: float = 99.0,
 ) -> dict[str, float | bool]:
     """Push a cutout after one phase-center SIN warp.
 
@@ -392,7 +436,14 @@ def _push_cutout_frame(
     """
     t0 = time.perf_counter()
     projected, naive_wcs, reproject_ms = _project_native_sin(data, cut_wcs)
-    sky.push_shader_frame(projected, naive_wcs, time_idx=time_idx, freq_idx=freq_idx)
+    sky.push_shader_frame(
+        projected,
+        naive_wcs,
+        time_idx=time_idx,
+        freq_idx=freq_idx,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
     if update_view:
         sky.view_ra = float(center.icrs.ra.deg)
         sky.view_dec = float(center.icrs.dec.deg)
@@ -574,6 +625,14 @@ class FovOverlaySession:
         self._logged_skip = False
         self._faded = False
         self._anchor: SkyCoord | None = None
+        self.on_settled: Callable[[], None] | None = None
+        self.percentile_low = 1.0
+        self.percentile_high = 99.0
+
+    def _notify_settled(self) -> None:
+        callback = self.on_settled
+        if callback is not None:
+            callback()
 
     def set_slice_indices(self, t: int, f: int) -> None:
         self._tf["t"], self._tf["f"] = int(t), int(f)
@@ -795,6 +854,7 @@ class FovOverlaySession:
                 )
                 if reason == "slice":
                     self._restore_opacity()
+                    self._notify_settled()
                 return
             t_b = time.perf_counter()
             push_prof = _push_cutout_frame(
@@ -806,6 +866,8 @@ class FovOverlaySession:
                 time_idx=t_idx,
                 freq_idx=f_idx,
                 update_view=False,
+                percentile_low=self.percentile_low,
+                percentile_high=self.percentile_high,
             )
             self.cache = CachedCutout(
                 data=data,
@@ -826,6 +888,8 @@ class FovOverlaySession:
                 f"chunks={spec.n_chunks} zarr={zarr_ms:.0f}ms "
                 f"reproj={reproj_ms:.0f}ms apply={apply_ms:.0f}ms"
             )
+            if reason == "slice":
+                self._notify_settled()
 
         pool = self.executor
         if pool is None:
@@ -844,6 +908,7 @@ class FovOverlaySession:
                     self.log(f"FOV overlay [{reason} error] {err}")
                     if reason == "slice":
                         self._restore_opacity()
+                        self._notify_settled()
 
                 self.schedule_main(_fail)
                 return

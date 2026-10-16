@@ -11,6 +11,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,7 @@ from ovro_lwa_portal.viz.source_review import (
     should_reset_heatmap_on_center,
 )
 from ovro_lwa_portal.accessor import PatchFitCellResult
+from ovro_lwa_portal.fov_overlay import FovOverlaySession, SkyPlaneReader, attach_fov_pan_reload
 from ovro_lwa_portal.viz.source_review_data import (
     HEATMAP_METHOD_OPTIONS,
     HeatmapLoad,
@@ -284,6 +286,9 @@ class SourceReview(param.Parameterized):
         self._time_day_labels: np.ndarray | None = None
         self._freq_mhz: np.ndarray | None = None
         self._sky_widget: SkyWidget | None = None
+        self._fov_session: FovOverlaySession | None = None
+        self._fov_executor: ThreadPoolExecutor | None = None
+        self._fov_pan_attached = False
         self._hips_background_url = hips_background_survey_url(
             self._config.hips_background,
             hips_root=self._config.hips_root,
@@ -990,8 +995,9 @@ class SourceReview(param.Parameterized):
         def _run() -> None:
             if generation != self._overlay_load_generation:
                 return
+            async_load = False
             try:
-                self._update_sky(
+                async_load = self._update_sky(
                     int(time_idx),
                     int(freq_idx),
                     center_on_target=center_on_target,
@@ -999,11 +1005,12 @@ class SourceReview(param.Parameterized):
                     preserve_view=preserve_view,
                     log_loading=True,
                     overlay_generation=generation,
+                    manage_spinner=manage_spinner,
                 )
             except Exception as exc:
                 self._log(f"ERROR (overlay slice): {exc}")
             finally:
-                if manage_spinner and generation == self._overlay_load_generation:
+                if manage_spinner and not async_load and generation == self._overlay_load_generation:
                     self._clear_loading_indicator()
 
         self._ui.schedule(_run)
@@ -1961,11 +1968,9 @@ class SourceReview(param.Parameterized):
         widget.invert_horizontal_pan = True
         max_size = max(256, int(ds.sizes["l"]) // 2)
         bind_sky_widget_dataset(widget, ds, max_size=max_size)
-        if self._hips_background_url:
-            widget.overlay_view_lock = True
-            widget.observe(self._on_view_gesture_revision, names="view_gesture_revision")
         widget.observe(self._on_sky_widget_click, names="click_tick")
         self._sky_widget = widget
+        self._ensure_fov_session()
         if self._panel_serve_mode:
             self._install_sky_ipywidget_pane(widget)
         else:
@@ -1978,67 +1983,73 @@ class SourceReview(param.Parameterized):
         rev = change.get("new")
         self._schedule_ui_action(lambda: self._log(f"Overlay view lock: gesture revision {rev}"))
 
-    def _update_sky(
+    def _fov_pool(self) -> ThreadPoolExecutor:
+        pool = self._fov_executor
+        if pool is None:
+            pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="fov-overlay")
+            self._fov_executor = pool
+        return pool
+
+    def _on_fov_pan(self, center: SkyCoord, fov_deg: float) -> None:
+        """Gesture end: in-cache pans stay bright; an off-cache pan fades and reloads."""
+        session = self._fov_session
+        widget = self._sky_widget
+        if session is None or widget is None:
+            return
+        rev = getattr(widget, "view_gesture_revision", None)
+        self._log(f"Overlay view lock: gesture revision {rev}")
+        session.on_pan(center, float(fov_deg))
+
+    def _ensure_fov_session(self) -> FovOverlaySession | None:
+        widget = self._sky_widget
+        dataset = self._dataset
+        if widget is None or dataset is None or "SKY" not in dataset:
+            return None
+        session = self._fov_session
+        if session is None or session.sky is not widget or session.ds is not dataset:
+            session = FovOverlaySession(
+                widget,
+                dataset,
+                SkyPlaneReader(dataset["SKY"]),
+                pol_idx=self._pol_idx(),
+                executor=self._fov_pool(),
+                debounce_s=0.3,
+                fade_opacity=0.35,
+                schedule_main=self._ui.schedule,
+                log=self._log,
+            )
+            self._fov_session = session
+            if not self._fov_pan_attached:
+                attach_fov_pan_reload(widget, self._on_fov_pan)
+                self._fov_pan_attached = True
+        else:
+            session.pol_idx = self._pol_idx()
+            session.sky_arr = SkyPlaneReader(dataset["SKY"])
+        return session
+
+    def _finish_fov_overlay(
         self,
+        generation: int | None,
         time_idx: int,
         freq_idx: int,
         *,
-        center_on_target: bool = False,
-        center: SkyCoord | None = None,
-        preserve_view: bool = False,
-        log_loading: bool = False,
-        overlay_generation: int | None = None,
+        diag_center: SkyCoord,
+        diag_context: str,
+        log_loading: bool,
+        manage_spinner: bool,
     ) -> None:
+        if generation is not None and generation != self._overlay_load_generation:
+            return
         widget = self._sky_widget
-        if widget is None:
-            return
-        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
-            return
-        reproject_center = center if center is not None else self._coord
-        if reproject_center is None:
-            return
-        self._apply_sky_widget_pol()
-        if log_loading and self._freq_mhz is not None:
-            self._log(
-                f"Loading overlay slice {self._slice_descriptor(int(time_idx), int(freq_idx))}…"
-            )
-        scale = self._overlay_scale_kwargs()
-        if preserve_view:
-            widget.update_slice(
-                time_idx=int(time_idx),
-                freq_idx=int(freq_idx),
-                view_lock=True,
-                **scale,
-            )
-            diag_center = widget.view_center_skycoord()
-            diag_context = "update_sky[heatmap]"
-        elif center_on_target or not widget.overlay_view_lock:
-            widget.update_slice(
-                time_idx=int(time_idx),
-                freq_idx=int(freq_idx),
-                center=reproject_center,
-                fov=self._sky_fov_deg * u.deg,
-                **scale,
-            )
-            diag_center = reproject_center
-            diag_context = "update_sky[center]"
-        else:
-            widget.update_slice(
-                time_idx=int(time_idx),
-                freq_idx=int(freq_idx),
-                view_lock=True,
-                **scale,
-            )
-            diag_center = widget.view_center_skycoord()
-            diag_context = "update_sky[view_lock]"
-        self._apply_overlay_fixed_scale(widget)
-        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
-            return
-        # NOTE: Users perceive the overlay as "loaded" once the image is visible, which
-        # happens immediately after ``update_slice``. Any extra logging / forced comm
-        # flush can take seconds, so keep it off the critical path for the spinner.
+        if widget is not None:
+            self._apply_overlay_fixed_scale(widget)
+        if manage_spinner:
+            self._clear_loading_indicator()
+
         def _post_overlay_loaded() -> None:
-            if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
+            if generation is not None and generation != self._overlay_load_generation:
+                return
+            if widget is None:
                 return
             self._log_overlay_diagnostics(diag_center, context=diag_context)
             if log_loading:
@@ -2047,8 +2058,6 @@ class SourceReview(param.Parameterized):
                     f"Overlay slice loaded ({self._slice_descriptor(int(time_idx), int(freq_idx))}, "
                     f"{nbytes // 1024} KB)."
                 )
-            # User-visible overlay loads always push widget state; revision-gated
-            # skip is only for silent/internal paths.
             if self._panel_serve_mode and log_loading:
 
                 def _after_overlay_push(comm_ms: float) -> None:
@@ -2065,11 +2074,106 @@ class SourceReview(param.Parameterized):
                 if self._config.log_overlay_timing and log_loading:
                     self._log_overlay_push_timing(widget, comm_ms=comm_ms)
 
-        # Defer post-load comm/log work so the spinner can stop promptly.
         if log_loading:
             self._ui.schedule(_post_overlay_loaded)
         else:
             _post_overlay_loaded()
+
+    def _load_overlay_cutout(
+        self,
+        time_idx: int,
+        freq_idx: int,
+        *,
+        center: SkyCoord | None,
+        preserve_view: bool,
+        overlay_generation: int | None,
+        log_loading: bool,
+        manage_spinner: bool,
+        diag_context: str,
+    ) -> bool:
+        """Start one FOV cutout. Return True when the read finishes on a later turn."""
+        session = self._ensure_fov_session()
+        widget = self._sky_widget
+        if session is None or widget is None:
+            return False
+        scale = self._overlay_scale_kwargs()
+        session.percentile_low = float(scale["percentile_low"])
+        session.percentile_high = float(scale["percentile_high"])
+        session.pol_idx = self._pol_idx()
+        if preserve_view:
+            diag_center = widget.view_center_skycoord()
+        else:
+            if center is None:
+                return False
+            diag_center = center
+            widget.view_ra = float(center.icrs.ra.deg)
+            widget.view_dec = float(center.icrs.dec.deg)
+            widget.view_fov = float(self._sky_fov_deg)
+        session.on_settled = lambda: self._finish_fov_overlay(
+            overlay_generation,
+            int(time_idx),
+            int(freq_idx),
+            diag_center=diag_center,
+            diag_context=diag_context,
+            log_loading=log_loading,
+            manage_spinner=manage_spinner,
+        )
+        session.reload_time_freq(int(time_idx), int(freq_idx))
+        return session.executor is not None
+
+    def _update_sky(
+        self,
+        time_idx: int,
+        freq_idx: int,
+        *,
+        center_on_target: bool = False,
+        center: SkyCoord | None = None,
+        preserve_view: bool = False,
+        log_loading: bool = False,
+        overlay_generation: int | None = None,
+        manage_spinner: bool = True,
+    ) -> bool:
+        """Load the radio overlay as a native FOV cutout.
+
+        Heatmap taps (``preserve_view``) keep the current view. Center and the
+        overlay toggle write the view to ``center`` and then reload there.
+        Returns True when the Zarr read continues after this call.
+        """
+        widget = self._sky_widget
+        if widget is None:
+            return False
+        if overlay_generation is not None and overlay_generation != self._overlay_load_generation:
+            return False
+        reproject_center = center if center is not None else self._coord
+        if preserve_view:
+            if reproject_center is None:
+                return False
+            diag_context = "update_sky[heatmap]"
+            load_center = None
+        elif center_on_target or center is not None:
+            if reproject_center is None:
+                return False
+            diag_context = "update_sky[center]"
+            load_center = reproject_center
+        else:
+            diag_context = "update_sky[view_lock]"
+            load_center = None
+            preserve_view = True
+        self._apply_sky_widget_pol()
+        if log_loading and self._freq_mhz is not None:
+            self._log(
+                f"Loading overlay slice {self._slice_descriptor(int(time_idx), int(freq_idx))}…"
+            )
+        return self._load_overlay_cutout(
+            int(time_idx),
+            int(freq_idx),
+            center=load_center,
+            preserve_view=preserve_view,
+            overlay_generation=overlay_generation,
+            log_loading=log_loading,
+            manage_spinner=manage_spinner,
+            diag_context=diag_context,
+        )
 
     def _on_heatmap_tap(self, time_idx: int, freq_idx: int) -> None:
         self._time_idx = time_idx

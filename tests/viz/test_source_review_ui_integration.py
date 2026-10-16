@@ -712,14 +712,20 @@ def test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch(
     review._sky_widget = widget
 
     scheduled: list[str] = []
+    cutout_calls: list[int] = []
     real_schedule = review._ui.schedule
 
     def _track_schedule(callback) -> None:
         scheduled.append("schedule")
         real_schedule(callback)
 
+    def _record_cutout(*_args, **_kwargs) -> bool:
+        cutout_calls.append(1)
+        return False
+
     monkeypatch.setattr(review._ui, "schedule", _track_schedule)
     monkeypatch.setattr(review._ui, "defer_dispatch", lambda _cb: scheduled.append("defer_dispatch"))
+    monkeypatch.setattr(review, "_load_overlay_cutout", _record_cutout)
 
     review._on_overlay_toggle_impl(True)
     assert review.loading is True
@@ -730,7 +736,7 @@ def test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch(
     assert not _spinner_spinning(review)
     assert "schedule" in scheduled
     assert "defer_dispatch" not in scheduled
-    widget.update_slice.assert_called_once()
+    assert cutout_calls == [1]
 
     scheduled.clear()
     review._on_heatmap_tap(2, 1)
@@ -739,7 +745,7 @@ def test_overlay_toggle_and_heatmap_tap_use_schedule_not_dispatch(
 
     assert review.loading is False
     assert scheduled == ["schedule"]
-    assert widget.update_slice.call_count == 2
+    assert cutout_calls == [1, 1]
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -762,11 +768,11 @@ def test_overlay_single_flight_drops_stale_load(
 
     update_calls: list[tuple[int, int]] = []
 
-    def _record_update_slice(time_idx, freq_idx, **kwargs) -> None:
+    def _record_cutout(time_idx, freq_idx, **kwargs) -> bool:
         update_calls.append((int(time_idx), int(freq_idx)))
-        widget.image_revision = int(widget.image_revision) + 1
+        return False
 
-    widget.update_slice.side_effect = _record_update_slice
+    monkeypatch.setattr(review, "_load_overlay_cutout", _record_cutout)
 
     review._schedule_overlay_slice_load(0, 0, preserve_view=True)
     review._schedule_overlay_slice_load(5, 0, preserve_view=True)
@@ -775,6 +781,112 @@ def test_overlay_single_flight_drops_stale_load(
     assert update_calls == [(5, 0)]
     assert review.loading is False
     assert not _spinner_spinning(review)
+
+
+class _CutoutSky:
+    """SkyWidget stand-in that records shader pushes and does not invent view writes."""
+
+    def __init__(self) -> None:
+        self.view_ra = 180.0
+        self.view_dec = 40.0
+        self.view_fov = 8.0
+        self.opacity = 1.0
+        self.crval = (180.0, 40.0)
+        self.image_shape = (0, 0)
+        self.image_data = b""
+        self.image_revision = 0
+        self.overlay_view_lock = False
+        self.view_gesture_revision = 0
+        self.pushes: list[np.ndarray] = []
+
+    def view_center_skycoord(self) -> SkyCoord:
+        return SkyCoord(self.view_ra, self.view_dec, unit="deg", frame="icrs")
+
+    def push_shader_frame(self, data: np.ndarray, wcs: object, **_kwargs: object) -> None:
+        array = np.asarray(data)
+        self.pushes.append(array)
+        self.image_data = array.tobytes()
+        self.image_shape = tuple(int(x) for x in array.shape)
+        self.image_revision += 1
+
+    def send_state(self) -> None:
+        return None
+
+    def unobserve(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+    def observe(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
+def _wait_until(loop: QueuedIOLoop, predicate, *, timeout_s: float = 5.0) -> None:
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        _drain_io_loop(loop, timeout_s=0.05)
+        if predicate():
+            return
+        time.sleep(0.01)
+    msg = "condition was not met"
+    raise AssertionError(msg)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_heatmap_tap_fades_cutout_without_moving_the_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A heatmap tap reloads (time, freq) at the current view and fades first."""
+    from astropy.wcs import WCS
+
+    from ovro_lwa_portal import fov_overlay
+
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    sky = np.ones((6, 4, 8, 8), dtype=np.float32)
+    sky[1] = np.nan
+    review._dataset["SKY"] = (("time", "frequency", "l", "m"), sky)
+    review._coord = CAS_A
+    widget = _CutoutSky()
+    review._sky_widget = widget
+
+    def _wcs(*_args: object, **_kwargs: object) -> WCS:
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---SIN", "DEC--SIN"]
+        wcs.wcs.crval = [180.0, 40.0]
+        wcs.wcs.cdelt = [-1.0, 1.0]
+        wcs.wcs.crpix = [4.5, 4.5]
+        wcs.wcs.cunit = ["deg", "deg"]
+        return wcs
+
+    seen: list[float] = []
+    real_extract = fov_overlay.extract_fov_cutout
+
+    def _extract(*args: object, **kwargs: object) -> np.ndarray:
+        seen.append(widget.opacity)
+        return real_extract(*args, **kwargs)
+
+    monkeypatch.setattr(fov_overlay, "celestial_wcs_for_time", _wcs)
+    monkeypatch.setattr(
+        fov_overlay,
+        "_project_native_sin",
+        lambda data, cut_wcs: (np.asarray(data, dtype=np.float32), cut_wcs, 0.2),
+    )
+    monkeypatch.setattr(fov_overlay, "extract_fov_cutout", _extract)
+
+    review._on_heatmap_tap(0, 0)
+    _wait_until(loop, lambda: widget.opacity == 1.0 and len(widget.pushes) == 1)
+
+    assert seen[0] == pytest.approx(0.35)
+    assert (widget.view_ra, widget.view_dec, widget.view_fov) == (180.0, 40.0, 8.0)
+    assert review.loading is False
+
+    seen.clear()
+    review._on_heatmap_tap(1, 0)
+    _wait_until(loop, lambda: widget.opacity == 1.0 and review.loading is False)
+
+    assert seen[0] == pytest.approx(0.35)
+    assert len(widget.pushes) == 1
+    assert (widget.view_ra, widget.view_dec, widget.view_fov) == (180.0, 40.0, 8.0)
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -1074,11 +1186,11 @@ def test_post_generate_overlay_skipped_when_heatmap_tap_supersedes(
 
     update_calls: list[tuple[int, int]] = []
 
-    def _record_update_slice(time_idx, freq_idx, **kwargs) -> None:
+    def _record_cutout(time_idx, freq_idx, **kwargs) -> bool:
         update_calls.append((int(time_idx), int(freq_idx)))
-        widget.image_revision = int(widget.image_revision) + 1
+        return False
 
-    widget.update_slice.side_effect = _record_update_slice
+    monkeypatch.setattr(review, "_load_overlay_cutout", _record_cutout)
 
     src = review._current_source
     assert src is not None
