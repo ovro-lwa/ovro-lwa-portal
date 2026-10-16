@@ -29,12 +29,18 @@ __all__ = [
 
 ZARR_STORE_ENCODING_KEY = "ovro_lwa_portal_zarr_store"
 _GROUP_ENCODING_KEY = "ovro_lwa_portal_zarr_group"
+_ARRAY_GRAPH_LAYERS_ENCODING_KEY = "ovro_lwa_portal_zarr_array_graph_layers"
 IMAGE_CUBE_DIMS = ("time", "frequency", "polarization", "l", "m")
 
 
 def attach_zarr_store(ds: xr.Dataset, store: Any) -> xr.Dataset:
     """Record the store ``ds`` was opened from. Survives ``isel`` / ``chunk``."""
     ds.encoding[ZARR_STORE_ENCODING_KEY] = store
+    ds.encoding[_ARRAY_GRAPH_LAYERS_ENCODING_KEY] = {
+        name: frozenset(data.data.dask.layers)
+        for name, data in ds.data_vars.items()
+        if hasattr(getattr(data.data, "dask", None), "layers")
+    }
     return ds
 
 
@@ -159,6 +165,19 @@ def _pol_map(ds: xr.Dataset, group: Any, n_raw: int) -> np.ndarray | None:
     return out
 
 
+def _retains_zarr_backing(ds: xr.Dataset, var: str) -> bool:
+    """Check that ``ds[var]`` is still backed by its original Zarr Dask graph."""
+    original_layers = ds.encoding.get(_ARRAY_GRAPH_LAYERS_ENCODING_KEY, {}).get(var)
+    graph = getattr(ds[var].data, "dask", None)
+    layers = getattr(graph, "layers", None)
+    if not original_layers or layers is None or not original_layers.issubset(layers):
+        return False
+    return all(
+        name in original_layers or name.startswith(("getitem-", "rechunk-"))
+        for name in layers
+    )
+
+
 def direct_zarr_array(ds: xr.Dataset, var: str = "SKY") -> DirectZarrArray | None:
     """On-disk array for ``ds[var]``, or ``None`` when direct reads are unsafe.
 
@@ -171,6 +190,8 @@ def direct_zarr_array(ds: xr.Dataset, var: str = "SKY") -> DirectZarrArray | Non
         return None
     da = ds[var]
     if tuple(da.dims) != IMAGE_CUBE_DIMS or "preferred_chunks" not in da.encoding:
+        return None
+    if not _retains_zarr_backing(ds, var):
         return None
     group = _open_group(ds)
     if group is None or var not in group:

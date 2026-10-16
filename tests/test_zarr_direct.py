@@ -71,12 +71,34 @@ def test_direct_array_maps_polarization_subset(cube_store: Path) -> None:
     )
 
 
+def test_direct_array_allows_rechunking(cube_store: Path) -> None:
+    ds = _open(cube_store).chunk({"l": 6, "m": 5})
+    direct = direct_zarr_array(ds)
+    assert direct is not None
+    np.testing.assert_array_equal(
+        direct[0, 0, 1, slice(0, 12), slice(0, 10)],
+        ds.SKY.isel(time=0, frequency=0, polarization=1).values,
+    )
+
+
 def test_direct_array_rejects_modified_or_unbacked_data(cube_store: Path) -> None:
     ds = _open(cube_store)
     assert direct_zarr_array(_cube()) is None
     assert direct_zarr_array(ds.isel(time=slice(1, None))) is None
     assert direct_zarr_array(ds.sortby("time", ascending=False)) is None
     replaced = ds.assign(SKY=ds.SKY * 2)
+    assert direct_zarr_array(replaced) is None
+
+
+def test_direct_array_rejects_replaced_data_with_retained_encoding(cube_store: Path) -> None:
+    ds = _open(cube_store)
+    replaced = ds.copy(deep=False)
+    replaced.SKY.data = ds.SKY.data * 2
+    assert "preferred_chunks" in replaced.SKY.encoding
+    assert direct_zarr_array(replaced) is None
+
+    replaced.SKY.data = np.full(ds.SKY.shape, 17, dtype=np.float32)
+    assert "preferred_chunks" in replaced.SKY.encoding
     assert direct_zarr_array(replaced) is None
 
 
