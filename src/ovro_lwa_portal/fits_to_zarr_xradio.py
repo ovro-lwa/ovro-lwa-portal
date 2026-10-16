@@ -6028,20 +6028,6 @@ def convert_fits_dir_to_zarr(
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
 
-    if sky_dtype_mode == "preserve":
-        all_paths = [fp for files in by_time.values() for fp in files]
-        fits_dt = _resolve_preserve_sky_dtype_from_fits_paths(all_paths)
-        sky_dtype_mode = _sky_dtype_mode_from_numpy(fits_dt)
-        logger.info(
-            "SKY dtype mode: preserve → %s (from input FITS BITPIX; "
-            "append casts to store dtype on mismatch)",
-            sky_dtype_mode,
-        )
-    else:
-        logger.info(
-            "SKY dtype mode: %s (resolved per write; append casts to store dtype on mismatch)",
-            sky_dtype_mode,
-        )
     if progress_callback is not None:
         progress_callback(
             "setup",
@@ -6088,6 +6074,23 @@ def convert_fits_dir_to_zarr(
             if consolidate_metadata_at_end:
                 _consolidate_zarr_metadata(out_zarr)
             return out_zarr
+
+    # Resolve BITPIX only for times that will be written. A resume that finds
+    # every key already present returns above and must not open source FITS.
+    if sky_dtype_mode == "preserve":
+        all_paths = [fp for files in by_time.values() for fp in files]
+        fits_dt = _resolve_preserve_sky_dtype_from_fits_paths(all_paths)
+        sky_dtype_mode = _sky_dtype_mode_from_numpy(fits_dt)
+        logger.info(
+            "SKY dtype mode: preserve → %s (from input FITS BITPIX; "
+            "append casts to store dtype on mismatch)",
+            sky_dtype_mode,
+        )
+    else:
+        logger.info(
+            "SKY dtype mode: %s (resolved per write; append casts to store dtype on mismatch)",
+            sky_dtype_mode,
+        )
 
     if _zarr_store_exists(out_zarr) and not rebuild:
         freq_coord_hz = _frequency_coord_hz_from_zarr(out_zarr)

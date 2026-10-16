@@ -2755,6 +2755,12 @@ def test_convert_resume_skips_already_ingested_times(monkeypatch, tmp_path: Path
             first_write
         ),
     )
+    # Placeholder paths are empty; dtype resolution must not open them.
+    monkeypatch.setattr(
+        mod,
+        "_resolve_preserve_sky_dtype_from_fits_paths",
+        lambda _paths, **_kwargs: np.dtype(np.float32),
+    )
     # Empty out_zarr dir only signals "store exists" for resume; skip real pol read.
     monkeypatch.setattr(
         mod,
@@ -2817,6 +2823,12 @@ def test_convert_skips_consolidate_when_disabled(monkeypatch, tmp_path: Path):
     )
     monkeypatch.setattr(mod, "_combine_time_step", lambda *_args, **_kwargs: (xds_t, [4.1e7], []))
     monkeypatch.setattr(mod, "_write_or_append_zarr", lambda *_args, **_kwargs: None)
+    # Placeholder paths are empty; dtype resolution must not open them.
+    monkeypatch.setattr(
+        mod,
+        "_resolve_preserve_sky_dtype_from_fits_paths",
+        lambda _paths, **_kwargs: np.dtype(np.float32),
+    )
 
     consolidate_calls: list[Path] = []
     monkeypatch.setattr(
