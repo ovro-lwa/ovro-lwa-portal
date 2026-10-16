@@ -268,10 +268,10 @@ app, do **not** run `panel serve` on the notebook — use
 2. **A readable Zarr store** — required at launch via `OVRO_SOURCE_REVIEW_ZARR`
    or `--args /path/to/store.zarr`.
 3. **HiPS tiles reachable by the browser** — either an on-disk root under
-   `--hips-root` / `OVRO_HIPS_ROOT` (default `/lustre/pipeline/calibration/hips`)
-   so the script can mount `/calibration/hips` on the Panel server, or an
-   absolute HTTP base via `OVRO_HIPS_HTTP_BASE` (e.g.
-   `http://lwacalim09:3005`).
+   `--hips-root` / `OVRO_HIPS_ROOT` (default
+   `/lustre/pipeline/calibration/hips`) so the script can mount
+   `/calibration/hips` on the Panel server, or an absolute HTTP base via
+   `OVRO_HIPS_HTTP_BASE` (e.g. `http://lwacalim09:3005`).
 4. **Optional:** `notebooks/known_sources.yaml` (or `--known-sources` /
    `OVRO_SOURCE_REVIEW_KNOWN_SOURCES`) for autocomplete.
 
@@ -291,22 +291,22 @@ pixi run panel serve scripts/serve_source_review.py --show --autoreload \
 
 Useful options (see `scripts/serve_source_review.py`):
 
-| Flag / env                              | Role                                      |
-| --------------------------------------- | ----------------------------------------- |
-| `--coordinate` / `OVRO_SOURCE_REVIEW_COORDINATE` | Initial coordinate field            |
-| `--known-sources` / `OVRO_SOURCE_REVIEW_KNOWN_SOURCES` | Autocomplete YAML             |
-| `--heatmap-method`                      | Default heatmap method                    |
-| `--hips-root` / `OVRO_HIPS_ROOT`        | On-disk HiPS survey root                  |
-| `--hips-http-prefix` / `OVRO_HIPS_HTTP_BASE` | HiPS URL prefix or full `http://…` base |
+| Flag / env                                             | Role                                    |
+| ------------------------------------------------------ | --------------------------------------- |
+| `--coordinate` / `OVRO_SOURCE_REVIEW_COORDINATE`       | Initial coordinate field                |
+| `--known-sources` / `OVRO_SOURCE_REVIEW_KNOWN_SOURCES` | Autocomplete YAML                       |
+| `--heatmap-method`                                     | Default heatmap method                  |
+| `--hips-root` / `OVRO_HIPS_ROOT`                       | On-disk HiPS survey root                |
+| `--hips-http-prefix` / `OVRO_HIPS_HTTP_BASE`           | HiPS URL prefix or full `http://…` base |
 
 ### Notebook vs Panel serve
 
-| Notebook                              | Panel serve                                         |
-| ------------------------------------- | --------------------------------------------------- |
-| `configure_source_review_notebook()`  | `configure_source_review_serve()`                   |
-| `JupyterPanelUISession`               | `ServedPanelUISession`                              |
-| Config cell constants                 | CLI / environment variables                         |
-| Jupyter HiPS extension                | `register_hips_panel_serve` or absolute HiPS URL    |
+| Notebook                             | Panel serve                                      |
+| ------------------------------------ | ------------------------------------------------ |
+| `configure_source_review_notebook()` | `configure_source_review_serve()`                |
+| `JupyterPanelUISession`              | `ServedPanelUISession`                           |
+| Config cell constants                | CLI / environment variables                      |
+| Jupyter HiPS extension               | `register_hips_panel_serve` or absolute HiPS URL |
 
 Do **not** call `pn.extension("ipywidgets")` in JupyterLab — that bridge is for
 `panel serve` only.
