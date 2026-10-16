@@ -244,9 +244,15 @@ def rechunk_store(
     cfg = config or RechunkConfig()
     src_path = Path(source).expanduser().resolve()
     dst_path = Path(dest).expanduser().resolve()
-    if src_path == dst_path or src_path in dst_path.parents:
-        msg = f"dest must be outside source: {dst_path}"
-        raise ValueError(msg)
+    output_paths = (dst_path, dst_path.with_name(dst_path.name + ".partial").resolve())
+    for output_path in output_paths:
+        if (
+            src_path == output_path
+            or src_path in output_path.parents
+            or output_path in src_path.parents
+        ):
+            msg = f"dest and staging must be outside source and not contain it: {output_path}"
+            raise ValueError(msg)
     if dst_path.exists() and not overwrite:
         msg = f"dest exists (pass overwrite=True to replace): {dst_path}"
         raise FileExistsError(msg)
