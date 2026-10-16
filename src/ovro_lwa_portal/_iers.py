@@ -15,6 +15,9 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from threading import RLock
+
+_IERS_LOCK = RLock()
 
 
 @contextmanager
@@ -22,15 +25,16 @@ def offline_iers() -> Iterator[None]:
     """Disable IERS auto-download and allow stale predictive values."""
     from astropy.utils.iers import conf as iers_conf
 
-    orig_download = iers_conf.auto_download
-    orig_max_age = iers_conf.auto_max_age
-    orig_degraded = iers_conf.iers_degraded_accuracy
-    try:
-        iers_conf.auto_download = False
-        iers_conf.auto_max_age = None
-        iers_conf.iers_degraded_accuracy = "ignore"
-        yield
-    finally:
-        iers_conf.auto_download = orig_download
-        iers_conf.auto_max_age = orig_max_age
-        iers_conf.iers_degraded_accuracy = orig_degraded
+    with _IERS_LOCK:
+        orig_download = iers_conf.auto_download
+        orig_max_age = iers_conf.auto_max_age
+        orig_degraded = iers_conf.iers_degraded_accuracy
+        try:
+            iers_conf.auto_download = False
+            iers_conf.auto_max_age = None
+            iers_conf.iers_degraded_accuracy = "ignore"
+            yield
+        finally:
+            iers_conf.auto_download = orig_download
+            iers_conf.auto_max_age = orig_max_age
+            iers_conf.iers_degraded_accuracy = orig_degraded
