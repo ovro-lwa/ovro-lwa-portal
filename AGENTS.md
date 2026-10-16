@@ -257,6 +257,7 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 │   ├── fits2zarr.ipynb        # Main FITS to Zarr conversion notebook
 │   ├── fits2zarr_and_viz_user_cases.ipynb  # User case examples with visualization
 │   ├── source_review.ipynb    # LPT source review; per-time WCS + SkyWidget (canonical Panel comm)
+│   ├── async_cube_slice/      # FOV-native async overlay experiment (section F); not production
 │   └── test_fits_files/       # Sample FITS files for testing
 │       ├── README.md          # Documentation for test FITS files
 │       └── .gitignore         # Ignores FITS files (downloaded separately)
@@ -630,6 +631,110 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
 
 Data loading for QA apps follows `viz/pipeline_qa.py` → `load_qa_datasets()` →
 `ovro_lwa_portal.open_dataset(zarr_path, chunks={…})`.
+
+### FOV-native async overlay (experiment; keep when promoting)
+
+Validated in Jupyter on `notebooks/async_cube_slice/linked_async_ui.ipynb` **section F**
+(`fov_cutout.py`, `linked_ui.py`). This is **not** production `SourceReview` /
+`PreloadedCube.update_slice`. Section **E** stays the full-plane `SKY_MAX_SIZE`
+baseline. Do not port these rules by editing production until that promotion, and
+do not drop them when you do.
+
+Research: `.agents/research-accessor-async-hotpath.md` (2026-10-16 follow-ups),
+`.agents/plan-fov-native-async-overlay.md`. Bench:
+`notebooks/async_cube_slice/bench_reproject_options.py` →
+`results/reproject_options.jsonl`. Store used for timings:
+`/fast/claw/IV_1hMHz_Taper_shflux_coadd.zarr` (`CDELT = 0.037°`, chunks
+`(1, 2, 1, 391, 391)`).
+
+#### Read a native cutout, project it once
+
+`SKY_MAX_SIZE` only under-resolves. Zarr still touches the plane. A small FOV
+should be a chunk-aligned `(l, m)` bbox from the **per-time** SIN WCS, read at
+native resolution, then warped **once**.
+
+| Tile on that store | What it actually is |
+| --- | --- |
+| 1 chunk, 391² | The chunk that contains the phase center (~14.5°). Warm read ~1 ms. |
+| 8° request, 782² | **4 chunks**, ~29° on a side. `CRPIX = 1562` sits on a 391-px boundary, so an 8° request is not 1 chunk. Warm read ~2 ms. |
+
+Workers read **one spatial chunk each** (same pool as the progressive dynspec).
+The main thread projects the **assembled** tile once. Do not reproject per
+chunk, and do not paint a partial tile — the warm read finishes before a
+partial paint would help.
+
+Warp with `reproject_for_shader_display` at the **slice phase center**
+(`CRVAL` of that time/frequency), then
+
+`_push_image_frame(..., center=None, fov=None, update_view=False)`.
+
+Passing `center=` into `_push_image_frame` runs a **second** view-centered
+warp. OVRO headers often have `LONPOLE=180`, so `should_skip_shader_reproject`
+is false even when the view matches naive SIN. The ~21 ms figure on a 782²
+push is only `map_coordinates` after a map-cache hit. The uncached
+view-centered warp is ~148 ms (build ~120 ms + apply ~20 ms). Native SIN once
+is ~140 ms; later zoom and slew inside that texture pay nothing.
+
+Write `view_ra` / `view_dec` / `view_fov` only when the action is supposed to
+move the view. A time/frequency change must not.
+
+| Grid (782², warm) | Project | Use for this shader? |
+| --- | --- | --- |
+| Native SIN at slice `CRVAL` | ~140 ms | **Yes.** One warp per cutout. The shader samples later zoom and slew. |
+| CAR | ~129 ms | No. Same order of cost; the current shader cannot sample it. |
+| HEALPix (`healpy.query_disc`, nside 2048) | ~270 ms | No. `query_disc` is ~0.7 ms; `pix2ang` + `all_world2pix` dominate. |
+| View-centered SIN, uncached | ~148 ms | No, not on every gesture. That is the cost `center=` repeats. |
+
+healpy **1.20.1** is a PyPI dependency of the `visualization` feature.
+`pixi add --feature visualization healpy` (conda-forge) pulls Astropy 8 and
+conflicts with `astropy>=7.1,<8`. Do not switch that pin to conda-forge.
+
+#### Gestures: fade only a pan that no longer fits
+
+`FovOverlaySession` owns this. Do not re-implement it as a per-gesture
+`update_slice(center=, fov=)` inside astrowidget.
+
+| Gesture | Overlay |
+| --- | --- |
+| Zoom, or pan whose center stays within 0.05° and whose FOV still fits the cached cutout | No read, no reproject, full opacity (`[pan-skip]`). |
+| Pan whose center moved **or** whose FOV no longer fits | Fade to 0.35 immediately (`[pan-fade]`), debounce ~0.3 s, **one** async read (`[pan]`), restore opacity. |
+| Zoom out around the **same** center, even if the corners leave the cache | Stay bright, then one read. Do not fade a zoom. |
+| All-NaN / empty read | Drop it. Keep the finite overlay already on screen. |
+
+Set opacity and return **before** the Zarr read. A fade followed by a blocking
+`push_slice` on the kernel `io_loop` never reaches the browser. Submit the
+read to the executor; project and restore opacity on the main thread.
+
+A new time index always reloads. Per-time `CRVAL` moves, so a cache built for
+another time does not cover the same sky. Missing WCS for that time → skip.
+Do not fall back to time 0.
+
+#### One control changes one parameter
+
+Section F felt right only after heatmap clicks and the spectrum button stopped
+sharing `on_slice`.
+
+| Action | Changes | Does not change |
+| --- | --- | --- |
+| Dynspec / heatmap click | Overlay `(time, freq)` at the **current view**, after a fade | View center, FOV, crosshair, heatmap values, Bokeh sky tile |
+| **Heatmap at crosshair** | Spectrum values at the placed crosshair (`start_tracked(..., sync_slice=False)`) | Overlay, view, selected `(time, freq)` |
+| Pan / zoom | View, and a cutout only when the cache no longer covers it | Spectrum values, selected `(time, freq)` |
+
+Enforcement:
+
+- Heatmap taps go through `LinkedAsyncView.on_tf_only`, **not** `request_tile`.
+  `request_tile` reloads the Bokeh sky tile and then calls `on_slice`, which
+  recenters or repaints a second view. Section F sets `on_slice = None`.
+- The spectrum button must not call `request_tile` (`sync_slice=False`). That
+  call moves the red box and the overlay to the first visible time.
+- The spectrum coordinate is the **crosshair**, not `view_ra` / `view_dec`.
+  A canvas click stores the on-screen marker in `clicked_coord` and increments
+  `click_tick`. It does **not** write `crosshair_ra` / `crosshair_dec` (those
+  update only from `set_crosshair`; values `<= -900` mean hidden).
+  `crosshair_skycoord()` prefers the click. With no marker, do not silently
+  use the view center.
+- `view.dyn_pane` is mounted **once**, in section F. Mounting it in section A
+  and again in F breaks heatmap tap callbacks.
 
 ### Panel notebook comm management (Jupyter)
 

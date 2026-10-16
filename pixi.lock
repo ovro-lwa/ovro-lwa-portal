@@ -534,6 +534,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/d5/4e/e4691508f9477ce67da2015d8c00acd751e6287739123113a9fca6f1604e/frozenlist-1.8.0-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e6/ab/fb21f4c939bb440104cc2b396d3be1d9b7a9fd3c6c2a53d98c45b3d7c954/fsspec-2026.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/35/05/9e0fbbe13d130d1a3d12ce0297c18524d1f99cf82a1a748708b4cdfb9e64/healpy-1.20.1-cp313-cp313-manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4f/ab/a6aa43d45ceb88adc0e8c1358fa6935c6e6a5895537431dec67524ca2ccd/holoviews-1.22.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl
@@ -881,6 +882,7 @@ environments:
       - pypi: https://files.pythonhosted.org/packages/d5/4e/e4691508f9477ce67da2015d8c00acd751e6287739123113a9fca6f1604e/frozenlist-1.8.0-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/e6/ab/fb21f4c939bb440104cc2b396d3be1d9b7a9fd3c6c2a53d98c45b3d7c954/fsspec-2026.2.0-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl
+      - pypi: https://files.pythonhosted.org/packages/35/05/9e0fbbe13d130d1a3d12ce0297c18524d1f99cf82a1a748708b4cdfb9e64/healpy-1.20.1-cp313-cp313-manylinux_2_28_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/4f/ab/a6aa43d45ceb88adc0e8c1358fa6935c6e6a5895537431dec67524ca2ccd/holoviews-1.22.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl
@@ -2126,6 +2128,30 @@ packages:
   purls: []
   size: 3708864
   timestamp: 1770390337946
+- pypi: https://files.pythonhosted.org/packages/35/05/9e0fbbe13d130d1a3d12ce0297c18524d1f99cf82a1a748708b4cdfb9e64/healpy-1.20.1-cp313-cp313-manylinux_2_28_x86_64.whl
+  name: healpy
+  version: 1.20.1
+  sha256: 4bc6cced86a14868d74df7ca3cb9240715437477bc5e5c087a714679dc7b5119
+  requires_dist:
+  - numpy>=2.0.0
+  - astropy
+  - matplotlib ; extra == 'all'
+  - scipy ; extra == 'all'
+  - pytest ; extra == 'test'
+  - pytest-astropy-header ; extra == 'test'
+  - pytest-cython ; extra == 'test'
+  - pytest-doctestplus ; extra == 'test'
+  - requests ; extra == 'test'
+  - matplotlib ; extra == 'test'
+  - scipy ; extra == 'test'
+  - ipykernel ; extra == 'doc'
+  - matplotlib ; extra == 'doc'
+  - nbsphinx ; extra == 'doc'
+  - numpydoc ; extra == 'doc'
+  - sphinxnotebookgist ; extra == 'doc'
+  - sphinx>=6,<9 ; extra == 'doc'
+  - sphinx-book-theme ; extra == 'doc'
+  requires_python: '>=3.10'
 - pypi: https://files.pythonhosted.org/packages/4f/ab/a6aa43d45ceb88adc0e8c1358fa6935c6e6a5895537431dec67524ca2ccd/holoviews-1.22.1-py3-none-any.whl
   name: holoviews
   version: 1.22.1
@@ -4132,8 +4158,8 @@ packages:
   timestamp: 1769555830639
 - pypi: ./
   name: ovro-lwa-portal
-  version: 0.1.1.dev9
-  sha256: 14c5547339615700601c846eb178bc824c2458d367de1238b1105ba06a94ddd0
+  version: 0.1.1.dev73
+  sha256: a133a62ce950966ec3becbaa1a9bf83aaafc02c09922b0c20a8aa7fc73be121c
   requires_dist:
   - astropy>=7.1.0,<8
   - dask>=2025.9.1,<2026
