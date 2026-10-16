@@ -197,7 +197,7 @@ def direct_zarr_array(ds: xr.Dataset, var: str = "SKY") -> DirectZarrArray | Non
     if group is None or var not in group:
         return None
     raw = group[var]
-    if len(raw.shape) != 5:
+    if len(raw.shape) != 5 or raw.dtype.kind != "f" or raw.dtype.itemsize != 4:
         return None
     for axis, dim in enumerate(IMAGE_CUBE_DIMS):
         if dim == "polarization":
