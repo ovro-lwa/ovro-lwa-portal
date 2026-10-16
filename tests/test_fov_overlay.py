@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import pytest
+import xarray as xr
 from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS
 
@@ -14,6 +17,7 @@ from ovro_lwa_portal.fov_overlay import (
     FovCutoutSpec,
     FovOverlaySession,
     adjust_wcs_for_cutout,
+    celestial_wcs_for_time,
     chunk_align_bbox,
     fov_pixel_bbox,
     read_sky_tile_parallel,
@@ -64,6 +68,22 @@ class _Cube:
 
     def __getitem__(self, key: object) -> np.ndarray:
         return self._data[key]
+
+
+def test_newline_separated_header_keeps_crval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """80-column cards plus newlines must not be read as a fixed 80-byte grid."""
+    header = _sin_wcs().to_header()
+    header["CRVAL1"] = 172.5
+    header["CRVAL2"] = 37.215849166667
+    ds = xr.Dataset({"fits_header_str": ("time", [header.tostring(sep="\n")])})
+    monkeypatch.setattr(fov_overlay, "_wcs_from_astrowidget", lambda *_a, **_k: None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        wcs = celestial_wcs_for_time(ds, 0)
+    assert wcs is not None
+    assert wcs.wcs.crval[0] == pytest.approx(172.5)
+    assert wcs.wcs.crval[1] == pytest.approx(37.215849166667)
+    assert not any("unrecognized non-standard convention" in str(item.message) for item in caught)
 
 
 def test_fov_pixel_bbox_contains_center() -> None:

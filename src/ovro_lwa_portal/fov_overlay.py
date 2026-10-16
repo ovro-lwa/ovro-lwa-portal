@@ -351,7 +351,9 @@ def celestial_wcs_for_time(ds: xr.Dataset, time_idx: int, *, freq_idx: int = 0) 
     header_str = _read_wcs_header_str(ds, time_idx=int(time_idx), freq_idx=int(freq_idx))
     if not header_str:
         return None
-    header = fits.Header.fromstring(header_str)
+    # Cards are newline-separated. The default separator reads a fixed 80-column
+    # grid and shifts every card after the first newline.
+    header = fits.Header.fromstring(header_str, sep="\n")
     return WCS(header).celestial
 
 
