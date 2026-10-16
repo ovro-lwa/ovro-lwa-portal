@@ -798,9 +798,13 @@ class _CutoutSky:
         self.overlay_view_lock = False
         self.view_gesture_revision = 0
         self.pushes: list[np.ndarray] = []
+        self.update_slice_calls: list[dict[str, object]] = []
 
     def view_center_skycoord(self) -> SkyCoord:
         return SkyCoord(self.view_ra, self.view_dec, unit="deg", frame="icrs")
+
+    def update_slice(self, *_args: object, **kwargs: object) -> None:
+        self.update_slice_calls.append(dict(kwargs))
 
     def push_shader_frame(self, data: np.ndarray, wcs: object, **_kwargs: object) -> None:
         array = np.asarray(data)
@@ -877,6 +881,7 @@ def test_heatmap_tap_fades_cutout_without_moving_the_view(
     _wait_until(loop, lambda: widget.opacity == 1.0 and len(widget.pushes) == 1)
 
     assert seen[0] == pytest.approx(0.35)
+    assert widget.update_slice_calls == []
     assert (widget.view_ra, widget.view_dec, widget.view_fov) == (180.0, 40.0, 8.0)
     assert review.loading is False
 
@@ -886,6 +891,53 @@ def test_heatmap_tap_fades_cutout_without_moving_the_view(
 
     assert seen[0] == pytest.approx(0.35)
     assert len(widget.pushes) == 1
+    assert widget.update_slice_calls == []
+    assert (widget.view_ra, widget.view_dec, widget.view_fov) == (180.0, 40.0, 8.0)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_large_cutout_push_does_not_call_update_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 782^2 Source Review overlay must not call ``update_slice(center=)``."""
+    from astropy.wcs import WCS
+
+    from ovro_lwa_portal import fov_overlay
+
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._coord = CAS_A
+    widget = _CutoutSky()
+    review._sky_widget = widget
+
+    def _wcs(*_args: object, **_kwargs: object) -> WCS:
+        wcs = WCS(naxis=2)
+        wcs.wcs.ctype = ["RA---SIN", "DEC--SIN"]
+        wcs.wcs.crval = [180.0, 40.0]
+        wcs.wcs.cdelt = [-0.037, 0.037]
+        wcs.wcs.crpix = [391.5, 391.5]
+        wcs.wcs.cunit = ["deg", "deg"]
+        return wcs
+
+    tile = np.ones((782, 782), dtype=np.float32)
+    monkeypatch.setattr(fov_overlay, "celestial_wcs_for_time", _wcs)
+    monkeypatch.setattr(
+        fov_overlay,
+        "extract_fov_cutout",
+        lambda *_a, **_k: tile,
+    )
+    monkeypatch.setattr(
+        fov_overlay,
+        "_project_native_sin",
+        lambda data, cut_wcs: (np.asarray(data, dtype=np.float32), cut_wcs, 0.2),
+    )
+
+    review._on_heatmap_tap(0, 0)
+    _wait_until(loop, lambda: len(widget.pushes) == 1 and widget.opacity == 1.0)
+
+    assert widget.pushes[0].shape == (782, 782)
+    assert widget.update_slice_calls == []
     assert (widget.view_ra, widget.view_dec, widget.view_fov) == (180.0, 40.0, 8.0)
 
 
