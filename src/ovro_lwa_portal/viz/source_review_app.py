@@ -65,6 +65,11 @@ from ovro_lwa_portal.viz.source_review import (
     should_reset_heatmap_on_center,
 )
 from ovro_lwa_portal.accessor import PatchFitCellResult
+from ovro_lwa_portal.dynspec_fill import (
+    ProgressiveSpectrumFill,
+    TrackedPixelReader,
+    spectrum_chunk_lengths,
+)
 from ovro_lwa_portal.fov_overlay import FovOverlaySession, SkyPlaneReader, attach_fov_pan_reload
 from ovro_lwa_portal.viz.source_review_data import (
     HEATMAP_METHOD_OPTIONS,
@@ -289,6 +294,7 @@ class SourceReview(param.Parameterized):
         self._fov_session: FovOverlaySession | None = None
         self._fov_executor: ThreadPoolExecutor | None = None
         self._fov_pan_attached = False
+        self._spectrum_fill: ProgressiveSpectrumFill | None = None
         self._hips_background_url = hips_background_survey_url(
             self._config.hips_background,
             hips_root=self._config.hips_root,
@@ -1709,13 +1715,19 @@ class SourceReview(param.Parameterized):
         cache_key = (self.coordinate_string.strip(), method, str(self.stokes))
         if cache_key in self._cache:
             cached = self._cache[cache_key]
-            self._dispatch(lambda: self._apply_heatmap(src, cached))
+            if method == "dynamic_spectrum":
+                self._schedule_main(lambda: self._paint_dynamic_spectrum(src, cached.values, done=True))
+            else:
+                self._dispatch(lambda: self._apply_heatmap(src, cached))
             return
 
         self._heatmap_job_id += 1
         job_id = self._heatmap_job_id
         self._invalidate_overlay_patch_fit()
         self._begin_heatmap_load(src)
+        if method == "dynamic_spectrum":
+            self._start_dynamic_spectrum(src, job_id)
+            return
 
         def _work() -> None:
             t0 = time.perf_counter()
@@ -1747,6 +1759,176 @@ class SourceReview(param.Parameterized):
         import threading
 
         threading.Thread(target=_work, daemon=True).start()
+
+    def _spectrum_fill_session(self) -> ProgressiveSpectrumFill:
+        fill = self._spectrum_fill
+        if fill is None or fill.executor is not self._fov_pool():
+            fill = ProgressiveSpectrumFill(self._fov_pool(), self._schedule_main)
+            self._spectrum_fill = fill
+        return fill
+
+    def _start_dynamic_spectrum(self, src: dict, job_id: int) -> None:
+        """Pixel-track off the UI thread, then paint chunk reads into the heatmap."""
+        started_at = time.perf_counter()
+        dataset = self._dataset
+        if dataset is None:
+            return
+        ra = float(src["ra"])
+        dec = float(src["dec"])
+
+        def _work() -> None:
+            try:
+                l_indices, m_indices, visible = self._pixel_track(ra, dec)
+            except Exception as exc:  # noqa: BLE001 — track failures are reported in the log
+                err = exc
+                self._schedule_main(
+                    lambda: self._fail_dynamic_spectrum(src, err, job_id, started_at)
+                )
+                return
+            tracked = (l_indices, m_indices, visible)
+            self._schedule_main(
+                lambda: self._begin_spectrum_chunks(src, tracked, job_id, started_at)
+            )
+
+        self._fov_pool().submit(_work)
+
+    def _pixel_track(
+        self,
+        ra: float,
+        dec: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Per-time ``(l, m)`` for one catalog position. Runs off the UI thread."""
+        dataset = self._dataset
+        if dataset is None:
+            msg = "Zarr store is not open"
+            raise RuntimeError(msg)
+        return dataset.radport._compute_pixel_track(
+            float(ra),
+            float(dec),
+            pol=self._pol_idx(),
+            progress_callback=self._heatmap_progress_callback(),
+        )
+
+    def _fail_dynamic_spectrum(
+        self,
+        src: dict,
+        error: BaseException,
+        job_id: int,
+        started_at: float,
+    ) -> None:
+        if job_id != self._heatmap_job_id:
+            return
+        self.loading = False
+        self._sync_spinner(False)
+        elapsed_s = time.perf_counter() - started_at
+        self._log(f"ERROR ({src['name']}): {error} ({elapsed_s:.1f} s)")
+        self._set_status(f"**Heatmap failed for {src['name']}:** {error}")
+
+    def _begin_spectrum_chunks(
+        self,
+        src: dict,
+        tracked: tuple[np.ndarray, np.ndarray, np.ndarray],
+        job_id: int,
+        started_at: float,
+    ) -> None:
+        if job_id != self._heatmap_job_id or self._dataset is None:
+            return
+        l_indices, m_indices, visible = tracked
+        sky = self._dataset["SKY"]
+        time_chunk, freq_chunk = spectrum_chunk_lengths(sky)
+        reader = TrackedPixelReader(
+            sky,
+            pol_idx=self._pol_idx(),
+            l_indices=l_indices,
+            m_indices=m_indices,
+            visible=visible,
+        )
+
+        def _paint(values: np.ndarray, done: bool) -> None:
+            self._paint_dynamic_spectrum(
+                src,
+                values,
+                done=done,
+                job_id=job_id,
+                started_at=started_at,
+            )
+
+        def _on_error(exc: BaseException) -> None:
+            self._fail_dynamic_spectrum(src, exc, job_id, started_at)
+
+        self._spectrum_fill_session().start(
+            reader,
+            n_time=int(sky.sizes["time"]),
+            n_freq=int(sky.sizes["frequency"]),
+            time_chunk=time_chunk,
+            freq_chunk=freq_chunk,
+            paint=_paint,
+            on_error=_on_error,
+        )
+
+    def _paint_dynamic_spectrum(
+        self,
+        src: dict,
+        values: np.ndarray,
+        *,
+        done: bool,
+        job_id: int | None = None,
+        started_at: float | None = None,
+    ) -> None:
+        """Mutate the mounted heatmap. Does not move the cell or load the overlay."""
+        if job_id is not None and job_id != self._heatmap_job_id:
+            return
+        self._current_source = src
+        self._heatmap_values = np.asarray(values, dtype=np.float64)
+        self._heatmap_grid_ready = True
+        self._coord = SkyCoord(
+            ra=float(src["ra"]) * u.deg,
+            dec=float(src["dec"]) * u.deg,
+            frame="icrs",
+        )
+        self._heatmap_coord = self._coord
+        self._sync_heatmap_pane_to_handles()
+        self._refresh_heatmap_figure(self._heatmap_values)
+
+        def _after_publish() -> None:
+            if not done:
+                return
+            self._finish_dynamic_spectrum_log(src, started_at)
+
+        if done:
+            self._publish_heatmap_mutation_to_notebook(after_publish=_after_publish)
+        else:
+            self._publish_heatmap_mutation_to_notebook()
+
+    def _finish_dynamic_spectrum_log(self, src: dict, started_at: float | None) -> None:
+        arr = self._heatmap_values
+        if arr is None:
+            return
+        cache_key = (self.coordinate_string.strip(), str(self.heatmap_method), str(self.stokes))
+        self._cache[cache_key] = HeatmapLoad(values=np.array(arr, copy=True))
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            self._log(
+                f"{src['name']} ({self._heatmap_method_label()}): "
+                f"range [{float(finite.min()):.3g}, {float(finite.max()):.3g}] "
+                f"({finite.size}/{arr.size} finite cells)"
+            )
+        else:
+            self._log(f"{src['name']} ({self._heatmap_method_label()}): no finite values")
+        if started_at is not None:
+            elapsed_s = time.perf_counter() - started_at
+            self._log(
+                f"Finished {src['name']} ({self._heatmap_method_label()}) in {elapsed_s:.1f} s"
+            )
+        self._clear_loading_indicator()
+        ra_h = self._coord.ra.to_string(unit=u.hour, precision=1) if self._coord is not None else ""
+        dec_s = self._coord.dec.to_string(unit=u.deg, precision=1) if self._coord is not None else ""
+        self._set_status(
+            f"**{src['name']}** — RA={ra_h}, Dec={dec_s} · "
+            f"Heatmap: **{self._heatmap_method_label()}** (Stokes {self.stokes}) · "
+            "**Click the heatmap** to inspect a time/frequency slice."
+        )
+        self._sync_fit_overlay_button()
 
     def _begin_heatmap_load(self, src: dict) -> None:
         """Show spinner/status for a new heatmap job."""

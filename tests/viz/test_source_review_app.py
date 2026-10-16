@@ -20,6 +20,31 @@ from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
 from ovro_lwa_portal.viz.source_review_app import SourceReview, SourceReviewConfig
 
 
+def test_control_row_names_and_order_are_unchanged(tmp_path: Path) -> None:
+    (tmp_path / "store.zarr").mkdir()
+    review = SourceReview(
+        tmp_path / "store.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    names = [str(getattr(child, "name", "")) for child in review._layout.objects[0].objects]
+    assert names[:7] == [
+        "Coordinate",
+        "Center",
+        "Generate heatmap",
+        "Stokes",
+        "Overlay: on",
+        "Fit overlay",
+        "Heatmap method",
+    ]
+
+
 def test_astrowidget_update_slice_supports_view_lock() -> None:
     """Editable ``../astrowidget`` is required for source review overlay view-lock."""
     import inspect

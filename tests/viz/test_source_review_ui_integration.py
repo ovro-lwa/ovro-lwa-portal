@@ -1376,3 +1376,141 @@ def test_overlay_fit_begin_logs_schedule_not_dispatch(
     _flush_jupyter_io(loop)
     assert dispatch_calls
     assert "Fit overlay finished" in review.log_text
+
+
+def _control_names(review: SourceReview) -> list[str]:
+    row = review._layout.objects[0]
+    return [str(getattr(child, "name", "")) for child in row.objects]
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_control_row_names_and_order_are_unchanged(tmp_path: Path) -> None:
+    """Phase 3 must not add a heatmap button or reorder the existing row."""
+    _harness, review = _mount_review(tmp_path)
+    assert _control_names(review)[:7] == [
+        "Coordinate",
+        "Center",
+        "Generate heatmap",
+        "Stokes",
+        "Overlay: on",
+        "Fit overlay",
+        "Heatmap method",
+    ]
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_dynamic_spectrum_generate_paints_click_without_moving_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generate heatmap fills the click coordinate and leaves the overlay cell put."""
+    mutation_calls: list[bool] = []
+    publish_calls: list[bool] = []
+    real_mutation = pqa.push_bokeh_pane_mutation_to_notebook
+    real_publish = pqa.publish_bokeh_pane_to_notebook
+
+    def _track_mutation(pane: object, *root_views: object, force_push: bool = False) -> None:
+        mutation_calls.append(bool(force_push))
+        real_mutation(pane, *root_views, force_push=force_push)
+
+    def _track_publish(
+        pane: object,
+        value: object,
+        *root_views: object,
+        force_push: bool = False,
+    ) -> None:
+        publish_calls.append(bool(force_push))
+        real_publish(pane, value, *root_views, force_push=force_push)
+
+    monkeypatch.setattr(sra, "push_bokeh_pane_mutation_to_notebook", _track_mutation)
+    monkeypatch.setattr(pqa, "push_bokeh_pane_mutation_to_notebook", _track_mutation)
+    monkeypatch.setattr(sra, "publish_bokeh_pane_to_notebook", _track_publish)
+    monkeypatch.setattr(pqa, "publish_bokeh_pane_to_notebook", _track_publish)
+
+    harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    sky = np.zeros((6, 4, 8, 8), dtype=np.float32)
+    sky[:, :, 2, 3] = 12.5
+    review._dataset["SKY"] = (("time", "frequency", "l", "m"), sky)
+    review._time_idx = 4
+    review._freq_idx = 2
+    review._ui.defer_dispatch(review._ensure_heatmap_grid)
+    _flush_jupyter_io(loop)
+
+    widget = MagicMock()
+    widget.clicked_coord = (10.25, -20.5)
+    widget.view_ra = 180.0
+    widget.view_dec = 40.0
+    widget.view_fov = 8.0
+    review._sky_widget = widget
+    review.heatmap_method = "dynamic_spectrum"
+    _flush_jupyter_io(loop)
+    mutation_calls.clear()
+    publish_calls.clear()
+
+    tracked: list[tuple[float, float]] = []
+
+    def _track(ra: float, dec: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        tracked.append((float(ra), float(dec)))
+        return np.full(6, 2), np.full(6, 3), np.ones(6, dtype=bool)
+
+    monkeypatch.setattr(review, "_pixel_track", _track)
+    overlay_calls: list[str] = []
+    monkeypatch.setattr(
+        review,
+        "_schedule_overlay_slice_load",
+        lambda *_a, **_k: overlay_calls.append("schedule"),
+    )
+    monkeypatch.setattr(
+        review,
+        "_update_sky",
+        lambda *_a, **_k: overlay_calls.append("update") or False,
+    )
+    compute_calls: list[str] = []
+
+    def _fail_compute(*_args: object, **_kwargs: object) -> HeatmapLoad:
+        compute_calls.append("compute")
+        raise AssertionError("dynamic_spectrum must not use compute_source_heatmap")
+
+    monkeypatch.setattr(sra, "compute_source_heatmap", _fail_compute)
+
+    review._on_sky_widget_click(None)
+    _flush_jupyter_io(loop)
+    review._on_generate_heatmap()
+    _wait_until(
+        loop,
+        lambda: review._heatmap_values is not None
+        and float(np.nanmax(review._heatmap_values)) == pytest.approx(12.5)
+        and review.loading is False,
+    )
+
+    assert tracked
+    assert tracked[0][0] == pytest.approx(10.25)
+    assert tracked[0][1] == pytest.approx(-20.5)
+    assert overlay_calls == []
+    assert compute_calls == []
+    assert (review._time_idx, review._freq_idx) == (4, 2)
+    assert (widget.view_ra, widget.view_dec) == (180.0, 40.0)
+    assert mutation_calls
+    assert publish_calls == []
+    _assert_heatmap_bokeh_model_live(harness, review)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_generate_with_empty_coordinate_does_not_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.coordinate_string = ""
+    review._coord_input.value = ""
+    review._coord_input.value_input = ""
+    review.heatmap_method = "dynamic_spectrum"
+    tracked: list[str] = []
+    monkeypatch.setattr(review, "_pixel_track", lambda *_a, **_k: tracked.append("track"))
+    review._on_generate_heatmap()
+    _flush_jupyter_io(loop)
+    assert tracked == []
+    assert "empty" in review.log_text.lower()
+    assert review._heatmap_values is None
