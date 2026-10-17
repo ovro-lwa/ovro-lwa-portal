@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from html.parser import HTMLParser
 from urllib.error import URLError
 from urllib.parse import quote
@@ -39,6 +39,16 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
 )
 
 _NUMERIC_COLUMNS = ("peak_jy", "detections", "snr", "elevation")
+# Rank and epoch counts stay text in the index parse. Range filters coerce them.
+RANGE_COLUMNS: tuple[str, ...] = (
+    "rank",
+    "peak_jy",
+    "detections",
+    "snr",
+    "elevation",
+    "n_epoch",
+)
+DATE_RANGE_COLUMNS: tuple[str, ...] = ("date",)
 _BAND_MHZ_RE = re.compile(r"^(\d+(?:\.\d+)?)MHz$", re.IGNORECASE)
 _LST_HOUR_RE = re.compile(r"^(\d{1,2})h$", re.IGNORECASE)
 _DETECTION_HEADERS = ("lst", "date", "band", "snr", "ra", "dec")
@@ -137,6 +147,65 @@ def subband_mhz_for_overlay(
             "has no subband detection"
         ),
     )
+
+
+def displayed_columns(columns: Sequence[str] | None = None) -> tuple[str, ...]:
+    """Columns shown in the candidate table. ``base_url`` stays hidden."""
+    names = CANDIDATE_COLUMNS if columns is None else columns
+    return tuple(column for column in names if column != "base_url")
+
+
+def is_range_column(column: str) -> bool:
+    """True when a displayed column filters with an inclusive min and max."""
+    return column in RANGE_COLUMNS or column in DATE_RANGE_COLUMNS
+
+
+def filter_candidates(
+    frame: pd.DataFrame,
+    *,
+    contains: Mapping[str, str] | None = None,
+    ranges: Mapping[str, tuple[object, object]] | None = None,
+) -> pd.DataFrame:
+    """Keep rows that match every displayed-column filter.
+
+    ``contains`` is a case-insensitive substring for text columns. A blank
+    string does not filter. ``ranges`` is an inclusive ``(low, high)`` for
+    numeric columns and ``date``. Either side may be ``None`` to leave that
+    end open. The result keeps ``frame.index``, so a Tabulator selection can
+    still be read with ``iloc`` on the unfiltered table.
+
+    Raises
+    ------
+    ValueError
+        When a column is hidden, missing, or paired with the other filter kind,
+        or when a bound is not a number or an ISO date.
+    """
+    text_filters = {
+        column: text.strip()
+        for column, text in (contains or {}).items()
+        if text is not None and str(text).strip()
+    }
+    range_filters: dict[str, tuple[float | date | None, float | date | None]] = {}
+    for column, bounds in (ranges or {}).items():
+        _require_filter_column(column, frame.columns, kind="range")
+        low, high = _range_bounds(column, bounds)
+        if low is None and high is None:
+            continue
+        range_filters[column] = (low, high)
+    for column in text_filters:
+        _require_filter_column(column, frame.columns, kind="contains")
+    for column in range_filters:
+        _require_filter_column(column, frame.columns, kind="range")
+    if not text_filters and not range_filters:
+        return frame
+
+    mask = pd.Series(True, index=frame.index)
+    for column, text in text_filters.items():
+        values = frame[column].astype("string")
+        mask &= values.str.contains(text, case=False, regex=False, na=False)
+    for column, (low, high) in range_filters.items():
+        mask &= _range_mask(frame[column], column, low, high)
+    return frame.loc[mask]
 
 
 def candidate_from_selection(frame: pd.DataFrame, selection: Sequence[int]) -> pd.Series:
@@ -239,6 +308,90 @@ def load_candidate_table(
     if not frames:
         return pd.DataFrame(columns=list(CANDIDATE_COLUMNS))
     return pd.concat(frames, ignore_index=True)
+
+
+def _blank_bound(value: object) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _range_bounds(
+    column: str,
+    bounds: tuple[object, object],
+) -> tuple[float | date | None, float | date | None]:
+    if len(bounds) != 2:
+        msg = f"{column} range must be a (low, high) pair"
+        raise ValueError(msg)
+    low, high = bounds
+    if column in DATE_RANGE_COLUMNS:
+        return _date_bound(column, low), _date_bound(column, high)
+    return _float_bound(column, low), _float_bound(column, high)
+
+
+def _float_bound(column: str, value: object) -> float | None:
+    if _blank_bound(value):
+        return None
+    msg = f"{column} range bound {value!r} is not a number"
+    try:
+        if isinstance(value, bool):
+            raise TypeError(msg)
+        if isinstance(value, (int, float, str)):
+            return float(value)
+        raise TypeError(msg)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(msg) from exc
+
+
+def _date_bound(column: str, value: object) -> date | None:
+    if _blank_bound(value):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value.strip())
+        except ValueError as exc:
+            msg = f"{column} range bound {value!r} is not a YYYY-MM-DD date"
+            raise ValueError(msg) from exc
+    msg = f"{column} range bound {value!r} is not a YYYY-MM-DD date"
+    raise ValueError(msg)
+
+
+def _require_filter_column(column: str, columns: pd.Index, *, kind: str) -> None:
+    if column not in displayed_columns(list(columns)):
+        msg = f"{column} is not a displayed candidate column"
+        raise ValueError(msg)
+    ranged = is_range_column(column)
+    if kind == "range" and not ranged:
+        msg = f"{column} is not a range column"
+        raise ValueError(msg)
+    if kind == "contains" and ranged:
+        msg = f"{column} uses a min/max range, not a text filter"
+        raise ValueError(msg)
+
+
+def _range_mask(
+    values: pd.Series,
+    column: str,
+    low: float | date | None,
+    high: float | date | None,
+) -> pd.Series:
+    if column in DATE_RANGE_COLUMNS:
+        parsed = pd.to_datetime(values, errors="coerce")
+        mask = parsed.notna()
+        if low is not None:
+            mask &= parsed >= pd.Timestamp(low)
+        if high is not None:
+            mask &= parsed <= pd.Timestamp(high)
+        return mask
+    parsed_numbers = pd.to_numeric(values, errors="coerce")
+    mask = parsed_numbers.notna()
+    if low is not None:
+        mask &= parsed_numbers >= low
+    if high is not None:
+        mask &= parsed_numbers <= high
+    return mask
 
 
 def _header_key(text: str) -> str:
@@ -438,10 +591,15 @@ class _LocbarParser(HTMLParser):
 
 __all__ = [
     "CANDIDATE_COLUMNS",
+    "DATE_RANGE_COLUMNS",
+    "RANGE_COLUMNS",
     "SourceDetection",
     "URLError",
     "candidate_from_selection",
+    "displayed_columns",
     "fetch_text",
+    "filter_candidates",
+    "is_range_column",
     "load_candidate_table",
     "parse_candidate_index",
     "parse_combined_position",
