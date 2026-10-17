@@ -13,8 +13,10 @@ from ovro_lwa_portal.name_resolution import resolve_coordinate_string
 from ovro_lwa_portal.viz.exopipe_catalog import (
     CandidateTabulator,
     candidate_from_selection,
+    candidate_row_for_load,
     candidate_tabulator_filters,
     load_candidate_table,
+    load_selected_candidate,
     parse_candidate_index,
     parse_combined_position,
     parse_source_detections,
@@ -184,6 +186,47 @@ def test_range_header_filter_stays_on_the_client() -> None:
     ]
     assert len(table._processed) == before
     assert table._get_header_filters(frame) == []
+
+
+def test_candidate_row_for_load_uses_a_visible_filtered_row() -> None:
+    frame = pd.DataFrame({"source": ["a", "b", "c"], "snr": [1.0, 5.0, 9.0]})
+    filters = [{"field": "snr", "type": "function", "value": {"start": "4", "end": ""}}]
+    assert candidate_row_for_load(frame, [2], filters).source == "c"
+    # Original row 0 is hidden, so 0 is the first visible row.
+    assert candidate_row_for_load(frame, [0], filters).source == "b"
+    with pytest.raises(ValueError, match="visible row"):
+        candidate_row_for_load(frame, [0], filters, allow_visible_position=False)
+    with pytest.raises(ValueError, match="visible row"):
+        candidate_row_for_load(frame, [5], filters)
+
+
+def test_load_selected_candidate_ignores_a_hidden_prefilter_click() -> None:
+    frame = pd.DataFrame({"source": ["a", "b", "c"], "snr": [1.0, 5.0, 9.0]})
+    filters = [{"field": "snr", "type": "function", "value": {"start": "4", "end": ""}}]
+    with pytest.raises(ValueError, match="visible row"):
+        load_selected_candidate(
+            frame,
+            clicked_iloc=0,
+            clicked_filter_key=(),
+            selection=[0],
+            filters=filters,
+        )
+    loaded = load_selected_candidate(
+        frame,
+        clicked_iloc=0,
+        clicked_filter_key=(("snr", "function", (("end", ""), ("start", "4"))),),
+        selection=[0],
+        filters=filters,
+    )
+    assert loaded.source == "b"
+    preferred = load_selected_candidate(
+        frame,
+        clicked_iloc=1,
+        clicked_filter_key=(("snr", "function", (("end", ""), ("start", "4"))),),
+        selection=[2],
+        filters=filters,
+    )
+    assert preferred.source == "c"
 
 
 def test_candidate_from_selection_uses_last_iloc() -> None:

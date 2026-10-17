@@ -277,11 +277,16 @@ def _only_filter_events(events: tuple[object, ...]) -> bool:
 class CandidateTabulator(pn.widgets.Tabulator):
     """Candidate table whose header filters stay in the browser.
 
+    ``clicked_iloc`` is the last row index reported by the browser.
+
     With local pagination, echoing a header filter through ``_update_cds``
     replaces every row. A min/max value is ``{start, end}``, and Panel then
     tries to cast that dict with the column dtype. Leaving the filter on the
     client keeps the visible rows and the row selection.
     """
+
+    clicked_iloc: int | None = None
+    clicked_filter_key: tuple[object, ...] | None = None
 
     def _update_cds(self, *events: object) -> None:
         if self.pagination != "remote" and events and _only_filter_events(events):
@@ -290,7 +295,11 @@ class CandidateTabulator(pn.widgets.Tabulator):
 
     def _get_header_filters(self, df: pd.DataFrame) -> list[pd.Series]:
         current = list(self.filters or [])
-        kept = [item for item in current if item.get("type") != "function"]
+        kept = [
+            item
+            for item in current
+            if isinstance(item.get("type"), str) and item.get("type") != "function"
+        ]
         if len(kept) == len(current):
             return super()._get_header_filters(df)  # type: ignore[misc]
         with param.discard_events(self):
@@ -299,6 +308,160 @@ class CandidateTabulator(pn.widgets.Tabulator):
                 return super()._get_header_filters(df)  # type: ignore[misc]
             finally:
                 self.filters = current
+
+    def _process_event(self, event: object) -> None:
+        # Remember the browser row before Panel remaps it. A header filter can
+        # make that remap fail, and Load would otherwise keep the previous candidate.
+        raw = getattr(event, "row", None)
+        if getattr(event, "event_name", None) != "selection-change" and isinstance(raw, int):
+            self.clicked_iloc = raw
+            self.clicked_filter_key = _filter_key(self.filters)
+        super()._process_event(event)  # type: ignore[misc]
+
+
+def _header_filter_mask(frame: pd.DataFrame, filters: Sequence[Mapping[str, object]]) -> pd.Series:
+    """Rows that pass the Tabulator header filters currently on the table."""
+    mask = pd.Series(True, index=frame.index)
+    for item in filters:
+        field = item.get("field")
+        if not isinstance(field, str) or field not in frame.columns:
+            continue
+        op = item.get("type")
+        value = item.get("value")
+        column = frame[field]
+        if op == "like":
+            mask &= column.astype(str).str.contains(
+                "" if value is None else str(value),
+                case=False,
+                regex=False,
+                na=False,
+            )
+            continue
+        if isinstance(value, Mapping) and (op in {None, "function"} or not isinstance(op, str)):
+            mask &= _range_filter_mask(column, value, date=field == "date")
+    return mask
+
+
+def _range_filter_mask(
+    column: pd.Series,
+    value: Mapping[str, object],
+    *,
+    date: bool,
+) -> pd.Series:
+    start = value.get("start")
+    end = value.get("end")
+    has_start = start is not None and str(start) != ""
+    has_end = end is not None and str(end) != ""
+    if not has_start and not has_end:
+        return pd.Series(True, index=column.index)
+    if date:
+        text = column.astype(str).str.slice(0, 10)
+        keep = pd.Series(True, index=column.index)
+        if has_start:
+            keep &= text >= str(start)
+        if has_end:
+            keep &= text <= str(end)
+        return keep.fillna(False)
+    numbers = pd.to_numeric(column, errors="coerce")
+    keep = numbers.notna()
+    if has_start:
+        try:
+            keep &= numbers >= float(str(start))
+        except ValueError:
+            return pd.Series(False, index=column.index)
+    if has_end:
+        try:
+            keep &= numbers <= float(str(end))
+        except ValueError:
+            return pd.Series(False, index=column.index)
+    return keep.fillna(False)
+
+
+def _filter_key(filters: Sequence[Mapping[str, object]] | None) -> tuple[object, ...]:
+    key: list[object] = []
+    for item in filters or []:
+        op = item.get("type")
+        op_key = op if isinstance(op, str) and op != "function" else "function"
+        value = item.get("value")
+        if isinstance(value, Mapping):
+            frozen: object = tuple(
+                sorted((str(name), "" if raw is None else str(raw)) for name, raw in value.items())
+            )
+        else:
+            frozen = "" if value is None else str(value)
+        key.append((item.get("field"), op_key, frozen))
+    return tuple(key)
+
+
+def candidate_row_for_load(
+    frame: pd.DataFrame,
+    selection: Sequence[int],
+    filters: Sequence[Mapping[str, object]] | None = None,
+    *,
+    allow_visible_position: bool = True,
+) -> pd.Series:
+    """Return the candidate Load should open.
+
+    ``selection`` is a Tabulator row index. With no header filter that index is
+    a position in ``frame``. After a filter it may instead be a position in the
+    visible rows. A hidden row is not reused: that left the sky on the previous
+    candidate.
+    """
+    if len(selection) == 0:
+        msg = "Select a candidate row, then press Load."
+        raise ValueError(msg)
+    iloc = int(selection[-1])
+    visible = frame.loc[_header_filter_mask(frame, list(filters or []))]
+    if 0 <= iloc < len(frame) and frame.index[iloc] in visible.index:
+        return frame.iloc[iloc]
+    if allow_visible_position and 0 <= iloc < len(visible):
+        return visible.iloc[iloc]
+    msg = "Select a visible row, then press Load."
+    raise ValueError(msg)
+
+
+def load_selected_candidate(
+    frame: pd.DataFrame,
+    *,
+    clicked_iloc: int | None,
+    clicked_filter_key: tuple[object, ...] | None,
+    selection: Sequence[int],
+    filters: Sequence[Mapping[str, object]] | None,
+    picked_iloc: int | None = None,
+) -> pd.Series:
+    """Open the row clicked under the current header filter.
+
+    A click from before the filter is ignored when that row is now hidden.
+    The visible-page position is used only when the click happened with these
+    filters already applied.
+    """
+    current = list(filters or [])
+    chosen = list(selection)
+    if not chosen and picked_iloc is not None:
+        chosen = [picked_iloc]
+    if chosen:
+        try:
+            return candidate_row_for_load(
+                frame,
+                chosen,
+                current,
+                allow_visible_position=False,
+            )
+        except ValueError:
+            pass
+    if clicked_iloc is not None:
+        try:
+            return candidate_row_for_load(
+                frame,
+                [clicked_iloc],
+                current,
+                allow_visible_position=False,
+            )
+        except ValueError:
+            if clicked_filter_key == _filter_key(current):
+                return candidate_row_for_load(frame, [clicked_iloc], current)
+    msg = "Select a visible row, then press Load."
+    raise ValueError(msg)
 
 
 def candidate_from_selection(frame: pd.DataFrame, selection: Sequence[int]) -> pd.Series:
@@ -604,9 +767,11 @@ __all__ = [
     "SourceDetection",
     "URLError",
     "candidate_from_selection",
+    "candidate_row_for_load",
     "candidate_tabulator_filters",
     "fetch_text",
     "load_candidate_table",
+    "load_selected_candidate",
     "parse_candidate_index",
     "parse_combined_position",
     "parse_source_detections",

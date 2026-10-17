@@ -1444,9 +1444,11 @@ class SourceReview(param.Parameterized):
         self._set_sky_crosshair(widget, coord)
         # The notebook IPyWidget bundle is a snapshot. Load runs inside a layout
         # push, and that push resends the snapshot from before goto unless the
-        # embed is rebuilt from the widget's current view.
+        # embed is rebuilt from the widget's current view. A second Load, often
+        # after a header filter, needs another snapshot once that push finishes.
         if not self._panel_serve_mode:
             self._refresh_notebook_sky_embed()
+            self._schedule_main(self._refresh_notebook_sky_embed)
         self._force_send_sky_widget_state(widget)
         self._schedule_overlay_slice_load(
             self._time_idx,
@@ -2324,7 +2326,16 @@ class SourceReview(param.Parameterized):
         try:
             index = children.index(old_model)
         except ValueError:
-            return
+            index = next(
+                (
+                    position
+                    for position, child in enumerate(children)
+                    if isinstance(child, BkIPyWidget)
+                ),
+                None,
+            )
+            if index is None:
+                return
         children[index] = new_model
         parent.children = children
         pane._models[ref] = (new_model, parent)
