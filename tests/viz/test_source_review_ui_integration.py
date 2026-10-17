@@ -260,6 +260,15 @@ def test_notebook_sky_embed_includes_widget_mounted_after_placeholder(
     assert "Sky view loads after the Zarr store opens." not in blob
     sky_model = harness.bokeh_model(review._sky_pane, review._layout)
     assert sky_model is model
+    parent = sky_model.document
+    assert parent is not None
+    n_models = len(parent.roots)
+    review._sky_container.children = [HTML("SKY-MOVED")]
+    review._refresh_notebook_sky_embed()
+    _ref, (again, _parent) = next(iter(review._sky_pane._models.items()))
+    assert again is model
+    assert "SKY-MOVED" in str(model.bundle)
+    assert len(parent.roots) == n_models
 
 
 def _make_dataset(*, n_times: int = 6, n_freqs: int = 4) -> xr.Dataset:
@@ -1236,6 +1245,8 @@ def test_review_catalog_position_keeps_detection_slice_for_overlay(
     )
     _flush_jupyter_io(loop)
 
+    assert "32.0 MHz" in review.status
+    assert "01-01 04h" in review.status
     assert review._pending_overlay_slice == (4, 1)
     chosen = review._consume_pending_overlay_slice(np.zeros((6, 4)))
     assert chosen == (4, 1)

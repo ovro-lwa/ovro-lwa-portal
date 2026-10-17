@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import ipywidgets as widgets
+from ipywidgets import Widget, embed
 import numpy as np
 import ovro_lwa_portal as ovro
 import panel as pn
@@ -150,6 +151,14 @@ LOADING_SPINNER_HTML = (
     'animation:ovro-lwa-spin 0.8s linear infinite"></div>'
     "<style>@keyframes ovro-lwa-spin{to{transform:rotate(360deg)}}</style>"
 )
+
+
+def _ipywidget_embed_bundle(widget: object) -> dict[str, object]:
+    """Snapshot an ipywidget the way Panel's notebook ``IPyWidget`` model does."""
+    spec = widget.get_view_spec()  # type: ignore[attr-defined]
+    state = Widget.get_manager_state(widgets=[])
+    state["state"] = embed.dependency_state([widget], drop_defaults=True)
+    return {"spec": spec, "state": state}
 
 
 def _placeholder_heatmap_figure() -> figure:
@@ -319,6 +328,7 @@ class SourceReview(param.Parameterized):
         self._overlay_fit_job_id = 0
         self._fit_overlay_sync_token = 0
         self._last_sent_image_revision: int | None = None
+        self._notebook_sky_embed_live = False
 
         super().__init__(coordinate_string=coordinate_string.strip(), **params)
 
@@ -1436,20 +1446,19 @@ class SourceReview(param.Parameterized):
             self._time_idx = resolved_time
             self._freq_idx = resolved_freq
             self._pending_overlay_slice = (resolved_time, resolved_freq)
-            self._log(
-                "Overlay detection sample "
-                f"{self._slice_descriptor(resolved_time, resolved_freq)}."
-            )
+            overlay = self._overlay_time_freq_text(resolved_time, resolved_freq)
+            self._set_status(f"**{name}** · overlay {overlay}")
+            self._log(f"Overlay detection sample {overlay}.")
         widget.goto(coord, fov=self._sky_fov_deg * u.deg)
         self._set_sky_crosshair(widget, coord)
-        # The notebook IPyWidget bundle is a snapshot. Load runs inside a layout
-        # push, and that push resends the snapshot from before goto unless the
-        # embed is rebuilt from the widget's current view. A second Load, often
-        # after a header filter, needs another snapshot once that push finishes.
+        # The first notebook snapshot is the placeholder. Later Loads update that
+        # same embed: a new IPyWidget model on every Load left the previous sky
+        # view on screen.
         if not self._panel_serve_mode:
             self._refresh_notebook_sky_embed()
-            self._schedule_main(self._refresh_notebook_sky_embed)
         self._force_send_sky_widget_state(widget)
+        if not self._panel_serve_mode:
+            self._schedule_main(lambda: self._force_send_sky_widget_state(widget))
         self._schedule_overlay_slice_load(
             self._time_idx,
             self._freq_idx,
@@ -1507,6 +1516,22 @@ class SourceReview(param.Parameterized):
             return 0
         label = str(self.stokes) if self.stokes in options else options[0]
         return polarization_index_for_stokes(self._dataset, label)
+
+    def _overlay_time_freq_text(self, time_idx: int, freq_idx: int) -> str:
+        """Calendar day, LST, and frequency of the slice shown on the sky."""
+        when = f"t={int(time_idx)}"
+        if self._dataset is not None and self._lst_hours is not None and len(self._lst_hours):
+            when = format_heatmap_time_axis_label(
+                np.asarray(self._dataset.coords["time"].values),
+                int(time_idx),
+                self._lst_hours,
+                day_labels=self._time_day_labels,
+            )
+        if self._freq_mhz is not None and len(self._freq_mhz):
+            freq = f"{float(self._freq_mhz[int(freq_idx)]):.1f} MHz"
+        else:
+            freq = f"f={int(freq_idx)}"
+        return f"Stokes {self.stokes} · {when} · {freq}"
 
     def _slice_descriptor(self, time_idx: int, freq_idx: int) -> str:
         """Stokes + time/frequency label for overlay logs, status, and titles."""
@@ -2154,13 +2179,14 @@ class SourceReview(param.Parameterized):
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
         dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
         overlay_hint = (
-            "**Click the heatmap** to inspect a time/frequency slice."
+            "**Click the heatmap** to inspect another time/frequency slice."
             if self._overlay_enabled
             else "Overlay is **off** — toggle **Overlay** to show slices."
         )
         status_text = (
             f"**{src['name']}** — l={src['l']:.2f}°, b={src['b']:.2f}°, "
             f"RA={ra_h}, Dec={dec_s} · "
+            f"Overlay: {self._overlay_time_freq_text(self._time_idx, self._freq_idx)} · "
             f"Heatmap: **{self._heatmap_method_label()}** (Stokes {self.stokes}, "
             f"scale={self._patch_scale:g}) · "
             f"{overlay_hint}"
@@ -2321,24 +2347,23 @@ class SourceReview(param.Parameterized):
         for attr in ("height", "width", "sizing_mode", "margin"):
             if hasattr(old_model, attr):
                 style[attr] = getattr(old_model, attr)
-        new_model = BkIPyWidget(widget=container, **style)
         children = list(parent.children)
         try:
             index = children.index(old_model)
         except ValueError:
-            index = next(
-                (
-                    position
-                    for position, child in enumerate(children)
-                    if isinstance(child, BkIPyWidget)
-                ),
-                None,
-            )
-            if index is None:
-                return
+            index = None
+        bundle = _ipywidget_embed_bundle(container)
+        if self._notebook_sky_embed_live:
+            # Replacing the Bokeh model again creates another on-screen sky view.
+            old_model.bundle = bundle
+            return
+        if index is None:
+            return
+        new_model = BkIPyWidget(widget=container, **style)
         children[index] = new_model
         parent.children = children
         pane._models[ref] = (new_model, parent)
+        self._notebook_sky_embed_live = True
 
     def _on_view_gesture_revision(self, change) -> None:
         """Activity-log hook when pan/zoom triggers debounced overlay reproject."""
