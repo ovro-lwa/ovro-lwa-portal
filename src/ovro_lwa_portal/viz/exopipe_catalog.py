@@ -287,6 +287,7 @@ class CandidateTabulator(pn.widgets.Tabulator):
 
     clicked_iloc: int | None = None
     clicked_filter_key: tuple[object, ...] | None = None
+    clicked_row: pd.Series | None = None
 
     def _update_cds(self, *events: object) -> None:
         if self.pagination != "remote" and events and _only_filter_events(events):
@@ -310,13 +311,35 @@ class CandidateTabulator(pn.widgets.Tabulator):
                 self.filters = current
 
     def _process_event(self, event: object) -> None:
-        # Remember the browser row before Panel remaps it. A header filter can
-        # make that remap fail, and Load would otherwise keep the previous candidate.
+        # The browser ``_index`` is the position in the full frame. Record that
+        # row before Panel remaps it. A header filter can make the remap fail,
+        # and Load would otherwise keep the previous candidate.
         raw = getattr(event, "row", None)
-        if getattr(event, "event_name", None) != "selection-change" and isinstance(raw, int):
+        name = getattr(event, "event_name", None)
+        recorded = False
+        if (
+            name == "cell-click"
+            and isinstance(raw, int)
+            and self.value is not None
+            and 0 <= raw < len(self.value)
+        ):
             self.clicked_iloc = raw
             self.clicked_filter_key = _filter_key(self.filters)
-        super()._process_event(event)  # type: ignore[misc]
+            self.clicked_row = self.value.iloc[raw]
+            recorded = True
+        try:
+            super()._process_event(event)  # type: ignore[misc]
+        except (KeyError, IndexError, ValueError):
+            if not recorded:
+                raise
+            for callback in self._on_click_callbacks.get(None, []):
+                callback(event)
+            return
+        if name == "cell-click" and isinstance(getattr(event, "row", None), int):
+            iloc = int(event.row)
+            if self.value is not None and 0 <= iloc < len(self.value):
+                self.clicked_iloc = iloc
+                self.clicked_row = self.value.iloc[iloc]
 
 
 def _header_filter_mask(frame: pd.DataFrame, filters: Sequence[Mapping[str, object]]) -> pd.Series:

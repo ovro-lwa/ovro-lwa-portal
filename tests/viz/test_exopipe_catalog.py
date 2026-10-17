@@ -188,6 +188,27 @@ def test_range_header_filter_stays_on_the_client() -> None:
     assert table._get_header_filters(frame) == []
 
 
+def test_cell_click_records_the_full_frame_row() -> None:
+    frame = pd.DataFrame({"source": ["a", "b", "c"], "snr": [1.0, 5.0, 9.0]})
+    table = CandidateTabulator(frame, selectable=1, pagination="local")
+    seen: list[str] = []
+
+    def _click(_event: object) -> None:
+        assert table.clicked_row is not None
+        seen.append(str(table.clicked_row.source))
+
+    table.on_click(_click)
+
+    class _Click:
+        event_name = "cell-click"
+        row = 2
+        column = "source"
+
+    table._process_event(_Click())
+    assert seen == ["c"]
+    assert table.clicked_iloc == 2
+
+
 def test_candidate_row_for_load_uses_a_visible_filtered_row() -> None:
     frame = pd.DataFrame({"source": ["a", "b", "c"], "snr": [1.0, 5.0, 9.0]})
     filters = [{"field": "snr", "type": "function", "value": {"start": "4", "end": ""}}]

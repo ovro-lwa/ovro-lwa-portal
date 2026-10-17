@@ -33,7 +33,11 @@ from bokeh.plotting import figure
 from ovro_lwa_portal import resolve_coordinate_string
 from ovro_lwa_portal.io import DataSourceError, cap_lm_chunks
 from ovro_lwa_portal.name_resolution import format_icrs_degree_pair
-from ovro_lwa_portal.viz.hips import compute_hips_percentile_cuts, hips_background_survey_url
+from ovro_lwa_portal.viz.hips import (
+    compute_hips_percentile_cuts,
+    hips_background_survey_url,
+    read_hips_pixel_cut,
+)
 from ovro_lwa_portal.viz.pipeline_qa_app import (
     ACTIVITY_LOG_HEIGHT_PX,
     ScrollLog,
@@ -2278,6 +2282,13 @@ class SourceReview(param.Parameterized):
                 f"HiPS cuts (fixed): {cfg.background_cut_min:.4g} .. "
                 f"{cfg.background_cut_max:.4g}"
             )
+            return
+        suggested = read_hips_pixel_cut(cfg.hips_background)
+        if suggested is not None:
+            cut_lo, cut_hi = suggested
+            widget.background_cut_min = cut_lo
+            widget.background_cut_max = cut_hi
+            self._log(f"HiPS cuts (hips_pixel_cut): {cut_lo:.4g} .. {cut_hi:.4g}")
             return
         try:
             cut_lo, cut_hi = compute_hips_percentile_cuts(
