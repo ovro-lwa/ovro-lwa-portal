@@ -5,13 +5,15 @@ from __future__ import annotations
 from datetime import date
 
 import pandas as pd
+import panel as pn
 import pytest
+from panel.io.model import JSCode
 
 from ovro_lwa_portal.name_resolution import resolve_coordinate_string
 from ovro_lwa_portal.viz.exopipe_catalog import (
+    CandidateTabulator,
     candidate_from_selection,
-    displayed_columns,
-    filter_candidates,
+    candidate_tabulator_filters,
     load_candidate_table,
     parse_candidate_index,
     parse_combined_position,
@@ -127,41 +129,61 @@ def test_parse_source_detections_peak_uses_subband_at_same_time() -> None:
     assert "32MHz at 2025-05-05 17h" in own_note
 
 
-def test_filter_candidates_combines_text_and_ranges() -> None:
+def test_candidate_tabulator_filters_put_ranges_on_column_headers() -> None:
     frame = parse_candidate_index(
         _INDEX_I,
         stokes="I",
         base_url="http://127.0.0.1:8768",
     )
-    assert "base_url" not in displayed_columns(frame.columns)
-    narrowed = filter_candidates(
+    header_filters, configuration = candidate_tabulator_filters(frame.columns)
+    assert "base_url" not in header_filters
+    assert "snr" not in header_filters
+    assert header_filters["source"] == {"type": "input", "func": "like"}
+    table = pn.widgets.Tabulator(
         frame,
-        contains={"source": "1939", "bands": "red"},
-        ranges={"snr": (80, None), "rank": ("1", "1"), "date": ("2025-05-01", date(2025, 5, 31))},
+        show_index=False,
+        header_filters=header_filters,
+        configuration=configuration,
+        editors=dict.fromkeys(frame.columns),
+        pagination="local",
     )
-    assert list(narrowed["source"]) == ["J1939+2136"]
-    assert narrowed.index.tolist() == [1]
-    assert frame.iloc[int(narrowed.index[0])].source == "J1939+2136"
-    assert filter_candidates(frame, contains={"source": "  "}, ranges={"snr": (None, None)}) is frame
+    specs = {
+        column["field"]: column
+        for column in table._get_configuration(table._get_columns())["columns"]
+    }
+    assert isinstance(specs["snr"]["headerFilter"], JSCode)
+    assert isinstance(specs["snr"]["headerFilterFunc"], JSCode)
+    assert specs["snr"]["headerFilterFuncParams"] == {"kind": "number"}
+    assert specs["date"]["headerFilterParams"] == {"kind": "date"}
+    assert specs["rank"]["headerFilterFuncParams"] == {"kind": "number"}
+    assert specs["source"]["headerFilter"] == "input"
+    assert specs["source"]["headerFilterFunc"] == "like"
+    assert specs["snr"]["headerFilterLiveFilter"] is False
+    assert "keyup" in specs["snr"]["headerFilter"].js_code
+    assert "headerFilter" not in specs["base_url"]
 
 
-def test_filter_candidates_rejects_hidden_and_wrong_kind() -> None:
+def test_range_header_filter_stays_on_the_client() -> None:
     frame = parse_candidate_index(
         _INDEX_I,
         stokes="I",
         base_url="http://127.0.0.1:8768",
     )
-    with pytest.raises(ValueError, match="base_url"):
-        filter_candidates(frame, contains={"base_url": "8768"})
-    with pytest.raises(ValueError, match="not a range column"):
-        filter_candidates(frame, ranges={"source": ("a", "z")})
-    with pytest.raises(ValueError, match="min/max"):
-        filter_candidates(frame, contains={"snr": "70"})
-    with pytest.raises(ValueError, match="not a number"):
-        filter_candidates(frame, ranges={"snr": ("high", None)})
-    with pytest.raises(ValueError, match="YYYY-MM-DD"):
-        filter_candidates(frame, ranges={"date": ("05-05-2025", None)})
-    assert filter_candidates(frame, ranges={"elevation": (60, 90)}).empty
+    header_filters, configuration = candidate_tabulator_filters(frame.columns)
+    table = CandidateTabulator(
+        frame,
+        show_index=False,
+        header_filters=header_filters,
+        configuration=configuration,
+        editors=dict.fromkeys(frame.columns),
+        pagination="local",
+    )
+    before = len(table._processed)
+    table.filters = [
+        {"field": "snr", "type": "function", "value": {"start": "5", "end": ""}},
+    ]
+    assert len(table._processed) == before
+    assert table._get_header_filters(frame) == []
 
 
 def test_candidate_from_selection_uses_last_iloc() -> None:

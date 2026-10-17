@@ -1442,6 +1442,12 @@ class SourceReview(param.Parameterized):
             )
         widget.goto(coord, fov=self._sky_fov_deg * u.deg)
         self._set_sky_crosshair(widget, coord)
+        # The notebook IPyWidget bundle is a snapshot. Load runs inside a layout
+        # push, and that push resends the snapshot from before goto unless the
+        # embed is rebuilt from the widget's current view.
+        if not self._panel_serve_mode:
+            self._refresh_notebook_sky_embed()
+        self._force_send_sky_widget_state(widget)
         self._schedule_overlay_slice_load(
             self._time_idx,
             self._freq_idx,

@@ -10,13 +10,16 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from html.parser import HTMLParser
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import urlopen
 
 import pandas as pd
+import panel as pn
+import param
+from panel.io.model import JSCode
 
 CANDIDATE_COLUMNS: tuple[str, ...] = (
     "stokes",
@@ -39,8 +42,8 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
 )
 
 _NUMERIC_COLUMNS = ("peak_jy", "detections", "snr", "elevation")
-# Rank and epoch counts stay text in the index parse. Range filters coerce them.
-RANGE_COLUMNS: tuple[str, ...] = (
+# Rank and epoch counts stay text in the index parse. The header filter coerces them.
+_RANGE_FILTER_COLUMNS = (
     "rank",
     "peak_jy",
     "detections",
@@ -48,7 +51,85 @@ RANGE_COLUMNS: tuple[str, ...] = (
     "elevation",
     "n_epoch",
 )
-DATE_RANGE_COLUMNS: tuple[str, ...] = ("date",)
+_DATE_FILTER_COLUMNS = ("date",)
+_RANGE_HEADER_EDITOR = """
+function(cell, onRendered, success, cancel, editorParams) {
+  var kind = editorParams && editorParams.kind === "date" ? "date" : "number";
+  var box = document.createElement("span");
+  box.style.display = "flex";
+  box.style.gap = "2px";
+  function makeInput(placeholder) {
+    var input = document.createElement("input");
+    input.type = kind;
+    input.placeholder = placeholder;
+    input.style.width = "50%";
+    input.style.minWidth = "0";
+    input.style.boxSizing = "border-box";
+    input.style.padding = "2px";
+    function stop(event) { event.stopPropagation(); }
+    input.addEventListener("mousedown", stop);
+    input.addEventListener("click", stop);
+    input.addEventListener("keydown", stop);
+    input.addEventListener("keyup", stop);
+    input.addEventListener("keypress", stop);
+    return input;
+  }
+  var start = makeInput(kind === "date" ? "from" : "min");
+  var end = makeInput(kind === "date" ? "to" : "max");
+  var current = cell.getValue();
+  if (current && typeof current === "object") {
+    if (current.start) start.value = current.start;
+    if (current.end) end.value = current.end;
+  }
+  function commit() {
+    success({start: start.value, end: end.value});
+  }
+  start.addEventListener("input", commit);
+  end.addEventListener("input", commit);
+  box.appendChild(start);
+  box.appendChild(end);
+  return box;
+}
+"""
+_RANGE_HEADER_FILTER = """
+function(headerValue, rowValue, rowData, filterParams) {
+  if (!headerValue || typeof headerValue !== "object") {
+    return true;
+  }
+  var start = headerValue.start;
+  var end = headerValue.end;
+  var hasStart = start !== undefined && start !== null && String(start) !== "";
+  var hasEnd = end !== undefined && end !== null && String(end) !== "";
+  if (!hasStart && !hasEnd) {
+    return true;
+  }
+  if (rowValue === null || rowValue === undefined || rowValue === "") {
+    return false;
+  }
+  var kind = filterParams && filterParams.kind === "date" ? "date" : "number";
+  if (kind === "date") {
+    var text = String(rowValue).slice(0, 10);
+    if (hasStart && text < String(start)) {
+      return false;
+    }
+    if (hasEnd && text > String(end)) {
+      return false;
+    }
+    return true;
+  }
+  var value = Number(rowValue);
+  if (!Number.isFinite(value)) {
+    return false;
+  }
+  if (hasStart && value < Number(start)) {
+    return false;
+  }
+  if (hasEnd && value > Number(end)) {
+    return false;
+  }
+  return true;
+}
+"""
 _BAND_MHZ_RE = re.compile(r"^(\d+(?:\.\d+)?)MHz$", re.IGNORECASE)
 _LST_HOUR_RE = re.compile(r"^(\d{1,2})h$", re.IGNORECASE)
 _DETECTION_HEADERS = ("lst", "date", "band", "snr", "ra", "dec")
@@ -149,63 +230,75 @@ def subband_mhz_for_overlay(
     )
 
 
-def displayed_columns(columns: Sequence[str] | None = None) -> tuple[str, ...]:
-    """Columns shown in the candidate table. ``base_url`` stays hidden."""
-    names = CANDIDATE_COLUMNS if columns is None else columns
-    return tuple(column for column in names if column != "base_url")
+def candidate_tabulator_filters(
+    columns: Sequence[str],
+) -> tuple[dict[str, dict[str, str]], dict[str, list[dict[str, object]]]]:
+    """Header filters for the displayed candidate columns.
 
+    Text columns match a substring. Numeric columns and ``date`` use a
+    min/max editor in that column's header. ``base_url`` is omitted.
 
-def is_range_column(column: str) -> bool:
-    """True when a displayed column filters with an inclusive min and max."""
-    return column in RANGE_COLUMNS or column in DATE_RANGE_COLUMNS
-
-
-def filter_candidates(
-    frame: pd.DataFrame,
-    *,
-    contains: Mapping[str, str] | None = None,
-    ranges: Mapping[str, tuple[object, object]] | None = None,
-) -> pd.DataFrame:
-    """Keep rows that match every displayed-column filter.
-
-    ``contains`` is a case-insensitive substring for text columns. A blank
-    string does not filter. ``ranges`` is an inclusive ``(low, high)`` for
-    numeric columns and ``date``. Either side may be ``None`` to leave that
-    end open. The result keeps ``frame.index``, so a Tabulator selection can
-    still be read with ``iloc`` on the unfiltered table.
-
-    Raises
-    ------
-    ValueError
-        When a column is hidden, missing, or paired with the other filter kind,
-        or when a bound is not a number or an ISO date.
+    Returns
+    -------
+    header_filters, configuration
+        Pass these to ``pn.widgets.Tabulator``. The configuration columns
+        carry the range editor; Tabulator runs it in the browser.
     """
-    text_filters = {
-        column: text.strip()
-        for column, text in (contains or {}).items()
-        if text is not None and str(text).strip()
-    }
-    range_filters: dict[str, tuple[float | date | None, float | date | None]] = {}
-    for column, bounds in (ranges or {}).items():
-        _require_filter_column(column, frame.columns, kind="range")
-        low, high = _range_bounds(column, bounds)
-        if low is None and high is None:
+    header_filters: dict[str, dict[str, str]] = {}
+    range_columns: list[dict[str, object]] = []
+    for column in columns:
+        if column == "base_url":
             continue
-        range_filters[column] = (low, high)
-    for column in text_filters:
-        _require_filter_column(column, frame.columns, kind="contains")
-    for column in range_filters:
-        _require_filter_column(column, frame.columns, kind="range")
-    if not text_filters and not range_filters:
-        return frame
+        if column in _DATE_FILTER_COLUMNS or column in _RANGE_FILTER_COLUMNS:
+            kind = "date" if column in _DATE_FILTER_COLUMNS else "number"
+            params = {"kind": kind}
+            range_columns.append(
+                {
+                    "field": column,
+                    "headerFilter": JSCode(_RANGE_HEADER_EDITOR),
+                    "headerFilterParams": params,
+                    "headerFilterFunc": JSCode(_RANGE_HEADER_FILTER),
+                    "headerFilterFuncParams": params,
+                    # Tabulator's default live filter reads the wrapper node's
+                    # .value. That node is a <span>, so .value is undefined and
+                    # the filter is deleted ~300 ms after it is applied.
+                    "headerFilterLiveFilter": False,
+                }
+            )
+            continue
+        header_filters[column] = {"type": "input", "func": "like"}
+    return header_filters, {"columns": range_columns}
 
-    mask = pd.Series(True, index=frame.index)
-    for column, text in text_filters.items():
-        values = frame[column].astype("string")
-        mask &= values.str.contains(text, case=False, regex=False, na=False)
-    for column, (low, high) in range_filters.items():
-        mask &= _range_mask(frame[column], column, low, high)
-    return frame.loc[mask]
+
+def _only_filter_events(events: tuple[object, ...]) -> bool:
+    return all(getattr(event, "name", None) == "filters" for event in events)
+
+
+class CandidateTabulator(pn.widgets.Tabulator):
+    """Candidate table whose header filters stay in the browser.
+
+    With local pagination, echoing a header filter through ``_update_cds``
+    replaces every row. A min/max value is ``{start, end}``, and Panel then
+    tries to cast that dict with the column dtype. Leaving the filter on the
+    client keeps the visible rows and the row selection.
+    """
+
+    def _update_cds(self, *events: object) -> None:
+        if self.pagination != "remote" and events and _only_filter_events(events):
+            return
+        super()._update_cds(*events)  # type: ignore[misc]
+
+    def _get_header_filters(self, df: pd.DataFrame) -> list[pd.Series]:
+        current = list(self.filters or [])
+        kept = [item for item in current if item.get("type") != "function"]
+        if len(kept) == len(current):
+            return super()._get_header_filters(df)  # type: ignore[misc]
+        with param.discard_events(self):
+            self.filters = kept
+            try:
+                return super()._get_header_filters(df)  # type: ignore[misc]
+            finally:
+                self.filters = current
 
 
 def candidate_from_selection(frame: pd.DataFrame, selection: Sequence[int]) -> pd.Series:
@@ -308,90 +401,6 @@ def load_candidate_table(
     if not frames:
         return pd.DataFrame(columns=list(CANDIDATE_COLUMNS))
     return pd.concat(frames, ignore_index=True)
-
-
-def _blank_bound(value: object) -> bool:
-    return value is None or (isinstance(value, str) and not value.strip())
-
-
-def _range_bounds(
-    column: str,
-    bounds: tuple[object, object],
-) -> tuple[float | date | None, float | date | None]:
-    if len(bounds) != 2:
-        msg = f"{column} range must be a (low, high) pair"
-        raise ValueError(msg)
-    low, high = bounds
-    if column in DATE_RANGE_COLUMNS:
-        return _date_bound(column, low), _date_bound(column, high)
-    return _float_bound(column, low), _float_bound(column, high)
-
-
-def _float_bound(column: str, value: object) -> float | None:
-    if _blank_bound(value):
-        return None
-    msg = f"{column} range bound {value!r} is not a number"
-    try:
-        if isinstance(value, bool):
-            raise TypeError(msg)
-        if isinstance(value, (int, float, str)):
-            return float(value)
-        raise TypeError(msg)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(msg) from exc
-
-
-def _date_bound(column: str, value: object) -> date | None:
-    if _blank_bound(value):
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value.strip())
-        except ValueError as exc:
-            msg = f"{column} range bound {value!r} is not a YYYY-MM-DD date"
-            raise ValueError(msg) from exc
-    msg = f"{column} range bound {value!r} is not a YYYY-MM-DD date"
-    raise ValueError(msg)
-
-
-def _require_filter_column(column: str, columns: pd.Index, *, kind: str) -> None:
-    if column not in displayed_columns(list(columns)):
-        msg = f"{column} is not a displayed candidate column"
-        raise ValueError(msg)
-    ranged = is_range_column(column)
-    if kind == "range" and not ranged:
-        msg = f"{column} is not a range column"
-        raise ValueError(msg)
-    if kind == "contains" and ranged:
-        msg = f"{column} uses a min/max range, not a text filter"
-        raise ValueError(msg)
-
-
-def _range_mask(
-    values: pd.Series,
-    column: str,
-    low: float | date | None,
-    high: float | date | None,
-) -> pd.Series:
-    if column in DATE_RANGE_COLUMNS:
-        parsed = pd.to_datetime(values, errors="coerce")
-        mask = parsed.notna()
-        if low is not None:
-            mask &= parsed >= pd.Timestamp(low)
-        if high is not None:
-            mask &= parsed <= pd.Timestamp(high)
-        return mask
-    parsed_numbers = pd.to_numeric(values, errors="coerce")
-    mask = parsed_numbers.notna()
-    if low is not None:
-        mask &= parsed_numbers >= low
-    if high is not None:
-        mask &= parsed_numbers <= high
-    return mask
 
 
 def _header_key(text: str) -> str:
@@ -591,15 +600,12 @@ class _LocbarParser(HTMLParser):
 
 __all__ = [
     "CANDIDATE_COLUMNS",
-    "DATE_RANGE_COLUMNS",
-    "RANGE_COLUMNS",
+    "CandidateTabulator",
     "SourceDetection",
     "URLError",
     "candidate_from_selection",
-    "displayed_columns",
+    "candidate_tabulator_filters",
     "fetch_text",
-    "filter_candidates",
-    "is_range_column",
     "load_candidate_table",
     "parse_candidate_index",
     "parse_combined_position",
