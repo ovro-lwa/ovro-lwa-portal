@@ -23,6 +23,7 @@ from ovro_lwa_portal.io import (
     _validate_dataset,
     open_dataset,
     resolve_source,
+    resolve_zarr_source,
     validate_local_zarr_store,
 )
 
@@ -378,6 +379,56 @@ class TestValidateLocalZarrStore:
 
         with pytest.raises(DataSourceError, match="is a file, not a directory"):
             validate_local_zarr_store(file_path)
+
+
+class TestResolveZarrSource:
+    """Tests for resolve_zarr_source (local validate + remote/DOI passthrough)."""
+
+    def test_local_validates_and_resolves(self, tmp_path: Path) -> None:
+        zarr_path = tmp_path / "obs.zarr"
+        xr.Dataset({"SKY": (["time"], [1.0])}, coords={"time": [0]}).to_zarr(zarr_path)
+        resolved = resolve_zarr_source(zarr_path)
+        assert resolved.source_type == "local"
+        assert Path(resolved.open_source) == zarr_path.resolve()
+        assert resolved.storage_options is None
+
+    def test_local_missing_raises_when_validate(self, tmp_path: Path) -> None:
+        missing = tmp_path / "missing.zarr"
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            resolve_zarr_source(missing, validate_local=True)
+
+    def test_local_skips_validate_when_disabled(self, tmp_path: Path) -> None:
+        missing = tmp_path / "missing.zarr"
+        resolved = resolve_zarr_source(missing, validate_local=False)
+        assert resolved.source_type == "local"
+        assert resolved.open_source == str(missing.expanduser())
+
+    def test_s3_url_passthrough(self) -> None:
+        url = "s3://bucket/path/obs.zarr"
+        opts = {"key": "AKIA", "secret": "secret"}
+        resolved = resolve_zarr_source(url, storage_options=opts)
+        assert resolved.source_type == "remote"
+        assert resolved.open_source == url
+        assert resolved.storage_options == opts
+        assert resolved.storage_options is not opts  # shallow copy
+
+    def test_https_url_passthrough(self) -> None:
+        url = "https://example.com/data.zarr"
+        resolved = resolve_zarr_source(url)
+        assert resolved.source_type == "remote"
+        assert resolved.open_source == url
+
+    def test_doi_normalized_without_network(self) -> None:
+        resolved = resolve_zarr_source("doi:10.5281/zenodo.1234567")
+        assert resolved.source_type == "doi"
+        assert resolved.open_source == "10.5281/zenodo.1234567"
+
+    def test_path_object_does_not_accept_s3_scheme(self) -> None:
+        # pathlib collapses s3:// to s3:/ — callers must pass remote URLs as str.
+        mangled = str(Path("s3://bucket/obs.zarr"))
+        assert mangled != "s3://bucket/obs.zarr"
+        resolved = resolve_zarr_source("s3://bucket/obs.zarr")
+        assert resolved.open_source == "s3://bucket/obs.zarr"
 
 
 class TestDOIResolution:

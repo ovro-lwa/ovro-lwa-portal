@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ovro_lwa_portal.ingest.discovery import (
     IngestDiscoveryConfig,
     discover_time_grouped_fits,
     discover_time_grouped_paths,
+    estimate_glob_convert_size,
     plan_convert_discovery,
     prepare_ingest_time_groups,
     summarize_time_grouped_fits,
@@ -24,11 +27,16 @@ def test_prepare_ingest_time_groups_resume_uses_completed_filter(
 
     monkeypatch.setattr(
         "ovro_lwa_portal.ingest.discovery._filter_invalid_beam_files",
-        lambda groups: groups,
+        lambda groups, **kwargs: groups,
     )
 
     def fake_filter(
-        groups: dict[str, list[Path]], path: Path, *, rebuild: bool, context: str
+        groups: dict[str, list[Path]],
+        path: Path,
+        *,
+        rebuild: bool,
+        context: str,
+        **_kwargs: object,
     ) -> dict[str, list[Path]]:
         assert path == out_zarr
         assert context == "convert"
@@ -86,6 +94,11 @@ def test_discover_time_grouped_fits_forwards_time_key_source(monkeypatch, tmp_pa
         discovery=IngestDiscoveryConfig(time_key_source="header"),
     )
     assert seen == ["header"]
+    discover_time_grouped_fits(
+        tmp_path,
+        discovery=IngestDiscoveryConfig(time_key_source="directory"),
+    )
+    assert seen == ["header", "directory"]
 
 
 def _image_name(time_key: str, mhz: int) -> str:
@@ -135,11 +148,11 @@ def test_plan_convert_discovery_splits_discovered_and_to_process(
 
     monkeypatch.setattr(
         "ovro_lwa_portal.ingest.discovery._filter_invalid_beam_files",
-        lambda groups: groups,
+        lambda groups, **kwargs: groups,
     )
     monkeypatch.setattr(
         "ovro_lwa_portal.ingest.discovery._filter_completed_time_keys",
-        lambda groups, path, *, rebuild, context: {tkey_b: groups[tkey_b]},
+        lambda groups, path, *, rebuild, context, **_kwargs: {tkey_b: groups[tkey_b]},
     )
 
     discovery = IngestDiscoveryConfig(group_metadata_source="filename")
@@ -154,3 +167,377 @@ def test_plan_convert_discovery_splits_discovered_and_to_process(
     assert discovered.input_files == 2
     assert to_process.time_groups == 1
     assert to_process.input_files == 1
+
+
+def test_summarize_time_grouped_fits_attaches_zarr_size_estimate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Discovery summary includes the per-file pixel size estimate when available."""
+    tkey = "20250106_051855"
+    by_time = {tkey: [tmp_path / _image_name(tkey, 41)]}
+    by_time[tkey][0].write_bytes(b"")
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery.estimate_zarr_store_bytes",
+        lambda groups, **kwargs: 12_345,
+    )
+    summary = summarize_time_grouped_fits(
+        by_time,
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+    )
+    assert summary.estimated_zarr_bytes == 12_345
+    assert summary.estimated_zarr_size == "12.1 KiB"
+
+
+def test_resolve_glob_convert_discovery_single_pass(tmp_path: Path, monkeypatch) -> None:
+    """resolve_glob_convert_discovery groups once and fills cached metadata."""
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    paths = [
+        tmp_path / _image_name(tkey, 41),
+        tmp_path / _image_name(tkey, 55),
+    ]
+    for mhz, path in zip((41, 55), paths, strict=True):
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header(
+                {"RESTFREQ": float(mhz * 1e6), "BMAJ": 0.25, "BMIN": 0.25}
+            ),
+        ).writeto(path)
+
+    discover_calls = 0
+    original = __import__(
+        "ovro_lwa_portal.ingest.discovery", fromlist=["discover_time_grouped_paths"]
+    ).discover_time_grouped_paths
+
+    def counting_discover(*args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal discover_calls
+        discover_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery.discover_time_grouped_paths",
+        counting_discover,
+    )
+
+    plan = resolve_glob_convert_discovery(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="fits"),
+        out_zarr=tmp_path / "store.zarr",
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert discover_calls == 1
+    assert len(plan.discovery_metadata) == 2
+    assert plan.discovered.input_files == 2
+    assert plan.to_process_summary.input_files == 2
+
+
+def test_summarize_time_grouped_fits_uses_cached_metadata(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Summarize reuses discovery metadata instead of re-reading FITS headers."""
+    from ovro_lwa_portal.fits_to_zarr_xradio import _DiscoveryFileMetadata
+
+    tkey = "20250106_051855"
+    fp = tmp_path / _image_name(tkey, 41)
+    fp.write_bytes(b"")
+    by_time = {tkey: [fp]}
+    metadata = {
+        fp.resolve(): _DiscoveryFileMetadata(
+            time_key=tkey,
+            frequency_hz=41e6,
+            notes=("time-from-filename",),
+            stokes_key=1,
+            ingest_header=None,
+        )
+    }
+
+    def boom(*_a: object, **_k: object) -> None:
+        pytest.fail("metadata extract should not run when cache is provided")
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery._extract_group_metadata_for_discovery",
+        boom,
+    )
+    summary = summarize_time_grouped_fits(
+        by_time,
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+        discovery_metadata=metadata,
+    )
+    assert summary.input_files == 1
+    assert summary.frequency_groups == 1
+
+
+def test_discovery_sidecar_path_for_zarr() -> None:
+    """Sidecar name replaces ``.zarr`` with ``_metadata.json`` beside the store."""
+    from ovro_lwa_portal.ingest.discovery_sidecar import discovery_sidecar_path_for_zarr
+
+    out = Path("/fast/claw/IV-10min-Taper-Robust-0_30jun26.zarr")
+    assert discovery_sidecar_path_for_zarr(out) == Path(
+        "/fast/claw/IV-10min-Taper-Robust-0_30jun26_metadata.json"
+    )
+
+
+def test_resolve_glob_convert_discovery_uses_sidecar_on_rerun(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A second convert run loads discovery from the sidecar instead of re-reading FITS."""
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    paths = [
+        tmp_path / _image_name(tkey, 41),
+        tmp_path / _image_name(tkey, 55),
+    ]
+    for mhz, path in zip((41, 55), paths, strict=True):
+        fits.PrimaryHDU(
+            data=[[1.0]],
+            header=fits.Header(
+                {"RESTFREQ": float(mhz * 1e6), "BMAJ": 0.25, "BMIN": 0.25}
+            ),
+        ).writeto(path)
+
+    discover_calls = 0
+    original = __import__(
+        "ovro_lwa_portal.ingest.discovery", fromlist=["discover_time_grouped_paths"]
+    ).discover_time_grouped_paths
+
+    def counting_discover(*args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal discover_calls
+        discover_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "ovro_lwa_portal.ingest.discovery.discover_time_grouped_paths",
+        counting_discover,
+    )
+
+    out_zarr = tmp_path / "store.zarr"
+    glob_pattern = str(tmp_path / "*.fits")
+    discovery = IngestDiscoveryConfig(group_metadata_source="fits")
+
+    plan1 = resolve_glob_convert_discovery(
+        glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert discover_calls == 1
+    assert (tmp_path / "store_metadata.json").is_file()
+
+    plan2 = resolve_glob_convert_discovery(
+        glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert discover_calls == 1
+    assert plan2.discovered.input_files == plan1.discovered.input_files
+    assert len(plan2.discovery_metadata) == len(plan1.discovery_metadata)
+
+
+def test_filename_discovery_sidecar_persists_beam_header(tmp_path: Path) -> None:
+    """Filename-mode discovery caches BMAJ/BMIN into the sidecar for convert reuse."""
+    import json
+
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    path = tmp_path / _image_name(tkey, 55)
+    fits.PrimaryHDU(
+        data=[[1.0, 2.0], [3.0, 4.0]],
+        header=fits.Header(
+            {"RESTFREQ": 99e6, "BMAJ": 0.18, "BMIN": 0.14, "BPA": 33.0}
+        ),
+    ).writeto(path)
+
+    plan = resolve_glob_convert_discovery(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+        out_zarr=tmp_path / "store.zarr",
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    meta = plan.discovery_metadata[path.resolve()]
+    assert meta.ingest_header is not None
+    assert float(meta.ingest_header["BMAJ"]) == pytest.approx(0.18)
+    assert meta.frequency_hz == pytest.approx(55e6)
+
+    payload = json.loads((tmp_path / "store_metadata.json").read_text())
+    entry = payload["files"][str(path.resolve())]
+    assert "ingest_header_text" in entry
+    assert "BMAJ" in entry["ingest_header_text"]
+
+
+def test_discovery_sidecar_invalidates_on_mtime_change(tmp_path: Path) -> None:
+    """Sidecar is ignored when a source FITS file changes on disk."""
+    from astropy.io import fits
+
+    from ovro_lwa_portal.ingest.discovery import (
+        IngestDiscoveryConfig,
+        resolve_glob_convert_discovery,
+    )
+
+    tkey = "20250106_051855"
+    path = tmp_path / _image_name(tkey, 41)
+    fits.PrimaryHDU(
+        data=[[1.0]],
+        header=fits.Header({"RESTFREQ": 41e6, "BMAJ": 0.25, "BMIN": 0.25}),
+    ).writeto(path)
+
+    out_zarr = tmp_path / "store.zarr"
+    glob_pattern = str(tmp_path / "*.fits")
+    discovery = IngestDiscoveryConfig(group_metadata_source="fits")
+
+    resolve_glob_convert_discovery(
+        glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+
+    path.write_bytes(path.read_bytes() + b" ")
+
+    from ovro_lwa_portal.ingest.discovery_sidecar import load_glob_discovery_sidecar
+
+    sidecar = tmp_path / "store_metadata.json"
+    loaded = load_glob_discovery_sidecar(
+        sidecar,
+        glob_pattern=glob_pattern,
+        discovery=discovery,
+        out_zarr=out_zarr,
+        rebuild=True,
+        resume=False,
+        funpack=False,
+    )
+    assert loaded is None
+
+
+def test_estimate_glob_convert_size_filename_skips_header_cache(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Filename estimate-size groups without caching every image HDU."""
+    from astropy.io import fits
+
+    tkey_a = "20250106_051855"
+    tkey_b = "20250106_052955"
+    paths = [
+        tmp_path / _image_name(tkey_a, 41),
+        tmp_path / _image_name(tkey_a, 55),
+        tmp_path / _image_name(tkey_b, 41),
+    ]
+    for path in paths:
+        fits.PrimaryHDU(
+            data=[[1.0, 2.0], [3.0, 4.0]],
+            header=fits.Header(
+                {
+                    "NAXIS": 2,
+                    "NAXIS1": 2,
+                    "NAXIS2": 2,
+                    "RESTFREQ": 41e6,
+                    "BMAJ": 0.25,
+                    "BMIN": 0.25,
+                }
+            ),
+        ).writeto(path)
+
+    import ovro_lwa_portal.fits_to_zarr_xradio as ftz
+
+    header_opens = 0
+    real_ingest_header = ftz._getheader_for_ingest
+
+    def counting_ingest_header(fp):  # noqa: ANN001
+        nonlocal header_opens
+        header_opens += 1
+        return real_ingest_header(fp)
+
+    monkeypatch.setattr(ftz, "_getheader_for_ingest", counting_ingest_header)
+
+    estimate = estimate_glob_convert_size(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+        target_size=128,
+    )
+    assert estimate.grouped_without_headers is True
+    assert estimate.peeked_headers_for_lm is False
+    assert estimate.reference_lm_shape == (128, 128)
+    assert estimate.summary.input_files == 3
+    assert estimate.summary.time_groups == 2
+    assert estimate.summary.estimated_zarr_bytes == 3 * 128 * 128 * 4
+    assert header_opens == 0
+    assert not list(tmp_path.glob("*_metadata.json"))
+
+
+def test_estimate_glob_convert_size_peeks_lm_without_full_tree_cache(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Without --target-size, only LM peeks run (not per-file header cache)."""
+    from astropy.io import fits
+
+    tkey = "20250106_051855"
+    paths = [
+        tmp_path / _image_name(tkey, 41),
+        tmp_path / _image_name(tkey, 55),
+    ]
+    for mhz, path in zip((41, 55), paths, strict=True):
+        fits.PrimaryHDU(
+            data=[[1.0] * 4] * 4,
+            header=fits.Header(
+                {
+                    "NAXIS": 2,
+                    "NAXIS1": 4,
+                    "NAXIS2": 4,
+                    "RESTFREQ": float(mhz * 1e6),
+                    "BMAJ": 0.25,
+                    "BMIN": 0.25,
+                }
+            ),
+        ).writeto(path)
+
+    import ovro_lwa_portal.fits_to_zarr_xradio as ftz
+
+    cache_notes: list[str] = []
+    real_build = ftz._build_discovery_file_metadata
+
+    def tracking_build(fp, **kwargs):  # noqa: ANN001, ANN003
+        meta = real_build(fp, **kwargs)
+        cache_notes.extend(meta.notes)
+        return meta
+
+    monkeypatch.setattr(ftz, "_build_discovery_file_metadata", tracking_build)
+
+    estimate = estimate_glob_convert_size(
+        str(tmp_path / "*.fits"),
+        discovery=IngestDiscoveryConfig(group_metadata_source="filename"),
+    )
+    assert estimate.grouped_without_headers is True
+    assert estimate.peeked_headers_for_lm is True
+    assert estimate.reference_lm_shape == (4, 4)
+    assert estimate.summary.estimated_zarr_bytes == 2 * 4 * 4 * 4
+    assert "header-cache-skipped" in cache_notes
+    assert "header-cached-for-ingest" not in cache_notes

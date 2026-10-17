@@ -8,6 +8,7 @@ import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _clear_sky_coord_cache,
@@ -17,16 +18,22 @@ from ovro_lwa_portal.fits_to_zarr_xradio import (
     repair_zero_beam_from_nearby_time,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
-from ovro_lwa_portal.ingest.dewarp_convert import remove_staged_files_for_time_key
+from ovro_lwa_portal.ingest.dewarp_convert import (
+    clear_ingest_directory,
+    remove_staged_files_for_time_key,
+)
 from ovro_lwa_portal.ingest.discovery import (
+    GlobConvertDiscoveryPlan,
     IngestDiscoveryConfig,
     collect_glob_sources,
     discover_time_grouped_paths,
     prepare_ingest_time_groups,
 )
+from ovro_lwa_portal.ingest.progress import report_ingest_progress
 
 __all__ = [
     "PerTimeGlobConvertConfig",
+    "filter_existing_source_paths",
     "funpack_time_group",
     "run_per_time_glob_convert",
     "sources_need_funpack",
@@ -97,12 +104,42 @@ def _staged_symlink_name(time_key: str, src: Path, seen: set[str]) -> str:
     return link_name
 
 
+def filter_existing_source_paths(
+    files: Sequence[Path],
+    *,
+    time_key: str | None = None,
+) -> list[Path]:
+    """Drop paths that are missing on disk; log each skip.
+
+    Discovery sidecars and long multi-hour runs can reference FITS that were
+    removed mid-ingest (pipeline cleanup). Staging must not create dangling
+    symlinks that later fail with ``ENOENT`` during convert.
+    """
+    kept: list[Path] = []
+    for src in files:
+        if src.exists():
+            kept.append(src)
+            continue
+        if time_key is None:
+            logger.warning("Skipping missing source FITS: %s", src)
+        else:
+            logger.warning(
+                "Skipping missing source FITS for time %s: %s",
+                time_key,
+                src,
+            )
+    return kept
+
+
 def stage_time_group_symlinks(staging_dir: Path, time_key: str, files: Sequence[Path]) -> int:
-    """Symlink FITS into *staging_dir* as ``{time_key}__{basename}`` to avoid collisions."""
+    """Symlink FITS into *staging_dir* as ``{time_key}__{basename}`` to avoid collisions.
+
+    Missing sources are skipped (see :func:`filter_existing_source_paths`).
+    """
     staging_dir.mkdir(parents=True, exist_ok=True)
     seen_names: set[str] = set()
     n = 0
-    for src in files:
+    for src in filter_existing_source_paths(files, time_key=time_key):
         dest = staging_dir / _staged_symlink_name(time_key, src, seen_names)
         if dest.exists() or dest.is_symlink():
             dest.unlink()
@@ -128,6 +165,7 @@ class PerTimeGlobConvertConfig:
     zarr_name: str = "ovro_lwa_full_lm_only.zarr"
     work_root: Path | None = None
     chunk_lm: int = 1024
+    sky_dtype: Literal["preserve", "float32", "float64"] = "preserve"
     rebuild: bool = False
     resume: bool = True
     fix_headers_on_demand: bool = True
@@ -138,6 +176,7 @@ class PerTimeGlobConvertConfig:
     lm_reference_target_size: int | None = None
     duplicate_resolver: Callable[[str, float, list[Path]], Path] | None = None
     verbose: bool = False
+    prepared_discovery: GlobConvertDiscoveryPlan | None = None
 
 
 def run_per_time_glob_convert(
@@ -151,21 +190,41 @@ def run_per_time_glob_convert(
         time_key_source="filename",
     )
 
-    source_paths = collect_glob_sources(config.glob_pattern)
-    if not source_paths:
-        msg = f"Glob matched no files: {config.glob_pattern}"
-        raise FileNotFoundError(msg)
+    plan = config.prepared_discovery
+    if plan is not None:
+        source_paths = list(plan.source_paths)
+        by_time_all = plan.by_time_filtered
+        use_funpack = plan.use_funpack
+        repair_zero_beam = (
+            config.repair_zero_beam
+            if config.repair_zero_beam is not None
+            else use_funpack
+        )
+    else:
+        source_paths = collect_glob_sources(config.glob_pattern)
+        if not source_paths:
+            msg = f"Glob matched no files: {config.glob_pattern}"
+            raise FileNotFoundError(msg)
 
-    use_funpack = (
-        config.funpack
-        if config.funpack is not None
-        else sources_need_funpack(source_paths)
-    )
-    repair_zero_beam = (
-        config.repair_zero_beam
-        if config.repair_zero_beam is not None
-        else use_funpack
-    )
+        use_funpack = (
+            config.funpack
+            if config.funpack is not None
+            else sources_need_funpack(source_paths)
+        )
+        repair_zero_beam = (
+            config.repair_zero_beam
+            if config.repair_zero_beam is not None
+            else use_funpack
+        )
+
+        by_time_all = discover_time_grouped_paths(
+            source_paths,
+            duplicate_resolver=config.duplicate_resolver,
+            discovery=discovery,
+        )
+        if not by_time_all:
+            msg = "No groupable source files after discovery."
+            raise FileNotFoundError(msg)
 
     work_root = config.work_root
     if use_funpack and work_root is None:
@@ -174,19 +233,17 @@ def run_per_time_glob_convert(
     if work_root is None:
         work_root = config.staging_dir / ".work"
 
-    by_time_all = discover_time_grouped_paths(
-        source_paths,
-        duplicate_resolver=config.duplicate_resolver,
-        discovery=discovery,
-    )
-    if not by_time_all:
-        msg = "No groupable source files after discovery."
-        raise FileNotFoundError(msg)
-
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    config.fixed_dir.mkdir(parents=True, exist_ok=True)
-    config.staging_dir.mkdir(parents=True, exist_ok=True)
-    work_root.mkdir(parents=True, exist_ok=True)
+    # Reused staging / fixed_fits dirs may still hold leftovers from another product;
+    # clear them before discovery-of-staging and again in finally after the run.
+    clear_ingest_directory(config.staging_dir, label="staging dir")
+    clear_ingest_directory(config.fixed_dir, label="fixed FITS dir")
+    if work_root.resolve() != config.staging_dir.resolve() and not work_root.is_relative_to(
+        config.staging_dir.resolve()
+    ):
+        clear_ingest_directory(work_root, label="funpack work root")
+    else:
+        work_root.mkdir(parents=True, exist_ok=True)
     out_zarr = config.output_dir / config.zarr_name
 
     logger.info(
@@ -195,102 +252,194 @@ def run_per_time_glob_convert(
         len(by_time_all),
     )
 
-    lm_ref_ds = _load_global_lm_reference_dataset(
-        by_time_all,
-        config.fixed_dir,
-        chunk_lm=config.chunk_lm,
-        fix_headers_on_demand=config.fix_headers_on_demand,
-        target_size=config.lm_reference_target_size,
-        group_metadata_source=discovery.group_metadata_source,
-        filename_convention=discovery.filename_convention,
-    ).copy(deep=True)
+    try:
+        report_ingest_progress(
+            progress_callback,
+            "setup",
+            0,
+            2,
+            "Loading global LM reference grid…",
+        )
+        lm_ref_ds = _load_global_lm_reference_dataset(
+            by_time_all,
+            config.fixed_dir,
+            chunk_lm=config.chunk_lm,
+            fix_headers_on_demand=config.fix_headers_on_demand,
+            target_size=config.lm_reference_target_size,
+            group_metadata_source=discovery.group_metadata_source,
+            filename_convention=discovery.filename_convention,
+            discovery_metadata=plan.discovery_metadata if plan is not None else None,
+        ).copy(deep=True)
 
-    global_freq_hz = _global_frequency_coord_hz(
-        by_time_all,
-        group_metadata_source=discovery.group_metadata_source,
-        filename_convention=discovery.filename_convention,
-    )
+        report_ingest_progress(
+            progress_callback,
+            "setup",
+            1,
+            2,
+            "Building global frequency axis…",
+        )
+        global_freq_hz = _global_frequency_coord_hz(
+            by_time_all,
+            group_metadata_source=discovery.group_metadata_source,
+            filename_convention=discovery.filename_convention,
+            discovery_metadata=plan.discovery_metadata if plan is not None else None,
+        )
 
-    by_time = prepare_ingest_time_groups(
-        by_time_all,
-        out_zarr=out_zarr,
-        rebuild=config.rebuild,
-        resume=config.resume,
-        require_73mhz=False,
-        context="convert",
-        filter_invalid_beam=not repair_zero_beam,
-    )
-    if not by_time:
-        logger.info("Every time key is already in %s.", out_zarr)
+        by_time = (
+            plan.to_process
+            if plan is not None
+            else prepare_ingest_time_groups(
+                by_time_all,
+                out_zarr=out_zarr,
+                rebuild=config.rebuild,
+                resume=config.resume,
+                require_73mhz=False,
+                context="convert",
+                filter_invalid_beam=not repair_zero_beam,
+                time_key_source=discovery.time_key_source,
+            )
+        )
+        if not by_time:
+            logger.info("Every time key is already in %s.", out_zarr)
+            _consolidate_zarr_metadata(out_zarr)
+            return out_zarr
+
+        first_zarr_write = not (out_zarr.exists() and not config.rebuild)
+        time_keys_sorted = sorted(by_time.keys())
+        total = len(time_keys_sorted)
+
+        for idx, tkey in enumerate(time_keys_sorted):
+            sources = filter_existing_source_paths(list(by_time[tkey]), time_key=tkey)
+            work_dir = work_root / tkey
+            _cleanup_time_work(work_dir, config.staging_dir, tkey)
+
+            report_ingest_progress(
+                progress_callback,
+                "converting",
+                idx,
+                total,
+                f"Time step {idx + 1}/{total}: preparing {tkey}",
+            )
+
+            if not sources:
+                logger.warning(
+                    "Time %s (%d/%d): all %d source file(s) are missing on disk; "
+                    "skipping this time key (re-run with --refresh-discovery after "
+                    "pipeline cleanup, or restore the FITS).",
+                    tkey,
+                    idx + 1,
+                    total,
+                    len(by_time[tkey]),
+                )
+                report_ingest_progress(
+                    progress_callback,
+                    "converting",
+                    idx + 1,
+                    total,
+                    f"Time step {idx + 1}/{total}: skipped missing {tkey}",
+                )
+                continue
+
+            logger.info(
+                "Time %s (%d/%d): preparing %d source(s)",
+                tkey,
+                idx + 1,
+                total,
+                len(sources),
+            )
+
+            if use_funpack:
+                logger.info("Funpacking into %s", work_dir)
+                prepared = funpack_time_group(sources, work_dir)
+                if repair_zero_beam:
+                    repaired = repair_zero_beam_from_nearby_time(
+                        sources,
+                        prepared,
+                        tkey,
+                        by_time_all,
+                        freq_bin_hz=discovery.freq_bin_hz,
+                    )
+                    if repaired:
+                        logger.info(
+                            "Repaired synthesized beam from nearby time on %d file(s) for time %s",
+                            repaired,
+                            tkey,
+                        )
+            else:
+                prepared = sources
+
+            n_staged = stage_time_group_symlinks(config.staging_dir, tkey, prepared)
+            logger.info("Staged %d FITS for convert", n_staged)
+            if n_staged == 0:
+                logger.warning(
+                    "Time %s (%d/%d): nothing staged after filtering missing sources; skipping.",
+                    tkey,
+                    idx + 1,
+                    total,
+                )
+                report_ingest_progress(
+                    progress_callback,
+                    "converting",
+                    idx + 1,
+                    total,
+                    f"Time step {idx + 1}/{total}: skipped empty stage {tkey}",
+                )
+                continue
+
+            convert_config = ConversionConfig(
+                input_dir=config.staging_dir,
+                output_dir=config.output_dir,
+                zarr_name=config.zarr_name,
+                fixed_dir=config.fixed_dir,
+                chunk_lm=config.chunk_lm,
+                sky_dtype=config.sky_dtype,
+                rebuild=first_zarr_write,
+                resume=False,
+                fix_headers_on_demand=config.fix_headers_on_demand,
+                cleanup_fixed_fits=config.cleanup_fixed_fits,
+                duplicate_resolver=config.duplicate_resolver,
+                discovery_freq_bin_hz=discovery.freq_bin_hz,
+                time_keys_only=(tkey,),
+                lm_reference_ds=lm_ref_ds,
+                group_metadata_source=discovery.group_metadata_source,
+                discovery_time_key_source=discovery.time_key_source,
+                discovery_filename_convention=discovery.filename_convention,
+                lm_reference_target_size=config.lm_reference_target_size,
+                consolidate_metadata_at_end=False,
+                global_frequency_coord_hz=global_freq_hz if first_zarr_write else None,
+                verbose=config.verbose,
+            )
+            # Inner convert handles one staged time key; outer loop owns progress reporting.
+            try:
+                FITSToZarrConverter(convert_config, progress_callback=None).convert()
+            except Exception:
+                logger.error(
+                    "Conversion failed at time %s (%d/%d). Times already written to %s "
+                    "are kept; re-run the same command with resume enabled (default) to "
+                    "continue from the next time key.",
+                    tkey,
+                    idx + 1,
+                    total,
+                    out_zarr,
+                )
+                raise
+            report_ingest_progress(
+                progress_callback,
+                "converting",
+                idx + 1,
+                total,
+                f"Time step {idx + 1}/{total}: wrote {tkey}",
+            )
+            first_zarr_write = False
+            _clear_sky_coord_cache()
+            _cleanup_time_work(work_dir, config.staging_dir, tkey)
+
         _consolidate_zarr_metadata(out_zarr)
         return out_zarr
-
-    first_zarr_write = not (out_zarr.exists() and not config.rebuild)
-    time_keys_sorted = sorted(by_time.keys())
-    total = len(time_keys_sorted)
-
-    for idx, tkey in enumerate(time_keys_sorted):
-        sources = list(by_time[tkey])
-        work_dir = work_root / tkey
-        _cleanup_time_work(work_dir, config.staging_dir, tkey)
-
-        logger.info(
-            "Time %s (%d/%d): preparing %d source(s)",
-            tkey,
-            idx + 1,
-            total,
-            len(sources),
-        )
-
-        if use_funpack:
-            logger.info("Funpacking into %s", work_dir)
-            prepared = funpack_time_group(sources, work_dir)
-            if repair_zero_beam:
-                repaired = repair_zero_beam_from_nearby_time(
-                    sources,
-                    prepared,
-                    tkey,
-                    by_time_all,
-                    freq_bin_hz=discovery.freq_bin_hz,
-                )
-                if repaired:
-                    logger.info(
-                        "Repaired synthesized beam from nearby time on %d file(s) for time %s",
-                        repaired,
-                        tkey,
-                    )
-        else:
-            prepared = sources
-
-        n_staged = stage_time_group_symlinks(config.staging_dir, tkey, prepared)
-        logger.info("Staged %d FITS for convert", n_staged)
-
-        convert_config = ConversionConfig(
-            input_dir=config.staging_dir,
-            output_dir=config.output_dir,
-            zarr_name=config.zarr_name,
-            fixed_dir=config.fixed_dir,
-            chunk_lm=config.chunk_lm,
-            rebuild=first_zarr_write,
-            resume=False,
-            fix_headers_on_demand=config.fix_headers_on_demand,
-            cleanup_fixed_fits=config.cleanup_fixed_fits,
-            duplicate_resolver=config.duplicate_resolver,
-            discovery_freq_bin_hz=discovery.freq_bin_hz,
-            time_keys_only=(tkey,),
-            lm_reference_ds=lm_ref_ds,
-            group_metadata_source=discovery.group_metadata_source,
-            discovery_time_key_source=discovery.time_key_source,
-            discovery_filename_convention=discovery.filename_convention,
-            lm_reference_target_size=config.lm_reference_target_size,
-            consolidate_metadata_at_end=False,
-            global_frequency_coord_hz=global_freq_hz if first_zarr_write else None,
-            verbose=config.verbose,
-        )
-        FITSToZarrConverter(convert_config, progress_callback=progress_callback).convert()
-        first_zarr_write = False
-        _clear_sky_coord_cache()
-        _cleanup_time_work(work_dir, config.staging_dir, tkey)
-
-    _consolidate_zarr_metadata(out_zarr)
-    return out_zarr
+    finally:
+        clear_ingest_directory(config.staging_dir, label="staging dir")
+        clear_ingest_directory(config.fixed_dir, label="fixed FITS dir")
+        if work_root.resolve() != config.staging_dir.resolve() and not work_root.is_relative_to(
+            config.staging_dir.resolve()
+        ):
+            clear_ingest_directory(work_root, label="funpack work root")

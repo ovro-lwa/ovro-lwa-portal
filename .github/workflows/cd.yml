@@ -30,6 +30,8 @@ jobs:
           fetch-depth: 0
 
       - uses: hynek/build-and-inspect-python-package@v2
+        with:
+          python-version: "3.13"
 
   publish:
     needs: [dist]

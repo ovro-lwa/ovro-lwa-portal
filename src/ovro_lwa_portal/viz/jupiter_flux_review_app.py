@@ -27,6 +27,7 @@ from bokeh.events import Tap
 from bokeh.models import ColumnDataSource, FixedTicker, HoverTool
 from bokeh.plotting import figure
 
+from ovro_lwa_portal.io import cap_lm_chunks
 from ovro_lwa_portal.viz.jupiter_flux_review_data import (
     JupiterLoad,
     format_flux_hover,
@@ -74,6 +75,7 @@ JUPITER_SKY_FOV_DEG = 10.0
 class JupiterFluxReviewConfig:
     """Runtime tuning knobs normally set in the notebook config cell."""
 
+    # Upper bound on Dask l/m chunks; finer on-disk chunks are left as stored.
     zarr_lm_chunk: int = 512
 
 
@@ -364,11 +366,8 @@ class JupiterFluxReview(param.Parameterized):
         def _open(report: Callable[[str], None]) -> JupiterLoad:
             t0 = time.perf_counter()
             report(f"Opening Stokes I Zarr at {path}…")
-            ds = ovro.open_dataset(path, chunks="auto").chunk(
-                {
-                    "l": self._review_config.zarr_lm_chunk,
-                    "m": self._review_config.zarr_lm_chunk,
-                }
+            ds = cap_lm_chunks(
+                ovro.open_dataset(path, chunks={}), self._review_config.zarr_lm_chunk
             )
             report(
                 f"Opened Zarr ({int(ds.sizes['time'])} times, "

@@ -10,17 +10,22 @@ import difflib
 import json
 import re
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
+import numpy as np
 import xarray as xr
 
 __all__ = [
+    "cap_lm_chunks",
     "DataSourceError",
     "LmChunkSummary",
+    "ResolvedZarrSource",
     "open_dataset",
     "resolve_source",
+    "resolve_zarr_source",
     "summarize_lm_chunks",
     "validate_local_zarr_store",
     "warn_if_suboptimal_lm_chunks",
@@ -52,6 +57,7 @@ class LmChunkSummary(TypedDict):
 
 
 _MIN_RECOMMENDED_LM_CHUNK = 512
+_MIN_BLOCKED_CHUNK_BYTES = 4 * 1024**2
 
 
 def _is_doi(source: str) -> bool:
@@ -379,6 +385,113 @@ def validate_local_zarr_store(source: str | Path) -> Path:
     return resolved
 
 
+@dataclass(frozen=True)
+class ResolvedZarrSource:
+    """Normalized Zarr source ready for :func:`open_dataset`.
+
+    Attributes
+    ----------
+    source_type
+        ``"local"``, ``"remote"``, or ``"doi"``.
+    open_source
+        String to pass as the ``source`` argument of :func:`open_dataset`.
+        Local stores are absolute paths when ``validate_local`` was True.
+    original_source
+        Caller-supplied source string (before local path resolution).
+    storage_options
+        Optional filesystem options to forward to :func:`open_dataset`
+        (e.g. S3 credentials). Unchanged by this helper except for a shallow
+        copy when provided.
+    """
+
+    source_type: Literal["local", "remote", "doi"]
+    open_source: str
+    original_source: str
+    storage_options: dict[str, Any] | None = None
+
+
+def _source_input_as_string(source: str | Path) -> str:
+    """Convert *source* to a string without mangling remote URL schemes.
+
+    ``pathlib.Path`` collapses ``s3://bucket/key`` to ``s3:/bucket/key`` on
+    POSIX. Remote / DOI identifiers must therefore be passed as ``str``.
+    """
+    if isinstance(source, Path):
+        return str(source.expanduser())
+    return str(source)
+
+
+def resolve_zarr_source(
+    source: str | Path,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    validate_local: bool = True,
+) -> ResolvedZarrSource:
+    """Normalize a Zarr path/URL/DOI for :func:`open_dataset`.
+
+    Local paths are optionally checked with :func:`validate_local_zarr_store`
+    so typos fail before an expensive open. Remote URLs (``s3://``, ``https://``,
+    …) and DOI strings are returned as-is for :func:`open_dataset` to load
+    (DOI resolution still happens inside ``open_dataset``).
+
+    Parameters
+    ----------
+    source
+        Local filesystem path, remote URL, or DOI. Use a plain ``str`` for
+        ``s3://`` / ``https://`` / DOI values — do not wrap them in
+        ``pathlib.Path``.
+    storage_options
+        Optional credentials / filesystem options forwarded to
+        :func:`open_dataset`.
+    validate_local
+        If True (default), require a readable local Zarr group when the source
+        is local. Ignored for remote and DOI sources.
+
+    Returns
+    -------
+    ResolvedZarrSource
+        ``open_source`` is safe to pass to :func:`open_dataset`.
+
+    Raises
+    ------
+    FileNotFoundError, DataSourceError
+        From :func:`validate_local_zarr_store` when ``validate_local`` is True
+        and the local path is missing or not a Zarr store.
+
+    Examples
+    --------
+    >>> info = resolve_zarr_source("/data/obs.zarr")
+    >>> info.source_type
+    'local'
+    >>> info = resolve_zarr_source("s3://bucket/obs.zarr", validate_local=False)
+    >>> info.open_source
+    's3://bucket/obs.zarr'
+    """
+    original = _source_input_as_string(source)
+    source_type, normalized = _detect_source_type(original)
+    opts = dict(storage_options) if storage_options else None
+
+    if source_type == "local":
+        if validate_local:
+            open_source = str(validate_local_zarr_store(normalized))
+        else:
+            open_source = str(Path(normalized).expanduser())
+    else:
+        # remote / doi — keep the string open_dataset understands (no Path)
+        open_source = normalized
+
+    if source_type not in ("local", "remote", "doi"):
+        msg = f"Unexpected source type from detector: {source_type!r}"
+        raise DataSourceError(msg)
+
+    return ResolvedZarrSource(
+        source_type=source_type,
+        open_source=open_source,
+        original_source=original,
+        storage_options=opts,
+    )
+
+
 def _chunk_sizes_on_axis(chunk_size: int, axis_length: int) -> tuple[int, ...]:
     """Expand a uniform Zarr chunk length into per-chunk sizes along one axis."""
     size = int(chunk_size)
@@ -473,16 +586,55 @@ def warn_if_suboptimal_lm_chunks(
     if smallest >= max_achievable:
         return summary
 
+    # Small l/m chunks that span many times and frequencies (the
+    # ``ovro-ingest rechunk`` layout) keep per-chunk bytes large.
+    nbytes = _chunk_nbytes(zarr_path, var)
+    if nbytes is not None and nbytes >= _MIN_BLOCKED_CHUNK_BYTES:
+        return summary
+
     warnings.warn(
         "Zarr store "
         f"{Path(zarr_path).expanduser()} has small on-disk l/m chunks "
         f"(minimum={smallest}, recommended>={min_chunk}). "
-        "Single-slice overlay reads may be slow. Re-ingest with "
-        f"`ovro-ingest convert ... --chunk-lm {min_chunk}` or higher.",
+        "Overlay and spectrum reads open many small chunks. Run "
+        "`ovro-ingest rechunk SOURCE DEST` for the time-blocked review layout, or "
+        f"re-ingest with `ovro-ingest convert ... --chunk-lm {min_chunk}` or higher.",
         UserWarning,
         stacklevel=2,
     )
     return summary
+
+
+def cap_lm_chunks(ds: xr.Dataset, max_lm_chunk: int | None, *, var: str = "SKY") -> xr.Dataset:
+    """Rechunk ``l``/``m`` to ``max_lm_chunk`` only where ``var``'s chunks are larger.
+
+    Splitting 391- or 128-pixel on-disk chunks into 512 merges partial chunks
+    into every Dask task and slows reads; only coarse layouts (e.g. 4096) gain.
+    """
+    if not max_lm_chunk or var not in ds.data_vars:
+        return ds
+    data = ds[var].data
+    chunks = getattr(data, "chunks", None)
+    if not chunks:
+        return ds
+    target: dict[str, int] = {}
+    for dim in ("l", "m"):
+        if dim not in ds[var].dims:
+            continue
+        sizes = chunks[ds[var].get_axis_num(dim)]
+        if max(sizes) > int(max_lm_chunk):
+            target[dim] = int(max_lm_chunk)
+    return ds.chunk(target) if target else ds
+
+
+def _chunk_nbytes(zarr_path: str | Path, var: str) -> int | None:
+    """Decoded bytes per on-disk chunk of ``var``, or ``None`` if unreadable."""
+    zarray_path = Path(zarr_path).expanduser() / var / ".zarray"
+    try:
+        meta = json.loads(zarray_path.read_text(encoding="utf-8"))
+        return int(np.prod(meta["chunks"])) * int(np.dtype(meta["dtype"]).itemsize)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _validate_dataset(ds: xr.Dataset) -> None:
@@ -965,5 +1117,6 @@ def open_dataset(
         warn_if_suboptimal_lm_chunks(local_zarr_path)
 
     from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
+    from ovro_lwa_portal.zarr_direct import attach_zarr_store
 
-    return strip_redundant_fits_wcs_header_attrs(ds)
+    return attach_zarr_store(strip_redundant_fits_wcs_header_attrs(ds), store)

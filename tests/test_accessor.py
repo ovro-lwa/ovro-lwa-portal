@@ -2417,6 +2417,21 @@ class TestRadportGetWcsTimePromotedHeader:
         assert wcs1 is not None
         assert WCS(afits.Header.fromstring(wcs1, sep="\n")).wcs.crval[0] == pytest.approx(181.0)
 
+    def test_decode_wcs_header_bytes_treats_nan_as_empty(self) -> None:
+        from ovro_lwa_portal.accessor import _decode_wcs_header_bytes
+
+        assert _decode_wcs_header_bytes(np.nan) == ""
+        assert _decode_wcs_header_bytes(float("nan")) == ""
+        assert _decode_wcs_header_bytes("nan") == ""
+        assert _decode_wcs_header_bytes(np.bytes_(b"nan")) == ""
+        assert _decode_wcs_header_bytes(b"nan") == ""
+
+    def test_parse_sin_celestial_keywords_ignores_nan_placeholder(self) -> None:
+        from ovro_lwa_portal.accessor import _parse_sin_celestial_keywords
+
+        assert _parse_sin_celestial_keywords("nan") is None
+        assert _parse_sin_celestial_keywords("nan\n") is None
+
     def test_read_wcs_header_str_time_frequency_dim(self) -> None:
         """Per-time WCS may be stored as ``fits_header_str(time, frequency)``."""
         from astropy.io import fits as afits

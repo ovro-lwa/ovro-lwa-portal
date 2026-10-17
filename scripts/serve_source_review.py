@@ -120,8 +120,7 @@ def _build_review(args: argparse.Namespace) -> SourceReview:
             "Zarr path required: panel serve ... --args /path/to/store.zarr, "
             "or --args --zarr /path, or set OVRO_SOURCE_REVIEW_ZARR",
         )
-    zarr_path = zarr_raw.expanduser()
-    ovro.validate_local_zarr_store(zarr_path)
+    zarr_path = ovro.resolve_zarr_source(zarr_raw.expanduser()).open_source
     review_holder: dict[str, SourceReview] = {}
 
     def _root_views() -> tuple:

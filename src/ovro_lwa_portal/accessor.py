@@ -19,6 +19,7 @@ import threading
 import time
 import warnings
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -27,6 +28,9 @@ import numpy as np
 import xarray as xr
 from scipy import interpolate
 from scipy.optimize import least_squares
+
+from ovro_lwa_portal.dynspec_fill import TrackedPixelReader, plan_fill_units
+from ovro_lwa_portal.zarr_direct import DirectZarrArray, direct_zarr_array, read_workers
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -52,13 +56,40 @@ _MAX_PIXEL_TRACK_PLANE_ELEMENTS = 72_000_000
 _MAX_PIXEL_TRACK_CHUNK_ELEMENTS = 40_000_000
 
 
+def _is_nan_like_header_text(text: str) -> bool:
+    """True when a decoded header payload is a placeholder NaN, not real FITS."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.lower() == "nan":
+        return True
+    first_line = stripped.splitlines()[0].strip().lower()
+    return first_line == "nan"
+
+
+def _sanitize_decoded_header_text(text: str) -> str:
+    """Normalize decoded header text; map NaN placeholders to empty."""
+    cleaned = text.rstrip("\x00")
+    if _is_nan_like_header_text(cleaned):
+        return ""
+    return cleaned
+
+
 def _decode_wcs_header_bytes(raw: object) -> str:
     """Decode a scalar WCS header payload from Zarr (bytes or str)."""
     while isinstance(raw, np.ndarray):
         raw = raw.item()
+    if raw is None:
+        return ""
+    if isinstance(raw, (float, np.floating)) and not np.isfinite(raw):
+        # Frequency reindex used ``fill_value=np.nan`` on ``fits_header_str`` in older
+        # ingests; treat as empty rather than the literal FITS card ``nan``.
+        return ""
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
-        return raw.decode("utf-8", errors="replace").rstrip("\x00")
-    return str(raw).rstrip("\x00")
+        return _sanitize_decoded_header_text(
+            raw.decode("utf-8", errors="replace").rstrip("\x00")
+        )
+    return _sanitize_decoded_header_text(str(raw).rstrip("\x00"))
 
 
 def _has_fits_header_str(ds: xr.Dataset) -> bool:
@@ -139,6 +170,7 @@ def _read_wcs_header_str(
     var: str = "SKY",
     time_idx: int = 0,
     freq_idx: int = 0,
+    pol_idx: int = 0,
 ) -> str | None:
     """Return the celestial WCS header string derived from ``fits_header_str``.
 
@@ -153,7 +185,7 @@ def _read_wcs_header_str(
             from astropy.wcs import WCS
 
             full_hdr = _read_fits_header_str(
-                ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=0
+                ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=int(pol_idx)
             )
             from astropy.wcs import FITSFixedWarning
 
@@ -171,6 +203,8 @@ def _read_wcs_header_str(
         sel = wcs_var.isel(time=time_idx)
         if "frequency" in sel.dims:
             sel = sel.isel(frequency=freq_idx)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=int(pol_idx))
         hdr = _decode_wcs_header_bytes(sel.values)
         if hdr.strip():
             return hdr
@@ -182,7 +216,14 @@ def _read_wcs_header_str(
     if not hdr_str:
         hdr_str = ds.attrs.get("fits_wcs_header")
     if hdr_str is not None:
-        return str(hdr_str)
+        # Some legacy stores accidentally persisted NaN as the WCS header attr.
+        # Treat it as missing to avoid astropy parsing warnings ("invalid keyword: nan").
+        if isinstance(hdr_str, (float, np.floating)) and not np.isfinite(hdr_str):
+            return None
+        text = str(hdr_str)
+        if _is_nan_like_header_text(text):
+            return None
+        return text
 
     if "wcs_header_str" not in ds:
         return None
@@ -203,6 +244,42 @@ def _maybe_load(da: xr.DataArray) -> xr.DataArray:
         if hasattr(da, "load"):
             da = da.load()
     return da
+
+
+def _read_spectrum_direct(
+    direct: DirectZarrArray,
+    sky: xr.DataArray,
+    *,
+    pol: int,
+    l_indices: np.ndarray,
+    m_indices: np.ndarray,
+    visible: np.ndarray,
+    progress_callback: RadportProgressCallback | None,
+    message: str,
+) -> np.ndarray:
+    """``(time, frequency)`` values at per-time pixels, one thread per on-disk chunk."""
+    n_t, n_f = int(direct.shape[0]), int(direct.shape[1])
+    units = plan_fill_units(n_t, n_f, int(direct.chunks[0]), int(direct.chunks[1]))
+    reader = TrackedPixelReader(
+        sky,
+        pol_idx=pol,
+        l_indices=l_indices,
+        m_indices=m_indices,
+        visible=visible,
+        direct=direct,
+    )
+    out = np.full((n_t, n_f), np.nan, dtype=np.float32)
+    total = len(units)
+    step = max(1, total // 20)
+    _emit_radport_progress(progress_callback, "extract", 0, total, message)
+    with ThreadPoolExecutor(max_workers=read_workers(direct.chunk_nbytes)) as pool:
+        futures = {pool.submit(reader, unit): unit for unit in units}
+        for done, fut in enumerate(as_completed(futures), start=1):
+            unit = futures[fut]
+            out[unit.t0 : unit.t1, unit.f0 : unit.f1] = fut.result()
+            if done == total or done % step == 0:
+                _emit_radport_progress(progress_callback, "extract", done, total, message)
+    return out
 
 
 @contextlib.contextmanager
@@ -481,7 +558,7 @@ def _header_has_sin_celestial(hdr: object) -> bool:
 
 def _parse_sin_celestial_keywords(hdr_str: str) -> dict[str, float | str] | None:
     """Return normalized celestial WCS keywords from one FITS header string."""
-    if not hdr_str.strip():
+    if _is_nan_like_header_text(hdr_str) or not hdr_str.strip():
         return None
     try:
         from astropy.io.fits import Header
@@ -600,7 +677,7 @@ def _world2pix_from_header_str(
     pixels, returns out-of-range sentinels ``(n_l, n_m)`` with ``visible=False``,
     matching :meth:`RadportAccessor._compute_pixel_track` error handling.
     """
-    if not hdr_str.strip():
+    if _is_nan_like_header_text(hdr_str) or not hdr_str.strip():
         return int(n_l), int(n_m), False
     try:
         from astropy.io.fits import Header
@@ -2516,15 +2593,12 @@ class RadportAccessor:
             return float(np.asarray(self._lst_cache[single_key], dtype=np.float64).ravel()[0])
 
         from astropy.time import Time
-        from astropy.utils.iers import conf as iers_conf
 
-        orig = iers_conf.auto_download
-        try:
-            iers_conf.auto_download = False
+        from ovro_lwa_portal._iers import offline_iers
+
+        with offline_iers():
             t = Time(mjd, format="mjd", scale="utc")
             lst_deg = float(t.sidereal_time("mean", longitude=observatory.lon).deg)
-        finally:
-            iers_conf.auto_download = orig
         self._lst_cache[single_key] = np.atleast_1d(np.asarray(lst_deg, dtype=np.float64))
         return float(np.asarray(lst_deg, dtype=np.float64).ravel()[0])
 
@@ -2538,7 +2612,8 @@ class RadportAccessor:
         """
         from astropy.coordinates import EarthLocation
         from astropy.time import Time
-        from astropy.utils.iers import conf as iers_conf
+
+        from ovro_lwa_portal._iers import offline_iers
 
         if observatory is None:
             from astropy import units as u
@@ -2554,14 +2629,10 @@ class RadportAccessor:
         if full_key in self._lst_cache:
             return
 
-        orig = iers_conf.auto_download
-        try:
-            iers_conf.auto_download = False
+        with offline_iers():
             t = Time(all_mjd, format="mjd", scale="utc")
             lst_vec = t.sidereal_time("mean", longitude=observatory.lon).deg
             lst_arr = np.atleast_1d(np.asarray(lst_vec, dtype=np.float64)).ravel()
-        finally:
-            iers_conf.auto_download = orig
         self._lst_cache[full_key] = lst_arr
 
     def _pixel_track_can_batch_time_radec_grids(self) -> bool:
@@ -3999,23 +4070,26 @@ class RadportAccessor:
             # Fixed pixel path (l/m) — single pixel across all times/freqs.
             # Eagerly load small results to avoid dask graph overhead.
             l_idx, m_idx = result
-            _emit_radport_progress(
-                progress_callback,
-                "extract",
-                0,
-                1,
-                "Reading tracked pixel (all times and frequencies)",
-            )
-            da = _maybe_load(
-                self._obj[var].isel(l=l_idx, m=m_idx, polarization=pol)
-            )
-            _emit_radport_progress(
-                progress_callback,
-                "extract",
-                1,
-                1,
-                "Reading tracked pixel (all times and frequencies)",
-            )
+            message = "Reading tracked pixel (all times and frequencies)"
+            template = self._obj[var].isel(l=l_idx, m=m_idx, polarization=pol)
+            direct = direct_zarr_array(self._obj, var)
+            if direct is not None:
+                n_t = int(self._obj.sizes["time"])
+                values = _read_spectrum_direct(
+                    direct,
+                    self._obj[var],
+                    pol=pol,
+                    l_indices=np.full(n_t, int(l_idx)),
+                    m_indices=np.full(n_t, int(m_idx)),
+                    visible=np.ones(n_t, dtype=bool),
+                    progress_callback=progress_callback,
+                    message=message,
+                )
+                da = template.copy(data=values.astype(template.dtype, copy=False))
+            else:
+                _emit_radport_progress(progress_callback, "extract", 0, 1, message)
+                da = _maybe_load(template)
+                _emit_radport_progress(progress_callback, "extract", 1, 1, message)
 
             if "time" in da.dims:
                 da = da.sortby("time")
@@ -4042,18 +4116,29 @@ class RadportAccessor:
         time_coords = self._obj.coords["time"].values
         freq_coords = self._obj.coords["frequency"].values
 
-        # Build output array, NaN-filled
-        out = np.full((n_times, n_freqs), np.nan)
-
-        vis_times, pixel_rows = self._extract_tracked_pixel_vectors(
-            data_var,
-            l_indices=l_indices,
-            m_indices=m_indices,
-            visible=visible,
-            progress_callback=progress_callback,
-        )
-        for ti, row in zip(vis_times, pixel_rows, strict=True):
-            out[int(ti)] = np.asarray(row)
+        direct = direct_zarr_array(self._obj, var)
+        if direct is not None:
+            out = _read_spectrum_direct(
+                direct,
+                self._obj[var],
+                pol=pol,
+                l_indices=np.asarray(l_indices, dtype=int),
+                m_indices=np.asarray(m_indices, dtype=int),
+                visible=np.asarray(visible, dtype=bool),
+                progress_callback=progress_callback,
+                message=f"Extracting {int(np.count_nonzero(visible))} tracked pixels",
+            ).astype(np.float64)
+        else:
+            out = np.full((n_times, n_freqs), np.nan)
+            vis_times, pixel_rows = self._extract_tracked_pixel_vectors(
+                data_var,
+                l_indices=l_indices,
+                m_indices=m_indices,
+                visible=visible,
+                progress_callback=progress_callback,
+            )
+            for ti, row in zip(vis_times, pixel_rows, strict=True):
+                out[int(ti)] = np.asarray(row)
 
         da = xr.DataArray(
             out,

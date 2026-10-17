@@ -160,6 +160,7 @@ if PREFECT_AVAILABLE:
         duplicate_resolver: Callable[[str, float, list[Path]], Path] | None = None,
         verbose: bool = False,
         group_metadata_source: Literal["fits", "filename"] = "fits",
+        sky_dtype: Literal["preserve", "float32", "float64"] = "preserve",
     ) -> Path:
         """Prefect flow for FITS to Zarr conversion.
 
@@ -190,6 +191,9 @@ if PREFECT_AVAILABLE:
             Enable verbose logging. Defaults to False.
         group_metadata_source : {"fits", "filename"}, optional
             Forwarded to :class:`~ovro_lwa_portal.ingest.core.ConversionConfig`.
+        sky_dtype : {"preserve", "float32", "float64"}, optional
+            On-disk ``SKY`` floating dtype policy. ``preserve`` (default) follows
+            input FITS ``BITPIX`` (``-32``→float32, ``-64``→float64).
 
         Returns
         -------
@@ -221,6 +225,7 @@ if PREFECT_AVAILABLE:
             duplicate_resolver=duplicate_resolver,
             verbose=verbose,
             group_metadata_source=group_metadata_source,
+            sky_dtype=sky_dtype,
         )
 
         # Execute tasks in sequence
@@ -247,6 +252,7 @@ def run_conversion_flow(
     duplicate_resolver: Callable[[str, float, list[Path]], Path] | None = None,
     verbose: bool = False,
     group_metadata_source: Literal["fits", "filename"] = "fits",
+    sky_dtype: Literal["preserve", "float32", "float64"] = "preserve",
 ) -> Path:
     """Run the FITS to Zarr conversion using Prefect orchestration.
 
@@ -272,6 +278,9 @@ def run_conversion_flow(
         duplicates exist, conversion raises at discovery time.
     verbose : bool, optional
         Enable verbose logging.
+    sky_dtype : {"preserve", "float32", "float64"}, optional
+        On-disk ``SKY`` floating dtype policy. ``preserve`` (default) follows
+        input FITS ``BITPIX`` (``-32``→float32, ``-64``→float64).
 
     Returns
     -------
@@ -304,4 +313,5 @@ def run_conversion_flow(
         duplicate_resolver=duplicate_resolver,
         verbose=verbose,
         group_metadata_source=group_metadata_source,
+        sky_dtype=sky_dtype,
     )

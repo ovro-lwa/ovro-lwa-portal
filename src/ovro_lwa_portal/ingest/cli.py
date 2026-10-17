@@ -30,18 +30,22 @@ from rich.prompt import Prompt
 from ovro_lwa_portal.fits_to_zarr_xradio import (
     _DISCOVERY_FREQ_BIN_HZ,
     fix_fits_headers,
+    repair_zarr_polarization,
     repair_zarr_store,
     validate_zarr_store,
 )
 from ovro_lwa_portal.ingest.discovery import (
+    GlobConvertDiscoveryPlan,
+    GlobSizeEstimate,
     IngestDiscoveryConfig,
     IngestDiscoverySummary,
-    collect_glob_sources,
     discover_time_grouped_fits,
-    discover_time_grouped_paths,
+    estimate_glob_convert_size,
     plan_convert_discovery,
+    resolve_glob_convert_discovery,
 )
 from ovro_lwa_portal.ingest.core import ConversionConfig, FITSToZarrConverter
+from ovro_lwa_portal.ingest.progress import ingest_progress_percent
 from ovro_lwa_portal.ingest.dewarp_convert import (
     dewarp_and_convert_append_each_time,
     run_cascade_per_time_group,
@@ -50,7 +54,12 @@ from ovro_lwa_portal.ingest.metadata_audit import audit_directory, print_audit_r
 from ovro_lwa_portal.ingest.per_time_convert import (
     PerTimeGlobConvertConfig,
     run_per_time_glob_convert,
-    sources_need_funpack,
+)
+from ovro_lwa_portal.ingest.rechunk import (
+    DEFAULT_LM_CHUNK,
+    DEFAULT_TIME_CHUNK,
+    RechunkConfig,
+    rechunk_store,
 )
 
 __all__ = ["main", "app"]
@@ -65,10 +74,10 @@ def _cli_group_metadata_source(value: str) -> Literal["fits", "filename"]:
     return value  # type: ignore[return-value]
 
 
-def _cli_time_key_source(value: str) -> Literal["header", "filename"]:
-    if value not in ("header", "filename"):
+def _cli_time_key_source(value: str) -> Literal["header", "filename", "directory"]:
+    if value not in ("header", "filename", "directory"):
         raise typer.BadParameter(
-            f'expected "header" or "filename", got {value!r}',
+            f'expected "header", "filename", or "directory", got {value!r}',
             param_hint="--discovery-time-key-source",
         )
     return value  # type: ignore[return-value]
@@ -144,6 +153,7 @@ def _configure_logging(level: LogLevel) -> None:
 
 
 _MIN_RECOMMENDED_LM_CHUNK = 512
+_SKY_DTYPE_CHOICES = ("preserve", "float32", "float64")
 
 
 def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> None:
@@ -158,6 +168,17 @@ def _ensure_chunk_lm_allowed(chunk_lm: int, *, allow_small_lm_chunks: bool) -> N
         "Pass --allow-small-lm-chunks to override, or use 512 or higher.",
         param_hint="--chunk-lm",
     )
+
+
+def _cli_sky_dtype(sky_dtype: str) -> Literal["preserve", "float32", "float64"]:
+    """Normalize ``--sky-dtype`` to ``preserve`` / ``float32`` / ``float64``."""
+    mode = str(sky_dtype).strip().lower()
+    if mode not in _SKY_DTYPE_CHOICES:
+        raise typer.BadParameter(
+            f"expected one of {', '.join(_SKY_DTYPE_CHOICES)}; got {sky_dtype!r}",
+            param_hint="--sky-dtype",
+        )
+    return mode  # type: ignore[return-value]
 
 
 def _print_convert_discovery_summary(
@@ -183,6 +204,10 @@ def _print_convert_discovery_summary(
         f"{discovered.time_frequency_polarization_cells} "
         f"(Zarr hint {discovered.zarr_shape_hint})"
     )
+    if discovered.estimated_zarr_size is not None:
+        console.print(
+            f"  Estimated final Zarr size:        {discovered.estimated_zarr_size}"
+        )
 
     if resume and to_process.time_groups != discovered.time_groups:
         console.print("\n[bold]To process this run[/bold] (resume skips completed times)")
@@ -198,6 +223,10 @@ def _print_convert_discovery_summary(
             f"{to_process.time_frequency_polarization_cells} "
             f"(Zarr hint {to_process.zarr_shape_hint})"
         )
+        if to_process.estimated_zarr_size is not None:
+            console.print(
+                f"  Estimated Zarr size (this run):   {to_process.estimated_zarr_size}"
+            )
     elif to_process.input_files == 0 and discovered.input_files > 0 and resume:
         console.print(
             "\n[bold yellow]Nothing to process:[/bold yellow] every discovered time is "
@@ -216,34 +245,37 @@ def _resolve_convert_discovery_summary(
     resume: bool,
     glob_pattern: str | None = None,
     funpack: bool | None = None,
-) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary]:
+    use_discovery_cache: bool = True,
+    refresh_discovery: bool = False,
+) -> tuple[IngestDiscoverySummary, IngestDiscoverySummary, GlobConvertDiscoveryPlan | None]:
     """Discover grouped FITS and return summary counts for the convert CLI."""
     out_zarr = output_dir / zarr_name
     if glob_pattern is not None:
-        source_paths = collect_glob_sources(glob_pattern)
-        if not source_paths:
-            msg = f"Glob matched no files: {glob_pattern}"
-            raise FileNotFoundError(msg)
-        by_time = discover_time_grouped_paths(source_paths, discovery=discovery)
-        use_funpack = funpack if funpack is not None else sources_need_funpack(source_paths)
-        filter_invalid_beam = not use_funpack
-    else:
-        by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
-        filter_invalid_beam = True
-
-    if not by_time:
-        raise FileNotFoundError(
-            f"No groupable FITS found under {input_dir if glob_pattern is None else glob_pattern}"
+        plan = resolve_glob_convert_discovery(
+            glob_pattern,
+            discovery=discovery,
+            out_zarr=out_zarr,
+            rebuild=rebuild,
+            resume=resume,
+            funpack=funpack,
+            use_discovery_cache=use_discovery_cache,
+            refresh_discovery=refresh_discovery,
         )
+        return plan.discovered, plan.to_process_summary, plan
 
-    return plan_convert_discovery(
+    by_time = discover_time_grouped_fits(input_dir, discovery=discovery)
+    if not by_time:
+        raise FileNotFoundError(f"No groupable FITS found under {input_dir}")
+
+    discovered, to_process = plan_convert_discovery(
         by_time,
         discovery=discovery,
         out_zarr=out_zarr,
         rebuild=rebuild,
         resume=resume,
-        filter_invalid_beam=filter_invalid_beam,
+        filter_invalid_beam=True,
     )
+    return discovered, to_process, None
 
 
 def _execute_fits_to_zarr_conversion(
@@ -275,9 +307,8 @@ def _execute_fits_to_zarr_conversion(
         def progress_callback(stage: str, current: int, total: int, message: str) -> None:
             if duplicate_prompt_context["active"]:
                 return
-            if total > 0:
-                percentage = (current / total) * 100
-                progress.update(task, completed=percentage, description=message)
+            percentage = ingest_progress_percent(stage, current, total)
+            progress.update(task, completed=percentage, description=message)
 
         def duplicate_resolver(time_key: str, frequency_hz: float, candidates: list[Path]) -> Path:
             duplicate_prompt_context["active"] = True
@@ -371,9 +402,8 @@ def _execute_per_time_glob_conversion(
         task = progress.add_task("Converting per time step...", total=100)
 
         def progress_callback(stage: str, current: int, total: int, message: str) -> None:
-            if total > 0:
-                percentage = (current / total) * 100
-                progress.update(task, completed=percentage, description=message)
+            percentage = ingest_progress_percent(stage, current, total)
+            progress.update(task, completed=percentage, description=message)
 
         try:
             if log_level != LogLevel.DEBUG:
@@ -393,12 +423,23 @@ def _execute_per_time_glob_conversion(
 
         except FileNotFoundError as e:
             console.print(f"\n[bold red]✗[/bold red] Error: {e}", style="red")
-            console.print(
-                "\nNo matching source files found. Please check:\n"
-                "  • The --glob-pattern matches your FITS or .fits.fs files\n"
-                "  • Basenames include ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tokens\n"
-                "  • Use --discovery-metadata-source filename for large nested trees"
-            )
+            err_text = str(e)
+            if "staging" in err_text or "No such file" in err_text:
+                console.print(
+                    "\nA staged or source FITS path is missing (common after mid-run "
+                    "pipeline cleanup, or a stale discovery sidecar).\n"
+                    "  • Times already written to the Zarr are kept\n"
+                    "  • Re-run the same command without --rebuild to resume\n"
+                    "  • Add --refresh-discovery if Lustre products were removed/renamed\n"
+                    "  • Confirm only one convert process is writing this staging dir"
+                )
+            else:
+                console.print(
+                    "\nNo matching source files found. Please check:\n"
+                    "  • The --glob-pattern matches your FITS or .fits.fs files\n"
+                    "  • Basenames include ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tokens\n"
+                    "  • Use --discovery-metadata-source filename for large nested trees"
+                )
             raise typer.Exit(code=1) from e
 
         except (RuntimeError, ValueError, subprocess.CalledProcessError) as e:
@@ -468,6 +509,16 @@ def convert(
             "overlay performance)"
         ),
     ),
+    sky_dtype: str = typer.Option(
+        "preserve",
+        "--sky-dtype",
+        help=(
+            "On-disk SKY floating dtype: preserve (default; from input FITS "
+            "BITPIX: -32→float32, -64→float64), float32, or float64. Appends cast "
+            "to the store dtype on mismatch."
+        ),
+        case_sensitive=False,
+    ),
     rebuild: bool = typer.Option(
         False,
         "--rebuild",
@@ -519,19 +570,31 @@ def convert(
         "--discovery-metadata-source",
         help=(
             'How to infer observation time and subband when grouping: "fits" reads FITS '
-            'headers (with filename fallbacks; default). "filename" uses only basename '
-            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, avoiding FITS header reads "
-            "during discovery and frequency ordering."
+            'headers (with filename fallbacks; default). "filename" groups by basename '
+            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, but still reads each image "
+            "HDU once to cache beam/LM keywords for convert and the discovery sidecar."
         ),
     ),
     discovery_time_key_source: str = typer.Option(
         "filename",
         "--discovery-time-key-source",
         help=(
-            'When --discovery-metadata-source is "fits", how to choose the observation time '
-            'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
-            "DATE-OBS only."
+            'How to choose the observation time key: "filename" prefers '
+            "``-image-YYYYMMDD_HHMMSS`` (default; falls back to DATE-OBS when reading "
+            'FITS); "header" uses DATE-OBS only; "directory" uses parent '
+            "``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST-hour directory when present "
+            "(``YYYYMMDD_LST{HH}h``, else ``YYYYMMDD_000000``; no DATE-OBS fallback)."
         ),
+    ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging). Use 60 for 10 min co-add products whose subbands differ "
+            "by seconds in DATE-OBS."
+        ),
+        min=0.0,
     ),
     discovery_filename_convention: str = typer.Option(
         "image",
@@ -571,6 +634,19 @@ def convert(
             "Funpack compressed ``*.fits.fs`` sources before convert. Default: auto-detect "
             "from matched paths."
         ),
+    ),
+    refresh_discovery: bool = typer.Option(
+        False,
+        "--refresh-discovery",
+        help=(
+            "Re-scan FITS headers for glob discovery instead of reusing "
+            "``{zarr_stem}_metadata.json`` beside the output Zarr."
+        ),
+    ),
+    no_discovery_cache: bool = typer.Option(
+        False,
+        "--no-discovery-cache",
+        help="Do not read or write the glob discovery sidecar JSON.",
     ),
     log_level: LogLevel = typer.Option(
         LogLevel.INFO,
@@ -620,6 +696,7 @@ def convert(
     """
     _configure_logging(log_level)
     _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
+    sky_dtype_mode = _cli_sky_dtype(sky_dtype)
 
     verbose = log_level == LogLevel.DEBUG
 
@@ -640,33 +717,20 @@ def convert(
             group_metadata_source=group_metadata_source,
             time_key_source=time_key_source,
             filename_convention=filename_convention,
+            time_key_tolerance_sec=discovery_time_key_tolerance,
         )
-        per_time_config = PerTimeGlobConvertConfig(
-            glob_pattern=glob_pattern,
-            staging_dir=input_dir,
-            output_dir=output_dir,
-            fixed_dir=fixed_dir or (output_dir / "fixed_fits"),
-            zarr_name=zarr_name,
-            work_root=work_root,
-            chunk_lm=chunk_lm,
-            rebuild=rebuild,
-            resume=not no_resume,
-            fix_headers_on_demand=not skip_header_fixing,
-            cleanup_fixed_fits=cleanup_fixed_fits or True,
-            funpack=funpack,
-            discovery=discovery,
-            lm_reference_target_size=target_size,
-            verbose=verbose,
-        )
+        fixed_dir_resolved = fixed_dir or (output_dir / "fixed_fits")
 
         console.print("\n[bold cyan]OVRO-LWA FITS → Zarr Conversion (per-time glob)[/bold cyan]")
         console.print(f"  Glob pattern:     {glob_pattern}")
         console.print(f"  Staging dir:      {input_dir}")
         console.print(f"  Output directory: {output_dir}")
         console.print(f"  Zarr store name:  {zarr_name}")
-        console.print(f"  Fixed FITS dir:   {per_time_config.fixed_dir}")
+        console.print(f"  Fixed FITS dir:   {fixed_dir_resolved}")
         console.print(f"  Work root:        {work_root or input_dir / '.work'}")
+        console.print("  Clear staging/fixed: YES (start + end of run)")
         console.print(f"  Chunk size (l,m): {chunk_lm}")
+        console.print(f"  SKY dtype mode:   {sky_dtype_mode}")
         console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
         console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
         console.print(f"  Funpack:          {funpack if funpack is not None else 'auto'}")
@@ -676,15 +740,17 @@ def convert(
             f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}"
         )
         console.print(
-            f"  Cleanup fixed:    {'YES' if per_time_config.cleanup_fixed_fits else 'NO'}"
+            f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits or True else 'NO'}"
         )
         console.print(f"  Discovery meta:   {group_metadata_source}")
         console.print(f"  Time key source:  {time_key_source}")
+        if discovery_time_key_tolerance > 0.0:
+            console.print(f"  Time key tol.:    {discovery_time_key_tolerance:g} s")
         console.print(f"  Filename conv.:   {filename_convention}")
         console.print(f"  Log level:        {log_level.value.upper()}\n")
 
         try:
-            discovered, to_process = _resolve_convert_discovery_summary(
+            discovered, to_process, glob_plan = _resolve_convert_discovery_summary(
                 discovery=discovery,
                 input_dir=input_dir,
                 output_dir=output_dir,
@@ -693,11 +759,33 @@ def convert(
                 resume=not no_resume,
                 glob_pattern=glob_pattern,
                 funpack=funpack,
+                use_discovery_cache=not no_discovery_cache,
+                refresh_discovery=refresh_discovery,
             )
         except FileNotFoundError as exc:
             console.print(f"[bold red]✗[/bold red] {exc}", style="red")
             raise typer.Exit(code=1) from exc
         _print_convert_discovery_summary(discovered, to_process, resume=not no_resume)
+
+        per_time_config = PerTimeGlobConvertConfig(
+            glob_pattern=glob_pattern,
+            staging_dir=input_dir,
+            output_dir=output_dir,
+            fixed_dir=fixed_dir_resolved,
+            zarr_name=zarr_name,
+            work_root=work_root,
+            chunk_lm=chunk_lm,
+            sky_dtype=sky_dtype_mode,
+            rebuild=rebuild,
+            resume=not no_resume,
+            fix_headers_on_demand=not skip_header_fixing,
+            cleanup_fixed_fits=cleanup_fixed_fits or True,
+            funpack=funpack,
+            discovery=discovery,
+            lm_reference_target_size=target_size,
+            verbose=verbose,
+            prepared_discovery=glob_plan,
+        )
 
         _execute_per_time_glob_conversion(per_time_config, log_level=log_level)
         return
@@ -708,6 +796,7 @@ def convert(
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
         filename_convention=filename_convention,
+        time_key_tolerance_sec=discovery_time_key_tolerance,
     )
     config = ConversionConfig(
         input_dir=input_dir,
@@ -725,7 +814,9 @@ def convert(
         group_metadata_source=group_metadata_source,
         discovery_time_key_source=time_key_source,
         discovery_filename_convention=filename_convention,
+        discovery_time_key_tolerance_sec=discovery_time_key_tolerance,
         lm_reference_target_size=target_size,
+        sky_dtype=sky_dtype_mode,
     )
 
     # Display configuration
@@ -735,6 +826,7 @@ def convert(
     console.print(f"  Zarr store name:  {zarr_name}")
     console.print(f"  Fixed FITS dir:   {config.fixed_dir}")
     console.print(f"  Chunk size (l,m): {chunk_lm}")
+    console.print(f"  SKY dtype mode:   {sky_dtype_mode}")
     console.print(f"  Mode:             {'REBUILD' if rebuild else 'APPEND'}")
     console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
     if target_size is not None:
@@ -743,11 +835,13 @@ def convert(
     console.print(f"  Cleanup fixed:    {'YES' if cleanup_fixed_fits else 'NO'}")
     console.print(f"  Discovery meta:   {group_metadata_source}")
     console.print(f"  Time key source:  {time_key_source}")
+    if discovery_time_key_tolerance > 0.0:
+        console.print(f"  Time key tol.:    {discovery_time_key_tolerance:g} s")
     console.print(f"  Filename conv.:   {filename_convention}")
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     try:
-        discovered, to_process = _resolve_convert_discovery_summary(
+        discovered, to_process, _ = _resolve_convert_discovery_summary(
             discovery=discovery,
             input_dir=input_dir,
             output_dir=output_dir,
@@ -813,6 +907,16 @@ def dewarp_convert(
             "overlay performance)"
         ),
     ),
+    sky_dtype: str = typer.Option(
+        "preserve",
+        "--sky-dtype",
+        help=(
+            "On-disk SKY floating dtype: preserve (default; from input FITS "
+            "BITPIX: -32→float32, -64→float64), float32, or float64. Appends cast "
+            "to the store dtype on mismatch."
+        ),
+        case_sensitive=False,
+    ),
     rebuild: bool = typer.Option(
         False,
         "--rebuild",
@@ -864,19 +968,31 @@ def dewarp_convert(
         "--discovery-metadata-source",
         help=(
             'How to infer observation time and subband when grouping raw FITS: "fits" reads '
-            'FITS headers (with filename fallbacks; default). "filename" uses only basename '
-            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, avoiding FITS header reads "
-            "during discovery and frequency ordering."
+            'FITS headers (with filename fallbacks; default). "filename" groups by basename '
+            "``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_`` tags, but still reads each image "
+            "HDU once to cache beam/LM keywords for convert and the discovery sidecar."
         ),
     ),
     discovery_time_key_source: str = typer.Option(
         "filename",
         "--discovery-time-key-source",
         help=(
-            'When --discovery-metadata-source is "fits", how to choose the observation time '
-            'key: "filename" prefers ``-image-YYYYMMDD_HHMMSS`` (default); "header" uses '
-            "DATE-OBS only."
+            'How to choose the observation time key: "filename" prefers '
+            "``-image-YYYYMMDD_HHMMSS`` (default; falls back to DATE-OBS when reading "
+            'FITS); "header" uses DATE-OBS only; "directory" uses parent '
+            "``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST-hour directory when present "
+            "(``YYYYMMDD_LST{HH}h``, else ``YYYYMMDD_000000``; no DATE-OBS fallback)."
         ),
+    ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging). Use 60 for 10 min co-add products whose subbands differ "
+            "by seconds in DATE-OBS."
+        ),
+        min=0.0,
     ),
     cascade_parent: Optional[Path] = typer.Option(
         None,
@@ -971,6 +1087,7 @@ def dewarp_convert(
     """
     _configure_logging(log_level)
     _ensure_chunk_lm_allowed(chunk_lm, allow_small_lm_chunks=allow_small_lm_chunks)
+    sky_dtype_mode = _cli_sky_dtype(sky_dtype)
     verbose = log_level == LogLevel.DEBUG
     group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
     time_key_source = _cli_time_key_source(discovery_time_key_source)
@@ -986,6 +1103,7 @@ def dewarp_convert(
     console.print(f"  Cascade parent:      {cascade_root}")
     console.print(f"  Staging (→ Zarr):    {staging}")
     console.print(f"  Zarr store name:     {zarr_name}")
+    console.print(f"  SKY dtype mode:      {sky_dtype_mode}")
     if target_size is not None:
         console.print(f"  Target size (px):  {target_size}")
     if append_after_each_time:
@@ -1007,6 +1125,7 @@ def dewarp_convert(
                 fixed_resolved,
                 zarr_name=zarr_name,
                 chunk_lm=chunk_lm,
+                sky_dtype=sky_dtype_mode,
                 rebuild=rebuild,
                 fix_headers_on_demand=not skip_header_fixing,
                 cleanup_fixed_fits=cleanup_fixed_fits,
@@ -1023,6 +1142,7 @@ def dewarp_convert(
                 progress_callback=None,
                 group_metadata_source=group_metadata_source,
                 time_key_source=time_key_source,
+                time_key_tolerance_sec=discovery_time_key_tolerance,
                 resume=resume,
             )
         else:
@@ -1040,6 +1160,7 @@ def dewarp_convert(
                 target_size=target_size,
                 group_metadata_source=group_metadata_source,
                 time_key_source=time_key_source,
+                time_key_tolerance_sec=discovery_time_key_tolerance,
                 out_zarr=output_dir / zarr_name,
                 rebuild=rebuild,
                 resume=resume,
@@ -1107,8 +1228,10 @@ def dewarp_convert(
         verbose=verbose,
         group_metadata_source=group_metadata_source,
         discovery_time_key_source=time_key_source,
+        discovery_time_key_tolerance_sec=discovery_time_key_tolerance,
         lm_reference_ds=lm_ref_ds,
         lm_reference_target_size=target_size,
+        sky_dtype=sky_dtype_mode,
     )
 
     console.print("[bold cyan]OVRO-LWA FITS → Zarr Conversion[/bold cyan]")
@@ -1117,6 +1240,7 @@ def dewarp_convert(
     console.print(f"  Zarr store name:  {zarr_name}")
     console.print(f"  Fixed FITS dir:   {config.fixed_dir}")
     console.print(f"  Chunk size (l,m): {chunk_lm}")
+    console.print(f"  SKY dtype mode:   {sky_dtype_mode}")
     console.print(f"  Mode:             {'REBUILD' if convert_rebuild else 'APPEND'}")
     console.print(f"  Resume mode:      {'OFF' if no_resume else 'ON'}")
     console.print(f"  Fix headers:      {'ON-DEMAND' if not skip_header_fixing else 'SKIP (pre-fixed)'}")
@@ -1126,6 +1250,196 @@ def dewarp_convert(
     console.print(f"  Log level:        {log_level.value.upper()}\n")
 
     _execute_fits_to_zarr_conversion(config, log_level=log_level)
+
+
+def _print_glob_size_estimate(
+    estimate: GlobSizeEstimate,
+    *,
+    glob_pattern: str,
+    discovery: IngestDiscoveryConfig,
+) -> None:
+    """Print discovery counts and estimated Zarr size for estimate-size."""
+    summary = estimate.summary
+    pol = ", ".join(summary.polarization_labels) or "—"
+
+    console.print("[bold]Size estimate[/bold] (no convert, no discovery sidecar)")
+    console.print(f"  Glob pattern:                     {glob_pattern}")
+    console.print(f"  Discovery meta:                   {discovery.group_metadata_source}")
+    console.print(f"  Time key source:                  {discovery.time_key_source}")
+    console.print(f"  Filename convention:              {discovery.filename_convention}")
+    if discovery.time_key_tolerance_sec > 0.0:
+        console.print(
+            f"  Time key tolerance:               {discovery.time_key_tolerance_sec:g} s"
+        )
+    console.print(f"  Glob-matched files:               {len(estimate.source_paths)}")
+    console.print(f"  Groupable input FITS:             {summary.input_files}")
+    console.print(f"  Time groups:                      {summary.time_groups}")
+    console.print(f"  Frequency subbands:               {summary.frequency_groups}")
+    console.print(
+        f"  Polarization products:            {summary.polarization_groups} ({pol})"
+    )
+    console.print(
+        f"  Time×frequency×polarization cells: "
+        f"{summary.time_frequency_polarization_cells} "
+        f"(Zarr hint {summary.zarr_shape_hint})"
+    )
+    if estimate.reference_lm_shape is not None:
+        n_l, n_m = estimate.reference_lm_shape
+        if estimate.target_size is not None:
+            grid_note = f"from --target-size {estimate.target_size}"
+        else:
+            grid_note = "from Stokes-I peek in first time group"
+        console.print(f"  Reference LM grid:                {n_l}×{n_m} ({grid_note})")
+    if summary.estimated_zarr_size is not None:
+        console.print(
+            f"  Estimated final Zarr size:        {summary.estimated_zarr_size} "
+            "(≈4 B/pixel, uncompressed SKY)"
+        )
+    else:
+        console.print(
+            "  Estimated final Zarr size:        unavailable "
+            "(pass --target-size or ensure Stokes-I NAXIS is readable)"
+        )
+
+    if estimate.grouped_without_headers and not estimate.peeked_headers_for_lm:
+        console.print("  Header I/O:                       none")
+    elif estimate.grouped_without_headers and estimate.peeked_headers_for_lm:
+        console.print(
+            "  Header I/O:                       LM peek on Stokes-I files in "
+            "first time group only (no full-tree header pass, no sidecar)"
+        )
+    else:
+        console.print(
+            "  Header I/O:                       per-file headers for grouping "
+            "(fits / lst-color); no sidecar written"
+        )
+    console.print()
+
+
+@app.command("estimate-size")
+def estimate_size(
+    glob_pattern: str = typer.Option(
+        ...,
+        "--glob-pattern",
+        "-g",
+        help="Python glob of FITS inputs (same semantics as convert --glob-pattern)",
+    ),
+    target_size: Optional[int] = typer.Option(
+        None,
+        "--target-size",
+        help=(
+            "Assume the Zarr LM grid is this square size (pixels). When set, no FITS "
+            "headers are read for LM shape (use the same value as convert/dewarp "
+            "--target-size when applicable)."
+        ),
+        min=1,
+    ),
+    discovery_freq_bin_hz: float = typer.Option(
+        _DISCOVERY_FREQ_BIN_HZ,
+        "--discovery-freq-bin-hz",
+        help=(
+            "Treat frequencies within this bin width (Hz) as one subband when grouping "
+            "(default: library default, 23 kHz)"
+        ),
+        min=1e-6,
+    ),
+    discovery_metadata_source: str = typer.Option(
+        "filename",
+        "--discovery-metadata-source",
+        help=(
+            'How to infer observation time and subband when grouping: "filename" '
+            "(default for estimate-size) uses basename ``-image-YYYYMMDD_HHMMSS`` and "
+            "``_NNNMHz_`` without caching every HDU; \"fits\" reads headers for grouping."
+        ),
+    ),
+    discovery_time_key_source: str = typer.Option(
+        "filename",
+        "--discovery-time-key-source",
+        help=(
+            'How to choose the observation time key: "filename" (default), "header" '
+            '(DATE-OBS; requires --discovery-metadata-source fits), or "directory".'
+        ),
+    ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging)."
+        ),
+        min=0.0,
+    ),
+    discovery_filename_convention: str = typer.Option(
+        "image",
+        "--discovery-filename-convention",
+        help=(
+            'Basename convention: "image" (default) or "lst-color" (requires '
+            "--discovery-metadata-source fits for subband frequency)."
+        ),
+    ),
+    log_level: LogLevel = typer.Option(
+        LogLevel.WARNING,
+        "--log-level",
+        "-l",
+        help="Logging verbosity level",
+        case_sensitive=False,
+    ),
+) -> None:
+    """Estimate final Zarr size for a glob without converting or writing a sidecar.
+
+    Uses the same discovery key options as ``convert``. With the default
+    ``--discovery-metadata-source filename``, grouping does not open every FITS
+    header; LM scale comes from ``--target-size`` or a small Stokes-I header peek
+    in the first time group. Does **not** write a discovery sidecar.
+
+    \b
+    Examples:
+        ovro-ingest estimate-size -g '/lustre/data/**/*-image-*.fits' \\
+            --discovery-metadata-source filename
+
+        ovro-ingest estimate-size -g '/data/**/*.fits' --target-size 4096
+    """
+    _configure_logging(log_level)
+    group_metadata_source = _cli_group_metadata_source(discovery_metadata_source)
+    time_key_source = _cli_time_key_source(discovery_time_key_source)
+    filename_convention = _cli_filename_convention(discovery_filename_convention)
+
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        raise typer.BadParameter(
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            "use --discovery-metadata-source fits.",
+            param_hint="--discovery-filename-convention",
+        )
+    if time_key_source == "header" and group_metadata_source == "filename":
+        raise typer.BadParameter(
+            '"header" time keys require FITS DATE-OBS; use '
+            "--discovery-metadata-source fits.",
+            param_hint="--discovery-time-key-source",
+        )
+
+    discovery = IngestDiscoveryConfig(
+        freq_bin_hz=discovery_freq_bin_hz,
+        group_metadata_source=group_metadata_source,
+        time_key_source=time_key_source,
+        filename_convention=filename_convention,
+        time_key_tolerance_sec=discovery_time_key_tolerance,
+    )
+
+    console.print("\n[bold cyan]OVRO-LWA Zarr size estimate[/bold cyan]\n")
+    try:
+        estimate = estimate_glob_convert_size(
+            glob_pattern,
+            discovery=discovery,
+            target_size=target_size,
+        )
+    except FileNotFoundError as exc:
+        console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        console.print(f"[bold red]✗[/bold red] {exc}", style="red")
+        raise typer.Exit(code=1) from exc
+
+    _print_glob_size_estimate(estimate, glob_pattern=glob_pattern, discovery=discovery)
 
 
 @app.command("audit-metadata")
@@ -1192,9 +1506,18 @@ def audit_metadata(
         "filename",
         "--discovery-time-key-source",
         help=(
-            'When --discovery-metadata-source is "fits", observation time key from '
-            '"filename" (default) or "header" (DATE-OBS only)'
+            'Observation time key from "filename" (default), "header" (DATE-OBS only), '
+            'or "directory" (YYYY-MM-DD/YYYYMMDD + optional NNh LST-hour parent dirs)'
         ),
+    ),
+    discovery_time_key_tolerance: float = typer.Option(
+        0.0,
+        "--discovery-time-key-tolerance",
+        help=(
+            "Merge discovery groups whose DATE-OBS keys fall within this many seconds "
+            "(0 disables merging)."
+        ),
+        min=0.0,
     ),
     strict: bool = typer.Option(
         False,
@@ -1235,6 +1558,7 @@ def audit_metadata(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
+        time_key_tolerance_sec=discovery_time_key_tolerance,
     )
 
     input_dir = Path(input_dir)
@@ -1498,6 +1822,146 @@ def repair(
     if not result["post"]["consistent"]:
         console.print("\n[bold red]✗[/bold red] Store remains inconsistent after repair", style="red")
         raise typer.Exit(code=1)
+
+
+@app.command("repair-polarization")
+def repair_polarization(
+    zarr_path: Path = typer.Argument(
+        ...,
+        help="Path to an existing Zarr store with duplicate Stokes on polarization",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    backup_suffix: str = typer.Option(
+        ".backup-before-pol-repair",
+        "--backup-suffix",
+        help="Suffix for the backup copy created before repair",
+    ),
+    skip_backup: bool = typer.Option(
+        False,
+        "--skip-backup",
+        help="Repair in place without creating a backup (not recommended)",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report planned changes without modifying the store",
+    ),
+) -> None:
+    """Drop duplicate Stokes planes from polarization (e.g. ``[I, V, I]`` → ``[I, V]``)."""
+    console.print("\n[bold cyan]OVRO-LWA Zarr polarization repair[/bold cyan]")
+    console.print(f"  Store:         {zarr_path}")
+    console.print(f"  Dry run:       {dry_run}")
+    if not skip_backup and not dry_run:
+        console.print(f"  Backup suffix: {backup_suffix}")
+
+    try:
+        result = repair_zarr_polarization(
+            zarr_path,
+            backup_suffix=backup_suffix,
+            skip_backup=skip_backup,
+            dry_run=dry_run,
+        )
+    except Exception as e:
+        console.print(f"\n[bold red]✗[/bold red] Repair failed: {e}", style="red")
+        raise typer.Exit(code=1) from e
+
+    console.print(f"\n{result.get('message', 'Done')}")
+    if result.get("changed"):
+        console.print("\n[bold green]✓[/bold green] Polarization repair completed")
+        if backup := result.get("backup"):
+            console.print(f"  Backup: {backup}")
+        console.print(f"  Before: {result.get('polarization_before')}")
+        console.print(f"  After:  {result.get('polarization_after')}")
+    elif not dry_run:
+        console.print("\n[bold green]✓[/bold green] No changes needed")
+
+
+@app.command()
+def rechunk(
+    source: Path = typer.Argument(
+        ...,
+        help="Finished Zarr store to read (left unchanged)",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    dest: Path = typer.Argument(
+        ...,
+        help="Path for the rechunked copy",
+        file_okay=False,
+        dir_okay=True,
+        resolve_path=True,
+    ),
+    time_chunk: int = typer.Option(
+        DEFAULT_TIME_CHUNK, "--chunk-time", help="Time steps per chunk"
+    ),
+    freq_chunk: int = typer.Option(
+        0, "--chunk-freq", help="Frequency channels per chunk (0 = all)"
+    ),
+    lm_chunk: int = typer.Option(DEFAULT_LM_CHUNK, "--chunk-lm", help="l and m pixels per chunk"),
+    workers: int = typer.Option(8, "--workers", help="Parallel block copies"),
+    max_unit_gb: float = typer.Option(
+        4.0,
+        "--max-unit-gb",
+        help="Decoded block size per worker in GB (memory is about workers x this)",
+    ),
+    verify_samples: int = typer.Option(
+        64, "--verify-samples", help="Random pixel spectra compared against the source"
+    ),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Replace DEST after the new copy is verified"
+    ),
+) -> None:
+    """Copy a store with image cubes rechunked for interactive review.
+
+    The default layout is 32 times x all frequencies x 1 Stokes x 128 x 128
+    pixels per chunk. Run it once after incremental ingest finishes.
+    """
+    config = RechunkConfig(
+        time_chunk=time_chunk,
+        freq_chunk=freq_chunk,
+        lm_chunk=lm_chunk,
+        workers=workers,
+        max_unit_bytes=int(max_unit_gb * 1024**3),
+        verify_samples=verify_samples,
+    )
+    console.print("\n[bold cyan]OVRO-LWA Zarr rechunk[/bold cyan]")
+    console.print(f"  Source: {source}")
+    console.print(f"  Dest:   {dest}")
+    freq_label = "all" if freq_chunk == 0 else str(freq_chunk)
+    console.print(
+        f"  Chunks: time={time_chunk} frequency={freq_label} polarization=1 l=m={lm_chunk}"
+    )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total} blocks"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as bar:
+        task = bar.add_task("Rechunking", total=None)
+
+        def _progress(done: int, total: int) -> None:
+            bar.update(task, completed=done, total=total)
+
+        try:
+            report = rechunk_store(source, dest, config, overwrite=overwrite, progress=_progress)
+        except Exception as e:
+            console.print(f"\n[bold red]✗[/bold red] Rechunk failed: {e}", style="red")
+            raise typer.Exit(code=1) from e
+
+    console.print("\n[bold green]✓[/bold green] Rechunk completed")
+    for name, info in report["variables"].items():
+        console.print(f"  {name}: {tuple(info['source_chunks'])} → {tuple(info['chunks'])}")
+    console.print(f"  Verified spectra: {report['verified_samples']}")
+    console.print(f"  Size on disk:     {report['bytes_on_disk'] / 1e9:.1f} GB")
+    console.print(f"  Elapsed:          {report['seconds']:.0f} s")
 
 
 @app.command()

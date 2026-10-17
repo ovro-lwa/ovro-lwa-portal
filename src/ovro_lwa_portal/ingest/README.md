@@ -55,6 +55,9 @@ ovro-ingest convert /path/to/fits /path/to/output \
     --zarr-name my_data.zarr \
     --chunk-lm 2048
 
+# Force float32 SKY on disk (smaller stores; default is preserve)
+ovro-ingest convert /path/to/fits /path/to/output --sky-dtype float32
+
 # Show help
 ovro-ingest convert --help
 
@@ -77,6 +80,7 @@ config = ConversionConfig(
     output_dir=Path("/path/to/output"),
     zarr_name="ovro_lwa_data.zarr",
     chunk_lm=1024,
+    sky_dtype="preserve",  # or "float32" / "float64"
     rebuild=False,
     verbose=True,
 )
@@ -109,15 +113,48 @@ result = fits_to_zarr_flow(
 
 ### `ovro-ingest convert`
 
-| Option              | Type   | Default                      | Description                                 |
-| ------------------- | ------ | ---------------------------- | ------------------------------------------- |
-| `input_dir`         | Path   | Required                     | Directory containing input FITS files       |
-| `output_dir`        | Path   | Required                     | Directory for output Zarr store             |
-| `--zarr-name`, `-z` | str    | `ovro_lwa_full_lm_only.zarr` | Name of output Zarr store                   |
-| `--fixed-dir`, `-f` | Path   | `OUTPUT_DIR/fixed_fits`      | Directory for fixed FITS files              |
-| `--chunk-lm`, `-c`  | int    | 1024                         | Chunk size for l,m dimensions (0=disable)   |
-| `--rebuild`, `-r`   | flag   | False                        | Overwrite existing Zarr store               |
-| `--log-level`, `-l` | choice | info                         | Logging level (debug, info, warning, error) |
+| Option              | Type   | Default                      | Description                                              |
+| ------------------- | ------ | ---------------------------- | -------------------------------------------------------- |
+| `input_dir`         | Path   | Required                     | Directory containing input FITS files                    |
+| `output_dir`        | Path   | Required                     | Directory for output Zarr store                          |
+| `--zarr-name`, `-z` | str    | `ovro_lwa_full_lm_only.zarr` | Name of output Zarr store                                |
+| `--fixed-dir`, `-f` | Path   | `OUTPUT_DIR/fixed_fits`      | Directory for fixed FITS files                           |
+| `--chunk-lm`, `-c`  | int    | 1024                         | Chunk size for l,m dimensions (0=disable)                |
+| `--sky-dtype`       | choice | `preserve`                   | On-disk `SKY` dtype: `preserve`, `float32`, or `float64` |
+| `--rebuild`, `-r`   | flag   | False                        | Overwrite existing Zarr store                            |
+| `--log-level`, `-l` | choice | info                         | Logging level (debug, info, warning, error)              |
+
+### `ovro-ingest rechunk`
+
+Incremental `convert` writes one time step per chunk. After a store is finished,
+rewrite its image cube for Source Review:
+
+```bash
+ovro-ingest rechunk /path/to/store.zarr /path/to/store_R2.zarr
+```
+
+The default layout is
+`(32 time, all frequencies, 1 polarization, 128 l, 128 m)`. Non-cube arrays are
+copied unchanged. The command writes `<dest>.partial`, compares random pixel
+spectra with the source, then renames. `convert` stays at `time: 1` so later
+appends remain one time step.
+
+### On-disk `SKY` dtype
+
+Conversion writes floating-point `SKY` only. Scaled-integer FITS (`BITPIX` +
+`BSCALE`/`BZERO`) are expanded to float at header-fix time; integer pixels are
+**not** stored in Zarr.
+
+- **`preserve` (default):** read input FITS `BITPIX` and use that float kind for
+  convert and Zarr write (`-32`→`float32`, `-64`→`float64`; integer
+  BITPIX→`float32` after scale expansion). Regrid/reproject may use float64
+  intermediates but cast `SKY` back to the FITS-resolved kind.
+- **`float32` / `float64`:** force that cast regardless of FITS BITPIX.
+- **Append:** if the incoming step dtype differs from the existing store `SKY`
+  dtype, the step is cast to the store dtype and a warning is logged.
+
+Typical OVRO float32 FITS (`BITPIX=-32`) therefore write `<f4` under the
+default. Pass `--sky-dtype float64` only when you intentionally want double.
 
 ## File Naming Convention
 
@@ -144,6 +181,7 @@ ovro_lwa_portal/ingest/
 ├── __init__.py              # Public API exports
 ├── core.py                  # Framework-independent conversion logic
 ├── cli.py                   # Typer-based CLI interface
+├── rechunk.py               # Rewrite a finished store to the review layout
 ├── prefect_workflow.py      # Optional Prefect orchestration
 └── README.md               # This file
 ```
