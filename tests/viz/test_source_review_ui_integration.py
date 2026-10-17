@@ -1111,6 +1111,85 @@ def test_center_without_overlay_resets_mismatched_heatmap(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_review_catalog_position_skips_heatmap_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog click must not republish the zeros grid before the new spectrum."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_coord = CYG_A
+    review._heatmap_values = np.ones((6, 4))
+
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    review._sky_widget = widget
+
+    reset_calls: list[bool] = []
+    load_calls: list[bool] = []
+    overlay_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(review, "_reset_heatmap_to_zeros", lambda: reset_calls.append(True))
+    monkeypatch.setattr(review, "_load_heatmap", lambda: load_calls.append(True))
+    monkeypatch.setattr(
+        review,
+        "_schedule_overlay_slice_load",
+        lambda *args, **kwargs: overlay_calls.append(kwargs),
+    )
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+
+    review.review_catalog_position("280.46630 -1.96395", name="J1841-0157", stokes="I")
+    _flush_jupyter_io(loop)
+
+    assert reset_calls == []
+    assert load_calls == [True]
+    assert len(overlay_calls) == 1
+    assert overlay_calls[0].get("center_on_target") is True
+    widget.goto.assert_called_once()
+    widget.set_crosshair.assert_called_once()
+    assert review._current_source is not None
+    assert review._current_source["name"] == "J1841-0157"
+    assert review._heatmap_coord == CYG_A
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_review_catalog_position_switches_stokes_without_zeros_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stokes on a catalog click must not clear the heatmap before Generate."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.stokes = "I"
+    review._heatmap_coord = CYG_A
+    review._heatmap_values = np.ones((6, 4))
+
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    review._sky_widget = widget
+
+    grid_calls: list[bool] = []
+
+    def _grid(*_args: object, **_kwargs: object) -> None:
+        grid_calls.append(True)
+
+    monkeypatch.setattr(review, "_ensure_heatmap_grid", _grid)
+    monkeypatch.setattr(review, "_load_heatmap", lambda: None)
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+
+    review.review_catalog_position("148.28526 +7.92746", name="J0953+0755", stokes="V")
+    _flush_jupyter_io(loop)
+
+    assert review.stokes == "V"
+    assert grid_calls == []
+    assert review._heatmap_coord == CYG_A
+    assert review._current_source is not None
+    assert review._current_source["name"] == "J0953+0755"
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_generate_after_center_rebinds_desynced_heatmap_pane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

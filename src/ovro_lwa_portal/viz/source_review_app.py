@@ -410,6 +410,7 @@ class SourceReview(param.Parameterized):
         self._coord_input.param.watch(self._on_coord_value_input, "value_input")
         self._coord_input.param.watch(self._on_coord_value, "value")
         self._suppress_coord_value_handler = False
+        self._suppress_stokes_handler = False
         self._coord_slew = pn.widgets.Button(
             name="Center",
             button_type="primary",
@@ -1351,6 +1352,71 @@ class SourceReview(param.Parameterized):
             pass
         self._log(f"[diag] Click reported=({ra_deg:.4f}, {dec_deg:.4f}) | " + " | ".join(parts))
 
+    def review_catalog_position(self, coordinate_string: str, *, name: str, stokes: str) -> None:
+        """Center on an ExoPipe combined position and start the dynamic spectrum.
+
+        ``coordinate_string`` is the locbar degree pair (``RA Dec``). ``name``
+        is the source id used as the heatmap label. ``stokes`` selects the
+        queue's Stokes plane. Does not reset the heatmap to zeros: the spectrum
+        publish replaces the previous figure.
+        """
+        self._schedule_ui_action(
+            lambda: self._review_catalog_position_impl(coordinate_string, name=name, stokes=stokes)
+        )
+
+    def _review_catalog_position_impl(
+        self,
+        coordinate_string: str,
+        *,
+        name: str,
+        stokes: str,
+    ) -> None:
+        text = coordinate_string.strip()
+        if not text:
+            self._log("WARNING: Catalog position is empty.")
+            return
+        resolution, messages = resolve_coordinate_string(
+            text,
+            use_ned_fallback=self._config.use_ned_fallback,
+            ned_timeout=self._config.ned_timeout_s,
+            known_source_names=frozenset(item.casefold() for item in self._known_source_names),
+        )
+        for message in messages:
+            self._log(message)
+        if resolution is None:
+            self._log(
+                f"WARNING: Could not resolve catalog position {text!r} "
+                "(expected RA/Dec in degrees)."
+            )
+            return
+        coord = resolution.coord
+        self._set_coordinate_field_from_text(text, log_prefix="Catalog")
+        if str(self.stokes) != stokes:
+            self._suppress_stokes_handler = True
+            try:
+                self.stokes = stokes
+            finally:
+                self._suppress_stokes_handler = False
+            self._apply_sky_widget_pol()
+            self._cache.clear()
+            self._invalidate_overlay_patch_fit()
+        self._coord = coord
+        self._current_source = build_source_from_coordinate(name, coord)
+        widget = self._sky_widget
+        if widget is None:
+            self._log("Sky widget not ready — wait for the Zarr store to open.")
+            return
+        widget.goto(coord, fov=self._sky_fov_deg * u.deg)
+        self._set_sky_crosshair(widget, coord)
+        self._schedule_overlay_slice_load(
+            self._time_idx,
+            self._freq_idx,
+            center_on_target=True,
+            center=coord,
+            manage_spinner=True,
+        )
+        self._load_heatmap()
+
     def _on_generate_heatmap(self, _event: object | None = None) -> None:
         self._schedule_ui_action(self._on_generate_heatmap_impl)
 
@@ -1450,10 +1516,12 @@ class SourceReview(param.Parameterized):
         cube.pol = self._pol_idx()
 
     def _on_stokes_change(self, *_events: object) -> None:
+        if self._suppress_stokes_handler:
+            return
         self._schedule_ui_action(self._on_stokes_change_impl)
 
     def _on_stokes_change_impl(self) -> None:
-        if self._dataset is None:
+        if self._suppress_stokes_handler or self._dataset is None:
             return
         self._apply_sky_widget_pol()
         self._cache.clear()
