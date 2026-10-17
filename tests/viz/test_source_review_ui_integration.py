@@ -1220,6 +1220,37 @@ def test_review_catalog_position_switches_stokes_without_zeros_reset(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_catalog_load_fades_the_previous_spectrum_until_new_values_paint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load dims the current spectrum; the next paint restores it."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_values = np.ones((6, 4))
+    review._refresh_heatmap_figure(review._heatmap_values)
+    glyph = review._heatmap_bokeh_handles.image_renderer.glyph
+    assert glyph.global_alpha == 1.0
+
+    monkeypatch.setattr(review, "_load_heatmap", lambda: None)
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    widget = MagicMock()
+    widget.image_shape = (8, 8)
+    review._sky_widget = widget
+
+    review.review_catalog_position("280.46630 -1.96395", name="J1841-0157", stokes="I")
+    _flush_jupyter_io(loop)
+    assert glyph.global_alpha == 0.35
+
+    review._update_heatmap_figure_shell(
+        review._heatmap_bokeh_handles,
+        np.full((6, 4), 2.0),
+    )
+    assert glyph.global_alpha == 1.0
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_review_catalog_position_keeps_detection_slice_for_overlay(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

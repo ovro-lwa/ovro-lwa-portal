@@ -1470,6 +1470,7 @@ class SourceReview(param.Parameterized):
             center=coord,
             manage_spinner=True,
         )
+        self._fade_heatmap_for_new_candidate()
         self._load_heatmap()
 
     def _on_generate_heatmap(self, _event: object | None = None) -> None:
@@ -2084,6 +2085,14 @@ class SourceReview(param.Parameterized):
             "**Click the heatmap** to inspect a time/frequency slice."
         )
         self._sync_fit_overlay_button()
+
+    def _fade_heatmap_for_new_candidate(self) -> None:
+        """Dim the previous spectrum until this candidate's values are drawn."""
+        handles = self._heatmap_bokeh_handles
+        if handles is None:
+            return
+        handles.image_renderer.glyph.global_alpha = 0.35
+        self._publish_heatmap_mutation_to_notebook()
 
     def _begin_heatmap_load(self, src: dict) -> None:
         """Show spinner/status for a new heatmap job."""
@@ -2967,6 +2976,7 @@ class SourceReview(param.Parameterized):
         }
         glyph.dw = n_times
         glyph.dh = n_freqs
+        glyph.global_alpha = 1.0
         glyph.color_mapper = _color_mapper(values.astype(np.float64, copy=False))
 
         hover_data, tooltips = self._heatmap_hover_payload(
