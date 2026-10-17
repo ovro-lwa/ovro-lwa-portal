@@ -154,7 +154,7 @@ def test_candidate_tabulator_filters_put_ranges_on_column_headers() -> None:
         for column in table._get_configuration(table._get_columns())["columns"]
     }
     assert isinstance(specs["snr"]["headerFilter"], JSCode)
-    assert isinstance(specs["snr"]["headerFilterFunc"], JSCode)
+    assert specs["snr"]["headerFilterFunc"] == "minMax"
     assert specs["snr"]["headerFilterFuncParams"] == {"kind": "number"}
     assert specs["date"]["headerFilterParams"] == {"kind": "date"}
     assert specs["rank"]["headerFilterFuncParams"] == {"kind": "number"}
@@ -162,6 +162,8 @@ def test_candidate_tabulator_filters_put_ranges_on_column_headers() -> None:
     assert specs["source"]["headerFilterFunc"] == "like"
     assert specs["snr"]["headerFilterLiveFilter"] is False
     assert "keyup" in specs["snr"]["headerFilter"].js_code
+    assert "registry.minMax" in specs["snr"]["headerFilter"].js_code
+    assert "Number(rowValue)" in specs["snr"]["headerFilter"].js_code
     assert "headerFilter" not in specs["base_url"]
 
 
@@ -182,10 +184,48 @@ def test_range_header_filter_stays_on_the_client() -> None:
     )
     before = len(table._processed)
     table.filters = [
-        {"field": "snr", "type": "function", "value": {"start": "5", "end": ""}},
+        {"field": "snr", "type": "minMax", "value": {"start": "5", "end": ""}},
     ]
     assert len(table._processed) == before
     assert table._get_header_filters(frame) == []
+
+
+def test_integer_detections_filter_still_records_the_clicked_row() -> None:
+    frame = pd.DataFrame(
+        {
+            "source": ["a", "b", "c"],
+            "detections": pd.Series([1, 2, 9], dtype="int64"),
+        }
+    )
+    header_filters, configuration = candidate_tabulator_filters(frame.columns)
+    table = CandidateTabulator(
+        frame,
+        show_index=False,
+        header_filters=header_filters,
+        configuration=configuration,
+        editors=dict.fromkeys(frame.columns),
+        pagination="local",
+        selectable=1,
+    )
+    table.filters = [
+        {"field": "detections", "type": "minMax", "value": {"start": "2", "end": ""}},
+    ]
+    assert table._get_header_filters(frame) == []
+    seen: list[str] = []
+
+    def _click(_event: object) -> None:
+        assert table.clicked_row is not None
+        seen.append(str(table.clicked_row.source))
+
+    table.on_click(_click)
+
+    class _Click:
+        event_name = "cell-click"
+        row = 2
+        column = "detections"
+
+    table._process_event(_Click())
+    assert seen == ["c"]
 
 
 def test_cell_click_records_the_full_frame_row() -> None:

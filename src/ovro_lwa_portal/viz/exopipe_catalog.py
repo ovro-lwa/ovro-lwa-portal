@@ -52,45 +52,11 @@ _RANGE_FILTER_COLUMNS = (
     "n_epoch",
 )
 _DATE_FILTER_COLUMNS = ("date",)
-_RANGE_HEADER_EDITOR = """
-function(cell, onRendered, success, cancel, editorParams) {
-  var kind = editorParams && editorParams.kind === "date" ? "date" : "number";
-  var box = document.createElement("span");
-  box.style.display = "flex";
-  box.style.gap = "2px";
-  function makeInput(placeholder) {
-    var input = document.createElement("input");
-    input.type = kind;
-    input.placeholder = placeholder;
-    input.style.width = "50%";
-    input.style.minWidth = "0";
-    input.style.boxSizing = "border-box";
-    input.style.padding = "2px";
-    function stop(event) { event.stopPropagation(); }
-    input.addEventListener("mousedown", stop);
-    input.addEventListener("click", stop);
-    input.addEventListener("keydown", stop);
-    input.addEventListener("keyup", stop);
-    input.addEventListener("keypress", stop);
-    return input;
-  }
-  var start = makeInput(kind === "date" ? "from" : "min");
-  var end = makeInput(kind === "date" ? "to" : "max");
-  var current = cell.getValue();
-  if (current && typeof current === "object") {
-    if (current.start) start.value = current.start;
-    if (current.end) end.value = current.end;
-  }
-  function commit() {
-    success({start: start.value, end: end.value});
-  }
-  start.addEventListener("input", commit);
-  end.addEventListener("input", commit);
-  box.appendChild(start);
-  box.appendChild(end);
-  return box;
-}
-"""
+# Tabulator stores a function-typed header filter as ``type: <function>``.
+# Bokeh then raises ``[object Function] is not serializable`` and drops the
+# next cell click, so Load keeps the previous candidate. A named string type
+# serializes. The editor registers that name on the filter module.
+_RANGE_FILTER_NAME = "minMax"
 _RANGE_HEADER_FILTER = """
 function(headerValue, rowValue, rowData, filterParams) {
   if (!headerValue || typeof headerValue !== "object") {
@@ -130,6 +96,50 @@ function(headerValue, rowValue, rowData, filterParams) {
   return true;
 }
 """
+_RANGE_HEADER_EDITOR = """
+function(cell, onRendered, success, cancel, editorParams) {
+  var filterModule = cell.getTable().modules.filter;
+  var registry = filterModule && (filterModule.constructor.filters || filterModule.filters);
+  if (registry && !registry.minMax) {
+    registry.minMax = __RANGE_FILTER__;
+  }
+  var kind = editorParams && editorParams.kind === "date" ? "date" : "number";
+  var box = document.createElement("span");
+  box.style.display = "flex";
+  box.style.gap = "2px";
+  function makeInput(placeholder) {
+    var input = document.createElement("input");
+    input.type = kind;
+    input.placeholder = placeholder;
+    input.style.width = "50%";
+    input.style.minWidth = "0";
+    input.style.boxSizing = "border-box";
+    input.style.padding = "2px";
+    function stop(event) { event.stopPropagation(); }
+    input.addEventListener("mousedown", stop);
+    input.addEventListener("click", stop);
+    input.addEventListener("keydown", stop);
+    input.addEventListener("keyup", stop);
+    input.addEventListener("keypress", stop);
+    return input;
+  }
+  var start = makeInput(kind === "date" ? "from" : "min");
+  var end = makeInput(kind === "date" ? "to" : "max");
+  var current = cell.getValue();
+  if (current && typeof current === "object") {
+    if (current.start) start.value = current.start;
+    if (current.end) end.value = current.end;
+  }
+  function commit() {
+    success({start: start.value, end: end.value});
+  }
+  start.addEventListener("input", commit);
+  end.addEventListener("input", commit);
+  box.appendChild(start);
+  box.appendChild(end);
+  return box;
+}
+""".replace("__RANGE_FILTER__", _RANGE_HEADER_FILTER.strip())
 _BAND_MHZ_RE = re.compile(r"^(\d+(?:\.\d+)?)MHz$", re.IGNORECASE)
 _LST_HOUR_RE = re.compile(r"^(\d{1,2})h$", re.IGNORECASE)
 _DETECTION_HEADERS = ("lst", "date", "band", "snr", "ra", "dec")
@@ -257,7 +267,7 @@ def candidate_tabulator_filters(
                     "field": column,
                     "headerFilter": JSCode(_RANGE_HEADER_EDITOR),
                     "headerFilterParams": params,
-                    "headerFilterFunc": JSCode(_RANGE_HEADER_FILTER),
+                    "headerFilterFunc": _RANGE_FILTER_NAME,
                     "headerFilterFuncParams": params,
                     # Tabulator's default live filter reads the wrapper node's
                     # .value. That node is a <span>, so .value is undefined and
@@ -296,11 +306,7 @@ class CandidateTabulator(pn.widgets.Tabulator):
 
     def _get_header_filters(self, df: pd.DataFrame) -> list[pd.Series]:
         current = list(self.filters or [])
-        kept = [
-            item
-            for item in current
-            if isinstance(item.get("type"), str) and item.get("type") != "function"
-        ]
+        kept = [item for item in current if not _is_client_range_filter(item)]
         if len(kept) == len(current):
             return super()._get_header_filters(df)  # type: ignore[misc]
         with param.discard_events(self):
@@ -342,6 +348,19 @@ class CandidateTabulator(pn.widgets.Tabulator):
                 self.clicked_row = self.value.iloc[iloc]
 
 
+def _is_client_range_filter(item: Mapping[str, object]) -> bool:
+    """True when the header value is a min/max pair applied in the browser.
+
+    ``detections`` is an integer column. Panel casts a header value with the
+    column dtype, and ``int({start, end})`` raises. That exception aborts the
+    click that should select the filtered row.
+    """
+    op = item.get("type")
+    if isinstance(item.get("value"), Mapping):
+        return True
+    return not isinstance(op, str) or op in {"function", _RANGE_FILTER_NAME}
+
+
 def _header_filter_mask(frame: pd.DataFrame, filters: Sequence[Mapping[str, object]]) -> pd.Series:
     """Rows that pass the Tabulator header filters currently on the table."""
     mask = pd.Series(True, index=frame.index)
@@ -360,7 +379,7 @@ def _header_filter_mask(frame: pd.DataFrame, filters: Sequence[Mapping[str, obje
                 na=False,
             )
             continue
-        if isinstance(value, Mapping) and (op in {None, "function"} or not isinstance(op, str)):
+        if isinstance(value, Mapping) and _is_client_range_filter(item):
             mask &= _range_filter_mask(column, value, date=field == "date")
     return mask
 
@@ -404,7 +423,7 @@ def _filter_key(filters: Sequence[Mapping[str, object]] | None) -> tuple[object,
     key: list[object] = []
     for item in filters or []:
         op = item.get("type")
-        op_key = op if isinstance(op, str) and op != "function" else "function"
+        op_key = "function" if _is_client_range_filter(item) else op
         value = item.get("value")
         if isinstance(value, Mapping):
             frozen: object = tuple(
