@@ -1211,6 +1211,41 @@ def test_review_catalog_position_switches_stokes_without_zeros_reset(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_review_catalog_position_keeps_detection_slice_for_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog time/frequency survives the post-heatmap overlay choice."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._lst_hours = np.arange(6, dtype=float)
+    review._freq_mhz = np.array([18.0, 32.0, 46.0, 82.0])
+    widget = MagicMock()
+    widget.image_shape = (8, 8)
+    review._sky_widget = widget
+    monkeypatch.setattr(review, "_load_heatmap", lambda: None)
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+
+    review.review_catalog_position(
+        "280.46630 -1.96395",
+        name="J1841-0157",
+        stokes="I",
+        time_idx=4,
+        freq_idx=1,
+    )
+    _flush_jupyter_io(loop)
+
+    assert review._pending_overlay_slice == (4, 1)
+    chosen = review._consume_pending_overlay_slice(np.zeros((6, 4)))
+    assert chosen == (4, 1)
+    assert review._pending_overlay_slice is None
+    assert review._consume_pending_overlay_slice(np.zeros((6, 4))) == review._default_slice(
+        np.zeros((6, 4))
+    )
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_generate_after_center_rebinds_desynced_heatmap_pane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

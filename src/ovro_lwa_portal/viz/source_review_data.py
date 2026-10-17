@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -322,6 +323,70 @@ def format_heatmap_time_axis_label(
     else:
         day = calendar_mmdd_labels_for_time_coord(time_values)[int(time_idx)]
     return f"{day} {lst}"
+
+
+def match_detection_slice(
+    time_mjd: np.ndarray,
+    freq_mhz: np.ndarray,
+    lst_hours: np.ndarray,
+    *,
+    on_date: date,
+    lst_hour: int,
+    band_mhz: float | None,
+) -> tuple[int, int, str]:
+    """Map a detection's UTC date, LST hour, and subband onto store indices.
+
+    ``lst_hours`` is mean LST in hours for each time sample (already computed
+    for the heatmap). ``freq_mhz`` is the store's frequency axis in MHz.
+    ``band_mhz`` is the detection subband, or ``None`` when the detection is
+    wideband and no subband shares that time.
+    """
+    mjd = np.asarray(time_mjd, dtype=np.float64)
+    lst = np.asarray(lst_hours, dtype=np.float64)
+    mhz = np.asarray(freq_mhz, dtype=np.float64)
+    if mjd.size == 0 or mhz.size == 0 or lst.shape != mjd.shape:
+        msg = "Time and frequency axes are empty or mismatched."
+        raise ValueError(msg)
+
+    from astropy.time import Time
+
+    dates = [stamp.datetime.date() for stamp in Time(mjd, format="mjd", scale="utc")]
+    rounded = np.rint(lst).astype(int) % 24
+    hour = int(lst_hour) % 24
+    exact = [
+        index
+        for index, (day, rounded_hour) in enumerate(zip(dates, rounded, strict=True))
+        if day == on_date and int(rounded_hour) == hour
+    ]
+    if exact:
+        time_idx = min(exact, key=lambda index: _lst_hour_delta(float(lst[index]), hour))
+        time_note = f"{on_date.isoformat()} {hour:02d}h"
+    else:
+        same_day = [index for index, day in enumerate(dates) if day == on_date]
+        if same_day:
+            time_idx = min(same_day, key=lambda index: _lst_hour_delta(float(lst[index]), hour))
+            got = int(rounded[time_idx])
+            time_note = (
+                f"no {hour:02d}h sample on {on_date.isoformat()}; "
+                f"nearest LST is {got:02d}h"
+            )
+        else:
+            noon = Time(f"{on_date.isoformat()}T12:00:00", scale="utc")
+            time_idx = int(np.argmin(np.abs(mjd - float(noon.mjd))))
+            time_note = f"{on_date.isoformat()} is not in this store"
+
+    if band_mhz is None:
+        freq_idx = int(mhz.size // 2)
+        freq_note = f"middle channel {float(mhz[freq_idx]):.0f} MHz"
+    else:
+        freq_idx = int(np.argmin(np.abs(mhz - float(band_mhz))))
+        freq_note = f"{float(mhz[freq_idx]):.0f} MHz"
+    return time_idx, freq_idx, f"{time_note}, {freq_note}"
+
+
+def _lst_hour_delta(lst_hour: float, target_hour: int) -> float:
+    delta = abs(float(lst_hour) - float(target_hour)) % 24.0
+    return min(delta, 24.0 - delta)
 
 
 def _format_scalar_hover(value: float, *, fmt: str = ".3g") -> str:

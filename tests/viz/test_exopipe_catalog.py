@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 import pytest
 
 from ovro_lwa_portal.name_resolution import resolve_coordinate_string
 from ovro_lwa_portal.viz.exopipe_catalog import (
+    candidate_from_selection,
     load_candidate_table,
     parse_candidate_index,
     parse_combined_position,
+    parse_source_detections,
+    peak_detection,
     source_page_url,
+    subband_mhz_for_overlay,
 )
 
 _INDEX_I = """
@@ -90,6 +96,49 @@ def test_parse_combined_position_uses_first_degree_pair() -> None:
     assert messages == []
     assert resolution.coord.ra.deg == 280.46630
     assert resolution.coord.dec.deg == -1.96395
+
+
+_DETECTIONS = """
+<h2>Detections of this source</h2>
+<table class="idx">
+<tr><th>LST</th><th>date</th><th>band</th><th>SNR</th><th>RA</th><th>Dec</th></tr>
+<tr><td>17h</td><td>2025-05-05</td><td>32MHz</td><td>68.27</td><td>294.90696</td><td>21.5738</td></tr>
+<tr><td>17h</td><td>2025-05-05</td><td>Full</td><td>92.61</td><td>294.91343</td><td>21.57423</td></tr>
+<tr><td>15h</td><td>2025-04-10</td><td>23MHz</td><td>33.77</td><td>294.82922</td><td>21.5583</td></tr>
+</table>
+"""
+
+
+def test_parse_source_detections_peak_uses_subband_at_same_time() -> None:
+    detections = parse_source_detections(_DETECTIONS)
+    assert len(detections) == 3
+    peak = peak_detection(detections)
+    assert peak.band == "Full"
+    assert peak.on_date == date(2025, 5, 5)
+    assert peak.lst_hour == 17
+    mhz, note = subband_mhz_for_overlay(peak, detections)
+    assert mhz == 32.0
+    assert "32MHz" in note
+    subband = next(item for item in detections if item.band == "32MHz")
+    own, own_note = subband_mhz_for_overlay(subband, detections)
+    assert own == 32.0
+    assert "32MHz at 2025-05-05 17h" in own_note
+
+
+def test_candidate_from_selection_uses_last_iloc() -> None:
+    frame = pd.DataFrame(
+        {
+            "stokes": ["V", "I"],
+            "source": ["J0953+0755", "J1841-0157"],
+            "base_url": ["http://127.0.0.1:8766", "http://127.0.0.1:8768"],
+        }
+    )
+    row = candidate_from_selection(frame, [0, 1])
+    assert row.source == "J1841-0157"
+    assert row.stokes == "I"
+    assert row.base_url == "http://127.0.0.1:8768"
+    with pytest.raises(ValueError, match="press Load"):
+        candidate_from_selection(frame, [])
 
 
 def test_parse_combined_position_missing_locbar_raises() -> None:

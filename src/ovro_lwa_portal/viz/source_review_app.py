@@ -162,6 +162,7 @@ def _placeholder_heatmap_figure() -> figure:
     plot = figure(
         width=1000,
         height=400,
+        sizing_mode="stretch_width",
         x_range=(0, 1),
         y_range=(0, 1),
         tools="",
@@ -306,6 +307,7 @@ class SourceReview(param.Parameterized):
         )
         self._time_idx = 0
         self._freq_idx = 0
+        self._pending_overlay_slice: tuple[int, int] | None = None
         self._default_time_idx = 0
         self._default_freq_idx = 0
         self._heatmap_job_id = 0
@@ -1352,16 +1354,32 @@ class SourceReview(param.Parameterized):
             pass
         self._log(f"[diag] Click reported=({ra_deg:.4f}, {dec_deg:.4f}) | " + " | ".join(parts))
 
-    def review_catalog_position(self, coordinate_string: str, *, name: str, stokes: str) -> None:
+    def review_catalog_position(
+        self,
+        coordinate_string: str,
+        *,
+        name: str,
+        stokes: str,
+        time_idx: int | None = None,
+        freq_idx: int | None = None,
+    ) -> None:
         """Center on an ExoPipe combined position and start the dynamic spectrum.
 
         ``coordinate_string`` is the locbar degree pair (``RA Dec``). ``name``
         is the source id used as the heatmap label. ``stokes`` selects the
-        queue's Stokes plane. Does not reset the heatmap to zeros: the spectrum
+        queue's Stokes plane. When ``time_idx`` and ``freq_idx`` are both set,
+        the sky overlay uses that detection sample instead of the middle
+        finite heatmap cell. Does not reset the heatmap to zeros: the spectrum
         publish replaces the previous figure.
         """
         self._schedule_ui_action(
-            lambda: self._review_catalog_position_impl(coordinate_string, name=name, stokes=stokes)
+            lambda: self._review_catalog_position_impl(
+                coordinate_string,
+                name=name,
+                stokes=stokes,
+                time_idx=time_idx,
+                freq_idx=freq_idx,
+            )
         )
 
     def _review_catalog_position_impl(
@@ -1370,6 +1388,8 @@ class SourceReview(param.Parameterized):
         *,
         name: str,
         stokes: str,
+        time_idx: int | None = None,
+        freq_idx: int | None = None,
     ) -> None:
         text = coordinate_string.strip()
         if not text:
@@ -1406,6 +1426,20 @@ class SourceReview(param.Parameterized):
         if widget is None:
             self._log("Sky widget not ready — wait for the Zarr store to open.")
             return
+        if time_idx is not None and freq_idx is not None:
+            resolved_time = int(time_idx)
+            resolved_freq = int(freq_idx)
+            if self._lst_hours is not None and len(self._lst_hours):
+                resolved_time = int(np.clip(resolved_time, 0, len(self._lst_hours) - 1))
+            if self._freq_mhz is not None and len(self._freq_mhz):
+                resolved_freq = int(np.clip(resolved_freq, 0, len(self._freq_mhz) - 1))
+            self._time_idx = resolved_time
+            self._freq_idx = resolved_freq
+            self._pending_overlay_slice = (resolved_time, resolved_freq)
+            self._log(
+                "Overlay detection sample "
+                f"{self._slice_descriptor(resolved_time, resolved_freq)}."
+            )
         widget.goto(coord, fov=self._sky_fov_deg * u.deg)
         self._set_sky_crosshair(widget, coord)
         self._schedule_overlay_slice_load(
@@ -2102,7 +2136,7 @@ class SourceReview(param.Parameterized):
         self._invalidate_overlay_patch_fit()
         self._coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg, frame="icrs")
         self._heatmap_coord = self._coord
-        self._time_idx, self._freq_idx = self._default_slice(payload.values)
+        self._time_idx, self._freq_idx = self._consume_pending_overlay_slice(payload.values)
         # Grid placeholder and deferred open-time grid must not clobber this figure.
         self._heatmap_grid_ready = True
 
@@ -2162,6 +2196,17 @@ class SourceReview(param.Parameterized):
         else:
             self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
         self._sync_fit_overlay_button()
+
+    def _consume_pending_overlay_slice(self, values: np.ndarray) -> tuple[int, int]:
+        """Use a catalog detection sample once, then fall back to the middle cell."""
+        pending = self._pending_overlay_slice
+        self._pending_overlay_slice = None
+        if pending is None:
+            return self._default_slice(values)
+        n_times, n_freqs = values.shape
+        time_idx = int(np.clip(pending[0], 0, max(n_times - 1, 0)))
+        freq_idx = int(np.clip(pending[1], 0, max(n_freqs - 1, 0)))
+        return time_idx, freq_idx
 
     def _default_slice(self, values: np.ndarray) -> tuple[int, int]:
         finite = np.argwhere(np.isfinite(values))
@@ -2778,6 +2823,7 @@ class SourceReview(param.Parameterized):
         plot = figure(
             width=1000,
             height=400,
+            sizing_mode="stretch_width",
             title=self._heatmap_figure_title(subject=title_name),
             x_range=(0, n_times),
             y_range=(0, n_freqs),

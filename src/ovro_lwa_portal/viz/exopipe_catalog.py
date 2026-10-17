@@ -7,7 +7,10 @@ the ExoPipe generator.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import date
 from html.parser import HTMLParser
 from urllib.error import URLError
 from urllib.parse import quote
@@ -36,6 +39,9 @@ CANDIDATE_COLUMNS: tuple[str, ...] = (
 )
 
 _NUMERIC_COLUMNS = ("peak_jy", "detections", "snr", "elevation")
+_BAND_MHZ_RE = re.compile(r"^(\d+(?:\.\d+)?)MHz$", re.IGNORECASE)
+_LST_HOUR_RE = re.compile(r"^(\d{1,2})h$", re.IGNORECASE)
+_DETECTION_HEADERS = ("lst", "date", "band", "snr", "ra", "dec")
 
 _HEADER_TO_COLUMN = {
     "#": "rank",
@@ -55,6 +61,94 @@ _HEADER_TO_COLUMN = {
     "cross-match": "cross_match",
     "note": "note",
 }
+
+
+@dataclass(frozen=True)
+class SourceDetection:
+    """One row of the source page's ``Detections of this source`` table."""
+
+    lst_hour: int
+    on_date: date
+    band: str
+    snr: float
+    ra_deg: float
+    dec_deg: float
+
+
+def parse_source_detections(html: str) -> list[SourceDetection]:
+    """Read per-detection LST, date, band, and SNR from a source page.
+
+    The index table has one date and a list of bands. This table is the
+    specific sample: ``15h``, ``2025-05-05``, ``32MHz``.
+    """
+    parser = _DetectionTableParser()
+    parser.feed(html)
+    parser.close()
+    detections: list[SourceDetection] = []
+    for cells in parser.rows:
+        parsed = _detection_from_cells(cells)
+        if parsed is not None:
+            detections.append(parsed)
+    return detections
+
+
+def peak_detection(detections: Sequence[SourceDetection]) -> SourceDetection:
+    """Highest-SNR detection. That row is the one the index date refers to."""
+    if len(detections) == 0:
+        msg = "Source page has no detection rows."
+        raise ValueError(msg)
+    return max(detections, key=lambda item: item.snr)
+
+
+def subband_mhz_for_overlay(
+    peak: SourceDetection,
+    detections: Sequence[SourceDetection],
+) -> tuple[float | None, str]:
+    """Frequency channel for the overlay, and a short explanation.
+
+    ``32MHz`` is that channel. ``Full``, ``Red``, ``Green``, and ``Blue`` are
+    wideband images, so the overlay uses the brightest ``NNMHz`` detection at
+    the same date and LST. ``None`` means no subband shares that time.
+    """
+    own = _band_mhz(peak.band)
+    if own is not None:
+        return own, f"{peak.band} at {peak.on_date.isoformat()} {peak.lst_hour:02d}h"
+    same_time = [
+        item
+        for item in detections
+        if item.on_date == peak.on_date
+        and item.lst_hour == peak.lst_hour
+        and _band_mhz(item.band) is not None
+    ]
+    if same_time:
+        best = max(same_time, key=lambda item: item.snr)
+        mhz = _band_mhz(best.band)
+        return (
+            mhz,
+            (
+                f"{peak.band} is wideband; overlay uses {best.band} "
+                f"(SNR {best.snr:.1f}) at {peak.on_date.isoformat()} {peak.lst_hour:02d}h"
+            ),
+        )
+    return (
+        None,
+        (
+            f"{peak.band} at {peak.on_date.isoformat()} {peak.lst_hour:02d}h "
+            "has no subband detection"
+        ),
+    )
+
+
+def candidate_from_selection(frame: pd.DataFrame, selection: Sequence[int]) -> pd.Series:
+    """Return the last selected candidate row.
+
+    ``selection`` is integer positions into ``frame``, matching Panel
+    Tabulator's ``selection``. An empty selection raises ``ValueError``.
+    """
+    if len(selection) == 0:
+        msg = "Select a candidate row, then press Load."
+        raise ValueError(msg)
+    return frame.iloc[int(selection[-1])]
 
 
 def source_page_url(base_url: str, source_id: str) -> str:
@@ -226,6 +320,97 @@ class _IndexTableParser(HTMLParser):
             self._cell_chunks.append(data)
 
 
+def _band_mhz(band: str) -> float | None:
+    match = _BAND_MHZ_RE.fullmatch(band.strip())
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
+def _detection_from_cells(cells: list[str]) -> SourceDetection | None:
+    if len(cells) < 6:
+        return None
+    lst = _LST_HOUR_RE.fullmatch(cells[0].strip())
+    if lst is None:
+        return None
+    hour = int(lst.group(1))
+    if hour > 23:
+        return None
+    try:
+        on_date = date.fromisoformat(cells[1].strip())
+        snr = float(cells[3].replace(",", ""))
+        ra_deg = float(cells[4])
+        dec_deg = float(cells[5])
+    except ValueError:
+        return None
+    return SourceDetection(
+        lst_hour=hour,
+        on_date=on_date,
+        band=cells[2].strip(),
+        snr=snr,
+        ra_deg=ra_deg,
+        dec_deg=dec_deg,
+    )
+
+
+class _DetectionTableParser(HTMLParser):
+    """Rows of the detections table (headers LST, date, band, SNR, RA, Dec)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._depth = 0
+        self._in_row = False
+        self._in_cell = False
+        self._cell_chunks: list[str] = []
+        self._row_cells: list[str] = []
+        self._capture = False
+        self._saw_header = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        if tag == "table":
+            self._depth += 1
+            if self._depth == 1:
+                self._capture = False
+                self._saw_header = False
+            return
+        if not self._depth:
+            return
+        if tag == "tr":
+            self._in_row = True
+            self._row_cells = []
+            return
+        if self._in_row and tag in {"td", "th"}:
+            self._in_cell = True
+            self._cell_chunks = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._in_cell:
+            text = " ".join("".join(self._cell_chunks).split())
+            self._row_cells.append(text)
+            self._in_cell = False
+            self._cell_chunks = []
+            return
+        if tag == "tr" and self._in_row:
+            cells = list(self._row_cells)
+            keys = tuple(cell.strip().casefold() for cell in cells[:6])
+            if not self._saw_header and keys == _DETECTION_HEADERS:
+                self._capture = True
+                self._saw_header = True
+            elif self._capture and cells:
+                self.rows.append(cells)
+            self._in_row = False
+            self._row_cells = []
+            return
+        if tag == "table" and self._depth:
+            self._depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._cell_chunks.append(data)
+
+
 class _LocbarParser(HTMLParser):
     """First ``input.lv`` value inside ``div.locbar``."""
 
@@ -253,10 +438,15 @@ class _LocbarParser(HTMLParser):
 
 __all__ = [
     "CANDIDATE_COLUMNS",
+    "SourceDetection",
     "URLError",
+    "candidate_from_selection",
     "fetch_text",
     "load_candidate_table",
     "parse_candidate_index",
     "parse_combined_position",
+    "parse_source_detections",
+    "peak_detection",
     "source_page_url",
+    "subband_mhz_for_overlay",
 ]

@@ -14,5 +14,6 @@ questions or need assistance, feel free to reach out to the project maintainers.
   (`Science_*`, `QA/*_thermal_noise_vs_freq.png`, run-level
   `QA/*_flux_check_hybrid.csv`).
 - `exopipe_candidate_review.ipynb` — 1-hour ExoPipe candidate list (ports 8766
-  and 8768 via an SSH forward from `lwacalim10` to `lwacalim07`). Clicking a
-  source name opens Source Review at that detection.
+  and 8768 via an SSH forward from `lwacalim10` to `lwacalim07`). The table
+  sits beside the sky view; **Load** opens Source Review at the selected
+  detection.
