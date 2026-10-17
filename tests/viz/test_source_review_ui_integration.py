@@ -241,6 +241,27 @@ def _mount_review_jupyter(
     return harness, review, loop
 
 
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_notebook_sky_embed_includes_widget_mounted_after_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first Panel snapshot is the placeholder; mounting must re-embed."""
+    from ipywidgets import HTML
+
+    harness, review, _loop = _mount_review_jupyter(tmp_path, monkeypatch)
+    assert review._sky_pane._models
+    review._sky_container.children = [HTML("SKY-MOUNTED")]
+    review._refresh_notebook_sky_embed()
+
+    _ref, (model, _parent) = next(iter(review._sky_pane._models.items()))
+    blob = str(model.bundle)
+    assert "SKY-MOUNTED" in blob
+    assert "Sky view loads after the Zarr store opens." not in blob
+    sky_model = harness.bokeh_model(review._sky_pane, review._layout)
+    assert sky_model is model
+
+
 def _make_dataset(*, n_times: int = 6, n_freqs: int = 4) -> xr.Dataset:
     from tests.test_fits_to_zarr import _make_sin_wcs_header_str
 

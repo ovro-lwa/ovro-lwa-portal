@@ -2241,6 +2241,42 @@ class SourceReview(param.Parameterized):
             self._install_sky_ipywidget_pane(widget)
         else:
             self._sky_container.children = [widget]
+            self._refresh_notebook_sky_embed()
+
+    def _refresh_notebook_sky_embed(self) -> None:
+        """Re-snapshot the notebook IPyWidget after SkyWidget replaces the placeholder.
+
+        Panel freezes ipywidget state into the Bokeh model when the pane is first
+        drawn. The first snapshot is the placeholder VBox, so a later ``children``
+        change stays in the kernel and the browser keeps "Sky view loads…".
+        """
+        from panel.models.ipywidget import IPyWidget as BkIPyWidget
+
+        pane = self._sky_pane
+        container = self._sky_container
+        if (
+            container is None
+            or not isinstance(pane, pn.pane.IPyWidget)
+            or not pane._models
+        ):
+            return
+        ref = next(iter(pane._models))
+        old_model, parent = pane._models[ref]
+        if parent is None:
+            return
+        style: dict[str, object] = {}
+        for attr in ("height", "width", "sizing_mode", "margin"):
+            if hasattr(old_model, attr):
+                style[attr] = getattr(old_model, attr)
+        new_model = BkIPyWidget(widget=container, **style)
+        children = list(parent.children)
+        try:
+            index = children.index(old_model)
+        except ValueError:
+            return
+        children[index] = new_model
+        parent.children = children
+        pane._models[ref] = (new_model, parent)
 
     def _on_view_gesture_revision(self, change) -> None:
         """Activity-log hook when pan/zoom triggers debounced overlay reproject."""
