@@ -55,6 +55,9 @@ ovro-ingest convert /path/to/fits /path/to/output \
     --zarr-name my_data.zarr \
     --chunk-lm 2048
 
+# Force float32 SKY on disk (smaller stores; default is preserve)
+ovro-ingest convert /path/to/fits /path/to/output --sky-dtype float32
+
 # Show help
 ovro-ingest convert --help
 
@@ -77,6 +80,7 @@ config = ConversionConfig(
     output_dir=Path("/path/to/output"),
     zarr_name="ovro_lwa_data.zarr",
     chunk_lm=1024,
+    sky_dtype="preserve",  # or "float32" / "float64"
     rebuild=False,
     verbose=True,
 )
@@ -109,15 +113,48 @@ result = fits_to_zarr_flow(
 
 ### `ovro-ingest convert`
 
-| Option              | Type   | Default                      | Description                                 |
-| ------------------- | ------ | ---------------------------- | ------------------------------------------- |
-| `input_dir`         | Path   | Required                     | Directory containing input FITS files       |
-| `output_dir`        | Path   | Required                     | Directory for output Zarr store             |
-| `--zarr-name`, `-z` | str    | `ovro_lwa_full_lm_only.zarr` | Name of output Zarr store                   |
-| `--fixed-dir`, `-f` | Path   | `OUTPUT_DIR/fixed_fits`      | Directory for fixed FITS files              |
-| `--chunk-lm`, `-c`  | int    | 1024                         | Chunk size for l,m dimensions (0=disable)   |
-| `--rebuild`, `-r`   | flag   | False                        | Overwrite existing Zarr store               |
-| `--log-level`, `-l` | choice | info                         | Logging level (debug, info, warning, error) |
+| Option              | Type   | Default                      | Description                                              |
+| ------------------- | ------ | ---------------------------- | -------------------------------------------------------- |
+| `input_dir`         | Path   | Required                     | Directory containing input FITS files                    |
+| `output_dir`        | Path   | Required                     | Directory for output Zarr store                          |
+| `--zarr-name`, `-z` | str    | `ovro_lwa_full_lm_only.zarr` | Name of output Zarr store                                |
+| `--fixed-dir`, `-f` | Path   | `OUTPUT_DIR/fixed_fits`      | Directory for fixed FITS files                           |
+| `--chunk-lm`, `-c`  | int    | 1024                         | Chunk size for l,m dimensions (0=disable)                |
+| `--sky-dtype`       | choice | `preserve`                   | On-disk `SKY` dtype: `preserve`, `float32`, or `float64` |
+| `--rebuild`, `-r`   | flag   | False                        | Overwrite existing Zarr store                            |
+| `--log-level`, `-l` | choice | info                         | Logging level (debug, info, warning, error)              |
+
+### `ovro-ingest rechunk`
+
+Incremental `convert` writes one time step per chunk. After a store is finished,
+rewrite its image cube for Source Review:
+
+```bash
+ovro-ingest rechunk /path/to/store.zarr /path/to/store_R2.zarr
+```
+
+The default layout is
+`(32 time, all frequencies, 1 polarization, 128 l, 128 m)`. Non-cube arrays are
+copied unchanged. The command writes `<dest>.partial`, compares random pixel
+spectra with the source, then renames. `convert` stays at `time: 1` so later
+appends remain one time step.
+
+### On-disk `SKY` dtype
+
+Conversion writes floating-point `SKY` only. Scaled-integer FITS (`BITPIX` +
+`BSCALE`/`BZERO`) are expanded to float at header-fix time; integer pixels are
+**not** stored in Zarr.
+
+- **`preserve` (default):** read input FITS `BITPIX` and use that float kind for
+  convert and Zarr write (`-32`→`float32`, `-64`→`float64`; integer
+  BITPIX→`float32` after scale expansion). Regrid/reproject may use float64
+  intermediates but cast `SKY` back to the FITS-resolved kind.
+- **`float32` / `float64`:** force that cast regardless of FITS BITPIX.
+- **Append:** if the incoming step dtype differs from the existing store `SKY`
+  dtype, the step is cast to the store dtype and a warning is logged.
+
+Typical OVRO float32 FITS (`BITPIX=-32`) therefore write `<f4` under the
+default. Pass `--sky-dtype float64` only when you intentionally want double.
 
 ## File Naming Convention
 
@@ -144,6 +181,7 @@ ovro_lwa_portal/ingest/
 ├── __init__.py              # Public API exports
 ├── core.py                  # Framework-independent conversion logic
 ├── cli.py                   # Typer-based CLI interface
+├── rechunk.py               # Rewrite a finished store to the review layout
 ├── prefect_workflow.py      # Optional Prefect orchestration
 └── README.md               # This file
 ```
@@ -221,24 +259,34 @@ The resulting Zarr store contains:
 - **Coordinates**:
   - `time`: Observation timestamps
   - `frequency`: Frequency values in Hz
+  - `polarization`: FITS Stokes values (e.g. `1` = I, `4` = V)
   - `l`, `m`: Spatial pixel coordinates
   - `right_ascension`, `declination`: 2D celestial coordinates (degrees,
     FK5/J2000)
 - **Data Variables**: Intensity values (e.g., `SKY`, `BEAM`)
-- **Metadata**: Per-time celestial WCS in `wcs_header_str(time)` (see below)
+- **Metadata**: Full primary HDU header per slice in
+  `fits_header_str(time, frequency, polarization)` (see below)
 
-### WCS metadata in the Zarr store
+### Header metadata in the Zarr store
 
-Snapshot ingest stores **one FITS WCS header per time step** (zenith-tracking;
-`CRVAL1`/`CRVAL2` change with time). The canonical on-disk field is the data
-variable **`wcs_header_str`**, indexed by `time` (sometimes `(time, frequency)`
-before collapse).
+New ingests persist the **complete primary FITS header** for each
+`(time, frequency, polarization)` slice in **`fits_header_str`**. Headers are
+**pixel-faithful**: they describe the stored pixels after `_fix_headers`, regrid
+(if any), and celestial WCS rebuild — not necessarily the pre-regrid input file.
+
+Separate Stokes I and V FITS at the same `(time, frequency)` are combined into
+**one** Zarr with `polarization = [1, 4]` (or the subset present). Each pol
+plane has its own `fits_header_str` entry.
+
+**`wcs_header_str` is not written** on new ingests. Portal WCS is derived in
+memory from `fits_header_str` via `_read_wcs_header_str` (celestial subset,
+default `freq_idx=0`).
 
 **Do not rely on `fits_wcs_header` in `SKY.attrs` or dataset attrs** on
 multi-time stores: Zarr array metadata is written once per array and would
 freeze the time-0 phase center after incremental append. Before every Zarr
-write/append and on load, the library strips those attrs when `wcs_header_str`
-is present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called
+write/append and on load, the library strips those attrs when per-slice headers
+are present (`strip_redundant_fits_wcs_header_attrs` in `accessor.py`, called
 from `_write_or_append_zarr` and `open_dataset`). See **Per-Time WCS and CRVAL**
 in `AGENTS.md`.
 
@@ -247,6 +295,28 @@ Audit per-time CRVAL drift:
 ```bash
 pixi run python scripts/audit_zarr_wcs_timeline.py /path/to/store.zarr
 ```
+
+### Exporting FITS slices
+
+Any `(time, frequency, polarization)` cell can be exported back to a standalone
+**4D singleton-axis** FITS file (`NAXIS=4`, `NAXIS3=NAXIS4=1`) for external
+tools:
+
+```python
+import ovro_lwa_portal as ovro
+from ovro_lwa_portal import write_fits_slice
+
+ds = ovro.open_dataset("/path/to/output/ovro_lwa_full_lm_only.zarr")
+
+# One slice → one FITS file
+write_fits_slice(ds, "image_t000_f000_I.fits", time_idx=0, freq_idx=0, pol_idx=0)
+
+# Batch export (default filename: image_t{time}_f{freq_mhz}MHz_s{stokes}.fits)
+ds.radport.export_fits("/path/to/exported_fits")
+```
+
+Legacy stores without `fits_header_str` cannot be exported — re-ingest from
+original FITS. See `ovro_lwa_portal.export_fits` module docstring for details.
 
 ### Reading the Output
 
@@ -259,6 +329,7 @@ ds = ovro.open_dataset("/path/to/output/ovro_lwa_full_lm_only.zarr")
 print(ds)
 print(f"Time range: {ds.time.values[0]} to {ds.time.values[-1]}")
 print(f"Frequency range: {ds.frequency.values.min():.2e} to {ds.frequency.values.max():.2e} Hz")
+print(f"Polarization (FITS Stokes): {ds.polarization.values}")
 
 # WCS for one time index (required when the store has multiple times)
 time_idx = 0

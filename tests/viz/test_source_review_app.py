@@ -11,6 +11,7 @@ pn = pytest.importorskip("panel")
 pytest.importorskip("astrowidget")
 
 import astropy.units as u
+import numpy as np
 from astropy.coordinates import SkyCoord
 
 from astrowidget import SkyWidget
@@ -19,12 +20,76 @@ from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
 from ovro_lwa_portal.viz.source_review_app import SourceReview, SourceReviewConfig
 
 
+def test_control_row_names_and_order_are_unchanged(tmp_path: Path) -> None:
+    (tmp_path / "store.zarr").mkdir()
+    review = SourceReview(
+        tmp_path / "store.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    names = [str(getattr(child, "name", "")) for child in review._layout.objects[0].objects]
+    assert names[:7] == [
+        "Coordinate",
+        "Center",
+        "Generate heatmap",
+        "Stokes",
+        "Overlay: on",
+        "Fit overlay",
+        "Heatmap method",
+    ]
+
+
 def test_astrowidget_update_slice_supports_view_lock() -> None:
     """Editable ``../astrowidget`` is required for source review overlay view-lock."""
     import inspect
 
     assert "view_lock" in inspect.signature(SkyWidget.update_slice).parameters
     assert "overlay_view_lock" in SkyWidget.class_trait_names()
+
+
+def test_source_review_accepts_remote_zarr_url(tmp_path: Path) -> None:
+    """Remote URLs skip local Path validation and stay as open_dataset strings."""
+    review = SourceReview(
+        "s3://bucket/obs.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=True,
+        storage_options={"anon": True},
+    )
+    assert review._zarr_path == "s3://bucket/obs.zarr"
+    assert review._zarr_source_type == "remote"
+    assert review._storage_options == {"anon": True}
+
+
+def test_source_review_resolves_local_zarr(tmp_path: Path) -> None:
+    import xarray as xr
+
+    zarr_path = tmp_path / "obs.zarr"
+    xr.Dataset({"SKY": (["time"], [1.0])}, coords={"time": [0]}).to_zarr(zarr_path)
+    review = SourceReview(
+        zarr_path,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=True,
+    )
+    assert Path(review._zarr_path) == zarr_path.resolve()
+    assert review._zarr_source_type == "local"
 
 
 def test_serve_sky_widget_coerces_null_background_cuts() -> None:
@@ -348,6 +413,61 @@ def test_configure_sky_widget_display_applies_config(tmp_path: Path) -> None:
     assert widget.background_cut_max == 42.0
 
 
+def _write_survey(root: Path, name: str, cut: str) -> Path:
+    survey = root / name
+    survey.mkdir()
+    (survey / "properties").write_text(f"hips_pixel_cut = {cut}\n", encoding="utf-8")
+    return survey
+
+
+def test_hips_selector_replaces_method_selector(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    a = _write_survey(tmp_path, "a.hips", "-1 2")
+    b = _write_survey(tmp_path, "b.hips", "-3 4")
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=a,
+            hips_http_prefix="http://host:3005",
+            hips_backgrounds=(a, b),
+        ),
+        validate_zarr=False,
+    )
+    assert review._hips_selector is not None
+    assert review._hips_selector.options == {"a": str(a), "b": str(b)}
+    assert review._hips_selector.value == str(a)
+    assert review._method_selector not in review._layout.select(type(review._method_selector))
+
+    widget = MagicMock()
+    review._sky_widget = widget
+    review._set_hips_background(b)
+
+    assert review._hips_background_url == "http://host:3005/b.hips/"
+    assert widget.background_survey == "http://host:3005/b.hips/"
+    assert widget.background_cut_min == -3.0
+    assert widget.background_cut_max == 4.0
+
+
+def test_method_selector_kept_without_hips_backgrounds(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(hips_root=tmp_path, hips_background=tmp_path / "bg.hips"),
+        validate_zarr=False,
+    )
+    assert review._hips_selector is None
+    assert review._method_selector in review._layout.select(type(review._method_selector))
+
+
 def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:
     zarr = tmp_path / "store.zarr"
     zarr.mkdir()
@@ -376,3 +496,175 @@ def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:
     review._apply_overlay_fixed_scale(widget)
     assert widget.vmin == -2.0
     assert widget.vmax == 20.0
+
+
+def test_stokes_toggle_hidden_until_iv_store_opened(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    assert review._stokes_toggle.visible is False
+    assert review._stokes_toggle in review._layout.objects[0].objects
+
+
+def test_configure_stokes_enables_toggle_for_iv_dataset(tmp_path: Path) -> None:
+    import numpy as np
+    import xarray as xr
+
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    ds = xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.ones((1, 1, 2, 4, 4)),
+            ),
+        },
+        coords={
+            "time": [60000.0],
+            "frequency": [50e6],
+            "polarization": [1, 4],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    review._dataset = ds
+    review._configure_stokes_from_dataset(ds)
+    assert review._stokes_toggle.visible is True
+    assert review.param.stokes.objects == ["I", "V"]
+    assert review._pol_idx() == 0
+    review.stokes = "V"
+    assert review._pol_idx() == 1
+
+
+def test_configure_stokes_pushes_toggle_visibility(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import numpy as np
+    import xarray as xr
+
+    pushed: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.source_review_app.set_notebook_widget_params",
+        lambda widget, *views, **params: pushed.append(params),
+    )
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    ds = xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.ones((1, 1, 2, 4, 4)),
+            ),
+        },
+        coords={
+            "time": [60000.0],
+            "frequency": [50e6],
+            "polarization": [1, 4],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    review._configure_stokes_from_dataset(ds)
+    assert pushed
+    assert pushed[-1]["visible"] is True
+    assert pushed[-1]["disabled"] is False
+
+
+def test_stokes_change_clears_computed_heatmap(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+
+    def _inline_dispatch(callback) -> None:
+        callback()
+
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        dispatch_override=_inline_dispatch,
+    )
+    import numpy as np
+    import xarray as xr
+
+    ds = xr.Dataset(
+        data_vars={
+            "SKY": (
+                ["time", "frequency", "polarization", "l", "m"],
+                np.ones((2, 2, 2, 4, 4)),
+            ),
+        },
+        coords={
+            "time": [60000.0, 60000.1],
+            "frequency": [46e6, 50e6],
+            "polarization": [1, 4],
+            "l": np.arange(4),
+            "m": np.arange(4),
+        },
+    )
+    review._dataset = ds
+    review._lst_hours = np.array([12.0, 13.0])
+    review._freq_mhz = np.array([46.0, 50.0])
+    review._configure_stokes_from_dataset(ds)
+    review._cache[("Cas A", "mad", "I")] = object()
+    review._heatmap_coord = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
+    review._heatmap_values = np.zeros((2, 2))
+    review._heatmap_grid_ready = True
+    review.stokes = "V"
+    review._on_stokes_change_impl()
+    assert review._cache == {}
+    assert review._heatmap_coord is None
+
+
+def test_slice_descriptor_includes_stokes_and_frequency(tmp_path: Path) -> None:
+    review = SourceReview(
+        tmp_path / "store.zarr",
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+    )
+    review.stokes = "V"
+    review._freq_mhz = np.array([46.0, 50.0])
+    assert review._slice_descriptor(3, 1) == "Stokes V, t=3, f=1, 50.0 MHz"

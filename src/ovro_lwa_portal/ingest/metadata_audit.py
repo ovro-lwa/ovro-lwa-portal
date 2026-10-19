@@ -324,7 +324,7 @@ def audit_directory(
     *,
     staging_dir: Path | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: Literal["header", "filename", "directory"] = "filename",
     discovery_freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
     probe_combine: bool = False,
     fixed_dir: Path | None = None,

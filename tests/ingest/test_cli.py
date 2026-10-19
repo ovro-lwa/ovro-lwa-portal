@@ -12,12 +12,24 @@ from typer.testing import CliRunner
 
 from ovro_lwa_portal.ingest.cli import app
 from ovro_lwa_portal.ingest.core import ConversionConfig
+from ovro_lwa_portal.ingest.discovery import IngestDiscoverySummary
 
 
 runner = CliRunner()
 
 # GitHub Actions sets FORCE_COLOR=3; disable color for stable help/substring checks.
 _CI_PLAIN_ENV = {"NO_COLOR": "1", "FORCE_COLOR": "0"}
+
+
+def _mock_discovery_summary() -> IngestDiscoverySummary:
+    return IngestDiscoverySummary(
+        input_files=1,
+        time_groups=1,
+        frequency_groups=1,
+        polarization_groups=1,
+        polarization_labels=("I",),
+        time_frequency_polarization_cells=1,
+    )
 
 
 class TestCLI:
@@ -55,9 +67,100 @@ class TestCLI:
         assert "Convert OVRO-LWA FITS files to a single Zarr store" in plain_output
         assert "largest grid" in plain_output
         assert "--no-resume" in plain_output
-        assert "discovery-time-key" in plain_output
+        assert "discovery-time" in plain_output
         assert "discovery-filename-convention" in plain_output
         assert "--target-size" in plain_output
+        assert "--sky-dtype" in plain_output
+        assert "preserve" in plain_output
+        assert "float32" in plain_output
+        assert "float64" in plain_output
+
+    def test_convert_help_documents_glob_pattern(self) -> None:
+        """convert --help documents per-time glob ingest."""
+        result = runner.invoke(
+            app,
+            ["convert", "--help"],
+            color=False,
+            terminal_width=120,
+            env=_CI_PLAIN_ENV,
+        )
+        plain_output = click.unstyle(result.stdout)
+        assert result.exit_code == 0
+        assert "--glob-pattern" in plain_output
+        assert "--work-root" in plain_output
+        assert "--funpack" in plain_output
+
+    def test_convert_glob_pattern_uses_per_time_pipeline(self, tmp_path: Path) -> None:
+        staging = tmp_path / "staging"
+        out = tmp_path / "out"
+        staging.mkdir()
+        out.mkdir()
+        captured: list[str] = []
+
+        def fake_per_time(config, *, log_level):  # noqa: ANN001
+            captured.append(config.glob_pattern)
+            return out / "store.zarr"
+
+        summary = _mock_discovery_summary()
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_per_time_glob_conversion",
+                side_effect=fake_per_time,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "convert",
+                    str(staging),
+                    str(out),
+                    "--glob-pattern",
+                    "/lustre/**/*.fits.fs",
+                ],
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert captured == ["/lustre/**/*.fits.fs"]
+
+    def test_convert_prints_discovery_summary(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+
+        discovered = IngestDiscoverySummary(
+            input_files=12,
+            time_groups=3,
+            frequency_groups=4,
+            polarization_groups=1,
+            polarization_labels=("I",),
+            time_frequency_polarization_cells=12,
+            estimated_zarr_bytes=1_073_741_824,
+        )
+        to_process = discovered
+
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(discovered, to_process, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                return_value=out / "dummy.zarr",
+            ),
+        ):
+            result = runner.invoke(app, ["convert", str(inp), str(out)])
+
+        assert result.exit_code == 0, result.stdout + result.stderr
+        assert "Discovery summary" in result.stdout
+        assert "Input FITS files:" in result.stdout
+        assert "Time groups:" in result.stdout
+        assert "Frequency subbands:" in result.stdout
+        assert "Polarization products:" in result.stdout
+        assert "Estimated final Zarr size:" in result.stdout
 
     def test_validate_help(self) -> None:
         """Test validate command help."""
@@ -114,6 +217,7 @@ class TestCLI:
         assert "--cascade-parent" in plain
         assert "--target-size" in plain
         assert "--append-after-each-time" in plain
+        assert "--sky-dtype" in plain
         assert "--cleanup-dewarp-staging" not in plain
 
     def test_audit_metadata_help(self) -> None:
@@ -293,14 +397,106 @@ class TestCLI:
         combined = click.unstyle(result.stdout + result.stderr).lower()
         assert "allow-small-lm-chunks" in combined
 
+    def test_convert_rejects_invalid_sky_dtype(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        result = runner.invoke(
+            app,
+            ["convert", str(inp), str(out), "--sky-dtype", "float16"],
+            color=False,
+            env=_CI_PLAIN_ENV,
+        )
+        assert result.exit_code != 0
+        combined = click.unstyle(result.stdout + result.stderr).lower()
+        assert "sky-dtype" in combined
+        assert "float32" in combined
+
+    def test_convert_prints_sky_dtype_mode_in_summary(self, tmp_path: Path) -> None:
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        summary = _mock_discovery_summary()
+        captured: list[object] = []
+
+        def fake_execute(config, *, log_level):  # noqa: ANN001
+            captured.append(config)
+            return out / "dummy.zarr"
+
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                side_effect=fake_execute,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["convert", str(inp), str(out), "--sky-dtype", "FLOAT32"],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        plain = click.unstyle(result.stdout)
+        assert "SKY dtype mode:   float32" in plain
+        assert len(captured) == 1
+        assert captured[0].sky_dtype == "float32"  # type: ignore[union-attr]
+
+    def test_convert_default_sky_dtype_is_preserve(self, tmp_path: Path) -> None:
+        """Omitting ``--sky-dtype`` keeps preserve and prints it in the summary."""
+        inp = tmp_path / "in"
+        out = tmp_path / "out"
+        inp.mkdir()
+        out.mkdir()
+        summary = _mock_discovery_summary()
+        captured: list[object] = []
+
+        def fake_execute(config, *, log_level):  # noqa: ANN001
+            captured.append(config)
+            return out / "dummy.zarr"
+
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                side_effect=fake_execute,
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                ["convert", str(inp), str(out)],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        plain = click.unstyle(result.stdout)
+        assert "SKY dtype mode:   preserve" in plain
+        assert len(captured) == 1
+        assert captured[0].sky_dtype == "preserve"  # type: ignore[union-attr]
+
     def test_convert_allows_small_chunk_lm_with_flag(self, tmp_path: Path) -> None:
         inp = tmp_path / "in"
         out = tmp_path / "out"
         inp.mkdir()
         out.mkdir()
-        with patch(
-            "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
-            return_value=out / "dummy.zarr",
+        summary = _mock_discovery_summary()
+        with (
+            patch(
+                "ovro_lwa_portal.ingest.cli._resolve_convert_discovery_summary",
+                return_value=(summary, summary, None),
+            ),
+            patch(
+                "ovro_lwa_portal.ingest.cli._execute_fits_to_zarr_conversion",
+                return_value=out / "dummy.zarr",
+            ),
         ):
             result = runner.invoke(
                 app,
@@ -318,3 +514,69 @@ class TestCLI:
         assert result.exit_code == 0, result.stdout + result.stderr
         combined = click.unstyle(result.stdout + result.stderr).lower()
         assert "below the recommended minimum" not in combined
+
+    def test_estimate_size_help(self) -> None:
+        """estimate-size --help documents glob and discovery options."""
+        result = runner.invoke(
+            app,
+            ["estimate-size", "--help"],
+            color=False,
+            terminal_width=120,
+            env=_CI_PLAIN_ENV,
+        )
+        plain = click.unstyle(result.stdout)
+        assert result.exit_code == 0
+        assert "Estimate final Zarr size" in plain
+        assert "--glob-pattern" in plain
+        assert "--target-size" in plain
+        assert "discovery-metadata-source" in plain
+        assert "sidecar" in plain.lower()
+
+    def test_estimate_size_prints_summary(self, tmp_path: Path) -> None:
+        """estimate-size prints counts and byte estimate without converting."""
+        from ovro_lwa_portal.ingest.discovery import (
+            GlobSizeEstimate,
+            IngestDiscoverySummary,
+        )
+
+        summary = IngestDiscoverySummary(
+            input_files=12,
+            time_groups=3,
+            frequency_groups=4,
+            polarization_groups=1,
+            polarization_labels=("I",),
+            time_frequency_polarization_cells=12,
+            estimated_zarr_bytes=1_073_741_824,
+        )
+        estimate = GlobSizeEstimate(
+            source_paths=tuple(),
+            by_time={},
+            summary=summary,
+            reference_lm_shape=(2048, 2048),
+            target_size=2048,
+            grouped_without_headers=True,
+            peeked_headers_for_lm=False,
+        )
+        with patch(
+            "ovro_lwa_portal.ingest.cli.estimate_glob_convert_size",
+            return_value=estimate,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "estimate-size",
+                    "--glob-pattern",
+                    str(tmp_path / "**/*.fits"),
+                    "--target-size",
+                    "2048",
+                ],
+                color=False,
+                env=_CI_PLAIN_ENV,
+            )
+        assert result.exit_code == 0, result.stdout + result.stderr
+        plain = click.unstyle(result.stdout)
+        assert "Size estimate" in plain
+        assert "Estimated final Zarr size:" in plain
+        assert "Header I/O:" in plain
+        assert "none" in plain
+        assert "no discovery sidecar" in plain

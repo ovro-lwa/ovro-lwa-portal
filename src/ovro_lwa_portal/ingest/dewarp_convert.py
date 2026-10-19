@@ -20,6 +20,7 @@ from ovro_lwa_portal.ingest.discovery import (
 )
 
 __all__ = [
+    "clear_ingest_directory",
     "collect_cascade_fits",
     "import_flow_cascade73mhz",
     "remove_staged_files_for_time_key",
@@ -154,6 +155,45 @@ def _link_or_copy(src: Path, dest: Path) -> None:
         shutil.copy2(src, dest)
 
 
+def clear_ingest_directory(path: Path, *, label: str | None = None) -> int:
+    """Delete all entries under *path* and ensure the directory exists.
+
+    Used for reused staging / ``fixed_fits`` workdirs so a new convert run cannot
+    pick up leftover symlinks or ``*_fixed.fits`` from a prior product. Returns
+    the number of top-level entries removed.
+    """
+    path = Path(path)
+    removed = 0
+    if path.exists():
+        if not path.is_dir():
+            msg = f"Expected a directory for {label or 'ingest workdir'}: {path}"
+            raise NotADirectoryError(msg)
+        for child in path.iterdir():
+            try:
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink(missing_ok=True)
+                removed += 1
+            except OSError as exc:
+                logger.warning(
+                    "Could not remove %s while clearing %s: %s",
+                    child,
+                    path,
+                    exc,
+                )
+    path.mkdir(parents=True, exist_ok=True)
+    if removed:
+        logger.info(
+            "Cleared %s (%d entr%s): %s",
+            label or "directory",
+            removed,
+            "y" if removed == 1 else "ies",
+            path,
+        )
+    return removed
+
+
 def remove_staged_files_for_time_key(staging_dir: Path, time_key: str) -> int:
     """Remove ``{time_key}__*.fits`` under *staging_dir*; return count removed."""
     n = 0
@@ -243,7 +283,8 @@ def run_cascade_per_time_group(
     target_size: int | None = None,
     clear_staging: bool = True,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: Literal["header", "filename", "directory"] = "filename",
+    time_key_tolerance_sec: float = 0.0,
     out_zarr: Path | None = None,
     rebuild: bool = False,
     resume: bool = True,
@@ -258,9 +299,9 @@ def run_cascade_per_time_group(
     ``-image-YYYYMMDD_HHMMSS`` stamp when present (so multi-band images that share a pipeline
     image id stay in one group even if ``DATE-OBS`` differs between symlink targets). If that
     pattern is missing, grouping falls back to ``DATE-OBS`` like the Zarr ingest path.
-    Pass ``group_metadata_source="filename"`` to infer time and subband **only** from the
-    basename (no FITS header reads during discovery); that requires the ``-image-`` stamp and
-    ``_NNNMHz_`` tokens when frequency bins matter.
+    Pass ``group_metadata_source="filename"`` to infer time and subband grouping keys from
+    the basename (``-image-`` stamp and ``_NNNMHz_`` tokens); each image HDU is still read
+    once to cache beam/LM keywords for convert.
 
     For each time key, all subband files in that group are passed as ``image_filenames`` to
     ``image_plane_correction.flow.flow_cascade73MHz`` with ``outroot=cascade_parent / time_key``.
@@ -328,17 +369,18 @@ def run_cascade_per_time_group(
     """
     cascade_fn = cascade_fn or import_flow_cascade73mhz()
     if clear_staging:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
-        staging_dir.mkdir(parents=True, exist_ok=True)
+        clear_ingest_directory(staging_dir, label="staging dir")
     else:
         staging_dir.mkdir(parents=True, exist_ok=True)
+    if fixed_dir is not None:
+        clear_ingest_directory(fixed_dir, label="fixed FITS dir")
     cascade_parent.mkdir(parents=True, exist_ok=True)
 
     discovery = IngestDiscoveryConfig(
         freq_bin_hz=discovery_freq_bin_hz,
         group_metadata_source=group_metadata_source,
         time_key_source=time_key_source,
+        time_key_tolerance_sec=time_key_tolerance_sec,
     )
     by_time = discover_time_grouped_fits(
         input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
@@ -386,6 +428,7 @@ def run_cascade_per_time_group(
         resume=resume,
         require_73mhz=False,
         context="dewarp-convert",
+        time_key_source=time_key_source,
     )
     if not by_time:
         logger.info(
@@ -439,8 +482,10 @@ def dewarp_and_convert_append_each_time(
     verbose: bool = False,
     progress_callback: Callable[[str, int, int, str], None] | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: Literal["header", "filename", "directory"] = "filename",
+    time_key_tolerance_sec: float = 0.0,
     resume: bool = True,
+    sky_dtype: Literal["preserve", "float32", "float64"] = "preserve",
 ) -> tuple[int, list[str]]:
     """Dewarp each time group, append its Zarr slice, then clean staging/cascade for that time.
 
@@ -453,7 +498,7 @@ def dewarp_and_convert_append_each_time(
 
     Pass ``group_metadata_source="filename"`` to align with
     :func:`run_cascade_per_time_group` when raw OVRO basenames carry ``-image-`` and
-    ``_NNNMHz_`` tags so discovery avoids FITS header reads.
+    ``_NNNMHz_`` tags (basename grouping keys; headers still cached once for beam/LM).
 
     Raw inputs are passed through
     :func:`ovro_lwa_portal.fits_to_zarr_xradio._filter_invalid_beam_files` before the
@@ -481,124 +526,133 @@ def dewarp_and_convert_append_each_time(
     from ovro_lwa_portal.ingest.core import FITSToZarrConverter, ConversionConfig
 
     cascade_fn = cascade_fn or import_flow_cascade73mhz()
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    # Reused workdirs may still hold leftover staged / fixed FITS from another product.
+    clear_ingest_directory(staging_dir, label="staging dir")
+    clear_ingest_directory(fixed_dir, label="fixed FITS dir")
     cascade_parent.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    fixed_dir.mkdir(parents=True, exist_ok=True)
 
-    discovery = IngestDiscoveryConfig(
-        freq_bin_hz=discovery_freq_bin_hz,
-        group_metadata_source=group_metadata_source,
-        time_key_source=time_key_source,
-    )
-    by_time = discover_time_grouped_fits(
-        input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
-    )
-    by_time = prepare_ingest_time_groups(
-        by_time,
-        rebuild=True,
-        resume=False,
-        require_73mhz=False,
-        context="dewarp-convert",
-    )
-    if not by_time:
-        msg = f"No groupable FITS files found in {input_dir}"
-        raise FileNotFoundError(msg)
-
-    by_time = prepare_ingest_time_groups(
-        by_time,
-        rebuild=True,
-        resume=False,
-        require_73mhz=True,
-        context="dewarp-convert",
-    )
-    if not by_time:
-        logger.warning(
-            "No time group in %s contains a 73 MHz reference image; nothing to dewarp.",
-            input_dir,
-        )
-        return 0, []
-
-    lm_ref_ds = _load_global_lm_reference_dataset(
-        by_time,
-        fixed_dir,
-        chunk_lm=chunk_lm,
-        fix_headers_on_demand=fix_headers_on_demand,
-        target_size=target_size,
-        group_metadata_source=group_metadata_source,
-    ).copy(deep=True)
-
-    out_zarr = output_dir / zarr_name
-    by_time = prepare_ingest_time_groups(
-        by_time,
-        out_zarr=out_zarr,
-        rebuild=rebuild,
-        resume=resume,
-        require_73mhz=False,
-        context="dewarp-convert",
-    )
-    if not by_time:
-        logger.info(
-            "Nothing to do: every discovered time key is already present in %s. "
-            "Pass --rebuild to start over, or --no-resume to reprocess all times.",
-            out_zarr,
-        )
-        _consolidate_zarr_metadata(out_zarr)
-        return 0, []
-
-    first_zarr_write = not (out_zarr.exists() and not rebuild)
-    time_keys_sorted = sorted(by_time.keys())
-    n_staged_total = 0
-    total_steps = len(time_keys_sorted)
-
-    for idx, tkey in enumerate(time_keys_sorted):
-        remove_staged_files_for_time_key(staging_dir, tkey)
-        n_staged_total += run_cascade_for_time_key(
-            tkey,
-            list(by_time[tkey]),
-            cascade_parent,
-            staging_dir,
-            cascade_fn=cascade_fn,
-            cleaned=cleaned,
-            qa=qa,
-            use_best_pb_model=use_best_pb_model,
-            bright_source_flux_qa=bright_source_flux_qa,
-            write=write,
-            target_size=target_size,
-        )
-        config = ConversionConfig(
-            input_dir=staging_dir,
-            output_dir=output_dir,
-            zarr_name=zarr_name,
-            fixed_dir=fixed_dir,
-            chunk_lm=chunk_lm,
-            rebuild=first_zarr_write,
-            resume=False,
-            fix_headers_on_demand=fix_headers_on_demand,
-            cleanup_fixed_fits=cleanup_fixed_fits,
-            duplicate_resolver=duplicate_resolver,
-            discovery_freq_bin_hz=discovery_freq_bin_hz,
-            verbose=verbose,
-            time_keys_only=(tkey,),
-            lm_reference_ds=lm_ref_ds,
+    try:
+        discovery = IngestDiscoveryConfig(
+            freq_bin_hz=discovery_freq_bin_hz,
             group_metadata_source=group_metadata_source,
-            discovery_time_key_source=time_key_source,
-            lm_reference_target_size=target_size,
-            consolidate_metadata_at_end=False,
+            time_key_source=time_key_source,
+            time_key_tolerance_sec=time_key_tolerance_sec,
         )
-        FITSToZarrConverter(config, progress_callback=progress_callback).convert()
-        first_zarr_write = False
-        remove_staged_files_for_time_key(staging_dir, tkey)
-        t_out = cascade_parent / tkey
-        if t_out.exists():
-            shutil.rmtree(t_out)
-        if progress_callback:
-            progress_callback(
-                "dewarp_convert",
-                idx + 1,
-                total_steps,
-                f"Completed dewarp+Zarr for time {idx + 1}/{total_steps} ({tkey})",
-            )
+        by_time = discover_time_grouped_fits(
+            input_dir, duplicate_resolver=duplicate_resolver, discovery=discovery
+        )
+        by_time = prepare_ingest_time_groups(
+            by_time,
+            rebuild=True,
+            resume=False,
+            require_73mhz=False,
+            context="dewarp-convert",
+        )
+        if not by_time:
+            msg = f"No groupable FITS files found in {input_dir}"
+            raise FileNotFoundError(msg)
 
-    _consolidate_zarr_metadata(out_zarr)
-    return n_staged_total, time_keys_sorted
+        by_time = prepare_ingest_time_groups(
+            by_time,
+            rebuild=True,
+            resume=False,
+            require_73mhz=True,
+            context="dewarp-convert",
+        )
+        if not by_time:
+            logger.warning(
+                "No time group in %s contains a 73 MHz reference image; nothing to dewarp.",
+                input_dir,
+            )
+            return 0, []
+
+        lm_ref_ds = _load_global_lm_reference_dataset(
+            by_time,
+            fixed_dir,
+            chunk_lm=chunk_lm,
+            fix_headers_on_demand=fix_headers_on_demand,
+            target_size=target_size,
+            group_metadata_source=group_metadata_source,
+        ).copy(deep=True)
+
+        out_zarr = output_dir / zarr_name
+        by_time = prepare_ingest_time_groups(
+            by_time,
+            out_zarr=out_zarr,
+            rebuild=rebuild,
+            resume=resume,
+            require_73mhz=False,
+            context="dewarp-convert",
+            time_key_source=time_key_source,
+        )
+        if not by_time:
+            logger.info(
+                "Nothing to do: every discovered time key is already present in %s. "
+                "Pass --rebuild to start over, or --no-resume to reprocess all times.",
+                out_zarr,
+            )
+            _consolidate_zarr_metadata(out_zarr)
+            return 0, []
+
+        first_zarr_write = not (out_zarr.exists() and not rebuild)
+        time_keys_sorted = sorted(by_time.keys())
+        n_staged_total = 0
+        total_steps = len(time_keys_sorted)
+
+        for idx, tkey in enumerate(time_keys_sorted):
+            remove_staged_files_for_time_key(staging_dir, tkey)
+            n_staged_total += run_cascade_for_time_key(
+                tkey,
+                list(by_time[tkey]),
+                cascade_parent,
+                staging_dir,
+                cascade_fn=cascade_fn,
+                cleaned=cleaned,
+                qa=qa,
+                use_best_pb_model=use_best_pb_model,
+                bright_source_flux_qa=bright_source_flux_qa,
+                write=write,
+                target_size=target_size,
+            )
+            config = ConversionConfig(
+                input_dir=staging_dir,
+                output_dir=output_dir,
+                zarr_name=zarr_name,
+                fixed_dir=fixed_dir,
+                chunk_lm=chunk_lm,
+                sky_dtype=sky_dtype,
+                rebuild=first_zarr_write,
+                resume=False,
+                fix_headers_on_demand=fix_headers_on_demand,
+                cleanup_fixed_fits=cleanup_fixed_fits,
+                duplicate_resolver=duplicate_resolver,
+                discovery_freq_bin_hz=discovery_freq_bin_hz,
+                verbose=verbose,
+                time_keys_only=(tkey,),
+                lm_reference_ds=lm_ref_ds,
+                group_metadata_source=group_metadata_source,
+                discovery_time_key_source=time_key_source,
+                discovery_time_key_tolerance_sec=time_key_tolerance_sec,
+                lm_reference_target_size=target_size,
+                consolidate_metadata_at_end=False,
+            )
+            FITSToZarrConverter(config, progress_callback=progress_callback).convert()
+            first_zarr_write = False
+            remove_staged_files_for_time_key(staging_dir, tkey)
+            t_out = cascade_parent / tkey
+            if t_out.exists():
+                shutil.rmtree(t_out)
+            if progress_callback:
+                progress_callback(
+                    "dewarp_convert",
+                    idx + 1,
+                    total_steps,
+                    f"Completed dewarp+Zarr for time {idx + 1}/{total_steps} ({tkey})",
+                )
+
+        _consolidate_zarr_metadata(out_zarr)
+        return n_staged_total, time_keys_sorted
+    finally:
+        clear_ingest_directory(staging_dir, label="staging dir")
+        clear_ingest_directory(fixed_dir, label="fixed FITS dir")

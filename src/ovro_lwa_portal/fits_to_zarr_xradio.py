@@ -45,8 +45,10 @@ Notes
   (from FITS headers when ``group_metadata_source`` is ``"fits"``, or from basename
   ``_NNNMHz_`` when ``group_metadata_source`` is ``"filename"``), so Hz-level jitter does
   not create extra ``frequency`` planes for one subband. Multiple files in the same
-  (time, bin) without a duplicate resolver keep the first and skip the rest (with a warning).
-  With ``"fits"``, filename parsing is a fallback when header metadata is missing.
+  (time, frequency bin, Stokes) without a duplicate resolver keep the first and skip the
+  rest (with a warning). Separate Stokes I and V at the same time and subband are **not**
+  duplicates — both are kept for polarization stacking. With ``"fits"``, filename parsing
+  is a fallback when header metadata is missing.
 * LM grids must match across time steps after global and per-step mixed-resolution normalization;
   a mismatch raises a RuntimeError.
 * Within a single time step, mixed LM shapes are regridded onto the reference grid before combine.
@@ -75,9 +77,10 @@ import re
 import shutil
 import tempfile
 import time
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Literal, Optional, Protocol, Sequence, Tuple
+from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 import xarray as xr
@@ -92,8 +95,11 @@ from numpy.typing import NDArray
 __all__ = [
     "InvalidBeamError",
     "convert_fits_dir_to_zarr",
+    "estimate_zarr_store_bytes",
     "fix_fits_headers",
+    "format_data_size",
     "repair_zarr_crval_from_fits",
+    "repair_zarr_polarization",
     "repair_zarr_store",
     "validate_zarr_store",
 ]
@@ -120,6 +126,45 @@ def _is_xradio_stokes_missing_valueerror(exc: BaseException) -> bool:
     return "stokes" in msg and "not in" in msg and "list" in msg
 
 
+def _is_xradio_missing_fits_keyword_error(exc: BaseException) -> bool:
+    """True when xradio/Astropy failed because a required FITS card is absent.
+
+    Astropy raises ``KeyError: Keyword 'TELESCOP' not found.`` when xradio does
+    ``header["TELESCOP"]`` (and similarly for ``CUNIT*`` / ``LONPOLE`` / ``EQUINOX``).
+    """
+    if not isinstance(exc, KeyError):
+        return False
+    msg = str(exc)
+    return "Keyword" in msg and "not found" in msg
+
+
+def _ensure_xradio_required_header_cards(hdr: fits.Header) -> None:
+    """Fill FITS cards xradio indexes that OVRO-LWA products sometimes omit.
+
+    Does not overwrite cards already present. ``TELESCOP`` is provenance only
+    (not used for WCS or pixel values); missing it must not abort ingest.
+    """
+    if "TELESCOP" not in hdr:
+        hdr["TELESCOP"] = _OVRO_LWA_DEFAULT_TELESCOP
+    radesys = str(hdr.get("RADESYS", "")).strip().upper()
+    if "EQUINOX" not in hdr and radesys != "ICRS":
+        hdr["EQUINOX"] = 2000.0
+    if "LONPOLE" not in hdr:
+        hdr["LONPOLE"] = 180.0
+    naxis = int(hdr.get("NAXIS", 0))
+    for i in range(1, naxis + 1):
+        key = f"CUNIT{i}"
+        if key in hdr:
+            continue
+        ctype = str(hdr.get(f"CTYPE{i}", "")).strip().upper()
+        if ctype.startswith("RA") or ctype.startswith("DEC"):
+            hdr[key] = "deg"
+        elif _fits_axis_is_freq_like(ctype):
+            hdr[key] = "Hz"
+        else:
+            hdr[key] = ""
+
+
 def _read_fits_via_xradio(
     path: str | Path,
     *,
@@ -142,9 +187,11 @@ def _read_fits_via_xradio(
 
     xradio's FITS reader assumes a literal ``STOKES`` axis in ``CTYPE`` when it
     builds polarization coordinates. Legitimate 3D RA/DEC/FREQ cubes therefore
-    raise ``ValueError: 'STOKES' is not in list``. On that specific failure we
-    materialize a temporary copy with :func:`_fix_headers` and read again so raw
-    paths and stale ``*_fixed.fits`` still work without a separate fix step.
+    raise ``ValueError: 'STOKES' is not in list``. It also indexes ``TELESCOP``
+    (and a few other cards) without ``.get``, so missing keywords raise
+    ``KeyError``. On those failures we materialize a temporary copy with
+    :func:`_fix_headers` and read again so raw paths and stale ``*_fixed.fits``
+    still work without a separate fix step.
 
     Pixel data are Dask-delayed reads of that temp path; we :meth:`xarray.Dataset.load`
     before unlinking so later ``compute()`` does not hit a missing file.
@@ -155,8 +202,11 @@ def _read_fits_via_xradio(
     p = Path(os.path.expanduser(str(path)))
     try:
         return _fits_image_to_xds(str(p), c, verbose, do_sky_coords, compute_mask)
-    except ValueError as exc:
-        if not _is_xradio_stokes_missing_valueerror(exc):
+    except (ValueError, KeyError) as exc:
+        if not (
+            _is_xradio_stokes_missing_valueerror(exc)
+            or _is_xradio_missing_fits_keyword_error(exc)
+        ):
             raise
         logger.info(
             "Re-reading FITS via temporary header fix copy: %s (%s)",
@@ -211,6 +261,9 @@ _CELESTIAL_DRIFT_SAMPLE_SEED: int = 0
 _OVRO_LWA_DEFAULT_LON_DEG = -118.28340511
 _OVRO_LWA_DEFAULT_LAT_DEG = 37.23338698
 _OVRO_LWA_DEFAULT_HEIGHT_M = 1188.6
+# xradio's FITS reader indexes ``header["TELESCOP"]`` (not ``.get``); phase-3 aligned
+# 10 min products omit the card. Ingest is OVRO-LWA-only, so this default is safe.
+_OVRO_LWA_DEFAULT_TELESCOP = "OVRO-LWA"
 
 # LRU cache for RA/Dec ``all_pix2world`` grids within one time step (~15 subbands).
 # Cleared after each :func:`_combine_time_step` so multi-hour ingest runs do not retain
@@ -242,6 +295,11 @@ def _sky_coord_cache_size() -> int:
 # Subband MHz in OVRO-style basenames, e.g. ``82MHz-I-...``, ``..._41MHz_...``,
 # ``...__18MHz-I-...`` (dewarp staging uses ``{time_key}__{original_name}``).
 MHZ_RE = re.compile(r"(?:^|_)(\d+)MHz(?:_|-|\.|$)")
+_STOKES_MHZ_POL_RE = re.compile(r"\d+MHz-([IV])(?:-|_)", re.IGNORECASE)
+_STOKES_MHZ_UNDERSCORE_POL_RE = re.compile(r"\d+MHz_([IV])_", re.IGNORECASE)
+_STOKES_IMAGE_SUFFIX_RE = re.compile(r"-IMAGE-([IV])(?:\.|-|_)", re.IGNORECASE)
+_STOKES_TOKEN_RE = re.compile(r"(?:^|[-_])STOKES[-_]([IV])(?:[-_.]|$)", re.IGNORECASE)
+_METADATA_PROGRESS_INTERVAL_CAP = 500
 
 # OVRO-LWA observation-time tokens in basenames (UTC wall-clock for the map).
 # Phase1: ``...-image-YYYYMMDD_HHMMSS...``; phase2 dewarped: ``...YYYYMMDD_HHMMSS-image...``.
@@ -251,12 +309,187 @@ _IMAGE_TIME_BEFORE_IMAGE_RE = re.compile(r"(\d{8})_(\d{6})-image", re.IGNORECASE
 # LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
 _LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
 
-DiscoveryFilenameConvention = Literal["image", "lst-color"]
+# Parent directory calendar dates / LST hours for discovery
+# (e.g. exopipe ``.../01h/2024-12-24/Run_.../``).
+_DIR_DATE_DASH_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_DIR_DATE_COMPACT_RE = re.compile(r"^(\d{8})$")
+_DIR_LST_HOUR_RE = re.compile(r"^(\d{1,2})h$")
+_DIR_TIME_KEY_LST_RE = re.compile(r"^(\d{8})_LST(\d+)h(?:_(t\d+))?$")
 
-# LST color-band products: ``Blue_..._20250508_LST22h_t0001.fits`` (date, LST hour, time bin).
-_LST_COLOR_TIME_RE = re.compile(r"_(\d{8})_LST(\d+)h_(t\d+)")
-
 DiscoveryFilenameConvention = Literal["image", "lst-color"]
+DiscoveryTimeKeySource = Literal["header", "filename", "directory"]
+SkyDtypeMode = Literal["preserve", "float32", "float64"]
+_SKY_DTYPE_MAP: dict[str, type[np.floating]] = {
+    "float32": np.float32,
+    "float64": np.float64,
+}
+_SKY_DTYPE_MODES: frozenset[str] = frozenset({"preserve", "float32", "float64"})
+
+
+class _DiscoveryFileMetadata(NamedTuple):
+    """Cached per-file metadata for FITS discovery (one header read when possible)."""
+
+    time_key: Optional[str]
+    frequency_hz: Optional[float]
+    notes: tuple[str, ...]
+    stokes_key: int
+    ingest_header: Optional[fits.Header]
+
+
+def _discovery_metadata_cache_key(fp: Path) -> tuple[Path, int, int]:
+    """Cache key from resolved path and file identity (mtime + size)."""
+    st = fp.stat()
+    return (fp.resolve(), st.st_mtime_ns, st.st_size)
+
+
+def _build_discovery_file_metadata(
+    fp: Path,
+    *,
+    filename_convention: DiscoveryFilenameConvention = "image",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: DiscoveryTimeKeySource = "filename",
+    cache_ingest_headers: bool = True,
+) -> _DiscoveryFileMetadata:
+    """Extract discovery metadata with at most one FITS header read per file.
+
+    When ``group_metadata_source="filename"`` and ``cache_ingest_headers=False``,
+    skip the image-HDU open entirely (estimate-size / dry-run paths). Convert still
+    defaults to caching headers so beam/LM keywords are available without a second
+    Lustre open.
+    """
+    if filename_convention == "lst-color":
+        notes: list[str] = []
+        time_key = _time_key_from_lst_color_filename(fp)
+        if time_key is not None:
+            notes.append("time-from-lst-color-filename")
+        frequency_hz: Optional[float] = None
+        header: Optional[fits.Header] = None
+        try:
+            header = _getheader_for_ingest(fp)
+        except Exception as exc:
+            logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+        if header is not None:
+            frequency_hz = _frequency_hz_from_header(header)
+            if frequency_hz is not None:
+                notes.append("frequency-from-header")
+        stokes_key = _resolve_stokes_key_for_discovery(fp, header)
+        return _DiscoveryFileMetadata(
+            time_key, frequency_hz, tuple(notes), stokes_key, header
+        )
+
+    if group_metadata_source == "filename":
+        # Grouping keys come from the basename / directory. Convert caches the
+        # image HDU once for beam/LM/sidecar reuse; estimate-size can skip that.
+        time_key, frequency_hz, note_list = _extract_group_metadata_filename_only(fp)
+        notes = list(note_list)
+        if time_key_source == "directory":
+            tk_dir = _time_key_from_directory(fp)
+            if tk_dir is not None:
+                time_key = tk_dir
+                notes.append("time-from-directory")
+            else:
+                time_key = None
+        header: Optional[fits.Header] = None
+        if cache_ingest_headers:
+            try:
+                header = _getheader_for_ingest(fp)
+                notes.append("header-cached-for-ingest")
+            except Exception as exc:
+                logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+        else:
+            notes.append("header-cache-skipped")
+        stokes_key = _resolve_stokes_key_for_discovery(fp, header)
+        return _DiscoveryFileMetadata(
+            time_key, frequency_hz, tuple(notes), stokes_key, header
+        )
+
+    notes = []
+    time_key: Optional[str] = None
+    frequency_hz = None
+    header = None
+    try:
+        header = _getheader_for_ingest(fp)
+    except Exception as exc:
+        logger.warning(f"Could not read FITS header for {fp.name}: {exc}")
+
+    if header is not None:
+        frequency_hz = _frequency_hz_from_header(header)
+
+    if time_key_source == "directory":
+        tk_dir = _time_key_from_directory(fp)
+        if tk_dir is not None:
+            time_key = tk_dir
+            notes.append("time-from-directory")
+    elif time_key_source == "header":
+        if header is not None:
+            time_key = _time_key_from_header(header)
+    else:
+        tk_fn = _time_key_from_filename(fp)
+        if tk_fn is not None:
+            time_key = tk_fn
+            notes.append("time-from-filename")
+        elif header is not None:
+            time_key = _time_key_from_header(header)
+
+    if frequency_hz is None:
+        mhz = _mhz_from_name(fp)
+        if mhz != 10**9:
+            frequency_hz = float(mhz * 1e6)
+            notes.append("frequency-from-filename")
+
+    stokes_key = _resolve_stokes_key_for_discovery(fp, header)
+    return _DiscoveryFileMetadata(time_key, frequency_hz, tuple(notes), stokes_key, header)
+
+
+def _get_discovery_file_metadata(
+    fp: Path,
+    *,
+    cache: Dict[tuple[Path, int, int], _DiscoveryFileMetadata],
+    filename_convention: DiscoveryFilenameConvention = "image",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    time_key_source: DiscoveryTimeKeySource = "filename",
+    cache_ingest_headers: bool = True,
+) -> _DiscoveryFileMetadata:
+    """Return cached discovery metadata for *fp*, building it on first access."""
+    key = _discovery_metadata_cache_key(fp)
+    meta = cache.get(key)
+    if meta is None:
+        meta = _build_discovery_file_metadata(
+            fp,
+            filename_convention=filename_convention,
+            group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
+            cache_ingest_headers=cache_ingest_headers,
+        )
+        cache[key] = meta
+    return meta
+
+
+def _discovery_frequency_sort_key_from_metadata(
+    meta: _DiscoveryFileMetadata,
+    name: str,
+) -> Tuple[float, str]:
+    """Sort key for deterministic frequency ordering from cached metadata."""
+    if meta.frequency_hz is None:
+        return (float(10**15), name)
+    return (float(meta.frequency_hz), name)
+
+
+def _metadata_progress_interval(total: int) -> int:
+    """Log metadata progress about every 5% of files, capped for very large sets."""
+    if total <= 1:
+        return 1
+    return min(_METADATA_PROGRESS_INTERVAL_CAP, max(1, total // 20))
+
+
+def _log_metadata_progress(stage: str, current: int, total: int) -> None:
+    """Emit INFO progress while scanning FITS metadata on slow filesystems."""
+    if total <= 0:
+        return
+    every = _metadata_progress_interval(total)
+    if current == 1 or current >= total or current % every == 0:
+        pct = 100.0 * float(current) / float(total)
+        logger.info("[%s] metadata progress: %d / %d files (%.1f%%)", stage, current, total, pct)
 
 
 def _mhz_from_name(p: Path) -> int:
@@ -339,7 +572,7 @@ def _frequency_hz_from_header(header: fits.Header) -> Optional[float]:
 def _extract_group_metadata(
     fp: Path,
     *,
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> Tuple[Optional[str], Optional[float], List[str]]:
     """Extract grouping metadata from FITS headers and optionally the basename.
 
@@ -356,6 +589,10 @@ def _extract_group_metadata(
         otherwise ``time_key`` comes from ``DATE-OBS`` (see :func:`_time_key_from_header`).
 
         When *time_key_source* is ``"header"``, ``time_key`` comes from ``DATE-OBS`` only.
+
+        When *time_key_source* is ``"directory"``, ``time_key`` comes from parent
+        directories ``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST hour when present
+        (see :func:`_time_key_from_directory`); there is no ``DATE-OBS`` fallback.
     """
     time_key: Optional[str] = None
     frequency_hz: Optional[float] = None
@@ -369,15 +606,21 @@ def _extract_group_metadata(
 
     if header is not None:
         frequency_hz = _frequency_hz_from_header(header)
-        if time_key_source == "header":
-            time_key = _time_key_from_header(header)
 
-    if time_key_source == "filename":
+    if time_key_source == "directory":
+        tk_dir = _time_key_from_directory(fp)
+        if tk_dir is not None:
+            time_key = tk_dir
+            notes.append("time-from-directory")
+    elif time_key_source == "header":
+        if header is not None:
+            time_key = _time_key_from_header(header)
+    else:
         tk_fn = _time_key_from_filename(fp)
         if tk_fn is not None:
             time_key = tk_fn
             notes.append("time-from-filename")
-        elif header is not None and time_key is None:
+        elif header is not None:
             time_key = _time_key_from_header(header)
 
     if frequency_hz is None:
@@ -457,13 +700,19 @@ def _extract_group_metadata_for_discovery(
     *,
     filename_convention: DiscoveryFilenameConvention = "image",
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> Tuple[Optional[str], Optional[float], List[str]]:
     """Dispatch discovery metadata extraction by filename convention and source mode."""
     if filename_convention == "lst-color":
         return _extract_group_metadata_lst_color(fp)
     if group_metadata_source == "filename":
-        return _extract_group_metadata_filename_only(fp)
+        time_key, frequency_hz, notes = _extract_group_metadata_filename_only(fp)
+        if time_key_source == "directory":
+            tk_dir = _time_key_from_directory(fp)
+            if tk_dir is not None:
+                return tk_dir, frequency_hz, [*notes, "time-from-directory"]
+            return None, frequency_hz, notes
+        return time_key, frequency_hz, notes
     return _extract_group_metadata(fp, time_key_source=time_key_source)
 
 
@@ -488,8 +737,9 @@ def _canonical_stack_frequency_hz(
     fp: Path,
     *,
     group_metadata_source: Literal["fits", "filename"],
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata: Optional[_DiscoveryFileMetadata] = None,
 ) -> Optional[float]:
     """Hz label to use when stacking single-channel slices along ``frequency``.
 
@@ -503,6 +753,8 @@ def _canonical_stack_frequency_hz(
         mhz = _mhz_from_name(fp)
         if mhz != 10**9:
             return float(mhz * 1_000_000)
+    if discovery_metadata is not None and discovery_metadata.frequency_hz is not None:
+        return float(discovery_metadata.frequency_hz)
     _, hz, _ = _extract_group_metadata_for_discovery(
         fp,
         filename_convention=filename_convention,
@@ -517,7 +769,7 @@ def _assign_canonical_frequency_for_stack(
     fp: Path,
     *,
     group_metadata_source: Literal["fits", "filename"],
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
 ) -> xr.Dataset:
     """Replace a length-1 ``frequency`` index with :func:`_canonical_stack_frequency_hz` when known."""
@@ -541,16 +793,21 @@ def _global_frequency_coord_hz(
     *,
     group_metadata_source: Literal["fits", "filename"],
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> np.ndarray:
     """Union of canonical per-file Hz labels across all time groups (sorted ascending)."""
     hz_vals: set[float] = set()
     for files in by_time.values():
         for fp in files:
+            meta = (
+                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+            )
             hz = _canonical_stack_frequency_hz(
                 fp,
                 group_metadata_source=group_metadata_source,
                 time_key_source="filename",
                 filename_convention=filename_convention,
+                discovery_metadata=meta,
             )
             if hz is not None:
                 hz_vals.add(float(hz))
@@ -573,6 +830,23 @@ def _frequency_coord_hz_from_zarr(out_zarr: Path) -> np.ndarray:
         return np.asarray(ds["frequency"].values, dtype=np.float64).copy()
 
 
+def _reindex_fill_values(ds: xr.Dataset) -> dict[str, object]:
+    """Per-variable fill values for frequency/polarization reindex operations."""
+    fill: dict[str, object] = {}
+    for name, da in ds.data_vars.items():
+        if name == "fits_header_str":
+            fill[name] = np.bytes_(b"")
+        elif da.dtype == bool:
+            fill[name] = False
+        elif np.issubdtype(da.dtype, np.complexfloating):
+            fill[name] = np.complex(np.nan, np.nan)
+        elif np.issubdtype(da.dtype, np.floating):
+            fill[name] = np.nan
+        elif np.issubdtype(da.dtype, np.integer):
+            fill[name] = 0
+    return fill
+
+
 def _align_time_step_to_frequency_grid(ds: xr.Dataset, freq_hz: np.ndarray) -> xr.Dataset:
     """Reindex one time step onto the fixed full-store ``frequency`` axis (NaN for missing subbands)."""
     if "frequency" not in ds.dims:
@@ -582,7 +856,196 @@ def _align_time_step_to_frequency_grid(ds: xr.Dataset, freq_hz: np.ndarray) -> x
         dims=("frequency",),
         name="frequency",
     )
-    return ds.reindex(frequency=template, fill_value=np.nan)
+    return ds.reindex(frequency=template, fill_value=_reindex_fill_values(ds))
+
+
+def _polarization_coord_from_zarr(out_zarr: Path) -> np.ndarray:
+    """Read the store's ``polarization`` coordinate (Stokes codes)."""
+    with xr.open_zarr(str(out_zarr), consolidated=False) as ds:
+        if "polarization" not in ds.coords:
+            return np.asarray([1.0], dtype=np.float64)
+        return np.asarray(ds["polarization"].values, dtype=np.float64).copy()
+
+
+def _polarization_plane_finite_score(ds: xr.Dataset, pol_idx: int) -> float:
+    """Return a rough finite-pixel count for one polarization plane (SKY, then BEAM)."""
+    score = 0.0
+    for var in ("SKY", "BEAM"):
+        if var not in ds:
+            continue
+        da = ds[var]
+        if "polarization" not in da.dims:
+            continue
+        plane = da.isel(polarization=pol_idx)
+        if hasattr(plane.data, "compute"):
+            score += float(plane.notnull().sum().compute())
+        else:
+            score += float(plane.notnull().sum())
+    return score
+
+
+def _canonicalize_polarization_coord(xds: xr.Dataset) -> xr.Dataset:
+    """Collapse duplicate Stokes labels on ``polarization`` to one plane per Stokes code.
+
+    When ``combine_by_coords`` or legacy ingest produced ``polarization=[1, 4, 1]``,
+    keep the plane with the most finite SKY/BEAM per Stokes value and drop extras.
+    """
+    if "polarization" not in xds.dims:
+        return xds
+    pol_vals = _polarization_coord_values_float64(xds["polarization"].values)
+    if pol_vals.size <= 1 or pol_vals.size == len(np.unique(pol_vals)):
+        return _normalize_polarization_coord(xds)
+
+    keep_indices: list[int] = []
+    new_pol: list[float] = []
+    seen: set[float] = set()
+    for stokes in pol_vals:
+        sf = float(stokes)
+        if sf in seen:
+            continue
+        candidates = [i for i, pv in enumerate(pol_vals) if float(pv) == sf]
+        best_idx = max(candidates, key=lambda i: _polarization_plane_finite_score(xds, i))
+        keep_indices.append(best_idx)
+        new_pol.append(sf)
+        seen.add(sf)
+
+    logger.warning(
+        "Canonicalizing duplicate polarization coordinate %s → %s",
+        _format_stokes_coord(pol_vals),
+        _format_stokes_coord(np.asarray(new_pol)),
+    )
+    out = xds.isel(polarization=keep_indices)
+    return _normalize_polarization_coord(
+        out.assign_coords(polarization=("polarization", np.asarray(new_pol, dtype=np.float64)))
+    )
+
+
+def _assert_unique_polarization_coord(xds: xr.Dataset) -> None:
+    """Fail fast when ``polarization`` carries duplicate Stokes codes."""
+    if "polarization" not in xds.coords:
+        return
+    pol = _polarization_coord_values_float64(xds["polarization"].values)
+    if pol.size != len(np.unique(pol)):
+        msg = (
+            "polarization coordinate has duplicate Stokes values before Zarr write: "
+            f"{_format_stokes_coord(pol)}"
+        )
+        raise RuntimeError(msg)
+
+
+def _polarization_plane_nan_fill(ds_slice: xr.Dataset) -> xr.Dataset:
+    """Return one polarization slice with NaN image data and empty ``fits_header_str``."""
+    out = ds_slice.copy(deep=True)
+    for name in list(out.data_vars):
+        da = out[name]
+        if name == "fits_header_str":
+            out = out.assign({name: xr.full_like(da, np.bytes_(b""))})
+        elif np.issubdtype(da.dtype, np.floating) or np.issubdtype(da.dtype, np.complexfloating):
+            out = out.assign({name: xr.full_like(da, np.nan)})
+        elif da.dtype == bool:
+            out = out.assign({name: xr.full_like(da, False)})
+        elif np.issubdtype(da.dtype, np.integer):
+            out = out.assign({name: xr.zeros_like(da)})
+    return out
+
+
+def _drop_polarization_coord(ds: xr.Dataset) -> xr.Dataset:
+    """Remove the ``polarization`` coordinate so ``xr.concat`` uses positional order."""
+    if "polarization" in ds.coords:
+        return ds.drop_vars("polarization")
+    return ds
+
+
+def _align_time_step_to_polarization_grid(
+    ds: xr.Dataset,
+    pol_stokes: np.ndarray,
+) -> xr.Dataset:
+    """Align one time step onto the store ``polarization`` axis (NaN for missing Stokes).
+
+    Uses label-based assignment so a legacy store template ``[1, 4, 1]`` does not
+    copy the I plane into both Stokes-1 slots (``xarray.Dataset.reindex`` would).
+    """
+    target = _polarization_coord_values_float64(pol_stokes)
+    if target.size == 0:
+        return ds
+    if "polarization" not in ds.dims:
+        if target.size == 1:
+            return ds.expand_dims(polarization=[float(target[0])])
+        return ds
+
+    incoming = _canonicalize_polarization_coord(ds)
+    incoming_pol = _polarization_coord_values_float64(incoming["polarization"].values)
+    incoming_by_stokes = {float(s): int(i) for i, s in enumerate(incoming_pol)}
+
+    seen_target_stokes: set[float] = set()
+    planes: list[xr.Dataset] = []
+    for stokes in target:
+        sf = float(_stokes_numeric_from_value(stokes))
+        if sf not in seen_target_stokes and sf in incoming_by_stokes:
+            planes.append(
+                _drop_polarization_coord(
+                    incoming.isel(polarization=incoming_by_stokes[sf])
+                )
+            )
+            seen_target_stokes.add(sf)
+        else:
+            planes.append(
+                _drop_polarization_coord(
+                    _polarization_plane_nan_fill(incoming.isel(polarization=0))
+                )
+            )
+
+    merged = xr.concat(planes, dim="polarization")
+    return merged.assign_coords(polarization=("polarization", target))
+
+
+def _stokes_numeric_from_value(raw: object, *, default: float = 1.0) -> float:
+    """Map FITS/xarray Stokes tokens (``1``, ``'I'``, ``np.str_('V')``) to numeric codes."""
+    if raw is None:
+        return float(default)
+    if isinstance(raw, (str, np.str_)):
+        label = str(raw).strip().upper()
+        table = {"I": 1.0, "Q": 2.0, "U": 3.0, "V": 4.0, "RR": -1.0, "LL": -2.0, "RL": -3.0, "LR": -4.0}
+        if label in table:
+            return table[label]
+        try:
+            return float(label)
+        except (TypeError, ValueError):
+            return float(default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _polarization_coord_values_float64(values: object) -> np.ndarray:
+    """Coerce polarization coordinate values to FITS Stokes ``float64`` codes."""
+    return np.asarray(
+        [_stokes_numeric_from_value(v) for v in np.asarray(values).ravel()],
+        dtype=np.float64,
+    )
+
+
+def _normalize_polarization_coord(xds: xr.Dataset) -> xr.Dataset:
+    """Ensure ``polarization`` uses numeric Stokes codes (not ``'I'``/``'V'`` strings)."""
+    if "polarization" not in xds.coords:
+        return xds
+    pol = xds["polarization"]
+    vals = _polarization_coord_values_float64(pol.values)
+    if "polarization" in pol.dims:
+        return xds.assign_coords(polarization=("polarization", vals))
+    return xds.assign_coords(polarization=vals)
+
+
+def _format_stokes_coord(values: np.ndarray) -> str:
+    """Human-readable Stokes list for log messages."""
+    labels = {1.0: "I", 4.0: "V", 2.0: "Q", 3.0: "U", -1.0: "RR", -2.0: "LL"}
+    parts: list[str] = []
+    for v in np.asarray(values).ravel():
+        fv = _stokes_numeric_from_value(v)
+        label = labels.get(fv, str(int(fv)) if fv == int(fv) else str(fv))
+        parts.append(f"{label}({fv:g})")
+    return "[" + ", ".join(parts) + "]"
 
 
 def _lm_reference_from_existing_zarr(out_zarr: Path) -> xr.Dataset:
@@ -720,8 +1183,9 @@ def _reindex_time_step_to_expected_frequencies(
 
     expected = np.asarray(expected_frequencies_hz, dtype=float)
     observed = np.asarray(np.atleast_1d(xds_t["frequency"].values), dtype=float)
+    fill_value = _reindex_fill_values(xds_t)
     if observed.size == 0:
-        return xds_t.reindex({"frequency": expected}, fill_value=np.nan)
+        return xds_t.reindex({"frequency": expected}, fill_value=fill_value)
 
     mapped = observed.copy()
     max_jitter_hz = _DISCOVERY_FREQ_BIN_HZ / 2.0
@@ -737,7 +1201,7 @@ def _reindex_time_step_to_expected_frequencies(
         xds_norm = xds_norm.isel(frequency=np.sort(first_indices))
 
     xds_norm = xds_norm.sortby("frequency")
-    return xds_norm.reindex({"frequency": expected}, fill_value=np.nan)
+    return xds_norm.reindex({"frequency": expected}, fill_value=fill_value)
 
 
 def _validate_time_axis_consistency_zarr(out_zarr: Path) -> None:
@@ -925,6 +1389,158 @@ def repair_zarr_store(
         "pre": pre,
         "post": post,
     }
+
+
+def _polarization_plane_scores_from_zarr(zg: zarr.Group, n_pol: int) -> dict[int, float]:
+    """Finite-pixel counts per polarization index from a small on-disk SKY/BEAM sample."""
+    scores = {i: 0.0 for i in range(n_pol)}
+    for var in ("SKY", "BEAM"):
+        if var not in zg:
+            continue
+        arr = zg[var]
+        dims_attr = arr.attrs.get("_ARRAY_DIMENSIONS")
+        if dims_attr is None:
+            continue
+        dims = [dims_attr] if isinstance(dims_attr, str) else [str(d) for d in dims_attr]
+        if "polarization" not in dims:
+            continue
+        pol_axis = dims.index("polarization")
+        slicer: list[slice | int] = [slice(None)] * arr.ndim
+        for ax, dim in enumerate(dims):
+            if dim == "time":
+                slicer[ax] = 0
+            elif dim == "frequency":
+                slicer[ax] = 0
+            elif dim == "l":
+                slicer[ax] = slice(2048, 2112, 16)
+            elif dim == "m":
+                slicer[ax] = slice(2048, 2112, 16)
+        for i in range(n_pol):
+            slicer[pol_axis] = i
+            block = np.asarray(arr[tuple(slicer)])
+            scores[i] += float(np.isfinite(block).sum())
+        break
+    return scores
+
+
+def _polarization_keep_indices_from_values(
+    pol_values: np.ndarray,
+    *,
+    plane_scores: dict[int, float] | None = None,
+) -> tuple[list[int], np.ndarray]:
+    """Choose one index per unique Stokes code; prefer the plane with more finite data."""
+    pol = _polarization_coord_values_float64(pol_values)
+    if pol.size <= 1 or pol.size == len(np.unique(pol)):
+        return list(range(int(pol.size))), pol
+
+    scores = plane_scores or {i: 0.0 for i in range(int(pol.size))}
+    keep_indices: list[int] = []
+    new_pol: list[float] = []
+    seen: set[float] = set()
+    for stokes in pol:
+        sf = float(stokes)
+        if sf in seen:
+            continue
+        candidates = [i for i, pv in enumerate(pol) if float(pv) == sf]
+        best_idx = max(candidates, key=lambda i: scores.get(i, 0.0))
+        keep_indices.append(best_idx)
+        new_pol.append(sf)
+        seen.add(sf)
+    return keep_indices, np.asarray(new_pol, dtype=np.float64)
+
+
+def repair_zarr_polarization(
+    out_zarr: str | Path,
+    *,
+    backup_suffix: str = ".backup-before-pol-repair",
+    skip_backup: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, object]:
+    """Drop duplicate Stokes planes from a Zarr store (e.g. ``polarization=[1, 4, 1]`` → ``[1, 4]``)."""
+    out_zarr = Path(out_zarr)
+    if not out_zarr.exists():
+        msg = f"Zarr store does not exist: {out_zarr}"
+        raise FileNotFoundError(msg)
+
+    zg = zarr.open_group(str(out_zarr), mode="r")
+    if "polarization" not in zg:
+        return {
+            "store": str(out_zarr),
+            "changed": False,
+            "message": "Store has no polarization coordinate; nothing to repair.",
+        }
+
+    pol_values = np.asarray(zg["polarization"][:], dtype=np.float64)
+    scores = _polarization_plane_scores_from_zarr(zg, int(pol_values.size))
+    keep_indices, new_pol = _polarization_keep_indices_from_values(
+        pol_values, plane_scores=scores
+    )
+    if len(keep_indices) == int(pol_values.size):
+        return {
+            "store": str(out_zarr),
+            "changed": False,
+            "polarization_before": [float(v) for v in pol_values],
+            "polarization_after": [float(v) for v in pol_values],
+            "message": "Polarization coordinate is already unique.",
+        }
+
+    dropped = [i for i in range(int(pol_values.size)) if i not in keep_indices]
+    report: Dict[str, object] = {
+        "store": str(out_zarr),
+        "changed": not dry_run,
+        "dry_run": dry_run,
+        "polarization_before": [float(v) for v in pol_values],
+        "polarization_after": [float(v) for v in new_pol],
+        "keep_indices": keep_indices,
+        "dropped_indices": dropped,
+        "plane_scores": {str(k): scores.get(k, 0.0) for k in range(int(pol_values.size))},
+    }
+    if dry_run:
+        report["message"] = (
+            f"Would drop polarization indices {dropped} "
+            f"({_format_stokes_coord(pol_values)} → {_format_stokes_coord(new_pol)})"
+        )
+        return report
+
+    rewritten_arrays = [
+        name
+        for name in zg.array_keys()
+        if name == "polarization"
+        or "polarization"
+        in (
+            [str(zg[name].attrs.get("_ARRAY_DIMENSIONS"))]
+            if isinstance(zg[name].attrs.get("_ARRAY_DIMENSIONS"), str)
+            else [str(d) for d in zg[name].attrs.get("_ARRAY_DIMENSIONS", [])]
+        )
+    ]
+
+    backup_path: str | None = None
+    if not skip_backup:
+        backup_path = str(out_zarr.with_name(out_zarr.name + backup_suffix))
+        if Path(backup_path).exists():
+            msg = f"Backup path already exists: {backup_path}"
+            raise FileExistsError(msg)
+        shutil.copytree(out_zarr, backup_path)
+        report["backup"] = backup_path
+
+    tmp_path = out_zarr.with_name(out_zarr.name + ".pol-repair-tmp")
+    if tmp_path.exists():
+        shutil.rmtree(tmp_path)
+
+    with xr.open_zarr(str(out_zarr), consolidated=False) as ds:
+        repaired = ds.isel(polarization=keep_indices)
+        repaired = repaired.assign_coords(polarization=("polarization", new_pol))
+        repaired.to_zarr(str(tmp_path), mode="w", consolidated=False)
+
+    shutil.rmtree(out_zarr)
+    shutil.move(str(tmp_path), str(out_zarr))
+    _consolidate_zarr_metadata(out_zarr)
+    report["rewritten_arrays"] = rewritten_arrays
+    report["message"] = (
+        f"Dropped polarization indices {dropped} "
+        f"({_format_stokes_coord(pol_values)} → {_format_stokes_coord(new_pol)})"
+    )
+    return report
 
 
 def _patch_celestial_crval_in_header_str(ref_hdr_str: str, src_hdr: fits.Header) -> str:
@@ -1304,6 +1920,53 @@ def _time_key_from_filename(fp: Path) -> Optional[str]:
     return obstime.to_datetime().strftime("%Y%m%d_%H%M%S")
 
 
+def _time_key_from_directory(fp: Path) -> Optional[str]:
+    """Observation key from parent date and LST-hour directories.
+
+    Walks from the file's parent toward the filesystem root and collects:
+
+    * nearest calendar-date directory ``YYYY-MM-DD`` or ``YYYYMMDD``
+    * nearest LST-hour directory ``NNh`` / ``Nh`` (0–23), e.g. ``01h``
+
+    Returns ``YYYYMMDD_LST{HH}h`` when both are present (exopipe layout
+    ``.../01h/2024-12-24/...``), ``YYYYMMDD_000000`` when only the date is found, or
+    ``None`` when no date directory exists.
+
+    Used for products whose ``DATE-OBS`` / basename stamps are unreliable.
+    """
+    ymd: Optional[str] = None
+    lst_hour: Optional[int] = None
+    for parent in fp.resolve().parents:
+        name = parent.name
+        if ymd is None:
+            dashed = _DIR_DATE_DASH_RE.fullmatch(name)
+            if dashed is not None:
+                candidate = f"{dashed.group(1)}{dashed.group(2)}{dashed.group(3)}"
+            else:
+                compact = _DIR_DATE_COMPACT_RE.fullmatch(name)
+                candidate = compact.group(1) if compact is not None else None
+            if candidate is not None:
+                try:
+                    datetime.strptime(candidate, "%Y%m%d")
+                except ValueError:
+                    pass
+                else:
+                    ymd = candidate
+        if lst_hour is None:
+            lst_match = _DIR_LST_HOUR_RE.fullmatch(name)
+            if lst_match is not None:
+                hour = int(lst_match.group(1))
+                if 0 <= hour <= 23:
+                    lst_hour = hour
+        if ymd is not None and lst_hour is not None:
+            break
+    if ymd is None:
+        return None
+    if lst_hour is not None:
+        return f"{ymd}_LST{lst_hour:02d}h"
+    return f"{ymd}_000000"
+
+
 def _strip_fits_ctype_cards(hdr: fits.Header) -> None:
     """Strip FITS ``CTYPEn`` string values of padding.
 
@@ -1358,7 +2021,8 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
     Adds/ensures:
       RESTFREQ/RESTFRQ when axis 3 is spectral (not after a synthetic Stokes axis),
       SPECSYS=LSRK, TIMESYS=UTC, RADESYS=FK5, LATPOLE=90,
-      identity PC matrix for LM, BUNIT=Jy/beam. ``BMAJ``/``BMIN`` from the input are
+      identity PC matrix for LM, BUNIT=Jy/beam, TELESCOP=OVRO-LWA when absent
+      (xradio requires the card). ``BMAJ``/``BMIN`` from the input are
       preserved verbatim — no placeholder beam is ever written. Inputs without a
       real (present, finite, strictly positive) ``BMAJ``/``BMIN`` raise
       :class:`InvalidBeamError`; the convert pipeline drops such files at discovery
@@ -1408,6 +2072,9 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
         # equal to ``'STOKES'``, which raises ``ValueError: 'STOKES' is not in the list``.
         _strip_fits_ctype_cards(hdr)
         naxis_in = int(hdr.get("NAXIS", 0))
+        for axis in range(1, naxis_in + 1):
+            if str(hdr.get(f"CTYPE{axis}", "")).strip().upper() == "STOKES":
+                hdr[f"CRVAL{axis}"] = _stokes_numeric_from_value(hdr.get(f"CRVAL{axis}", 1.0))
         if data is not None and not _header_has_exact_stokes_axis(hdr) and naxis_in == 4:
             # 4D cubes sometimes carry a length-1 axis mis-labeled (not RA/DEC/FREQ). xradio
             # still requires a literal ``STOKES`` axis name for polarization metadata.
@@ -1435,7 +2102,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 data = np.expand_dims(data, axis=0)
                 hdr["NAXIS"] = 4
                 hdr["CTYPE4"] = "STOKES"
-                hdr["CRVAL4"] = 1.0
+                hdr["CRVAL4"] = _stokes_numeric_from_value(hdr.get("CRVAL4", 1.0))
                 hdr["CRPIX4"] = 1.0
                 hdr["CDELT4"] = 1.0
                 if "CUNIT4" not in hdr:
@@ -1457,7 +2124,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
                 hdr["CUNIT3"] = "Hz"
                 hdr["NAXIS4"] = 1
                 hdr["CTYPE4"] = "STOKES"
-                hdr["CRVAL4"] = 1.0
+                hdr["CRVAL4"] = _stokes_numeric_from_value(hdr.get("CRVAL4", 1.0))
                 hdr["CRPIX4"] = 1.0
                 hdr["CDELT4"] = 1.0
                 if "CUNIT4" not in hdr:
@@ -1499,6 +2166,7 @@ def _fix_headers(path_in: Path, path_out: Path) -> None:
             H["BUNIT"] = "Jy/beam"
 
         _strip_fits_ctype_cards(H)
+        _ensure_xradio_required_header_cards(H)
 
         # Write via temporary file + atomic replace to avoid leaving a partial
         # output file when the underlying filesystem intermittently short-writes.
@@ -1728,8 +2396,12 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
 
     # 2) Open FITS header and extract 2D celestial WCS matching the image plane
     with fits.open(str(fp), memmap=True) as hdul:
-        H = hdul[0].header
-    w2d = WCS(H).celestial  # 2D (RA/Dec) WCS
+        H = hdul[0].header.copy()
+    from astropy.wcs import FITSFixedWarning
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FITSFixedWarning)
+        w2d = WCS(H).celestial  # 2D (RA/Dec) WCS
 
     # 3) Compute RA/Dec at pixel centers (origin=0); FITS (NAXIS2, NAXIS1) = (m, l) sizes
     ny = int(xds.sizes["m"])
@@ -1750,6 +2422,7 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
 
     # 5) Persist the exact celestial WCS header so we can re-create WCSAxes later without FITS
     xds.attrs["fits_wcs_header"] = hdr_str
+    xds.attrs[_FITS_PRIMARY_HEADER_ATTR] = H.tostring(sep="\n")
 
     # 6) Hygiene + optional LM chunking
     xds.attrs.pop("history", None)  # keep attrs minimal
@@ -1760,16 +2433,18 @@ def _load_for_combine(fp: Path, *, chunk_lm: int = 1024) -> xr.Dataset:
         xds = xds.chunk({"l": chunk_lm, "m": chunk_lm})
 
     # ---- persist celestial WCS for combine/regrid (in-memory only) ----
-    # Zarr export uses wcs_header_str(time) only; strip_redundant_fits_wcs_header_attrs
-    # removes fits_wcs_header attrs before write (see AGENTS.md Per-Time WCS).
-    # 2) 0-D variable that always survives (NumPy ≥ 2.0: use np.bytes_)
+    # Zarr export uses fits_header_str(time, frequency, polarization) only;
+    # strip_redundant_fits_wcs_header_attrs removes fits_wcs_header attrs before write.
     xds = xds.assign(wcs_header_str=((), np.bytes_(hdr_str.encode("utf-8"))))
+    xds = _assign_pixel_faithful_fits_header_str(xds, post_regrid_wcs_hdr=hdr_str)
 
-    # 3) per-variable attrs (in-memory merges; not written to multi-time Zarr)
+    # per-variable attrs (in-memory merges; not written to multi-time Zarr)
     for dv in xds.data_vars:
+        if dv in {"wcs_header_str", "fits_header_str"}:
+            continue
         xds[dv].attrs["fits_wcs_header"] = hdr_str
 
-    # 4) also stash on coords for convenience (in-memory only)
+    # also stash on coords for convenience (in-memory only)
     xds["right_ascension"].attrs["fits_wcs_header"] = hdr_str
     xds["declination"].attrs["fits_wcs_header"] = hdr_str
 
@@ -1840,6 +2515,23 @@ def _getheader_for_ingest(fp: Path) -> fits.Header:
     return fits.getheader(fp, ext=_image_hdu_index_for_header(fp))
 
 
+def _header_for_beam_check(
+    fp: Path,
+    meta: Optional[_DiscoveryFileMetadata],
+) -> fits.Header:
+    """Return a FITS header suitable for :func:`_invalid_beam_reason`.
+
+    Discovery sidecars from ``group_metadata_source="filename"`` may rebuild a
+    shape-only stub header (``NAXIS``/``NAXIS1``/``NAXIS2`` only) with no
+    ``BMAJ``/``BMIN``. Treat that as a cache miss and re-read the on-disk image
+    HDU so beam checks do not falsely reject valid products.
+    """
+    hdr = meta.ingest_header if meta is not None else None
+    if hdr is not None and "BMAJ" in hdr and "BMIN" in hdr:
+        return hdr
+    return _getheader_for_ingest(fp)
+
+
 def _lm_shape_from_header(header: fits.Header) -> Tuple[int, int]:
     """Return LM shape ``(l, m)`` from a FITS image header (``NAXIS1`` × ``NAXIS2``)."""
     naxis = int(header.get("NAXIS", 0))
@@ -1852,6 +2544,175 @@ def _lm_shape_from_header(header: fits.Header) -> Tuple[int, int]:
 def _peek_lm_shape(fp: Path) -> Tuple[int, int]:
     """Return LM shape ``(l, m)`` from FITS header without loading pixel data."""
     return _lm_shape_from_header(_getheader_for_ingest(fp))
+
+
+_ZARR_ESTIMATE_BYTES_PER_PIXEL = 4
+
+
+def format_data_size(num_bytes: int) -> str:
+    """Format a byte count using binary SI units (KiB, MiB, GiB, TiB)."""
+    if num_bytes < 0:
+        msg = f"num_bytes must be non-negative, got {num_bytes}"
+        raise ValueError(msg)
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            if unit == "B":
+                return f"{int(value)} B"
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def estimate_zarr_store_bytes(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
+    target_size: int | None = None,
+) -> int | None:
+    """Estimate Zarr store size from the global LM reference scale and file count.
+
+    Every slice is regridded onto the same ``(l, m)`` grid before write. The
+    reference pixel count is taken from Stokes-I subbands in the first time
+    group (same rule as :func:`_load_global_lm_reference_dataset`: largest
+    ``l×m`` among subbands, typically the highest-frequency image), unless
+    *target_size* is set (square ``target_size × target_size`` grid).
+    """
+    if not by_time:
+        return None
+
+    n_files = sum(len(files) for files in by_time.values())
+    if n_files <= 0:
+        return None
+
+    ref_shape = reference_lm_shape_for_zarr_estimate(
+        by_time,
+        discovery_metadata=discovery_metadata,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+        target_size=target_size,
+    )
+    if ref_shape is None:
+        return None
+    return n_files * ref_shape[0] * ref_shape[1] * _ZARR_ESTIMATE_BYTES_PER_PIXEL
+
+
+def _lm_shape_from_discovery_metadata(
+    fp: Path,
+    meta: _DiscoveryFileMetadata | None,
+) -> Tuple[int, int] | None:
+    """Return ``(l, m)`` from cached discovery metadata when possible."""
+    if meta is not None and meta.ingest_header is not None:
+        try:
+            return _lm_shape_from_header(meta.ingest_header)
+        except RuntimeError:
+            return None
+    return None
+
+
+def reference_lm_shape_for_zarr_estimate(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
+    target_size: int | None = None,
+) -> Tuple[int, int] | None:
+    """Return the ``(l, m)`` grid used for :func:`estimate_zarr_store_bytes`."""
+    if target_size is not None:
+        size = int(target_size)
+        if size <= 0:
+            msg = f"target_size must be positive, got {target_size}"
+            raise ValueError(msg)
+        return size, size
+    return _reference_lm_shape_for_zarr_estimate(
+        by_time,
+        discovery_metadata=discovery_metadata,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+
+
+def _reference_lm_shape_for_zarr_estimate(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
+) -> Tuple[int, int] | None:
+    """Infer reference ``(l, m)`` from Stokes-I subbands in the first time group."""
+    if not by_time:
+        return None
+
+    tkey = sorted(by_time)[0]
+    files = list(by_time[tkey])
+    sort_key = lambda p: _discovery_frequency_sort_tuple(
+        p,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+    files.sort(key=sort_key)
+
+    candidates: List[Tuple[Path, Tuple[int, int]]] = []
+    for fp in files:
+        meta = discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+        if meta is not None:
+            stokes_key = meta.stokes_key
+        else:
+            stokes_key = _resolve_stokes_key_for_discovery(fp, None)
+        if stokes_key == 4:
+            continue
+        shape = _lm_shape_from_discovery_metadata(fp, meta)
+        if shape is None:
+            try:
+                shape = _peek_lm_shape(fp)
+            except Exception:
+                continue
+        n_l, n_m = shape
+        if n_l > 0 and n_m > 0:
+            candidates.append((fp, (int(n_l), int(n_m))))
+
+    if not candidates:
+        return None
+
+    shapes = [shape for _, shape in candidates]
+    ref_idx = _select_reference_shape_index(shapes)
+    ref_fp, ref_shape = candidates[ref_idx]
+    unique_shapes = sorted(set(shapes))
+    logger.info(
+        "Zarr size estimate: reference grid %d×%d from %s (time=%s); "
+        "scanned %d Stokes-I subband(s) with shape(s) %s; assuming %d input "
+        "file(s) regrid to this scale.",
+        ref_shape[0],
+        ref_shape[1],
+        ref_fp.name,
+        tkey,
+        len(candidates),
+        unique_shapes,
+        sum(len(files) for files in by_time.values()),
+    )
+    return ref_shape
+
+
+def _reference_pixels_per_zarr_slice(
+    by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    group_metadata_source: Literal["fits", "filename"] = "filename",
+    filename_convention: DiscoveryFilenameConvention = "image",
+) -> int | None:
+    """Infer per-slice pixel count from Stokes-I subbands in the first time group."""
+    ref_shape = _reference_lm_shape_for_zarr_estimate(
+        by_time,
+        discovery_metadata=discovery_metadata,
+        group_metadata_source=group_metadata_source,
+        filename_convention=filename_convention,
+    )
+    if ref_shape is None:
+        return None
+    return ref_shape[0] * ref_shape[1]
 
 
 def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:
@@ -1887,6 +2748,662 @@ def _strip_axis_cards_above(header: fits.Header, *, max_axis: int = 2) -> None:
             pass
 
 
+_FITS_PRIMARY_HEADER_ATTR = "_fits_primary_header_str"
+
+
+def _promote_singleton_freq_stokes_cards(
+    hdr: fits.Header,
+    *,
+    freq_hz: float,
+    stokes: float,
+) -> None:
+    """Set OVRO 4D singleton FREQ and Stokes axis cards on ``hdr`` (in-place)."""
+    freq = float(freq_hz)
+    stokes_val = float(stokes)
+    hdr["NAXIS"] = 4
+    hdr["NAXIS3"] = 1
+    hdr["CTYPE3"] = "FREQ"
+    hdr["CRVAL3"] = freq
+    hdr["CRPIX3"] = 1.0
+    hdr["CDELT3"] = 1.0
+    hdr.setdefault("CUNIT3", "Hz")
+    hdr["NAXIS4"] = 1
+    hdr["CTYPE4"] = "STOKES"
+    hdr["CRVAL4"] = stokes_val
+    hdr["CRPIX4"] = 1.0
+    hdr["CDELT4"] = 1.0
+    hdr.setdefault("CUNIT4", "")
+    hdr["RESTFREQ"] = freq
+    hdr["RESTFRQ"] = (freq, "Rest frequency in Hz")
+
+
+def _freq_hz_for_fits_header_slice(
+    xds: xr.Dataset,
+    primary: fits.Header,
+) -> float:
+    """Resolve reference frequency (Hz) for a stored ``fits_header_str`` slice."""
+    if "frequency" in xds.coords and int(xds.sizes.get("frequency", 0)) >= 1:
+        return float(np.asarray(xds.frequency.values).ravel()[0])
+    hz = _frequency_hz_from_header(primary)
+    if hz is not None and hz > 0:
+        return float(hz)
+    return 6e7
+
+
+def _fits_stokes_from_polarization_coord(raw: object) -> float | None:
+    """Map Zarr ``polarization`` coord values to FITS Stokes codes when possible."""
+    if isinstance(raw, (str, np.str_)):
+        label = str(raw).strip().upper()
+        table = {"I": 1.0, "Q": 2.0, "U": 3.0, "V": 4.0, "RR": -1.0, "LL": -2.0}
+        if label in table:
+            return table[label]
+        try:
+            return float(label)
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stokes_for_fits_header_slice(
+    xds: xr.Dataset,
+    primary: fits.Header,
+) -> float:
+    """Resolve FITS Stokes code for a stored ``fits_header_str`` slice."""
+    if "polarization" in xds.coords and int(xds.sizes.get("polarization", 0)) >= 1:
+        mapped = _fits_stokes_from_polarization_coord(
+            np.asarray(xds.polarization.values).ravel()[0]
+        )
+        if mapped is not None:
+            return mapped
+    return _stokes_value_from_header(primary)
+
+
+def _normalize_sky_dtype_mode(sky_dtype: str | np.dtype | type) -> SkyDtypeMode:
+    """Normalize a user/API sky-dtype value to a :data:`SkyDtypeMode` string."""
+    if isinstance(sky_dtype, str):
+        mode = sky_dtype.strip().lower()
+    else:
+        dt = np.dtype(sky_dtype)
+        if dt == np.dtype(np.float32):
+            mode = "float32"
+        elif dt == np.dtype(np.float64):
+            mode = "float64"
+        else:
+            msg = (
+                f"Unsupported sky dtype {sky_dtype!r}; expected preserve, float32, "
+                "float64, or a float32/float64 numpy dtype"
+            )
+            raise ValueError(msg)
+    if mode not in _SKY_DTYPE_MODES:
+        msg = (
+            f"Unsupported sky_dtype {sky_dtype!r}; expected one of "
+            f"{sorted(_SKY_DTYPE_MODES)}"
+        )
+        raise ValueError(msg)
+    return mode  # type: ignore[return-value]
+
+
+def _native_float_dtype(dtype: np.dtype | type[np.floating] | str) -> np.dtype:
+    """Return a native-endian float32/float64 dtype for *dtype* (by itemsize)."""
+    dt = np.dtype(dtype)
+    if not np.issubdtype(dt, np.floating):
+        msg = f"Expected a floating dtype for SKY, got {dt!r}"
+        raise ValueError(msg)
+    if dt.itemsize == 4:
+        return np.dtype(np.float32)
+    if dt.itemsize == 8:
+        return np.dtype(np.float64)
+    msg = f"Unsupported floating SKY itemsize {dt.itemsize} for dtype {dt!r}"
+    raise ValueError(msg)
+
+
+def _bitpix_for_sky_numpy_dtype(dtype: np.dtype | type[np.floating] | str) -> int:
+    """FITS ``BITPIX`` for a floating ``SKY`` numpy dtype (``-32`` or ``-64``)."""
+    native = _native_float_dtype(dtype)
+    if native == np.dtype(np.float32):
+        return -32
+    return -64
+
+
+def _sky_numpy_dtype_from_fits_bitpix(bitpix: int) -> np.dtype:
+    """Map FITS ``BITPIX`` to the on-disk floating ``SKY`` dtype used by convert.
+
+    Floating FITS (``-32`` / ``-64``) map to ``float32`` / ``float64``. Integer
+    ``BITPIX`` (scaled images) maps to ``float32`` because :func:`_fix_headers`
+    expands ``BSCALE``/``BZERO`` into float32 physical pixels.
+    """
+    bp = int(bitpix)
+    if bp == -64:
+        return np.dtype(np.float64)
+    if bp == -32:
+        return np.dtype(np.float32)
+    if bp in (8, 16, 32):
+        return np.dtype(np.float32)
+    msg = (
+        f"Unsupported FITS BITPIX={bp} for sky_dtype='preserve'; "
+        "expected -32, -64, or integer 8/16/32"
+    )
+    raise ValueError(msg)
+
+
+def _sky_numpy_dtype_from_fits_path(fp: Path) -> np.dtype:
+    """Read image-HDU ``BITPIX`` from *fp* and map it to a native float dtype."""
+    hdr = _getheader_for_ingest(fp)
+    if "BITPIX" not in hdr:
+        msg = f"FITS file {fp} has no BITPIX card; cannot resolve sky_dtype='preserve'"
+        raise ValueError(msg)
+    return _sky_numpy_dtype_from_fits_bitpix(int(hdr["BITPIX"]))
+
+
+def _resolve_preserve_sky_dtype_from_fits_paths(
+    paths: Sequence[Path],
+    *,
+    sample_limit: int = 32,
+) -> np.dtype:
+    """Resolve ``sky_dtype='preserve'`` from input FITS ``BITPIX`` values.
+
+    Samples up to *sample_limit* paths (evenly spaced). All sampled files must
+    resolve to the same float kind; mixed float32/float64 raises ``ValueError``.
+    """
+    files = [Path(p) for p in paths]
+    if not files:
+        msg = "Cannot resolve sky_dtype='preserve': no input FITS paths"
+        raise ValueError(msg)
+    if len(files) <= sample_limit:
+        sample = files
+    else:
+        idxs = np.linspace(0, len(files) - 1, num=sample_limit, dtype=int)
+        sample = [files[int(i)] for i in dict.fromkeys(idxs.tolist())]
+
+    resolved: list[np.dtype] = []
+    for fp in sample:
+        resolved.append(_sky_numpy_dtype_from_fits_path(fp))
+    unique = {dt.str for dt in resolved}
+    if len(unique) != 1:
+        msg = (
+            "sky_dtype='preserve' found mixed FITS BITPIX→dtype among sampled inputs: "
+            f"{sorted(unique)}. Pass sky_dtype='float32' or 'float64' explicitly."
+        )
+        raise ValueError(msg)
+    return resolved[0]
+
+
+def _cast_sky_to_dtype(ds: xr.Dataset, dtype: np.dtype | type[np.floating] | str) -> xr.Dataset:
+    """Cast ``SKY`` (only) to *dtype* when present and mismatched."""
+    if "SKY" not in ds.data_vars:
+        return ds
+    target = _native_float_dtype(dtype)
+    if np.dtype(ds["SKY"].dtype) == target:
+        return ds
+    return ds.assign(SKY=ds["SKY"].astype(target, copy=False))
+
+
+def _sky_dtype_mode_from_numpy(dtype: np.dtype | type[np.floating] | str) -> Literal["float32", "float64"]:
+    """Map a floating numpy dtype to an explicit cast mode (not ``preserve``)."""
+    native = _native_float_dtype(dtype)
+    if native == np.dtype(np.float32):
+        return "float32"
+    return "float64"
+
+
+def _resolve_sky_numpy_dtype(sky: xr.DataArray, mode: SkyDtypeMode | str) -> np.dtype:
+    """Resolve the native numpy dtype to use for ``SKY`` under *mode*.
+
+    ``preserve`` without a prior FITS resolution falls back to the in-memory
+    floating kind of *sky* (native endian). Prefer resolving ``preserve`` from
+    input FITS ``BITPIX`` in :func:`convert_fits_dir_to_zarr` so write policy
+    matches the source files.
+    """
+    resolved_mode = _normalize_sky_dtype_mode(mode)
+    if resolved_mode == "preserve":
+        if not np.issubdtype(sky.dtype, np.floating):
+            msg = (
+                f"Cannot preserve SKY dtype {sky.dtype!r}: expected a floating type. "
+                "Pass sky_dtype='float32' or 'float64' to cast."
+            )
+            raise ValueError(msg)
+        return _native_float_dtype(sky.dtype)
+    return np.dtype(_SKY_DTYPE_MAP[resolved_mode])
+
+
+def _apply_sky_dtype(
+    ds: xr.Dataset,
+    mode: SkyDtypeMode | str,
+    *,
+    target_dtype: np.dtype | type[np.floating] | str | None = None,
+) -> tuple[xr.Dataset, np.dtype]:
+    """Cast ``SKY`` to the resolved dtype; return ``(dataset, resolved_dtype)``.
+
+    When *target_dtype* is set (append path), it overrides *mode* for the cast
+    target. Other variables are left unchanged. Missing ``SKY`` is a no-op that
+    still returns the resolved dtype when *target_dtype* or a floating mode is
+    given; ``preserve`` without ``SKY`` raises.
+    """
+    resolved_mode = _normalize_sky_dtype_mode(mode)
+    if target_dtype is not None:
+        resolved = _native_float_dtype(target_dtype)
+    elif "SKY" not in ds.data_vars:
+        if resolved_mode == "preserve":
+            msg = "Cannot resolve sky_dtype='preserve' because dataset has no SKY variable"
+            raise ValueError(msg)
+        resolved = np.dtype(_SKY_DTYPE_MAP[resolved_mode])
+        return ds, resolved
+    else:
+        resolved = _resolve_sky_numpy_dtype(ds["SKY"], resolved_mode)
+
+    if "SKY" not in ds.data_vars:
+        return ds, resolved
+
+    sky = ds["SKY"]
+    if sky.dtype == resolved:
+        return ds, resolved
+    cast = sky.astype(resolved, copy=False)
+    cast.encoding = dict(sky.encoding)
+    cast.encoding["dtype"] = resolved.str
+    return ds.assign(SKY=cast), resolved
+
+
+def _sky_dtype_from_zarr(out_zarr: Path) -> np.dtype | None:
+    """Return on-disk ``SKY`` dtype from an existing Zarr store, or ``None``."""
+    if not out_zarr.exists():
+        return None
+    try:
+        root = zarr.open_group(str(out_zarr), mode="r")
+    except Exception:
+        return None
+    if "SKY" not in root:
+        return None
+    try:
+        return _native_float_dtype(root["SKY"].dtype)
+    except ValueError:
+        return np.dtype(root["SKY"].dtype)
+
+
+def _sync_fits_header_str_bitpix(
+    ds: xr.Dataset,
+    sky_numpy_dtype: np.dtype | type[np.floating] | str,
+) -> xr.Dataset:
+    """Rewrite ``BITPIX`` on non-empty ``fits_header_str`` cells to match *sky_numpy_dtype*."""
+    if "fits_header_str" not in ds.data_vars:
+        return ds
+    bitpix = _bitpix_for_sky_numpy_dtype(sky_numpy_dtype)
+    fh = ds["fits_header_str"]
+    values = np.asarray(fh.values)
+    flat = values.reshape(-1)
+    out_flat = np.empty(flat.shape, dtype=object)
+    changed = False
+    for i, raw in enumerate(flat):
+        text = _decode_wcs_header_payload(raw)
+        if not text:
+            out_flat[i] = raw
+            continue
+        hdr = fits.Header.fromstring(text, sep="\n")
+        if int(hdr.get("BITPIX", 0)) == bitpix:
+            out_flat[i] = raw
+            continue
+        hdr["BITPIX"] = bitpix
+        out_flat[i] = np.bytes_(hdr.tostring(sep="\n").encode("utf-8"))
+        changed = True
+    if not changed:
+        return ds
+    new_values = out_flat.reshape(values.shape)
+    return ds.assign(
+        fits_header_str=xr.DataArray(new_values, dims=fh.dims, coords=fh.coords)
+    )
+
+
+def _fits_header_bytes_for_slice(
+    hdr: fits.Header,
+    *,
+    post_regrid_wcs_hdr: str,
+    nl: int,
+    nm: int,
+    freq_hz: float | None = None,
+    stokes: float | None = None,
+    sky_numpy_dtype: np.dtype | type[np.floating] | str | None = None,
+) -> bytes:
+    """Build a pixel-faithful 4D singleton-axis primary-header string for one ``SKY`` slice.
+
+    The output describes stored pixels after ingest transforms: celestial cards come
+    from the post-regrid WCS; provenance and beam keywords are retained from the
+    post-``_fix_headers`` primary header; axes 3–4 are singleton FREQ and Stokes
+    (``NAXIS3=NAXIS4=1``) for xradio-compatible export.
+
+    ``BITPIX`` matches *sky_numpy_dtype* when given (``-32`` for float32, ``-64`` for
+    float64); otherwise defaults to ``-32`` (historical fixed-FITS float32).
+    """
+    out = hdr.copy()
+    preserved: dict[str, object] = {}
+    for key in (
+        "RESTFREQ",
+        "RESTFRQ",
+        "SPECSYS",
+        "TIMESYS",
+        "DATE-OBS",
+        "MJD-OBS",
+        "TELESCOP",
+        "OBSERVER",
+        "ORIGIN",
+        "BMAJ",
+        "BMIN",
+        "BPA",
+        "BUNIT",
+    ):
+        if key in hdr:
+            preserved[key] = hdr[key]
+    resolved_freq = float(freq_hz) if freq_hz is not None else _frequency_hz_from_header(hdr)
+    if resolved_freq is None or resolved_freq <= 0:
+        resolved_freq = 6e7
+    resolved_stokes = float(stokes) if stokes is not None else _stokes_value_from_header(hdr)
+    cel = WCS(fits.Header.fromstring(post_regrid_wcs_hdr, sep="\n")).celestial
+    for key, value in cel.to_header(relax=True).items():
+        out[key] = value
+    _strip_axis_cards_above(out, max_axis=2)
+    for key, value in preserved.items():
+        out[key] = value
+    out["NAXIS1"] = int(nl)
+    out["NAXIS2"] = int(nm)
+    _promote_singleton_freq_stokes_cards(
+        out, freq_hz=resolved_freq, stokes=resolved_stokes
+    )
+    if sky_numpy_dtype is None:
+        out["BITPIX"] = -32
+    else:
+        out["BITPIX"] = _bitpix_for_sky_numpy_dtype(sky_numpy_dtype)
+    for key in ("BSCALE", "BZERO"):
+        if key in out:
+            del out[key]
+    return out.tostring(sep="\n").encode("utf-8")
+
+
+def _stokes_value_from_header(hdr: fits.Header) -> float:
+    """Return the FITS Stokes parameter encoded on a header's ``STOKES`` axis."""
+    naxis = int(hdr.get("NAXIS", 0))
+    for axis in range(1, naxis + 1):
+        if str(hdr.get(f"CTYPE{axis}", "")).strip().upper() == "STOKES":
+            return _stokes_numeric_from_value(hdr.get(f"CRVAL{axis}", 1.0))
+    if "CRVAL4" in hdr:
+        return _stokes_numeric_from_value(hdr["CRVAL4"])
+    return 1.0
+
+
+def _stokes_label_from_basename(fp: Path) -> int | None:
+    """Return Stokes ``1`` (I) or ``4`` (V) when encoded in the basename, else ``None``."""
+    name = fp.name.upper()
+    for pattern in (
+        _STOKES_MHZ_POL_RE,
+        _STOKES_MHZ_UNDERSCORE_POL_RE,
+        _STOKES_IMAGE_SUFFIX_RE,
+        _STOKES_TOKEN_RE,
+    ):
+        match = pattern.search(name)
+        if match is not None:
+            return 1 if match.group(1) == "I" else 4
+    stem = fp.stem.upper()
+    if stem.endswith("-V"):
+        return 4
+    if stem.endswith("-I"):
+        return 1
+    return None
+
+
+def _resolve_stokes_key_for_discovery(
+    fp: Path,
+    hdr: fits.Header | None,
+) -> int:
+    """Resolve the discovery Stokes bin, preferring OVRO basename tokens over headers."""
+    from_basename = _stokes_label_from_basename(fp)
+    if from_basename is not None:
+        return from_basename
+    if hdr is not None:
+        return int(round(_stokes_value_from_header(hdr)))
+    return 1
+
+
+def _stokes_key_from_fits_path(fp: Path) -> int:
+    """Integer Stokes code for discovery duplicate bins (``1`` = I, ``4`` = V, …)."""
+    try:
+        hdr = _getheader_for_ingest(fp)
+    except Exception as exc:
+        logger.debug("Could not read Stokes from %s (%s); defaulting to I.", fp.name, exc)
+        return _resolve_stokes_key_for_discovery(fp, None)
+    return _resolve_stokes_key_for_discovery(fp, hdr)
+
+
+def _stokes_key_from_filename(fp: Path) -> int:
+    """Best-effort Stokes code from basename when discovery skips FITS I/O."""
+    return _resolve_stokes_key_for_discovery(fp, None)
+
+
+def _stokes_key_for_discovery(
+    fp: Path,
+    *,
+    group_metadata_source: Literal["fits", "filename"],
+) -> int:
+    if group_metadata_source == "filename":
+        return _stokes_key_from_filename(fp)
+    return _stokes_key_from_fits_path(fp)
+
+
+def _stokes_key_for_loaded_slice(xds: xr.Dataset, source_path: Path) -> float:
+    """Stokes code for stacking, preferring OVRO basename tokens over FITS ``CRVAL``."""
+    hdr: fits.Header | None = None
+    primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
+    if primary_str is not None:
+        hdr = fits.Header.fromstring(str(primary_str), sep="\n")
+    return float(_resolve_stokes_key_for_discovery(source_path, hdr))
+
+
+def _stokes_sort_key_from_dataset(
+    xds: xr.Dataset,
+    *,
+    source_path: Path | None = None,
+) -> float:
+    """Stokes value used to order polarization slices before ``xr.concat``."""
+    if source_path is not None:
+        return _stokes_key_for_loaded_slice(xds, source_path)
+    primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
+    if primary_str is not None:
+        hdr = fits.Header.fromstring(str(primary_str), sep="\n")
+        return _stokes_value_from_header(hdr)
+    if "fits_header_str" in xds.data_vars:
+        fh = xds["fits_header_str"]
+        sel = fh
+        if "frequency" in sel.dims:
+            sel = sel.isel(frequency=0)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=0)
+        hdr = fits.Header.fromstring(_decode_wcs_header_payload(sel.values), sep="\n")
+        return _stokes_value_from_header(hdr)
+    return 1.0
+
+
+def _stack_polarization_slices_per_frequency(
+    xds_list: List[xr.Dataset],
+    source_paths: List[Path],
+) -> List[xr.Dataset]:
+    """Merge datasets that share a frequency but differ in Stokes along ``polarization``."""
+    if len(xds_list) <= 1:
+        return xds_list
+    if len(source_paths) != len(xds_list):
+        msg = (
+            f"source_paths length ({len(source_paths)}) must match xds_list ({len(xds_list)})."
+        )
+        raise ValueError(msg)
+
+    from collections import defaultdict
+
+    groups: dict[float, list[int]] = defaultdict(list)
+    for idx, xds in enumerate(xds_list):
+        if "frequency" not in xds.coords:
+            return xds_list
+        fvals = np.atleast_1d(np.asarray(xds["frequency"].values, dtype=np.float64))
+        if fvals.size == 0 or not np.isfinite(fvals[0]):
+            return xds_list
+        groups[float(fvals[0])].append(idx)
+
+    if all(len(indices) == 1 for indices in groups.values()):
+        return xds_list
+
+    merged: list[xr.Dataset] = []
+    for freq_hz in sorted(groups.keys()):
+        indices = groups[freq_hz]
+        if len(indices) == 1:
+            merged.append(xds_list[indices[0]])
+            continue
+        pairs: list[tuple[xr.Dataset, Path]] = []
+        seen_stokes: dict[float, Path] = {}
+        for i in indices:
+            path = source_paths[i]
+            xds = xds_list[i]
+            stokes = _stokes_key_for_loaded_slice(xds, path)
+            if stokes not in (1.0, 4.0):
+                logger.warning(
+                    "Unexpected Stokes %s from %s at %.3f MHz; OVRO ingest expects "
+                    "I (1) and/or V (4) from basename or header.",
+                    stokes,
+                    path.name,
+                    freq_hz / 1e6,
+                )
+            if stokes in seen_stokes:
+                logger.warning(
+                    "Skipping duplicate Stokes %s at %.3f MHz (%s); keeping %s.",
+                    stokes,
+                    freq_hz / 1e6,
+                    path.name,
+                    seen_stokes[stokes].name,
+                )
+                continue
+            seen_stokes[stokes] = path
+            pairs.append((xds, path))
+        if len(pairs) == 1:
+            merged.append(pairs[0][0])
+            continue
+        pairs.sort(key=lambda item: _stokes_key_for_loaded_slice(item[0], item[1]))
+        expanded: list[xr.Dataset] = []
+        for xds, path in pairs:
+            stokes = _stokes_key_for_loaded_slice(xds, path)
+            if "polarization" in xds.dims:
+                xds = xds.assign_coords(polarization=[stokes])
+            else:
+                xds = xds.expand_dims(polarization=[stokes])
+            if (
+                "fits_header_str" in xds.data_vars
+                and "polarization" not in xds["fits_header_str"].dims
+            ):
+                xds = xds.assign(
+                    fits_header_str=xds["fits_header_str"].expand_dims(
+                        polarization=[stokes]
+                    )
+                )
+            expanded.append(xds)
+        merged.append(
+            xr.concat(
+                expanded,
+                dim="polarization",
+                data_vars="minimal",
+                compat="no_conflicts",
+            )
+        )
+    return merged
+
+
+def _assign_pixel_faithful_fits_header_str(
+    xds: xr.Dataset,
+    *,
+    post_regrid_wcs_hdr: str,
+) -> xr.Dataset:
+    """Attach scalar ``fits_header_str`` from the in-memory primary header + post-regrid WCS."""
+    primary_str = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
+    if primary_str is None:
+        msg = (
+            "Dataset is missing the in-memory primary FITS header required to build "
+            "fits_header_str during ingest."
+        )
+        raise RuntimeError(msg)
+    nl, nm = _lm_shape(xds)
+    primary = fits.Header.fromstring(str(primary_str), sep="\n")
+    sky_dtype: np.dtype | None = None
+    if "SKY" in xds.data_vars and np.issubdtype(xds["SKY"].dtype, np.floating):
+        sky_dtype = _native_float_dtype(xds["SKY"].dtype)
+    payload = _fits_header_bytes_for_slice(
+        primary,
+        post_regrid_wcs_hdr=post_regrid_wcs_hdr,
+        nl=nl,
+        nm=nm,
+        freq_hz=_freq_hz_for_fits_header_slice(xds, primary),
+        stokes=_stokes_for_fits_header_slice(xds, primary),
+        sky_numpy_dtype=sky_dtype,
+    )
+    return xds.assign(fits_header_str=((), np.bytes_(payload)))
+
+
+def _set_polarization_coord_from_fits_headers(xds: xr.Dataset) -> xr.Dataset:
+    """Set ``polarization`` coordinate values from FITS ``CRVAL`` Stokes codes."""
+    if "fits_header_str" not in xds.data_vars:
+        return xds
+    fh = xds["fits_header_str"]
+    n_pol = int(xds.sizes.get("polarization", 1))
+    stokes_vals: list[float] = []
+    for pol_idx in range(n_pol):
+        sel = fh
+        if "frequency" in sel.dims:
+            sel = sel.isel(frequency=0)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=pol_idx)
+        hdr = fits.Header.fromstring(_decode_wcs_header_payload(sel.values), sep="\n")
+        stokes_vals.append(_stokes_value_from_header(hdr))
+    if "polarization" in xds.dims:
+        return xds.assign_coords(polarization=("polarization", np.asarray(stokes_vals)))
+    return xds.assign_coords(polarization=np.asarray(stokes_vals, dtype=np.float64))
+
+
+def _ensure_polarization_coord(
+    xds: xr.Dataset,
+    source_paths: Sequence[Path],
+) -> xr.Dataset:
+    """Attach ``polarization`` when missing; keep basename-based coords from stacking."""
+    if "polarization" in xds.coords and int(xds.sizes.get("polarization", 0)) >= 1:
+        return _normalize_polarization_coord(xds)
+    if source_paths:
+        stokes = _stokes_key_for_loaded_slice(xds, source_paths[0])
+        if "polarization" in xds.dims:
+            return xds.assign_coords(polarization=("polarization", np.asarray([stokes])))
+        return xds.expand_dims(polarization=[stokes])
+    return _set_polarization_coord_from_fits_headers(xds)
+
+
+def _expand_fits_header_str_to_data_dims(xds: xr.Dataset) -> xr.Dataset:
+    """Broadcast ``fits_header_str`` to ``(time, frequency, polarization)`` when needed."""
+    if "fits_header_str" not in xds.data_vars:
+        return xds
+    fh = xds["fits_header_str"]
+    target_dims: list[str] = []
+    for dim in ("time", "frequency", "polarization"):
+        if dim in xds.dims:
+            target_dims.append(dim)
+    missing = [dim for dim in target_dims if dim not in fh.dims]
+    if not missing:
+        return xds
+    expanded = fh
+    for dim in missing:
+        expanded = expanded.expand_dims({dim: xds.coords[dim]})
+    return xds.assign(fits_header_str=expanded)
+
+
+def _drop_ingest_only_metadata_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
+    """Remove in-memory-only metadata before persisting a Zarr store."""
+    out = xds
+    if "wcs_header_str" in out.data_vars:
+        out = out.drop_vars("wcs_header_str")
+    out = out.copy(deep=False)
+    out.attrs.pop(_FITS_PRIMARY_HEADER_ATTR, None)
+    return out
+
+
 def _make_target_wcs_scaled(seed_wcs: WCS, seed_n: int, target_size: int) -> WCS:
     """Scale a 2D celestial WCS to ``target_size × target_size`` preserving sky coverage.
 
@@ -1910,13 +3427,28 @@ def _reproject_celestial_plane(
     w_src: WCS,
     w_tgt: WCS,
     shape_out: tuple[int, int],
+    *,
+    out_dtype: np.dtype | type[np.floating] | str | None = None,
 ) -> NDArray[np.floating]:
+    """Reproject a 2D plane; interpolate in float64 then cast back to *out_dtype*.
+
+    When *out_dtype* is omitted, the output matches the floating kind of *plane*
+    (float32/float64 by itemsize) so accidental float64 promotion does not stick.
+    """
     from reproject import reproject_interp
 
+    src = np.asarray(plane)
+    if out_dtype is None:
+        if np.issubdtype(src.dtype, np.floating):
+            target = _native_float_dtype(src.dtype)
+        else:
+            target = np.dtype(np.float32)
+    else:
+        target = _native_float_dtype(out_dtype)
     rep, _ = reproject_interp(
-        (np.asarray(plane, dtype=np.float64), w_src), w_tgt, shape_out=shape_out
+        (np.asarray(src, dtype=np.float64), w_src), w_tgt, shape_out=shape_out
     )
-    return np.asarray(rep)
+    return np.asarray(rep, dtype=target)
 
 
 def _resample_lm_reference_to_target_size(
@@ -1977,14 +3509,17 @@ def _resample_lm_reference_to_target_size(
             for idx in np.ndindex(lead_shape):
                 plane = np.asarray(arr[idx], dtype=np.float64)
                 plane_ml = plane.T
-                rep_ml = _reproject_celestial_plane(plane_ml, w_src, w_tgt, shape_out)
-                out_lm = np.asarray(rep_ml).T
-                out_arr[idx] = out_lm.astype(out_dtype, copy=False)
+                rep_ml = _reproject_celestial_plane(
+                    plane_ml, w_src, w_tgt, shape_out, out_dtype=out_dtype
+                )
+                out_arr[idx] = np.asarray(rep_ml).T
         else:
             plane = np.asarray(arr, dtype=np.float64)
             plane_ml = plane.T
-            rep_ml = _reproject_celestial_plane(plane_ml, w_src, w_tgt, shape_out)
-            out_arr = np.asarray(rep_ml).T.astype(arr.dtype, copy=False)
+            rep_ml = _reproject_celestial_plane(
+                plane_ml, w_src, w_tgt, shape_out, out_dtype=arr.dtype
+            )
+            out_arr = np.asarray(rep_ml).T
         replaced[name] = xr.DataArray(out_arr, dims=out_dims, attrs=dict(dv.attrs))
 
     if not replaced:
@@ -2010,8 +3545,7 @@ def _resample_lm_reference_to_target_size(
     hdr["NAXIS"] = 2
     hdr["NAXIS1"] = target_size
     hdr["NAXIS2"] = target_size
-    if "TELESCOP" not in hdr:
-        hdr["TELESCOP"] = "UNKNOWN"
+    _ensure_xradio_required_header_cards(hdr)
 
     fd, tmp_name = tempfile.mkstemp(suffix=".fits")
     os.close(fd)
@@ -2078,6 +3612,7 @@ def _load_global_lm_reference_dataset(
     group_metadata_source: Literal["fits", "filename"] = "fits",
     max_time_groups: int | None = _LM_REF_SCAN_TIME_GROUPS,
     filename_convention: DiscoveryFilenameConvention = "image",
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> xr.Dataset:
     """Load the dataset whose LM grid has the largest shape for use as the global reference.
 
@@ -2125,13 +3660,18 @@ def _load_global_lm_reference_dataset(
                 filename_convention=filename_convention,
             )
         for fp in shape_paths:
+            meta = (
+                discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+            )
             if fix_headers_on_demand:
-                hdr = _getheader_for_ingest(fp)
+                hdr = _header_for_beam_check(fp, meta)
                 if _invalid_beam_reason(hdr) is not None:
                     continue
                 shape = _lm_shape_from_header(hdr)
             else:
-                shape = _peek_lm_shape(fp)
+                shape = _lm_shape_from_discovery_metadata(fp, meta)
+                if shape is None:
+                    shape = _peek_lm_shape(fp)
             candidates.append((fp, shape))
 
     if not candidates:
@@ -2196,23 +3736,13 @@ def _lm_index_coords_match(
 def _read_wcs_header_str(ds: xr.Dataset) -> Optional[str]:
     """Return the persisted 2D celestial WCS header string from *ds*, if any.
 
-    Looks first at ``ds.attrs['fits_wcs_header']`` (set by :func:`_load_for_combine`
-    and :func:`_resample_lm_reference_to_target_size`), then falls back to the 0-D
-    ``wcs_header_str`` data variable so the lookup also works after merges that may
-    strip non-essential attrs.
+  Delegates to :func:`ovro_lwa_portal.accessor._read_wcs_header_str` so ingest
+  resume/LM-reference paths understand ``fits_header_str`` on new Zarr stores as
+  well as legacy ``wcs_header_str``.
     """
-    s = ds.attrs.get("fits_wcs_header")
-    if s is None and "wcs_header_str" in ds:
-        raw_arr = np.asarray(ds["wcs_header_str"].values)
-        if raw_arr.size == 0:
-            return None
-        # After incremental Zarr appends, ``wcs_header_str`` is promoted to ``(time,)``
-        # (or ``(time, frequency)``); use any representative row for the LM grid WCS.
-        raw = np.ravel(raw_arr)[0]
-        s = raw.decode("utf-8") if isinstance(raw, (bytes, np.bytes_)) else str(raw)
-    if s is None:
-        return None
-    return str(s)
+    from ovro_lwa_portal.accessor import _read_wcs_header_str as _accessor_read_wcs
+
+    return _accessor_read_wcs(ds, time_idx=0, freq_idx=0)
 
 
 def _wcs_header_from_ref_grid_and_source_crval(
@@ -2294,25 +3824,31 @@ def _regrid_to_reference_lm(
         If interpolation fails (e.g. incompatible coordinates) or the per-time
         celestial WCS cannot be derived (missing ``fits_wcs_header``).
     """
-    if _lm_shape(xds) == _lm_shape(ref) and _lm_index_coords_match(ref, xds):
-        return xds
-
     if "l" not in xds.coords or "m" not in xds.coords:
         who = f"{source_label}: " if source_label else ""
         msg = f"{who}cannot regrid: dataset is missing ``l`` and/or ``m`` coordinates."
         raise RuntimeError(msg)
 
-    # Materialize for scipy-backed interp; reference coords may be lazy.
-    xds = xds.load()
-    target_l = ref["l"].load() if hasattr(ref["l"].data, "compute") else ref["l"]
-    target_m = ref["m"].load() if hasattr(ref["m"].data, "compute") else ref["m"]
+    if _lm_shape(xds) == _lm_shape(ref) and _lm_index_coords_match(ref, xds):
+        regridded = xds
+    else:
+        # Materialize for scipy-backed interp; reference coords may be lazy.
+        xds = xds.load()
+        target_l = ref["l"].load() if hasattr(ref["l"].data, "compute") else ref["l"]
+        target_m = ref["m"].load() if hasattr(ref["m"].data, "compute") else ref["m"]
 
-    try:
-        regridded = xds.interp(l=target_l, m=target_m, method="linear")
-    except Exception as exc:
-        who = f"{source_label}: " if source_label else ""
-        msg = f"{who}LM regridding onto reference grid failed: {exc}"
-        raise RuntimeError(msg) from exc
+        sky_dtype_before: np.dtype | None = None
+        if "SKY" in xds.data_vars and np.issubdtype(xds["SKY"].dtype, np.floating):
+            sky_dtype_before = _native_float_dtype(xds["SKY"].dtype)
+        try:
+            regridded = xds.interp(l=target_l, m=target_m, method="linear")
+        except Exception as exc:
+            who = f"{source_label}: " if source_label else ""
+            msg = f"{who}LM regridding onto reference grid failed: {exc}"
+            raise RuntimeError(msg) from exc
+        # xarray.interp often promotes float32→float64; restore FITS-native kind.
+        if sky_dtype_before is not None:
+            regridded = _cast_sky_to_dtype(regridded, sky_dtype_before)
 
     # Recompute sky coords on ref's pixel grid using the source's per-time CRVAL so
     # every subband at one time step shares identical RA/Dec regardless of which path
@@ -2341,15 +3877,20 @@ def _regrid_to_reference_lm(
 
     regridded.attrs.pop("history", None)
     regridded.attrs["fits_wcs_header"] = hdr_str
+    if _FITS_PRIMARY_HEADER_ATTR not in regridded.attrs:
+        regridded.attrs[_FITS_PRIMARY_HEADER_ATTR] = xds.attrs.get(_FITS_PRIMARY_HEADER_ATTR)
     regridded["right_ascension"].attrs["fits_wcs_header"] = hdr_str
     regridded["declination"].attrs["fits_wcs_header"] = hdr_str
     for dv in regridded.data_vars:
-        if dv == "wcs_header_str":
+        if dv in {"wcs_header_str", "fits_header_str"}:
             continue
         regridded[dv].attrs["fits_wcs_header"] = hdr_str
 
     regridded["wcs_header_str"] = xr.DataArray(
         np.bytes_(hdr_str.encode("utf-8")), dims=()
+    )
+    regridded = _assign_pixel_faithful_fits_header_str(
+        regridded, post_regrid_wcs_hdr=hdr_str
     )
 
     for v in regridded.data_vars:
@@ -2408,11 +3949,19 @@ def _sky_sep_max_vs_ref_arcsec(
 
 def _decode_wcs_header_payload(raw: object) -> str:
     """Decode a scalar ``wcs_header_str`` payload to a stripped UTF-8 string."""
+    from ovro_lwa_portal.accessor import _sanitize_decoded_header_text
+
     if isinstance(raw, np.ndarray):
         raw = raw.item() if raw.ndim == 0 else np.ravel(raw)[0]
+    if raw is None:
+        return ""
+    if isinstance(raw, (float, np.floating)) and not np.isfinite(raw):
+        return ""
     if isinstance(raw, (bytes, bytearray)) or type(raw).__name__ == "bytes_":
-        return raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
-    return str(raw).rstrip("\x00").strip()
+        return _sanitize_decoded_header_text(
+            raw.decode("utf-8", errors="replace").rstrip("\x00").strip()
+        )
+    return _sanitize_decoded_header_text(str(raw).rstrip("\x00").strip())
 
 
 def _collapse_wcs_header_str_variable(
@@ -2429,6 +3978,92 @@ def _collapse_wcs_header_str_variable(
     nf = int(xds.sizes.get("frequency", 1))
     ri = int(np.clip(ref_freq_idx, 0, max(0, nf - 1)))
     return xds.assign(wcs_header_str=wh.isel(frequency=ri, drop=True))
+
+
+def _sky_slice_has_finite_data(xds: xr.Dataset, indexers: dict[str, int]) -> bool:
+    """Return True when the ``SKY`` plane selected by *indexers* contains finite data."""
+    if "SKY" not in xds:
+        return False
+    sky = xds["SKY"]
+    for dim, idx in indexers.items():
+        if dim in sky.dims:
+            sky = sky.isel({dim: idx})
+    if hasattr(sky.data, "compute"):
+        return bool(sky.notnull().any().compute())
+    values = np.asarray(sky.values)
+    return bool(np.any(np.isfinite(values)))
+
+
+def _assert_nonempty_fits_header_str_before_zarr_write(xds: xr.Dataset) -> None:
+    """Fail fast when a populated slice would be written without ``fits_header_str``."""
+    if "fits_header_str" not in xds.data_vars:
+        msg = (
+            "Dataset is missing fits_header_str before Zarr write; each "
+            "(time, frequency, polarization) slice must persist a FITS header."
+        )
+        raise RuntimeError(msg)
+
+    fh = xds["fits_header_str"]
+    populated_cells = 0
+    if "time" in fh.dims:
+        for ti in range(int(fh.sizes["time"])):
+            sel = fh.isel(time=ti)
+            if "frequency" in sel.dims:
+                for fi in range(int(sel.sizes["frequency"])):
+                    freq_sel = sel.isel(frequency=fi)
+                    if "polarization" in freq_sel.dims:
+                        for pi in range(int(freq_sel.sizes["polarization"])):
+                            indexers = {"time": ti, "frequency": fi, "polarization": pi}
+                            has_data = _sky_slice_has_finite_data(xds, indexers)
+                            hdr = _decode_wcs_header_payload(
+                                freq_sel.isel(polarization=pi).values
+                            )
+                            if not hdr:
+                                if has_data:
+                                    msg = (
+                                        f"fits_header_str is empty for time={ti}, "
+                                        f"frequency={fi}, polarization={pi} before Zarr write."
+                                    )
+                                    raise RuntimeError(msg)
+                                continue
+                            if has_data:
+                                populated_cells += 1
+                    else:
+                        indexers = {"time": ti, "frequency": fi}
+                        has_data = _sky_slice_has_finite_data(xds, indexers)
+                        hdr = _decode_wcs_header_payload(freq_sel.values)
+                        if not hdr:
+                            if has_data:
+                                msg = (
+                                    f"fits_header_str is empty for time={ti}, "
+                                    f"frequency={fi} before Zarr write."
+                                )
+                                raise RuntimeError(msg)
+                            continue
+                        if has_data:
+                            populated_cells += 1
+            else:
+                indexers = {"time": ti}
+                has_data = _sky_slice_has_finite_data(xds, indexers)
+                hdr = _decode_wcs_header_payload(sel.values)
+                if not hdr:
+                    if has_data:
+                        msg = f"fits_header_str is empty for time index {ti} before Zarr write."
+                        raise RuntimeError(msg)
+                    continue
+                if has_data:
+                    populated_cells += 1
+        if populated_cells == 0:
+            msg = (
+                "Dataset has no populated SKY cells with fits_header_str before Zarr write."
+            )
+            raise RuntimeError(msg)
+        return
+
+    hdr = _decode_wcs_header_payload(fh.values)
+    if not hdr:
+        msg = "fits_header_str is empty before Zarr write."
+        raise RuntimeError(msg)
 
 
 def _assert_nonempty_wcs_header_str_before_zarr_write(xds: xr.Dataset) -> None:
@@ -2593,8 +4228,131 @@ def _harmonize_celestial_coords_independent_of_frequency(
 
 
 def _parse_discovery_time_key(time_key: str) -> datetime:
-    """Parse ``YYYYMMDD_HHMMSS`` observation keys for temporal distance."""
-    return datetime.strptime(time_key, "%Y%m%d_%H%M%S")
+    """Parse discovery time keys for temporal distance / ordering.
+
+    Accepts ``YYYYMMDD_HHMMSS`` and LST-style keys ``YYYYMMDD_LSTNNh`` /
+    ``YYYYMMDD_LSTNNh_tXXXX`` (LST hour mapped to the clock-hour field for ordering).
+    """
+    try:
+        return datetime.strptime(time_key, "%Y%m%d_%H%M%S")
+    except ValueError:
+        match = _DIR_TIME_KEY_LST_RE.fullmatch(time_key)
+        if match is None:
+            raise
+        ymd = match.group(1)
+        lst_h = int(match.group(2))
+        return datetime.strptime(f"{ymd}{lst_h:02d}0000", "%Y%m%d%H%M%S")
+
+
+def _mjd_from_discovery_time_key(time_key: str) -> float:
+    """Return a synthetic UTC MJD for a discovery time key (directory / filename).
+
+    Directory keys ``YYYYMMDD_LST{HH}h`` map the calendar night plus LST hour onto
+    ``YYYY-MM-DDTHH:00:00`` UTC so LOO coadd nights that share FITS ``DATE-OBS`` still
+    get distinct Zarr ``time`` rows. This is an ingest identity stamp, not a physical
+    LST→UTC conversion.
+    """
+    dt = _parse_discovery_time_key(time_key)
+    return float(Time(dt, scale="utc").mjd)
+
+
+def _assign_time_coord_from_discovery_key(xds: xr.Dataset, time_key: str) -> xr.Dataset:
+    """Overwrite the dataset ``time`` coordinate with the discovery-key MJD."""
+    if "time" not in xds.coords:
+        return xds
+    mjd = _mjd_from_discovery_time_key(time_key)
+    attrs = dict(xds["time"].attrs)
+    new_time = xr.DataArray(
+        np.asarray([mjd], dtype=np.float64),
+        dims=("time",),
+        attrs=attrs,
+    )
+    return xds.assign_coords(time=new_time)
+
+
+def _discovery_subband_stokes_key(fp: Path) -> tuple[int, int] | None:
+    """Return ``(mhz_token, stokes)`` for deduplicating merged discovery groups."""
+    mhz = _mhz_from_name(fp)
+    if mhz == 10**9:
+        return None
+    stokes = _stokes_label_from_basename(fp)
+    if stokes is None:
+        stokes = 1
+    return (int(mhz), int(stokes))
+
+
+def _dedupe_discovery_files_by_subband_stokes(files: Sequence[Path]) -> list[Path]:
+    """Keep one FITS per ``(MHz basename, Stokes)`` when merging discovery time keys."""
+    kept: dict[tuple[int, int], Path] = {}
+    extras: list[Path] = []
+    for fp in files:
+        key = _discovery_subband_stokes_key(fp)
+        if key is None:
+            extras.append(fp)
+            continue
+        if key not in kept:
+            kept[key] = fp
+    return extras + list(kept.values())
+
+
+def _merge_time_groups_within_tolerance(
+    by_time: Dict[str, List[Path]],
+    tolerance_sec: float,
+) -> Dict[str, List[Path]]:
+    """Merge discovery groups whose ``DATE-OBS`` keys fall within *tolerance_sec*.
+
+    Connected components use single-linkage clustering: two keys belong to the same
+    group when their absolute UTC separation is at most *tolerance_sec*. The earliest
+    key in each component becomes the canonical group name.
+    """
+    if tolerance_sec <= 0.0 or len(by_time) <= 1:
+        return by_time
+
+    keys = sorted(by_time.keys(), key=_parse_discovery_time_key)
+    n_keys = len(keys)
+    parent = list(range(n_keys))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    times = [_parse_discovery_time_key(key) for key in keys]
+    for left in range(n_keys):
+        for right in range(left + 1, n_keys):
+            delta_sec = abs((times[right] - times[left]).total_seconds())
+            if delta_sec <= tolerance_sec:
+                union(left, right)
+
+    clusters: Dict[int, list[str]] = {}
+    for index, key in enumerate(keys):
+        clusters.setdefault(find(index), []).append(key)
+
+    merged: Dict[str, List[Path]] = {}
+    for cluster_keys in clusters.values():
+        cluster_keys.sort(key=_parse_discovery_time_key)
+        canonical = cluster_keys[0]
+        files: list[Path] = []
+        for key in cluster_keys:
+            files.extend(by_time[key])
+        merged[canonical] = _dedupe_discovery_files_by_subband_stokes(files)
+
+    if len(merged) < n_keys:
+        logger.info(
+            "Merged discovery time groups using %.0f s DATE-OBS tolerance "
+            "(%d -> %d groups).",
+            tolerance_sec,
+            n_keys,
+            len(merged),
+        )
+    return merged
 
 
 def _same_frequency_subband(a: Path, b: Path) -> bool:
@@ -2773,6 +4531,8 @@ def _truncated_fits_reason(fp: Path) -> Optional[str]:
 
 def _filter_invalid_beam_files(
     by_time: Dict[str, List[Path]],
+    *,
+    discovery_metadata: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Drop FITS files with truncated data or a missing/non-positive synthesized beam.
 
@@ -2784,10 +4544,15 @@ def _filter_invalid_beam_files(
     check are dropped from the result (with a warning) so the outer convert loop
     does not attempt to combine an empty group.
 
+    When *discovery_metadata* is provided (from :func:`_discover_groups_from_files`),
+    beam checks reuse cached ingest headers instead of opening each FITS again.
+
     Parameters
     ----------
     by_time
         Discovery output mapping observation-time key → list of FITS file paths.
+    discovery_metadata
+        Optional per-file metadata keyed by ``Path.resolve()``.
 
     Returns
     -------
@@ -2797,47 +4562,56 @@ def _filter_invalid_beam_files(
     """
     filtered: Dict[str, List[Path]] = {}
     n_dropped_files = 0
+    file_entries = [(tkey, fp) for tkey, files in by_time.items() for fp in files]
+    total_files = len(file_entries)
+    if total_files:
+        logger.info("Running beam-quality filter on %d FITS file(s).", total_files)
+    kept_by_time: Dict[str, List[Path]] = {}
+    for file_idx, (tkey, fp) in enumerate(file_entries, start=1):
+        _log_metadata_progress("beam-filter", file_idx, total_files)
+        trunc_reason = _truncated_fits_reason(fp)
+        if trunc_reason is not None:
+            logger.warning(
+                "Skipping %s: %s; its (time=%s, frequency=*) slot will be filled "
+                "with NaN in Zarr.",
+                fp.name,
+                trunc_reason,
+                tkey,
+            )
+            n_dropped_files += 1
+            continue
+        cached = (
+            discovery_metadata.get(fp.resolve()) if discovery_metadata is not None else None
+        )
+        try:
+            hdr = _header_for_beam_check(fp, cached)
+        except Exception as exc:
+            logger.warning(
+                "Skipping %s: could not read image HDU header to check beam (%s); "
+                "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
+                fp.name,
+                exc,
+                tkey,
+            )
+            n_dropped_files += 1
+            continue
+        reason = _invalid_beam_reason(hdr)
+        if reason is None:
+            kept_by_time.setdefault(tkey, []).append(fp)
+        else:
+            logger.warning(
+                "Skipping %s: invalid synthesized beam (%s); its (time=%s, "
+                "frequency=*) slot will be filled with NaN in Zarr.",
+                fp.name,
+                reason,
+                tkey,
+            )
+            n_dropped_files += 1
     for tkey, files in by_time.items():
-        kept: List[Path] = []
-        for fp in files:
-            trunc_reason = _truncated_fits_reason(fp)
-            if trunc_reason is not None:
-                logger.warning(
-                    "Skipping %s: %s; its (time=%s, frequency=*) slot will be filled "
-                    "with NaN in Zarr.",
-                    fp.name,
-                    trunc_reason,
-                    tkey,
-                )
-                n_dropped_files += 1
-                continue
-            try:
-                hdr = _getheader_for_ingest(fp)
-            except Exception as exc:
-                logger.warning(
-                    "Skipping %s: could not read image HDU header to check beam (%s); "
-                    "its (time=%s, frequency=*) slot will be filled with NaN in Zarr.",
-                    fp.name,
-                    exc,
-                    tkey,
-                )
-                n_dropped_files += 1
-                continue
-            reason = _invalid_beam_reason(hdr)
-            if reason is None:
-                kept.append(fp)
-            else:
-                logger.warning(
-                    "Skipping %s: invalid synthesized beam (%s); its (time=%s, "
-                    "frequency=*) slot will be filled with NaN in Zarr.",
-                    fp.name,
-                    reason,
-                    tkey,
-                )
-                n_dropped_files += 1
+        kept = kept_by_time.get(tkey, [])
         if kept:
             filtered[tkey] = kept
-        else:
+        elif files:
             logger.warning(
                 "All FITS files for time=%s dropped because none have a valid "
                 "synthesized beam; this time step will not be written.",
@@ -2850,6 +4624,8 @@ def _filter_invalid_beam_files(
             n_dropped_files,
             len(filtered),
         )
+    elif total_files:
+        logger.info("Beam-quality filter retained all %d file(s).", total_files)
     return filtered
 
 
@@ -2894,7 +4670,11 @@ def _completed_times_in_zarr(
         mjds.append(mjd)
         try:
             t = Time(mjd, format="mjd", scale="utc")
-            keys.add(t.to_datetime().strftime("%Y%m%d_%H%M%S"))
+            dt = t.to_datetime()
+            keys.add(dt.strftime("%Y%m%d_%H%M%S"))
+            # Directory-mode writes stamp HH:00:00 UTC from YYYYMMDD_LST{HH}h.
+            if dt.minute == 0 and dt.second == 0 and getattr(dt, "microsecond", 0) == 0:
+                keys.add(f"{dt.strftime('%Y%m%d')}_LST{dt.hour:02d}h")
         except Exception as exc:
             logger.debug(
                 "Could not convert existing Zarr time=%r to a time key (%s); ignoring.",
@@ -3040,6 +4820,8 @@ def _discovery_time_key_completed_in_zarr(
     files: Sequence[Path],
     completed_keys: set[str],
     completed_mjds: np.ndarray,
+    *,
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> bool:
     """Return whether a discovered time key is already represented in the Zarr store.
 
@@ -3047,9 +4829,20 @@ def _discovery_time_key_completed_in_zarr(
     ``xradio`` writes the Zarr ``time`` coordinate from ``DATE-OBS`` in the FITS
     header. Those strings can differ on OVRO-LWA products, so resume also matches
     ``DATE-OBS`` keys and MJDs from the image HDU (not the empty fpacked primary).
+
+    When *time_key_source* is ``"directory"``, LOO coadds share ``DATE-OBS`` across
+    nights while discovery keys encode the calendar night + LST hour. Resume then
+    matches only the discovery key (or its synthetic MJD from
+    :func:`_mjd_from_discovery_time_key`) — never header ``DATE-OBS`` / MJD aliases.
     """
     if discovery_key in completed_keys:
         return True
+    if time_key_source == "directory":
+        try:
+            synth_mjd = _mjd_from_discovery_time_key(discovery_key)
+        except ValueError:
+            return False
+        return _mjd_matches_completed(synth_mjd, completed_mjds)
     header_key = _header_time_key_for_files(files)
     if header_key and header_key in completed_keys:
         return True
@@ -3063,6 +4856,7 @@ def _filter_completed_time_keys(
     *,
     rebuild: bool,
     context: str,
+    time_key_source: DiscoveryTimeKeySource = "filename",
 ) -> Dict[str, List[Path]]:
     """Drop time keys already present in *out_zarr* to make re-runs resumable.
 
@@ -3073,7 +4867,8 @@ def _filter_completed_time_keys(
     When discovery keys come from filenames but the Zarr ``time`` coordinate was
     written from FITS ``DATE-OBS`` (the usual ``xradio`` path), a group is also
     treated as complete when :func:`_header_time_key_for_files` matches a key
-    already in the store.
+    already in the store. Directory discovery keys skip that DATE-OBS aliasing (see
+    :func:`_discovery_time_key_completed_in_zarr`).
 
     Parameters
     ----------
@@ -3087,6 +4882,8 @@ def _filter_completed_time_keys(
     context
         Short label for log lines (e.g. ``"convert"``, ``"dewarp-convert"``); helps
         operators distinguish which subcommand reported the resume.
+    time_key_source
+        Discovery time-key mode; ``"directory"`` disables DATE-OBS/MJD alias resume.
 
     Returns
     -------
@@ -3102,12 +4899,18 @@ def _filter_completed_time_keys(
     remaining: Dict[str, List[Path]] = {}
     for discovery_key, files in by_time.items():
         if not _discovery_time_key_completed_in_zarr(
-            discovery_key, files, completed_keys, completed_mjds
+            discovery_key,
+            files,
+            completed_keys,
+            completed_mjds,
+            time_key_source=time_key_source,
         ):
             remaining[discovery_key] = files
             continue
         if discovery_key in completed_keys:
             skipped_exact.append(discovery_key)
+        elif time_key_source == "directory":
+            skipped_mjd.append(discovery_key)
         else:
             header_key = _header_time_key_for_files(files)
             if header_key and header_key in completed_keys:
@@ -3149,14 +4952,174 @@ def _filter_completed_time_keys(
     return remaining
 
 
+def _discover_groups_from_files(
+    fits_files: Sequence[Path],
+    duplicate_resolver: Optional[Callable[[str, float, List[Path]], Path]] = None,
+    *,
+    freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
+    time_key_source: DiscoveryTimeKeySource = "filename",
+    group_metadata_source: Literal["fits", "filename"] = "fits",
+    filename_convention: DiscoveryFilenameConvention = "image",
+    time_key_tolerance_sec: float = 0.0,
+    discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
+    cache_ingest_headers: bool = True,
+) -> Dict[str, List[Path]]:
+    """Group *fits_files* by observation time and frequency.
+
+    See :func:`_discover_groups` for parameter semantics and duplicate handling.
+
+    When *discovery_metadata_out* is provided, it is filled with per-file metadata
+    keyed by ``Path.resolve()`` so callers can reuse discovery results without
+    re-reading FITS headers.
+
+    When ``group_metadata_source="filename"`` and *cache_ingest_headers* is False,
+    grouping uses basename/directory keys only (no per-file HDU open). Use that for
+    estimate-size; convert keeps the default True so beam/LM keywords are cached.
+    """
+    if freq_bin_hz <= 0.0:
+        msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
+        raise ValueError(msg)
+    if filename_convention == "lst-color" and group_metadata_source == "filename":
+        msg = (
+            '"lst-color" grouping requires FITS header reads for subband frequency; '
+            'use group_metadata_source="fits".'
+        )
+        raise ValueError(msg)
+
+    metadata_cache: Dict[tuple[Path, int, int], _DiscoveryFileMetadata] = {}
+    by_time: Dict[str, List[Path]] = {}
+    by_time_freq_stokes: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
+    files_sorted = sorted(fits_files)
+    total_files = len(files_sorted)
+    if total_files:
+        logger.info("Discovering metadata for %d FITS file(s).", total_files)
+    for file_idx, f in enumerate(files_sorted, start=1):
+        _log_metadata_progress("discover", file_idx, total_files)
+        meta = _get_discovery_file_metadata(
+            f,
+            cache=metadata_cache,
+            filename_convention=filename_convention,
+            group_metadata_source=group_metadata_source,
+            time_key_source=time_key_source,
+            cache_ingest_headers=cache_ingest_headers,
+        )
+        if discovery_metadata_out is not None:
+            discovery_metadata_out[f.resolve()] = meta
+        time_key = meta.time_key
+        frequency_hz = meta.frequency_hz
+        notes = meta.notes
+        if time_key is None:
+            if filename_convention == "lst-color":
+                t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
+            elif time_key_source == "directory":
+                t_hint = "YYYY-MM-DD/YYYYMMDD parent directory (optional NNh LST hour dir)"
+            elif group_metadata_source == "filename":
+                t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
+            elif time_key_source == "filename":
+                t_hint = "-image-YYYYMMDD_HHMMSS in basename or DATE-OBS"
+            else:
+                t_hint = "DATE-OBS"
+            logger.warning(f"Skipping {f.name}: missing usable observation time ({t_hint}).")
+            continue
+        if frequency_hz is None:
+            logger.warning(
+                f"Could not determine frequency for {f.name}; duplicate detection disabled for this file."
+            )
+            by_time.setdefault(time_key, []).append(f)
+            continue
+
+        freq_key = int(round(frequency_hz / freq_bin_hz))
+        stokes_key = meta.stokes_key
+        time_freq_map = by_time_freq_stokes.setdefault(time_key, {})
+        bucket_key = (freq_key, stokes_key)
+        candidates = time_freq_map.setdefault(bucket_key, [])
+        candidates.append(f)
+
+        if len(candidates) > 1:
+            duplicate_names = [p.name for p in candidates]
+            if duplicate_resolver is None:
+                kept = candidates[0]
+                logger.warning(
+                    "Multiple FITS share time=%s, frequency bin %g Hz (key=%s, ~%.3f MHz), "
+                    "and Stokes %s: %s. Using only %s. "
+                    "Remove extras or pass duplicate_resolver to select a file.",
+                    time_key,
+                    freq_bin_hz,
+                    freq_key,
+                    frequency_hz / 1e6,
+                    stokes_key,
+                    duplicate_names,
+                    kept.name,
+                )
+                time_freq_map[bucket_key] = [kept]
+                continue
+
+            rep_meta = _get_discovery_file_metadata(
+                candidates[0],
+                cache=metadata_cache,
+                filename_convention=filename_convention,
+                group_metadata_source=group_metadata_source,
+                time_key_source=time_key_source,
+                cache_ingest_headers=cache_ingest_headers,
+            )
+            rep_hz = rep_meta.frequency_hz
+            resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
+            selected = duplicate_resolver(time_key, resolver_hz, candidates.copy())
+            if selected not in candidates:
+                msg = (
+                    f"Duplicate resolver returned unknown file {selected} for "
+                    f"time={time_key}, frequency_hz={resolver_hz}."
+                )
+                raise RuntimeError(msg)
+
+            by_time.setdefault(time_key, [])
+            by_time[time_key] = [p for p in by_time[time_key] if p not in candidates]
+            by_time[time_key].append(selected)
+            time_freq_map[bucket_key] = [selected]
+            logger.warning(
+                "Duplicate FITS files for time=%s, frequency_hz=%.1f, Stokes=%s. "
+                "Selected: %s. Candidates: %s",
+                time_key,
+                resolver_hz,
+                stokes_key,
+                selected.name,
+                duplicate_names,
+            )
+            continue
+
+        if notes:
+            logger.debug(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
+        by_time.setdefault(time_key, []).append(f)
+
+    for time_key, files in by_time.items():
+        by_time[time_key] = sorted(
+            files,
+            key=lambda p: _discovery_frequency_sort_key_from_metadata(
+                _get_discovery_file_metadata(
+                    p,
+                    cache=metadata_cache,
+                    filename_convention=filename_convention,
+                    group_metadata_source=group_metadata_source,
+                    time_key_source=time_key_source,
+                    cache_ingest_headers=cache_ingest_headers,
+                ),
+                p.name,
+            ),
+        )
+    return _merge_time_groups_within_tolerance(by_time, time_key_tolerance_sec)
+
+
 def _discover_groups(
     in_dir: Path,
     duplicate_resolver: Optional[Callable[[str, float, List[Path]], Path]] = None,
     *,
     freq_bin_hz: float = _DISCOVERY_FREQ_BIN_HZ,
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     group_metadata_source: Literal["fits", "filename"] = "fits",
     filename_convention: DiscoveryFilenameConvention = "image",
+    time_key_tolerance_sec: float = 0.0,
+    cache_ingest_headers: bool = True,
+    discovery_metadata_out: Optional[Dict[Path, _DiscoveryFileMetadata]] = None,
 ) -> Dict[str, List[Path]]:
     """Group input FITS by observation time and frequency (filename time stamp, header fallback).
 
@@ -3178,15 +5141,19 @@ def _discover_groups(
         ``int(round(frequency_hz / freq_bin_hz))``. Frequencies in the same bin are treated
         as one subband for grouping (up to ~``freq_bin_hz`` separation at bin edges).
     time_key_source
-        Used only when ``group_metadata_source`` is ``"fits"``. ``"filename"`` (default):
-        prefer the basename ``-image-YYYYMMDD_HHMMSS`` instant when present; otherwise use
-        ``DATE-OBS``. ``"header"``: group by ``DATE-OBS`` time key only.
+        How to choose the observation time key. ``"filename"`` (default): prefer the
+        basename ``-image-YYYYMMDD_HHMMSS`` instant when present; otherwise use
+        ``DATE-OBS`` (when ``group_metadata_source`` is ``"fits"``). ``"header"``: group by
+        ``DATE-OBS`` only. ``"directory"``: nearest parent ``YYYY-MM-DD``/``YYYYMMDD`` plus
+        ``NNh`` LST-hour directory when present (``YYYYMMDD_LST{HH}h``, else
+        ``YYYYMMDD_000000``); no ``DATE-OBS`` fallback. Directory mode also overrides
+        basename time when ``group_metadata_source`` is ``"filename"``.
     group_metadata_source
         ``"fits"`` (default): read FITS headers (and filename fallbacks) via
-        :func:`_extract_group_metadata`. ``"filename"``: derive time and frequency for
-        grouping **only** from the basename (no FITS I/O); requires ``-image-`` time and
-        ``_NNNMHz_`` / ``_NNNMHz-`` tokens when you need frequency-based bins. ``time_key_source``
-        is ignored in ``"filename"`` mode.
+        :func:`_extract_group_metadata`. ``"filename"``: derive time/frequency
+        grouping keys from the basename (or directory when
+        ``time_key_source="directory"``), while still reading each image HDU
+        once to cache beam/LM keywords for convert and the discovery sidecar.
     filename_convention
         ``"image"`` (default): standard OVRO ``-image-YYYYMMDD_HHMMSS`` and ``_NNNMHz_``
         basename patterns. ``"lst-color"``: LST color-band products
@@ -3198,115 +5165,17 @@ def _discover_groups(
     Dict[str, List[Path]]
         Dictionary mapping time keys to lists of FITS file paths.
     """
-    if freq_bin_hz <= 0.0:
-        msg = f"freq_bin_hz must be positive, got {freq_bin_hz}"
-        raise ValueError(msg)
-    if filename_convention == "lst-color" and group_metadata_source == "filename":
-        msg = (
-            '"lst-color" grouping requires FITS header reads for subband frequency; '
-            'use group_metadata_source="fits".'
-        )
-        raise ValueError(msg)
-
-    by_time: Dict[str, List[Path]] = {}
-    by_time_freq: Dict[str, Dict[int, List[Path]]] = {}
-    for f in sorted(in_dir.glob("*.fits")):
-        time_key, frequency_hz, notes = _extract_group_metadata_for_discovery(
-            f,
-            filename_convention=filename_convention,
-            group_metadata_source=group_metadata_source,
-            time_key_source=time_key_source,
-        )
-        if time_key is None:
-            if filename_convention == "lst-color":
-                t_hint = "_YYYYMMDD_LSTNNh_tXXXX in basename (lst-color grouping)"
-            elif group_metadata_source == "filename":
-                t_hint = "-image-YYYYMMDD_HHMMSS in basename (filename-only grouping; no header fallback)"
-            elif time_key_source == "filename":
-                t_hint = "-image-YYYYMMDD_HHMMSS in basename or DATE-OBS"
-            else:
-                t_hint = "DATE-OBS"
-            logger.warning(f"Skipping {f.name}: missing usable observation time ({t_hint}).")
-            continue
-        if frequency_hz is None:
-            logger.warning(
-                f"Could not determine frequency for {f.name}; duplicate detection disabled for this file."
-            )
-            by_time.setdefault(time_key, []).append(f)
-            continue
-
-        freq_key = int(round(frequency_hz / freq_bin_hz))
-        time_freq_map = by_time_freq.setdefault(time_key, {})
-        candidates = time_freq_map.setdefault(freq_key, [])
-        candidates.append(f)
-
-        if len(candidates) > 1:
-            duplicate_names = [p.name for p in candidates]
-            if duplicate_resolver is None:
-                # Same time + same binned subband: stacking would be wrong; keep the first
-                # file and drop the rest (typical: symlink pairs or header jitter in Hz).
-                kept = candidates[0]
-                logger.warning(
-                    "Multiple FITS share time=%s and the same %g Hz frequency bin "
-                    "(binned key=%s, ~%.3f MHz): %s. Using only %s. "
-                    "Remove extras or pass duplicate_resolver to select a file.",
-                    time_key,
-                    freq_bin_hz,
-                    freq_key,
-                    frequency_hz / 1e6,
-                    duplicate_names,
-                    kept.name,
-                )
-                time_freq_map[freq_key] = [kept]
-                continue
-
-            if group_metadata_source == "filename":
-                _, rep_hz, _ = _extract_group_metadata_filename_only(candidates[0])
-            else:
-                _, rep_hz, _ = _extract_group_metadata_for_discovery(
-                    candidates[0],
-                    filename_convention=filename_convention,
-                    group_metadata_source=group_metadata_source,
-                    time_key_source=time_key_source,
-                )
-            resolver_hz = float(rep_hz) if rep_hz is not None else float(freq_key) * freq_bin_hz
-            selected = duplicate_resolver(time_key, resolver_hz, candidates.copy())
-            if selected not in candidates:
-                msg = (
-                    f"Duplicate resolver returned unknown file {selected} for "
-                    f"time={time_key}, frequency_hz={resolver_hz}."
-                )
-                raise RuntimeError(msg)
-
-            by_time.setdefault(time_key, [])
-            by_time[time_key] = [p for p in by_time[time_key] if p not in candidates]
-            by_time[time_key].append(selected)
-            # Replace the pending duplicate bucket so the next file with this (time, freq)
-            # starts from the chosen file only. Otherwise `candidates` never shrinks and
-            # grows as [f1, f2, f3, ...], re-invoking the resolver with stale paths and
-            # widening the filter that strips `by_time[time_key]`.
-            time_freq_map[freq_key] = [selected]
-            logger.warning(
-                "Duplicate FITS files for time=%s, frequency_hz=%.1f. Selected: %s. Candidates: %s",
-                time_key,
-                resolver_hz,
-                selected.name,
-                duplicate_names,
-            )
-            continue
-
-        if notes:
-            logger.warning(f"Using fallback metadata for {f.name}: {', '.join(notes)}")
-        by_time.setdefault(time_key, []).append(f)
-
-    sort_key = lambda p: _discovery_frequency_sort_tuple(
-        p,
+    return _discover_groups_from_files(
+        sorted(in_dir.glob("*.fits")),
+        duplicate_resolver,
+        freq_bin_hz=freq_bin_hz,
+        time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        time_key_tolerance_sec=time_key_tolerance_sec,
+        discovery_metadata_out=discovery_metadata_out,
+        cache_ingest_headers=cache_ingest_headers,
     )
-    for time_key, files in by_time.items():
-        by_time[time_key] = sorted(files, key=sort_key)
-    return by_time
 
 
 def _combine_time_step(
@@ -3430,6 +5299,8 @@ def _combine_time_step(
                 )
             xds_list[i] = _regrid_to_reference_lm(xds, ref_ds, source_label=str(fixed_paths[i]))
 
+        xds_list = _stack_polarization_slices_per_frequency(xds_list, fixed_paths)
+
         try:
             xds_t = xr.combine_by_coords(
                 xds_list,
@@ -3466,7 +5337,14 @@ def _combine_time_step(
             xds_t[v].encoding = {}
 
         xds_t = _harmonize_celestial_coords_independent_of_frequency(xds_t)
-        xds_t = _collapse_wcs_header_str_variable(xds_t)
+        xds_t = _expand_fits_header_str_to_data_dims(xds_t)
+        xds_t = _ensure_polarization_coord(xds_t, fixed_paths)
+        xds_t = _canonicalize_polarization_coord(xds_t)
+        if "polarization" in xds_t.coords:
+            logger.info(
+                "  polarization Stokes: %s",
+                _format_stokes_coord(np.asarray(xds_t["polarization"].values)),
+            )
 
         xds_t = _rechunk_lm_for_zarr(xds_t, chunk_lm)
 
@@ -3696,7 +5574,16 @@ def _align_time_dimension_for_zarr_write(
             if "frequency" in da.dims and "time" not in da.dims:
                 target_dims_by_name[name] = ("time", *tuple(da.dims))
             elif da.dims == ():
-                target_dims_by_name[name] = ("time",)
+                if name == "fits_header_str":
+                    freq_dims = ("frequency", "polarization")
+                    if all(d in ds.dims for d in freq_dims):
+                        target_dims_by_name[name] = ("time", *freq_dims)
+                    elif "frequency" in ds.dims:
+                        target_dims_by_name[name] = ("time", "frequency")
+                    else:
+                        target_dims_by_name[name] = ("time",)
+                else:
+                    target_dims_by_name[name] = ("time",)
 
     out = ds
     for name, target_dims in target_dims_by_name.items():
@@ -3710,7 +5597,7 @@ def _align_time_dimension_for_zarr_write(
             and "frequency" in out.coords
         ):
             da = da.expand_dims(frequency=out.coords["frequency"])
-        if target_dims == ("time",) and "frequency" in da.dims:
+        if target_dims == ("time",) and "frequency" in da.dims and name == "wcs_header_str":
             da = da.isel(frequency=0, drop=True)
         expanded = _expand_leading_time_dim(
             da, time_coord=time_coord, target_dims=target_dims
@@ -3724,7 +5611,7 @@ def _align_time_dimension_for_zarr_write(
 
 
 def _prepare_time_only_vars_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
-    """Rechunk time-only metadata (e.g. ``wcs_header_str``) for safe Zarr append.
+    """Rechunk metadata variables with a leading ``time`` axis for safe Zarr append.
 
     After many ``append_dim='time'`` writes, a store can carry
     ``encoding['chunks']=(n_time,)`` while each new slice only spans one index.
@@ -3733,14 +5620,79 @@ def _prepare_time_only_vars_for_zarr_write(xds: xr.Dataset) -> xr.Dataset:
     out = xds
     for name in list(out.data_vars):
         da = out[name]
-        if da.dims != ("time",):
+        if da.dims == ("time",):
+            prepared = da.load()
+            if hasattr(prepared.data, "rechunk"):
+                prepared = prepared.chunk({"time": 1})
+            prepared.encoding = {}
+            out = out.assign({name: prepared})
             continue
-        prepared = da.load()
-        if hasattr(prepared.data, "rechunk"):
-            prepared = prepared.chunk({"time": 1})
-        prepared.encoding = {}
-        out = out.assign({name: prepared})
+        if da.dims and da.dims[0] == "time" and len(da.dims) > 1:
+            prepared = da.load()
+            if hasattr(prepared.data, "rechunk"):
+                prepared = prepared.chunk({"time": 1})
+            prepared.encoding = {}
+            out = out.assign({name: prepared})
     return out
+
+
+def _apply_sky_dtype_policy_for_zarr_write(
+    to_write: xr.Dataset,
+    out_zarr: Path,
+    *,
+    sky_dtype: SkyDtypeMode | str,
+    is_first_write: bool,
+) -> xr.Dataset:
+    """Cast ``SKY``, sync ``fits_header_str`` BITPIX, and set audit attrs/encoding.
+
+    On append, if the store ``SKY`` dtype differs from the resolved incoming dtype,
+    cast to the store dtype and log a warning (homogeneous Zarr array dtype).
+    """
+    mode = _normalize_sky_dtype_mode(sky_dtype)
+    store_dt: np.dtype | None = None
+    if not is_first_write:
+        store_dt = _sky_dtype_from_zarr(out_zarr)
+
+    target: np.dtype | None = None
+    if store_dt is not None and "SKY" in to_write.data_vars:
+        incoming = _resolve_sky_numpy_dtype(to_write["SKY"], mode)
+        if incoming != store_dt:
+            logger.warning(
+                "SKY dtype mismatch on append to %s (store=%s, incoming resolved=%s "
+                "from mode=%s); casting incoming to store dtype.",
+                out_zarr,
+                store_dt,
+                incoming,
+                mode,
+            )
+            target = store_dt
+
+    to_write, resolved = _apply_sky_dtype(to_write, mode, target_dtype=target)
+    to_write = _sync_fits_header_str_bitpix(to_write, resolved)
+    to_write.attrs["ovro_lwa_portal_sky_dtype"] = str(resolved)
+    if "SKY" in to_write.data_vars:
+        enc = dict(to_write["SKY"].encoding)
+        enc["dtype"] = resolved.str
+        to_write["SKY"].encoding = enc
+    logger.info(
+        "SKY dtype mode=%s resolved=%s for %s to %s",
+        mode,
+        resolved,
+        "first write" if is_first_write else "append",
+        out_zarr,
+    )
+    if not is_first_write and out_zarr.exists():
+        try:
+            root = zarr.open_group(str(out_zarr), mode="a")
+            if "ovro_lwa_portal_sky_dtype" not in root.attrs:
+                root.attrs["ovro_lwa_portal_sky_dtype"] = str(resolved)
+        except Exception:
+            logger.debug(
+                "Could not refresh ovro_lwa_portal_sky_dtype on %s",
+                out_zarr,
+                exc_info=True,
+            )
+    return to_write
 
 
 def _write_or_append_zarr(
@@ -3750,6 +5702,7 @@ def _write_or_append_zarr(
     *,
     chunk_lm: int,
     overwrite_existing_time: bool = False,
+    sky_dtype: SkyDtypeMode | str = "preserve",
 ) -> None:
     """Write or append one time step to a Zarr store without re-writing existing times.
 
@@ -3757,17 +5710,38 @@ def _write_or_append_zarr(
     Append uses ``to_zarr(..., mode='a', append_dim='time')``. If the new step's
     ``time`` already exists in the store, the write is skipped unless
     *overwrite_existing_time* is True (in which case that row is replaced in-place).
+
+    ``sky_dtype`` selects the on-disk ``SKY`` floating dtype (``preserve``,
+    ``float32``, or ``float64``). On append, a mismatch with the store casts the
+    incoming step to the store dtype.
     """
     from shutil import rmtree
 
-    xds_t = _collapse_wcs_header_str_variable(xds_t)
     if first_write or not out_zarr.exists():
         to_write = _align_time_dimension_for_zarr_write(xds_t)
+        to_write = _canonicalize_polarization_coord(to_write)
+        _assert_unique_polarization_coord(to_write)
+        is_first_write = True
     else:
         with xr.open_zarr(str(out_zarr), consolidated=False) as existing:
             to_write = _align_time_dimension_for_zarr_write(xds_t, schema=existing)
+            if "polarization" in existing.dims or "polarization" in to_write.dims:
+                existing_npol = int(existing.sizes.get("polarization", 1))
+                incoming_npol = int(to_write.sizes.get("polarization", 1))
+                if existing_npol != incoming_npol:
+                    store_pol = np.asarray(existing["polarization"].values, dtype=np.float64)
+                    logger.warning(
+                        "Polarization size mismatch on append to %s (store=%d %s, "
+                        "incoming=%d); reindexing to store layout with NaN fill.",
+                        out_zarr,
+                        existing_npol,
+                        _format_stokes_coord(store_pol),
+                        incoming_npol,
+                    )
+                    to_write = _align_time_step_to_polarization_grid(to_write, store_pol)
+        is_first_write = False
 
-    _assert_nonempty_wcs_header_str_before_zarr_write(to_write)
+    _assert_nonempty_fits_header_str_before_zarr_write(to_write)
     to_write = _rechunk_lm_for_zarr(to_write, chunk_lm)
     to_write = _ensure_append_friendly_time_chunks(to_write)
     to_write = _prepare_time_only_vars_for_zarr_write(to_write)
@@ -3779,8 +5753,15 @@ def _write_or_append_zarr(
     from ovro_lwa_portal.accessor import strip_redundant_fits_wcs_header_attrs
 
     to_write = strip_redundant_fits_wcs_header_attrs(to_write)
+    to_write = _drop_ingest_only_metadata_for_zarr_write(to_write)
+    to_write = _apply_sky_dtype_policy_for_zarr_write(
+        to_write,
+        out_zarr,
+        sky_dtype=sky_dtype,
+        is_first_write=is_first_write,
+    )
 
-    if first_write or not out_zarr.exists():
+    if is_first_write:
         if out_zarr.exists():
             rmtree(out_zarr)
         to_write.to_zarr(str(out_zarr), mode="w", consolidated=False)
@@ -3873,10 +5854,12 @@ def convert_fits_dir_to_zarr(
     lm_reference_ds: Optional[xr.Dataset] = None,
     lm_reference_target_size: int | None = None,
     group_metadata_source: Literal["fits", "filename"] = "fits",
-    time_key_source: Literal["header", "filename"] = "filename",
+    time_key_source: DiscoveryTimeKeySource = "filename",
     filename_convention: DiscoveryFilenameConvention = "image",
+    time_key_tolerance_sec: float = 0.0,
     consolidate_metadata_at_end: bool = True,
     global_frequency_coord_hz: np.ndarray | None = None,
+    sky_dtype: SkyDtypeMode | str = "preserve",
 ) -> Path:
     """Convert all matching FITS in a directory into a single LM-only Zarr store.
 
@@ -3929,9 +5912,11 @@ def convert_fits_dir_to_zarr(
         and order files using only basename ``-image-`` time and ``_NNNMHz_`` tokens,
         avoiding ``fits.getheader`` during discovery and frequency sorting.
     time_key_source
-        Used when ``group_metadata_source`` is ``"fits"``. ``"filename"`` (default):
-        prefer ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS``.
-        ``"header"``: use ``DATE-OBS`` only.
+        How to choose the observation time key. ``"filename"`` (default): prefer
+        ``-image-YYYYMMDD_HHMMSS`` in the basename, else ``DATE-OBS`` (when reading
+        FITS). ``"header"``: use ``DATE-OBS`` only. ``"directory"``: nearest parent
+        directories ``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST hour when present
+        (``YYYYMMDD_LST{HH}h``, else ``YYYYMMDD_000000``).
     consolidate_metadata_at_end
         When True (default), write a consolidated ``.zmetadata`` file after all
         pending time steps in this run are written (or when resume finds nothing
@@ -3942,6 +5927,13 @@ def convert_fits_dir_to_zarr(
         on the first write instead of inferring it only from FITS discovered in
         *input_dir*. Use when converting one time group at a time but the axis
         must reflect all subbands across the full observation set.
+    sky_dtype
+        On-disk ``SKY`` floating dtype policy: ``"preserve"`` (default) reads
+        input FITS ``BITPIX`` and uses that float kind (``-32``→float32,
+        ``-64``→float64; scaled integer BITPIX→float32) for combine/regrid cast
+        and Zarr write; ``"float32"`` / ``"float64"`` force that cast. On append,
+        a mismatch with the existing store casts the incoming step to the store
+        dtype.
     resume
         When True (default) and *rebuild* is False, skip time keys already present in
         an existing output Zarr via :func:`_filter_completed_time_keys`. Set False to
@@ -4005,7 +5997,11 @@ def convert_fits_dir_to_zarr(
     if lm_reference_target_size is not None and int(lm_reference_target_size) <= 0:
         msg = f"lm_reference_target_size must be positive, got {lm_reference_target_size}"
         raise ValueError(msg)
+    sky_dtype_mode = _normalize_sky_dtype_mode(sky_dtype)
 
+    discovery_metadata: Dict[Path, _DiscoveryFileMetadata] = {}
+    if progress_callback is not None:
+        progress_callback("setup", 0, 4, "Discovering FITS groups…")
     by_time = _discover_groups(
         input_dir,
         duplicate_resolver=duplicate_resolver,
@@ -4013,6 +6009,8 @@ def convert_fits_dir_to_zarr(
         time_key_source=time_key_source,
         group_metadata_source=group_metadata_source,
         filename_convention=filename_convention,
+        time_key_tolerance_sec=time_key_tolerance_sec,
+        discovery_metadata_out=discovery_metadata,
     )
     if time_keys_only is not None:
         allowed = {str(k) for k in time_keys_only}
@@ -4024,14 +6022,24 @@ def convert_fits_dir_to_zarr(
                 input_dir,
                 ", ".join(sorted(missing)),
             )
-    by_time = _filter_invalid_beam_files(by_time)
+    by_time = _filter_invalid_beam_files(by_time, discovery_metadata=discovery_metadata)
     if filename_convention == "lst-color":
         by_time = _filter_lst_color_groups_with_mismatched_header_times(by_time)
     total_files = sum(len(v) for v in by_time.values())
     logger.info(f"Discovered {total_files} FITS across {len(by_time)} time step(s).")
+
+    if progress_callback is not None:
+        progress_callback(
+            "setup",
+            1,
+            4,
+            f"Discovered {total_files} file(s) in {len(by_time)} time step(s)",
+        )
     for k, v in by_time.items():
         freqs_hz = [
-            _extract_group_metadata_for_discovery(
+            discovery_metadata[p.resolve()].frequency_hz
+            if p.resolve() in discovery_metadata
+            else _extract_group_metadata_for_discovery(
                 p,
                 filename_convention=filename_convention,
                 group_metadata_source=group_metadata_source,
@@ -4051,7 +6059,11 @@ def convert_fits_dir_to_zarr(
 
     if resume and not rebuild:
         by_time = _filter_completed_time_keys(
-            by_time, out_zarr, rebuild=False, context="convert"
+            by_time,
+            out_zarr,
+            rebuild=False,
+            context="convert",
+            time_key_source=time_key_source,
         )
         if not by_time:
             logger.info(
@@ -4062,6 +6074,23 @@ def convert_fits_dir_to_zarr(
             if consolidate_metadata_at_end:
                 _consolidate_zarr_metadata(out_zarr)
             return out_zarr
+
+    # Resolve BITPIX only for times that will be written. A resume that finds
+    # every key already present returns above and must not open source FITS.
+    if sky_dtype_mode == "preserve":
+        all_paths = [fp for files in by_time.values() for fp in files]
+        fits_dt = _resolve_preserve_sky_dtype_from_fits_paths(all_paths)
+        sky_dtype_mode = _sky_dtype_mode_from_numpy(fits_dt)
+        logger.info(
+            "SKY dtype mode: preserve → %s (from input FITS BITPIX; "
+            "append casts to store dtype on mismatch)",
+            sky_dtype_mode,
+        )
+    else:
+        logger.info(
+            "SKY dtype mode: %s (resolved per write; append casts to store dtype on mismatch)",
+            sky_dtype_mode,
+        )
 
     if _zarr_store_exists(out_zarr) and not rebuild:
         freq_coord_hz = _frequency_coord_hz_from_zarr(out_zarr)
@@ -4089,6 +6118,13 @@ def convert_fits_dir_to_zarr(
             float(np.min(freq_coord_hz)) / 1e6,
             float(np.max(freq_coord_hz)) / 1e6,
         )
+    if progress_callback is not None:
+        progress_callback(
+            "setup",
+            2,
+            4,
+            f"Frequency axis ready ({int(freq_coord_hz.size)} channel(s))",
+        )
 
     if lm_reference_ds is not None:
         lm_ref_ds = lm_reference_ds
@@ -4105,14 +6141,26 @@ def convert_fits_dir_to_zarr(
             group_metadata_source=group_metadata_source,
             filename_convention=filename_convention,
         )
+    if progress_callback is not None:
+        progress_callback("setup", 3, 4, "Global LM reference grid ready")
     lm_reference = (lm_ref_ds["l"].values.copy(), lm_ref_ds["m"].values.copy())
 
     # Decide whether we write a fresh store or append to an existing one
     first_write = not (out_zarr.exists() and not rebuild)
 
     total_time_steps = len(by_time)
+    if progress_callback is not None and total_time_steps:
+        progress_callback("setup", 4, 4, "Starting time-step conversion")
     for idx, tkey in enumerate(sorted(by_time.keys())):
         files = by_time[tkey]
+
+        if progress_callback is not None:
+            progress_callback(
+                "converting",
+                idx,
+                total_time_steps,
+                f"Converting time {idx + 1}/{total_time_steps}: {tkey}",
+            )
 
         logger.info(f"[read/combine] time {tkey}")
         xds_t, freqs, created_fixed_paths = _combine_time_step(
@@ -4125,6 +6173,35 @@ def convert_fits_dir_to_zarr(
             filename_convention=filename_convention,
         )
         xds_t = _align_time_step_to_frequency_grid(xds_t, freq_coord_hz)
+        if not first_write and out_zarr.exists():
+            store_pol = _polarization_coord_from_zarr(out_zarr)
+            if "polarization" in xds_t.coords:
+                incoming_pol = _polarization_coord_values_float64(xds_t["polarization"].values)
+            else:
+                incoming_pol = np.asarray([1.0], dtype=np.float64)
+            if incoming_pol.size != store_pol.size or not np.allclose(
+                incoming_pol, store_pol, rtol=0.0, atol=0.0, equal_nan=True
+            ):
+                logger.warning(
+                    "Polarization layout mismatch for time %s: store has %s (%d plane(s)), "
+                    "incoming step has %s (%d plane(s)); reindexing with NaN fill for missing "
+                    "Stokes (same as missing frequency subbands).",
+                    tkey,
+                    _format_stokes_coord(store_pol),
+                    int(store_pol.size),
+                    _format_stokes_coord(incoming_pol),
+                    int(incoming_pol.size),
+                )
+            xds_t = _align_time_step_to_polarization_grid(xds_t, store_pol)
+        if time_key_source == "directory":
+            # LOO coadds share DATE-OBS across nights; stamp Zarr time from the
+            # directory discovery key so each night+LST appends as a distinct row.
+            xds_t = _assign_time_coord_from_discovery_key(xds_t, tkey)
+            logger.info(
+                "  stamped time coord from directory key %s → MJD %.8f",
+                tkey,
+                float(np.asarray(xds_t["time"].values).ravel()[0]),
+            )
         logger.info(f"  combined dims: {dict(xds_t.sizes)}")
         logger.info(f"  combined freqs (Hz): {freqs[:8]}{' ...' if len(freqs) > 8 else ''}")
 
@@ -4133,7 +6210,13 @@ def convert_fits_dir_to_zarr(
         logger.info("  l/m grid matches global reference")
 
         logger.info(f"[{'write new' if first_write else 'append'}] {out_zarr}")
-        _write_or_append_zarr(xds_t, out_zarr, first_write=first_write, chunk_lm=chunk_lm)
+        _write_or_append_zarr(
+            xds_t,
+            out_zarr,
+            first_write=first_write,
+            chunk_lm=chunk_lm,
+            sky_dtype=sky_dtype_mode,
+        )
         first_write = False
         if cleanup_fixed_fits and fix_headers_on_demand and created_fixed_paths:
             removed = 0
@@ -4151,7 +6234,7 @@ def convert_fits_dir_to_zarr(
                 "converting",
                 idx + 1,
                 total_time_steps,
-                f"Completed time step {idx + 1}/{total_time_steps}"
+                f"Completed time {idx + 1}/{total_time_steps}: {tkey}",
             )
 
     logger.info(f"[done] All times appended into: {out_zarr}")

@@ -256,7 +256,7 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 │   ├── README.md              # Documentation for notebooks directory
 │   ├── fits2zarr.ipynb        # Main FITS to Zarr conversion notebook
 │   ├── fits2zarr_and_viz_user_cases.ipynb  # User case examples with visualization
-│   ├── source_review.ipynb    # LPT source review; per-time WCS + SkyWidget
+│   ├── source_review.ipynb    # LPT source review; per-time WCS + SkyWidget (canonical Panel comm)
 │   └── test_fits_files/       # Sample FITS files for testing
 │       ├── README.md          # Documentation for test FITS files
 │       └── .gitignore         # Ignores FITS files (downloaded separately)
@@ -277,13 +277,17 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
 │       ├── __init__.py        # Package initialization
 │       ├── version.py         # Auto-generated version from VCS
 │       ├── accessor.py        # Radport accessor; per-time WCS helpers
-│       ├── io.py              # open_dataset, Zarr validation
+│       ├── fov_overlay.py     # Source Review FOV cutout + pan/zoom session
+│       ├── dynspec_fill.py    # Progressive dynamic_spectrum chunk fill
+│       ├── zarr_direct.py     # Direct on-disk chunk reads behind SKY
+│       ├── io.py              # open_dataset, Zarr validation, cap_lm_chunks
 │       ├── fits_to_zarr_xradio.py  # Core FITS to Zarr conversion logic
 │       ├── ingest/            # Ingest subpackage
 │       │   ├── __init__.py    # Ingest package exports
 │       │   ├── README.md      # Ingest module documentation
 │       │   ├── core.py        # Framework-independent conversion orchestration
 │       │   ├── cli.py         # Typer-based CLI interface (ovro-ingest command)
+│       │   ├── rechunk.py     # Rewrite a finished store to the review layout
 │       │   └── prefect_workflow.py  # Optional Prefect workflow orchestration
 │       └── viz/               # Panel QA apps, SkyWidget integration
 │           ├── pipeline_qa.py      # FITS→Zarr QA pipeline, load_qa_datasets
@@ -296,9 +300,13 @@ This project uses **Hatchling** with **hatch-vcs** for building Python packages:
     ├── __init__.py            # Test package initialization
     ├── test_import.py         # Basic import tests
     ├── test_fits_to_zarr.py   # FITS to Zarr conversion tests
+    ├── test_fov_overlay.py    # FOV cutout, phase-center push, fade
+    ├── test_dynspec_fill.py   # Tracked-pixel chunk reads
+    ├── test_zarr_direct.py    # Direct Zarr reads vs xarray parity
     ├── test_ci_helpers.py     # Tests for CI helper scripts
     ├── ingest/                # Ingest module tests
-    │   └── test_cli.py        # CLI integration tests
+    │   ├── test_cli.py        # CLI integration tests
+    │   └── test_rechunk.py    # ovro-ingest rechunk
     └── viz/                   # Viz / pipeline QA tests
         ├── panel_ui_testkit.py        # PanelUITestHarness, QueuedIOLoop
         ├── test_panel_ui_session.py   # PanelUISession + harness
@@ -320,7 +328,20 @@ capabilities:
 - **Commands**:
   - `ovro-ingest convert` - Convert FITS to Zarr
   - `ovro-ingest fix-headers` - Pre-process FITS headers
+  - `ovro-ingest rechunk SOURCE DEST` - Copy a finished store with image cubes
+    rechunked to the review layout (default `(32, all freq, 1, 128, 128)`)
   - `ovro-ingest version` - Show version info
+
+### Review layout (default for stores used in Source Review)
+
+Incremental ingest writes `time: 1` chunks; keep it that way (each append is one
+time step). After ingest finishes, run `ovro-ingest rechunk` once. It rewrites
+only `(time, frequency, polarization, l, m)` arrays (`SKY`), copies everything
+else file-for-file, builds `<dest>.partial`, compares random pixel spectra
+against the source, then renames. On the 264 GB coadd store it took ~5 min
+(`/fast/claw/IV_1hMHz_Taper_shflux_coadd_R2.zarr`, 282.7 GB). `open_dataset`
+does not warn on this layout even though `l`/`m` chunks are 128, because each
+chunk spans 32 times × all frequencies.
 
 ### Core Architecture
 
@@ -368,16 +389,53 @@ a single header from time 0 or from static dataset attrs.
   **preserves native `CRVAL1`/`CRVAL2`** (and `LATPOLE` when present). Also
   applies BSCALE/BZERO, Stokes-axis promotion, and spectral/frame keywords. **Do
   not** overwrite the phase center from filename timestamps.
-- **Combine** (`_load_for_combine`, `_combine_time_step`): each time step gets
-  its own header string from the fixed FITS WCS;
-  `_collapse_wcs_header_str_variable` reduces auxiliary frequency dimensions so
-  the persisted variable is **`wcs_header_str(time)`** (or `(time, frequency)`
-  with one channel—see accessor handling). Regrid uses the reference LM pixel
-  grid but keeps each source's native `CRVAL1`/`CRVAL2`
-  (`_wcs_header_from_ref_grid_and_source_crval`).
+- **Combine** (`_load_for_combine`, `_combine_time_step`): after regrid, each
+  `(time, frequency, polarization)` slice gets a pixel-faithful full primary
+  header in **`fits_header_str`** (not collapsed across frequency). Regrid uses
+  the reference LM pixel grid but keeps each source's native `CRVAL1`/`CRVAL2`
+  (`_wcs_header_from_ref_grid_and_source_crval` →
+  `_fits_header_bytes_for_slice`).
 - **Zarr append** (`_align_time_dimension_for_zarr_write`): scalar metadata is
-  promoted to `(time,)` so incremental appends stay consistent.
+  promoted to `(time, frequency, polarization)` so incremental appends stay
+  consistent. **`wcs_header_str` is not written** to new ingests (in-memory only
+  during combine).
+- **Frequency reindex** (`_align_time_step_to_frequency_grid`): when a time step
+  is aligned onto the store's full frequency grid, **missing subbands** are
+  NaN-filled for float data (SKY, BEAM). Use `_reindex_fill_values()` so
+  **`fits_header_str` fills with empty bytes** (`np.bytes_(b"")`), not
+  `np.nan`—see **Missing subband placeholders** below.
 - **Do not** assume all slices share one phase center.
+
+#### Missing subband placeholders in `fits_header_str` (do not regress)
+
+Incremental ingest reindexes each time step onto the store's fixed `frequency`
+axis. Slots with no input subband are **empty cells** (all-NaN SKY / BEAM and
+empty header).
+
+| On-disk `fits_header_str` payload | Cause                                                | Read behavior                                     |
+| --------------------------------- | ---------------------------------------------------- | ------------------------------------------------- |
+| `np.bytes_(b"")`                  | Current ingest (`_reindex_fill_values`)              | Empty → skip time step in WCS track               |
+| `np.nan`, `"nan"`, `b"nan"`       | Legacy reindex used `fill_value=np.nan` for all vars | **Sanitize to empty** — never `Header.fromstring` |
+
+**Why this matters:** `str(np.nan)` and UTF-8 decode of placeholder bytes become
+the literal FITS card `nan`. Astropy warns (`invalid header keyword`); with
+`warnings.filterwarnings("error")`, **Generate heatmap** in `source_review`
+fails even though SKY at that cell is already NaN.
+
+**Enforcement:**
+
+- **Ingest:** `_reindex_fill_values()` — `fits_header_str` → `np.bytes_(b"")`;
+  test `test_reindex_time_step_preserves_empty_fits_header_str_fill`.
+- **Read:** `_decode_wcs_header_bytes()` → `_sanitize_decoded_header_text()` /
+  `_is_nan_like_header_text()` on **all** branches (float NaN, `str`,
+  **bytes**). `_parse_sin_celestial_keywords` and `_world2pix_from_header_str`
+  guard at entry. Empty headers → `header_valid[ti]=False` in pixel track (gray
+  heatmap cell), not an exception.
+- **FITS export:** `_read_fits_header_str` still **raises** on empty slots —
+  export only populated `(time, frequency, polarization)` cells.
+
+Legacy stores with on-disk `b"nan"` headers do **not** require re-ingest once
+read guards are in place; re-ingest optional for cleaner on-disk metadata.
 
 #### Filename timestamps vs WCS (do not confuse)
 
@@ -390,11 +448,11 @@ The FITS header `CRVAL1`/`CRVAL2` are **authoritative** for each integration's
 phase center. Filename time tokens are for **sorting files into time bins
 only**—not for recomputing celestial reference values.
 
-Per-time `wcs_header_str` drift in a Zarr store should match the native FITS
-headers written through `_fix_headers`, not a recomputed zenith from the
-basename. `_zenith_fk5_crvals_deg()` remains in the codebase for **audit
-diagnostics only** (`scripts/audit_zarr_wcs_timeline.py --sample-fits`); it is
-**not** called during convert.
+Per-time `fits_header_str` drift in a Zarr store should match the pixel-faithful
+headers captured after regrid (before celestial harmonization), not a recomputed
+zenith from the basename. `_zenith_fk5_crvals_deg()` remains in the codebase for
+**audit diagnostics only** (`scripts/audit_zarr_wcs_timeline.py --sample-fits`);
+it is **not** called during convert.
 
 **If you change `_fix_headers`:** extend
 `tests/test_fits_to_zarr.py::test_fix_headers_preserves_crval_from_input_not_filename`
@@ -403,13 +461,14 @@ separate from WCS stamping.
 
 #### Canonical Zarr metadata (do not regress)
 
-When **`wcs_header_str`** is a data variable, it is the **only** persisted
-celestial WCS for multi-time stores:
+When **`fits_header_str`** is a data variable, it is the **only** persisted
+metadata array for multi-time stores:
 
-| Storage                                                                  | Allowed?                  | Notes                                                                                                                                                                               |
-| ------------------------------------------------------------------------ | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `wcs_header_str(time)` (or `(time, frequency)` collapsed to time)        | **Yes**                   | One FITS header string per time step; updates on every append.                                                                                                                      |
-| `fits_wcs_header` on `ds.attrs`, `SKY.attrs`, other data vars, or coords | **No** on Zarr write/open | Zarr array attrs are **not** per-slice; a single `SKY.attrs["fits_wcs_header"]` freezes **time-0** CRVAL and breaks SkyWidget or any code that reads attrs before `wcs_header_str`. |
+| Storage                                                                  | Allowed?                  | Notes                                                                                                     |
+| ------------------------------------------------------------------------ | ------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `fits_header_str(time, frequency, polarization)`                         | **Yes**                   | Full primary HDU header per slice (pixel-faithful after regrid).                                          |
+| `wcs_header_str` on new ingests                                          | **No**                    | Legacy only; portal WCS is derived in memory from `fits_header_str`.                                      |
+| `fits_wcs_header` on `ds.attrs`, `SKY.attrs`, other data vars, or coords | **No** on Zarr write/open | Zarr array attrs are **not** per-slice; a single `SKY.attrs["fits_wcs_header"]` freezes **time-0** CRVAL. |
 
 **Enforcement (already in the library — keep these calls when touching I/O):**
 
@@ -423,34 +482,38 @@ celestial WCS for multi-time stores:
 
 `_load_for_combine` may still set `fits_wcs_header` **in memory** for
 combine/regrid; that is internal only. **Never** rely on those attrs after Zarr
-export—always `wcs_header_str` + `_read_wcs_header_str(ds, time_idx=…)`.
+export—always `fits_header_str` + `_read_fits_header_str` /
+`_read_wcs_header_str(ds, time_idx=…)` (celestial subset derived in memory).
 
 **If you change ingest or I/O:** extend
-`tests/test_fits_to_zarr.py::test_write_or_append_omits_fits_wcs_header_when_wcs_header_str_present`
-and
-`tests/test_io_integration.py::test_open_dataset_strips_stale_fits_wcs_header_with_wcs_header_str`.
-Do **not** re-add `fits_wcs_header` to Zarr `.zattrs` for QA/review paths.
+`tests/test_fits_to_zarr.py::test_write_or_append_omits_fits_wcs_header_when_fits_header_str_present`
+and `test_new_ingest_omits_wcs_header_str_from_zarr`. Do **not** re-add
+`fits_wcs_header` to Zarr `.zattrs` for QA/review paths.
 
 ### How WCS is read (accessor)
 
 Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
 
-| Function                                    | Role                                                                                                           |
-| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `_has_per_time_wcs_header_str(ds)`          | True when `wcs_header_str` is indexed by `time` (1-D or `(time, frequency)`)                                   |
-| `_read_wcs_header_str(ds, time_idx=…)`      | FITS header string for one time index                                                                          |
-| `strip_redundant_fits_wcs_header_attrs(ds)` | Drop static `fits_wcs_header` attrs when `wcs_header_str` is canonical (used by `open_dataset` and Zarr write) |
-| `RadportAccessor._get_wcs(time_idx=…)`      | Astropy WCS for pixel↔sky mapping                                                                             |
-| `pixel_to_coords` / `coords_to_pixel`       | Must pass `time_idx` when per-time WCS exists                                                                  |
+| Function                                                 | Role                                                                                                             |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `_has_fits_header_str(ds)`                               | True when `fits_header_str` is present                                                                           |
+| `_has_per_time_wcs_header_str(ds)`                       | True when `fits_header_str` or legacy `wcs_header_str` is indexed by `time`                                      |
+| `_decode_wcs_header_bytes(raw)`                          | Decode Zarr scalar to str; NaN / `"nan"` / `b"nan"` → `""`                                                       |
+| `_read_fits_header_str(ds, time_idx, freq_idx, pol_idx)` | Full FITS primary header string for one slice (export)                                                           |
+| `_read_wcs_header_str(ds, time_idx=…)`                   | Celestial subset derived from `fits_header_str` (default `freq_idx=0`)                                           |
+| `strip_redundant_fits_wcs_header_attrs(ds)`              | Drop static `fits_wcs_header` attrs when per-slice headers are canonical (used by `open_dataset` and Zarr write) |
+| `RadportAccessor._get_wcs(time_idx=…)`                   | Astropy WCS for pixel↔sky mapping (`_wcs_cache` keyed by `(time_idx, freq_idx)`)                                |
+| `pixel_to_coords` / `coords_to_pixel`                    | Must pass `time_idx` when per-time WCS exists                                                                    |
 
 **Strict rules (do not break these):**
 
-1. When per-time `wcs_header_str` exists, **always** select `time_idx` (and
-   `frequency=0` if the variable is 2-D). Never use static `fits_wcs_header`
-   attrs for a different time index.
-2. If a per-time header entry is **empty**, return `None`—**do not** fall back
-   to time-0 or static attrs (that mis-registers late slices and freezes
-   `CRVAL1`).
+1. When per-time `fits_header_str` exists, **always** select `time_idx` (and
+   `freq_idx` / `pol` when exporting a specific slice). Never use static
+   `fits_wcs_header` attrs for a different time index.
+2. If a per-time header entry is **empty or a NaN placeholder**, return
+   `None`—**do not** fall back to time-0 or static attrs (that mis-registers
+   late slices and freezes `CRVAL1`). Pixel tracking marks those time steps not
+   visible (NaN heatmap cells); do not call `Header.fromstring` on `"nan"`.
 3. Tests live in `tests/test_accessor.py`
    (`TestRadportGetWcsTimePromotedHeader`); extend them when changing WCS
    lookup.
@@ -458,10 +521,36 @@ Canonical helpers in `src/ovro_lwa_portal/accessor.py`:
    raw `xr.open_zarr` alone) so stale on-disk `fits_wcs_header` attrs are
    stripped.
 5. For review notebooks (`jupiter_flux_review.ipynb`, `source_review.ipynb`),
-   prefer `open_dataset(path, chunks="auto").chunk({"l": 512, "m": 512})`. Avoid
-   an extra `ds.chunk({"time": 1, …})` under an active distributed Dask `Client`
-   on large incremental stores (unnecessary rechunk/shuffle); Jupiter-style
-   review works without a `Client` for SkyWidget + tracked extractions.
+   open with `cap_lm_chunks(open_dataset(path, chunks={}), 512)`: native chunks,
+   split `l`/`m` only where on-disk chunks are coarser than 512. **Do not**
+   blanket `.chunk({"l": 512, "m": 512})` — on 391-px chunks it took ~23 s at
+   open and made the spectrum ~5× slower. Avoid an extra
+   `ds.chunk({"time": 1, …})` under an active distributed Dask `Client` on large
+   incremental stores; Jupiter-style review works without a `Client` for
+   SkyWidget + tracked extractions.
+
+### FITS export from Zarr (`export_fits.py`)
+
+Zarr is the consolidated archive; **`export_fits`** recovers any
+`(time, frequency, polarization)` slice as a **pixel-faithful** standalone FITS
+file for external tools (pybdsf, CASA, DS9, `ovro-ingest convert`, xradio).
+
+| API                                                         | Role                                                                       |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `build_fits_header` / `build_fits_hdu` / `write_fits_slice` | One 4D singleton-axis `PrimaryHDU` per call (`NAXIS=4`, `NAXIS3=NAXIS4=1`) |
+| `ds.radport.build_fits_hdu(...)`                            | Accessor wrapper                                                           |
+| `ds.radport.export_fits(output_dir, ...)`                   | Batch writer; default `image_t{time}_f{freq_mhz}MHz_s{stokes}.fits`        |
+
+**Export rules:**
+
+- Metadata from `fits_header_str` + live `frequency` / `polarization` coords for
+  `CRVAL3` / `CRVAL4`; `SKY` pixels only (`BEAM` not exported as a data var).
+- Combined I+V Zarr → **two** FITS files (`pol_idx=0`, `pol_idx=1`), not one
+  multi-Stokes cube.
+- Legacy stores without `fits_header_str` → `ValueError` (re-ingest required).
+- Do **not** export multi-frequency or multi-time cubes in one FITS file.
+
+Tests: `tests/test_export_fits.py` (round-trip FITS→Zarr→FITS→Zarr).
 
 ### Fixed-sky source tracking (`dynamic_spectrum`, `patch_*`, `light_curve`)
 
@@ -524,23 +613,27 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
    `crval`/`cdelt`/`crpix` traits match each slice.
 2. **Load the cube** with `bind_sky_widget_dataset(widget, ds, max_size=…)`
    (defer first frame) or `set_dataset(..., defer_display=True)` after
-   `_patch_astrowidget_get_wcs()`. `source_review.ipynb` uses
-   `bind_sky_widget_dataset`; call `update_slice` immediately so the first frame
-   is not zenith at t=0.
-3. **Update slices through**
+   `_patch_astrowidget_get_wcs()`. Jupiter and pipeline QA then call
+   `update_slice` so the first frame is not zenith at t=0. Source Review binds
+   the same way, then shows a FOV cutout (`FovOverlaySession`) instead of
+   `update_slice`.
+3. **Jupiter and pipeline QA** update slices through
    `widget.update_slice(time_idx, freq_idx, center=…)`. Astrowidget refreshes
    slice WCS when `time_idx` changes (`_update_display_wcs` → patched
-   `get_wcs`). When `center=` is set (catalog/LPT), astrowidget must
-   **reproject** onto a shader grid at the view center even if the header passes
+   `get_wcs`). When `center=` is set, astrowidget must **reproject** onto a
+   shader grid at the view center even if the header passes
    `wcs_projection_matches_naive_shader`—otherwise per-time `CRVAL` drifts in
    the traits while `view_ra` stays fixed and the source appears to move in RA.
+   **Source Review does not call `update_slice`.** See **FOV-native overlay**
+   below.
 4. **View center vs phase center**:
    - **Zenith QA** (`pipeline_qa_app`): recenter with
      `sky_view_center(dataset, time_idx)` (CRVAL from per-time WCS) on time
      changes.
-   - **Catalog / LPT review** (`notebooks/source_review.ipynb`): fixed catalog
-     `center=` (like Jupiter’s fixed t₀ ephemeris), with `update_slice` on every
-     heatmap click so image and WCS traits match that `time_idx`.
+   - **Catalog / LPT review** (`notebooks/source_review.ipynb`): a heatmap tap
+     reloads the FOV cutout at the current view and does not write `view_*`.
+     **Center** writes the view and crosshair, then reloads that cutout. The
+     shader warp is at the slice phase center, not a second warp at the view.
 5. After slice updates in Jupyter, call `widget.send_state()` when available
    (see `_notify_sky_widget` in pipeline QA).
 6. **Do not transpose** the slice sent to SkyWidget:
@@ -548,7 +641,13 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
    axis 1, column = axis 2). Transposing to `(m, l)` mis-registers the overlay
    (fixed catalog targets drift in RA as `CRVAL` changes). The editable package
    is `../astrowidget` via Pixi feature `astrowidget-local`.
-7. **WebGL texture UV vs numpy `(l, m)`** — the JS shader uploads
+7. **PreloadedCube slice cache must include Stokes** —
+   `PreloadedCube._load_slice` LRU key is `(time_idx, freq_idx, pol)`.
+   `update_slice` / `image()` / `spectrum()` / `light_curve()` must pass
+   `int(self.pol)`. Omitting `pol` from the cache key made the SkyWidget overlay
+   stick on the previous Stokes after switching I ↔ V in `source_review` even
+   when the heatmap used the new Stokes.
+8. **WebGL texture UV vs numpy `(l, m)`** — the JS shader uploads
    `image_shape = (n_l, n_m)` as texture **height × width** (`n_l` rows, `n_m`
    columns). WCS `world2pix` yields `px` on axis 1 and `py` on axis 2; texture
    sampling must be **`uv = (py/n_m, px/n_l)`** (axis 2 → `u`, axis 1 → `v`).
@@ -560,6 +659,97 @@ Reference implementation: `src/ovro_lwa_portal/viz/pipeline_qa_app.py`.
 
 Data loading for QA apps follows `viz/pipeline_qa.py` → `load_qa_datasets()` →
 `ovro_lwa_portal.open_dataset(zarr_path, chunks={…})`.
+
+### FOV-native overlay (Source Review production)
+
+Production path: `notebooks/source_review.ipynb` → `viz/source_review_app.py`.
+Helpers live in `src/ovro_lwa_portal/fov_overlay.py` (`FovOverlaySession`) and
+`src/ovro_lwa_portal/dynspec_fill.py` (progressive `dynamic_spectrum` only). The
+widget upload is `SkyWidget.push_shader_frame` (no second warp). Jupiter and
+pipeline QA keep `update_slice`.
+
+The measured rehearsal is `notebooks/async_cube_slice/linked_async_ui.ipynb`
+**section F** on branch `async-test` (`fov_cutout.py`, `linked_ui.py`). Leave
+that branch as the experiment record. Do not add its **Heatmap at crosshair**
+button or rearrange the Source Review panels. Research and timings:
+`.agents/research-accessor-async-hotpath.md`,
+`.agents/plan-fov-native-async-overlay.md`. Store used for those timings:
+`/fast/claw/IV_1hMHz_Taper_shflux_coadd.zarr` (`CDELT = 0.037°`, chunks
+`(1, 2, 1, 391, 391)`). On that store an 8° request is 782² = 4 chunks (~29°)
+because `CRPIX = 1562` sits on a 391-px boundary. One chunk is 391² (~14.5°).
+
+#### Read a native cutout, project it once
+
+Workers read one spatial chunk each. The main thread projects the assembled tile
+once. No per-chunk reproject and no partial-tile paint.
+
+#### Direct chunk reads (`zarr_direct.py`)
+
+`open_dataset` records its store on `ds.encoding`. `direct_zarr_array(ds)`
+returns the on-disk `SKY` array (Stokes subset mapped) only when the variable is
+unmodified and `time`/`frequency`/`l`/`m` match the store; otherwise `None` and
+callers read through xarray. Users of it: `FovOverlaySession` (cutouts),
+`TrackedPixelReader` (Generate heatmap), and `radport.dynamic_spectrum` (fixed
+and tracked). Fill units and cutout alignment follow on-disk chunks.
+
+Two pools in `SourceReview`: `_fov_pool` runs jobs that wait (one cutout, one
+pixel track); `_read_pool` runs one task per chunk, sized by
+`read_workers(chunk_nbytes)` (4 for ≤ 4 MB, 8 for ≤ 16 MB, else 16). A job must
+not wait on tasks in its own pool.
+
+Warm timings, `scripts/bench_review_reads.py` (same pixel and track on both):
+
+| Store                                      | Open                           | 8° cutout                  | Fixed spectrum | Tracked extract |
+| ------------------------------------------ | ------------------------------ | -------------------------- | -------------- | --------------- |
+| Native `(1, 2, 1, 391, 391)`, 4 workers    | 0.27 s (old 512 recipe 23.4 s) | 1.9 ms (782², 4 chunks)    | 744 ms         | 413 ms          |
+| Review `(32, 15, 1, 128, 128)`, 16 workers | 0.02 s                         | 33 ms (512×640, 20 chunks) | 26 ms          | 184 ms          |
+
+Pixel tracking (`_compute_pixel_track`, ~2.5 s) is unchanged and dominates
+RA/Dec Generate on either layout.
+
+Warp with `reproject_for_shader_display` at the slice phase center (`CRVAL`),
+then `push_shader_frame` (`center` is not an argument; `update_view=False`).
+Passing `center=` into the old `_push_image_frame` path repeats a view-centered
+warp (~148 ms uncached at 782²). The native SIN warp (~140 ms at 782²) is paid
+once per cutout. Later zoom and pan inside that texture do not read or warp. CAR
+and HEALPix stay benchmarks. healpy stays a PyPI pin of the visualization
+feature; do not switch it to conda-forge (that pulls Astropy 8).
+
+Write `view_ra` / `view_dec` / `view_fov` only when the action is supposed to
+move the view. A heatmap `(time, freq)` change must not. Missing per-time WCS
+skips the load. Do not fall back to time 0.
+
+#### Gestures
+
+`attach_fov_pan_reload` removes the widget's full-plane view-lock reproject.
+`FovOverlaySession.on_pan` is the only gesture handler.
+
+| Gesture                                                               | Overlay                                                                                    |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Zoom, or pan whose center stays within 0.05° and whose FOV still fits | No read, no reproject, full opacity (`[pan-skip]`).                                        |
+| Pan whose center moved, or whose FOV no longer fits                   | Fade to 0.35 immediately, debounce ~0.3 s, one async read (`[pan]`), then restore opacity. |
+| Zoom around the same center, even if the corners leave the cache      | Stay bright, then one read.                                                                |
+| All-NaN read                                                          | Drop it. Keep the previous finite frame. A slice reload still restores opacity.            |
+
+Set the fade and return before the Zarr read. The read runs on the overlay pool;
+the warp and the trait write run on the `io_loop` via
+`_schedule_overlay_slice_load`. Do not wrap that read in `_dispatch` or
+`defer_dispatch`.
+
+#### One control changes one parameter
+
+| Action                                          | Changes                                                                       | Does not change                          |
+| ----------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------- |
+| Heatmap click                                   | Overlay `(time, freq)` at the current view, after a fade                      | View, FOV, spectrum values               |
+| **Generate heatmap**, method `dynamic_spectrum` | Spectrum values at the coordinate field, painted by mutation as chunks arrive | Overlay, view, selected `(time, freq)`   |
+| **Generate heatmap**, any other method          | That method via `compute_source_heatmap`, still only from this button         | The control row                          |
+| Sky click                                       | Coordinate field, from `clicked_coord`                                        | Overlay, spectrum, view center           |
+| Pan / zoom                                      | View, and a cutout only when the cache no longer covers it                    | Spectrum values, selected `(time, freq)` |
+| **Center**                                      | View, crosshair, and a cutout reload at the field                             | Spectrum, until **Generate heatmap**     |
+
+An empty coordinate field logs and returns. Do not fall back to `view_ra` /
+`view_dec`. Chunk paints use `push_bokeh_pane_mutation_to_notebook`. Progress
+lines use `_schedule_ipython_main` only.
 
 ### Panel notebook comm management (Jupyter)
 
@@ -606,6 +796,70 @@ heatmap + coord field — **not** the ipywidgets log/spinner panes). **Do not**
 use `hold_and_push` in production `SourceReview`. **Do not** copy
 `jupiter_flux_review`'s Panel HTML log or inline-class structure when they
 differ — follow `source_review_app.py` instead.
+
+#### Simpler notebooks: SkyWidget + Bokeh (see `lwa-catalog`)
+
+For notebooks that combine **SkyWidget** with a **Bokeh scatter/map** (catalog
+overlay, tap-to-focus) but **not** the full `SourceReview` app, use the
+validated pattern formerly in `metacatalog_sky_view.ipynb` (now in
+[`lwa-catalog`](https://github.com/ovro-lwa/lwa-catalog) `notebooks/`). Do
+**not** port `JupyterPanelUISession`, `schedule_when_panel_loaded`, or VBox
+placeholder mounts unless you are building another `source_review`-class app
+with the matching Panel push helpers.
+
+**Validated layout (two interactive cells, two comm tiers):**
+
+| Layer               | Embed                                                   | Comm                                | Python callbacks?          |
+| ------------------- | ------------------------------------------------------- | ----------------------------------- | -------------------------- |
+| Matplotlib overlays | `%matplotlib inline`                                    | None (static PNG)                   | N/A                        |
+| SkyWidget           | `widgets.VBox([…, sky])` or bare `sky` in **same cell** | ipywidgets / anywidget              | Yes                        |
+| Bokeh map           | `pn.extension("bokeh")` + `pn.pane.Bokeh(fig, …)`       | Panel / `@pyviz/jupyterlab_pyviz`   | Yes                        |
+| Bokeh standalone    | `bokeh.io.show(fig)`                                    | None (embedded JS snapshot)         | **No**                     |
+| BokehModel          | `jupyter_bokeh.widgets.BokehModel(fig)`                 | ipywidgets + `@bokeh/jupyter_bokeh` | Yes (when extension loads) |
+
+**Rules that stuck (do not regress):**
+
+1. **SkyWidget:** create and display in **one cell** (same pattern as
+   `flux_position_testing.ipynb`). Do **not** create `sky` in one cell and
+   `display(sky)` in another — that often yields **"model not found"**.
+2. **SkyWidget:** use native **ipywidgets** display (`widgets.VBox` or trailing
+   `sky`). Do **not** nest SkyWidget in `pn.pane.IPyWidget` for simple notebooks
+   — child swaps and deferred mounts often never reach the browser.
+3. **SkyWidget:** do **not** use `schedule_when_panel_loaded` + VBox placeholder
+   unless you also implement `source_review`-style Panel push/remount (see
+   `_mount_sky_widget` in `source_review_app.py`). Placeholder text can stick
+   forever while Bokeh/Panel comm works fine.
+4. **Bokeh:** use **`pn.pane.Bokeh`** after `pn.extension("bokeh")` for notebook
+   maps that need Python `on_event` / tap handlers. Do **not** use
+   `bokeh.io.show()` — it emits standalone HTML/JS; Bokeh logs that Python
+   callbacks cannot run.
+5. **Bokeh:** prefer Panel over `jupyter_bokeh.BokehModel` in this repo's Pixi
+   env when `@pyviz/jupyterlab_pyviz` is already enabled. `BokehModel` uses a
+   different frontend module and can fail with
+   `Failed to create view for 'BokehView' … BokehModel`.
+6. **Matplotlib:** use **`%matplotlib inline`** when SkyWidget and Panel share
+   the same notebook. Do **not** mix `%matplotlib widget` (ipympl) with
+   SkyWidget
+   - Panel in one notebook — both compete for ipywidgets comm.
+7. **Cross-cell wiring:** Bokeh tap handlers may call functions that mutate
+   `sky` defined in an earlier cell (e.g. `focus_sky_widget(coord)`), but the
+   **widget comm must be established in the cell that constructs and displays
+   `sky`**.
+
+**Practical ops notes:**
+
+- Launch with `pixi run jupyter lab` so OVRO-LWA HiPS is served at
+  `HIPS_HTTP_PREFIX` (default `/calibration/hips`; see `source_review.ipynb`
+  config).
+- When comm misbehaves on **one notebook**, use **Kernel → Restart** and **Edit
+  → Clear All Outputs** on **that file only** — you do not need a full-browser
+  hard refresh or to interrupt other notebook kernels.
+- **Clear saved widget/Panel/Bokeh outputs** before commit. Bloated `.ipynb`
+  files (multi‑MB from embedded comm state) cause stale **"model not found"**
+  after reopen and can corrupt JSON.
+- After changing viz comm code in `src/`, restart the kernel and confirm
+  `ovro_lwa_portal.__file__` points at `src/ovro_lwa_portal/` (editable
+  install).
 
 **Kernel / package path (live Jupyter):** The notebook kernel must import the
 **editable** repo (Pixi: `sys.executable` under `.pixi/envs/default/`, or
@@ -740,7 +994,10 @@ frozen (activity log often still worked via ipywidgets):
    `_republish_heatmap_figure_for_notebook` only when mutation did not reach the
    browser. Overlay load follows via `_ui.schedule`.
 7. **`_schedule_overlay_slice_load`** — overlay on heatmap tap / overlay toggle:
-   spinner on, `self._ui.schedule(_update_sky)`, spinner off in `finally`.
+   spinner on, `self._ui.schedule(_update_sky)`, spinner off in `finally` when
+   `update_slice` returns. Post-load activity log and `send_state()` are
+   **deferred** on another io_loop turn (`_post_overlay_loaded`) so the spinner
+   does not track Panel comm latency after the overlay is already visible.
 8. **`finalize_dataset_load` builds the zeros grid synchronously** — call
    `_ensure_heatmap_grid()` from the `build_heatmap_grid` step in
    `_finish_open`, not `defer_dispatch` afterward. `_apply_heatmap` sets
@@ -1030,9 +1287,17 @@ its tests first, then the notebook call site.
   (`object = None`); it must stay clickable.
 - **Generate heatmap** — resolves the field, then `_load_heatmap()`; sets
   `_heatmap_coord` (the target the _computed_ spectrum belongs to, distinct from
-  `_coord`, the current overlay center). **Method dropdown** only updates the
-  heatmap title via `_sync_heatmap_method_display()` — it does **not** recompute
-  until **Generate heatmap** is pressed.
+  `_coord`, the current overlay center). For `dynamic_spectrum` the fill is
+  progressive (`dynspec_fill`) and does **not** call `_update_sky` or move the
+  selected cell. Other methods stay on `compute_source_heatmap`. **Method
+  dropdown** only updates the heatmap title via `_sync_heatmap_method_display()`
+  — it does **not** recompute until **Generate heatmap** is pressed.
+- **Stokes (I/V)** — when the Zarr has multiple polarizations, a Stokes radio
+  toggle appears. It drives overlay, heatmap, and patch fit via `pol_idx`.
+  Switching Stokes logs a hint to press **Generate heatmap**; overlay slice
+  loads and activity-log lines include `Stokes`, `t=`, and `f=`
+  (`_slice_descriptor`). Astrowidget `PreloadedCube` must cache slices per
+  `(time_idx, freq_idx, pol)` — see **How WCS is shown** above.
 - **Fit overlay** — per-cell Gaussian patch fit at the selected heatmap
   `(time_idx, freq_idx)` via `compute_overlay_patch_fit()` /
   `dataset.radport.patch_fit_cell()`. Full-cube `patch_fit` is **not** a heatmap
@@ -1053,10 +1318,10 @@ its tests first, then the notebook call site.
 - **Heatmap cell click** loads that Zarr slice as the overlay and **turns the
   overlay on** (`_set_overlay_toggle_display(True)`), even if the user toggled
   it off. Use `_schedule_overlay_slice_load(..., preserve_view=True)` — **not**
-  `defer_dispatch`. It must **preserve pan/zoom**: `preserve_view=True` →
-  `update_slice(view_lock=True)` with **no `center` and no `fov`**
-  (`_update_sky(..., preserve_view=True)`). Passing `fov=` on every slice change
-  resets the user's zoom and reads as the view "jumping".
+  `defer_dispatch`. It must **preserve pan/zoom**: `preserve_view=True` reloads
+  the FOV cutout at the current view (`update_view=False`, no `view_*` write).
+  Do not call `update_slice`, and do not pass `center=` / `fov=` on a heatmap
+  tap — that resets the user's zoom and reads as the view jumping.
 - **Overlay toggle on** (with a coordinate set) shows the spinner and loads the
   current `time_idx`/`freq_idx` slice via `_schedule_overlay_slice_load`.
 - **Overlay toggle off** calls `widget.clear_image()`; the JS side must clear
@@ -1379,6 +1644,38 @@ platforms = ["osx-arm64", "linux-64", "win-64"]
 
 Then run `pixi install`.
 
+### Issue: `invalid header keyword` / `nan` FITS warnings on Zarr open or heatmap
+
+**Symptoms:** Astropy logs `invalid header keyword … nan` when opening a store
+or during **Generate heatmap**; with `warnings.filterwarnings("error")` the
+activity log shows `ERROR (RA, Dec): The following header keyword is invalid…`
+and the heatmap aborts.
+
+**Cause:** Legacy frequency reindex wrote `fill_value=np.nan` into
+`fits_header_str` for missing subbands. On read, placeholders become the literal
+string/card `nan` (including **`b"nan"` bytes** that bypassed an early
+string-only guard). `dynamic_spectrum` bulk-loads per-time headers for pixel
+tracking.
+
+**Solution:** Use current `accessor.py` (`_sanitize_decoded_header_text` on all
+decode paths). New ingests use `_reindex_fill_values()` (empty bytes for
+headers). Restart the Jupyter kernel after upgrading. Gray heatmap cells at
+missing subbands are expected; FITS export of those slots still requires a
+populated cell. Regression: `test_decode_wcs_header_bytes_treats_nan_as_empty`,
+`test_parse_sin_celestial_keywords_ignores_nan_placeholder`.
+
+### Issue: Overlay stays on wrong Stokes after switching I ↔ V
+
+**Symptoms:** Heatmap updates after **Generate heatmap** on Stokes V, but the
+SkyWidget overlay still shows Stokes I until a heatmap cell click.
+
+**Cause:** `PreloadedCube._load_slice` LRU cache key omitted `pol`; slice image
+was reused across Stokes.
+
+**Solution:** Use editable `../astrowidget` with `pol` in `_load_slice` cache
+key. Restart kernel after upgrading astrowidget. Press **Generate heatmap**
+after Stokes change; heatmap taps load the active Stokes.
+
 ### Issue: LPT heatmap / dynamic spectrum looks like RA drifts in time
 
 **Symptoms:** Catalog source should be fixed on the sky, but the time–frequency
@@ -1455,10 +1752,11 @@ chunks are small (e.g. 128×128).
 written before chunk-size guidance. Single `(time, freq)` overlay reads touch
 many fragments along `l`/`m`.
 
-**Solution:** Re-ingest with `ovro-ingest convert ... --chunk-lm 512` (default
-ingest uses 1024). `open_dataset()` warns when on-disk min chunk is below 512.
-Review apps still rechunk reads to 512 via `SourceReviewConfig.zarr_lm_chunk`;
-that helps Dask but cannot fully fix fragmented on-disk layout.
+**Solution:** Run `ovro-ingest rechunk SOURCE DEST` (review layout; chunks of 32
+times × all frequencies make 128-px `l`/`m` cheap), or re-ingest with
+`--chunk-lm 512` or higher. `open_dataset()` warns when on-disk `l`/`m` chunks
+are below 512 and each chunk is under 4 MB. `SourceReviewConfig.zarr_lm_chunk`
+is now an upper bound (`cap_lm_chunks`): it never splits finer on-disk chunks.
 
 ### Issue: Sky click logs coordinates but Coordinate field stays empty
 
@@ -1702,6 +2000,73 @@ Panel path broken while activity log still works.
 `_schedule_overlay_slice_load`, not `defer_dispatch`. After comm fixes, restart
 the kernel and confirm the heatmap title changes from “Heatmap loads…” before
 testing clicks.
+
+### Issue: SkyWidget shows "model not found" in a simple notebook
+
+**Symptoms:** Matplotlib or other cells run; SkyWidget cell shows **Error
+displaying widget: model not found**. A fresh cell with only `sky` fails the
+same way if `sky` was created in a different cell.
+
+**Cause:** Widget model was created in one kernel session or cell but displayed
+from another comm path; or stale widget model IDs in saved notebook outputs
+(multi‑MB `.ipynb`); or ipympl / Panel / SkyWidget comm conflict in the same
+notebook.
+
+**Solution:** Follow **Simpler notebooks: SkyWidget + Bokeh** above: create and
+display SkyWidget in **one cell** via native ipywidgets; use
+`%matplotlib inline` not `%matplotlib widget`; restart this notebook's kernel
+and **Clear All Outputs** on this file; avoid `pn.pane.IPyWidget` wrappers and
+`display(..., display_id=…)` for SkyWidget. Reference:
+[`lwa-catalog`](https://github.com/ovro-lwa/lwa-catalog)
+`notebooks/metacatalog_sky_view.ipynb`.
+
+### Issue: Bokeh tap/click does nothing in a notebook map
+
+**Symptoms:** Bokeh scatter renders; taps/clicks produce no Python-side effect
+(e.g. SkyWidget does not slew). Bokeh may log:
+
+```text
+You are generating standalone HTML/JS output, but trying to use real Python
+callbacks … This combination cannot work.
+```
+
+**Cause:** Figure embedded with **`bokeh.io.show()`** / standalone output —
+Python `on_event` handlers never reach the kernel.
+
+**Solution:** Use **`pn.extension("bokeh")`** and **`pn.pane.Bokeh(fig, …)`** as
+the cell's return value (Panel / PyViz comm). Wire
+`scatter_fig.on_event("tap", …)` before displaying the pane. Do **not** use
+`output_notebook()` + `show()` for interactive notebook maps. Reference:
+[`lwa-catalog`](https://github.com/ovro-lwa/lwa-catalog)
+`notebooks/metacatalog_sky_view.ipynb`.
+
+### Issue: `BokehModel` / `@bokeh/jupyter_bokeh` view creation fails
+
+**Symptoms:** Cell output shows a JavaScript error such as **Failed to create
+view for 'BokehView' … BokehModel** while `pn.pane.Bokeh` worked in the same
+env.
+
+**Cause:** `jupyter_bokeh.widgets.BokehModel` uses the
+**`@bokeh/jupyter_bokeh`** frontend, separate from Panel's
+**`@pyviz/jupyterlab_pyviz`** bridge. Version or session mismatches can break
+`BokehModel` even when Panel Bokeh embed works.
+
+**Solution:** Prefer **`pn.pane.Bokeh`** for notebook Bokeh maps with Python
+callbacks in this repo. Reserve `BokehModel` only if you explicitly validate
+that extension in the target JupyterLab session.
+
+### Issue: SkyWidget stuck on "loads after comm is ready" placeholder
+
+**Symptoms:** Panel/Bokeh parts of the notebook work; sky pane shows placeholder
+text forever.
+
+**Cause:** Simple notebook copied **`schedule_when_panel_loaded`** +
+`pn.pane.IPyWidget(VBox placeholder)` from `source_review` without the Panel
+push/remount path that replaces placeholder children on the browser.
+
+**Solution:** For simple SkyWidget + Bokeh notebooks, display SkyWidget via
+**native ipywidgets in one cell** — do not defer mount through Panel. Full
+deferred mount remains **`source_review` only** (see `_mount_sky_widget`).
 
 ### Issue: Radio overlay flipped or rotated relative to HiPS
 

@@ -61,7 +61,6 @@ def register_hips_panel_serve(hips_root: Path, url_prefix: str) -> None:
         logger.warning("HiPS URL prefix is empty; refusing to register Panel serve static handler")
         return
     pattern = rf"/{re.escape(rel_prefix)}/(.*)"
-        return
     for entry in toplevel_patterns:
         existing_pattern = entry[0]
         if existing_pattern == pattern:

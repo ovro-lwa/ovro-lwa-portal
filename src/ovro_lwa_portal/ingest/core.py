@@ -67,9 +67,10 @@ class ConversionConfig:
     resume : bool, optional
         If True, skip discovered FITS time steps that already exist in the output
         Zarr (when not rebuilding). Defaults to True.
-    discovery_time_key_source : {"header", "filename"}, optional
-        How to infer observation time when ``group_metadata_source`` is ``"fits"``.
-        Defaults to ``"filename"`` (basename ``-image-`` stamp, else ``DATE-OBS``).
+    discovery_time_key_source : {"header", "filename", "directory"}, optional
+        How to infer observation time. Defaults to ``"filename"`` (basename
+        ``-image-`` stamp, else ``DATE-OBS``). ``"directory"`` uses a parent
+        directories ``YYYY-MM-DD``/``YYYYMMDD`` plus ``NNh`` LST hour when present.
     lm_reference_target_size : int | None, optional
         When building the global LM reference, reproject onto this square grid size.
         Use the same value as dewarp ``target_size`` when combining dewarped FITS.
@@ -90,8 +91,9 @@ class ConversionConfig:
     group_metadata_source : {"fits", "filename"}, optional
         How to discover observation time / subband for grouping and frequency ordering.
         ``"fits"`` (default) reads FITS headers (with filename fallbacks).
-        ``"filename"`` uses only basename ``-image-`` and ``_NNNMHz_`` tokens (no header
-        reads during discovery). Match the value used when building ``lm_reference_ds``.
+        ``"filename"`` groups by basename ``-image-`` and ``_NNNMHz_`` tokens, while
+        still caching each image HDU once for beam/LM keywords. Match the value used
+        when building ``lm_reference_ds``.
     discovery_filename_convention : {"image", "lst-color"}, optional
         Basename pattern for observation-time grouping. ``"image"`` (default) uses
         ``-image-YYYYMMDD_HHMMSS``. ``"lst-color"`` uses
@@ -102,6 +104,11 @@ class ConversionConfig:
     global_frequency_coord_hz : numpy.ndarray | None, optional
         Precomputed full-store ``frequency`` coordinate in Hz for the first Zarr
         write when converting one time group at a time.
+    sky_dtype : {"preserve", "float32", "float64"}, optional
+        On-disk ``SKY`` floating dtype policy. ``"preserve"`` (default) uses the
+        float kind implied by input FITS ``BITPIX`` (``-32``→float32,
+        ``-64``→float64); ``"float32"`` / ``"float64"`` force that cast before
+        Zarr write. Appends cast to the existing store dtype on mismatch.
     """
 
     def __init__(
@@ -121,11 +128,13 @@ class ConversionConfig:
         time_keys_only: Sequence[str] | None = None,
         lm_reference_ds: Any | None = None,
         group_metadata_source: Literal["fits", "filename"] = "fits",
-        discovery_time_key_source: Literal["header", "filename"] = "filename",
+        discovery_time_key_source: Literal["header", "filename", "directory"] = "filename",
         discovery_filename_convention: Literal["image", "lst-color"] = "image",
+        discovery_time_key_tolerance_sec: float = 0.0,
         lm_reference_target_size: int | None = None,
         consolidate_metadata_at_end: bool = True,
         global_frequency_coord_hz: Any | None = None,
+        sky_dtype: Literal["preserve", "float32", "float64"] = "preserve",
     ) -> None:
         self.input_dir = input_dir
         self.output_dir = output_dir
@@ -144,9 +153,11 @@ class ConversionConfig:
         self.group_metadata_source = group_metadata_source
         self.discovery_time_key_source = discovery_time_key_source
         self.discovery_filename_convention = discovery_filename_convention
+        self.discovery_time_key_tolerance_sec = discovery_time_key_tolerance_sec
         self.lm_reference_target_size = lm_reference_target_size
         self.consolidate_metadata_at_end = consolidate_metadata_at_end
         self.global_frequency_coord_hz = global_frequency_coord_hz
+        self.sky_dtype = sky_dtype
 
     @property
     def zarr_path(self) -> Path:
@@ -177,6 +188,11 @@ class ConversionConfig:
 
         if self.discovery_freq_bin_hz <= 0.0:
             msg = f"discovery_freq_bin_hz must be positive, got {self.discovery_freq_bin_hz}"
+            raise ValueError(msg)
+
+        allowed_sky = {"preserve", "float32", "float64"}
+        if self.sky_dtype not in allowed_sky:
+            msg = f"sky_dtype must be one of {sorted(allowed_sky)}, got {self.sky_dtype!r}"
             raise ValueError(msg)
 
 
@@ -279,8 +295,7 @@ class FITSToZarrConverter:
             logger.info(f"  Input: {self.config.input_dir}")
             logger.info(f"  Output: {self.config.zarr_path}")
             logger.info(f"  Mode: {'rebuild' if self.config.rebuild else 'append'}")
-
-            self._report_progress("start", 0, 1, "Starting conversion")
+            logger.info(f"  SKY dtype mode: {self.config.sky_dtype}")
 
             try:
                 result = convert_fits_dir_to_zarr(
@@ -301,12 +316,13 @@ class FITSToZarrConverter:
                     group_metadata_source=self.config.group_metadata_source,
                     time_key_source=self.config.discovery_time_key_source,
                     filename_convention=self.config.discovery_filename_convention,
+                    time_key_tolerance_sec=self.config.discovery_time_key_tolerance_sec,
                     lm_reference_target_size=self.config.lm_reference_target_size,
                     consolidate_metadata_at_end=self.config.consolidate_metadata_at_end,
                     global_frequency_coord_hz=self.config.global_frequency_coord_hz,
+                    sky_dtype=self.config.sky_dtype,
                 )
 
-                self._report_progress("complete", 1, 1, "Conversion complete")
                 logger.info(f"Conversion successful: {result}")
                 return result
 

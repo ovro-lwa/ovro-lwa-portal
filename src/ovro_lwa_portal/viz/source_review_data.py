@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,39 @@ HEATMAP_METHOD_OPTIONS = [
     "mean",
     "min",
 ]
+
+_STOKES_FITS_VALUE: dict[str, int] = {"I": 1, "V": 4}
+
+
+def available_stokes_labels(dataset: xr.Dataset) -> list[str]:
+    """Return ``I`` / ``V`` labels present on the dataset ``polarization`` coordinate."""
+    if "polarization" not in dataset.dims:
+        return []
+    pol_values = np.asarray(dataset.coords["polarization"].values).ravel().astype(int)
+    labels: list[str] = []
+    for val in pol_values:
+        for label, fits_val in _STOKES_FITS_VALUE.items():
+            if int(val) == int(fits_val) and label not in labels:
+                labels.append(label)
+    return labels
+
+
+def polarization_index_for_stokes(dataset: xr.Dataset, stokes: str) -> int:
+    """Map a Stokes label to the dataset ``polarization`` dimension index."""
+    label = str(stokes).strip().upper()
+    if label not in _STOKES_FITS_VALUE:
+        msg = f"Unknown Stokes label {stokes!r}; expected one of {sorted(_STOKES_FITS_VALUE)}"
+        raise ValueError(msg)
+    target = int(_STOKES_FITS_VALUE[label])
+    pol_values = np.asarray(dataset.coords["polarization"].values).ravel().astype(int)
+    matches = np.flatnonzero(pol_values == target)
+    if matches.size == 0:
+        msg = (
+            f"Dataset polarization coordinate {list(pol_values)} "
+            f"does not include Stokes {label} (FITS value {target})."
+        )
+        raise ValueError(msg)
+    return int(matches[0])
 
 def filter_known_source_names(text: str, names: list[str]) -> list[str]:
     """``includes`` match on known names when input starts with a letter."""
@@ -84,25 +118,27 @@ def lst_hours_for_dataset(ds: xr.Dataset) -> np.ndarray:
     """Mean local sidereal time (hours) for each dataset time sample."""
     from astropy.coordinates import EarthLocation
     from astropy.time import Time
-    from astropy.utils.iers import conf as iers_conf
+
+    from ovro_lwa_portal._iers import offline_iers
 
     observatory = EarthLocation.of_site("ovro")
     mjd = np.asarray(ds.coords["time"].values, dtype=np.float64)
-    orig = iers_conf.auto_download
-    try:
-        iers_conf.auto_download = False
+    with offline_iers():
         times = Time(mjd, format="mjd", scale="utc")
         lst_deg = np.asarray(times.sidereal_time("mean", longitude=observatory.lon).deg)
-    finally:
-        iers_conf.auto_download = orig
     return np.mod(lst_deg / 15.0, 24.0)
 
 
-def first_valid_sky_slice(dataset: xr.Dataset, freq_idx: int | None = None) -> tuple[int, int]:
+def first_valid_sky_slice(
+    dataset: xr.Dataset,
+    freq_idx: int | None = None,
+    *,
+    pol: int = 0,
+) -> tuple[int, int]:
     """First time index with finite SKY at the image centre."""
     fi = dataset.sizes["frequency"] // 2 if freq_idx is None else int(freq_idx)
     center = dataset.sizes["l"] // 2
-    ts = dataset["SKY"].isel(polarization=0, frequency=fi, l=center, m=center)
+    ts = dataset["SKY"].isel(polarization=int(pol), frequency=fi, l=center, m=center)
     data = ts.data
     vals = np.asarray(data.compute() if hasattr(data, "compute") else data)
     valid = np.flatnonzero(np.isfinite(vals))
@@ -135,6 +171,7 @@ def compute_source_heatmap(
     method: str,
     scale: float,
     patch_fit_max_reduced_chi_squared: float,
+    pol: int = 0,
     progress_callback: Callable[[str, int, int, str], None] | None = None,
 ) -> HeatmapLoad:
     """Build the (time, frequency) array used to fill the heatmap."""
@@ -142,7 +179,10 @@ def compute_source_heatmap(
     dec = float(src["dec"])
     if method == "dynamic_spectrum":
         da = dataset.radport.dynamic_spectrum(
-            ra=ra, dec=dec, progress_callback=progress_callback
+            ra=ra,
+            dec=dec,
+            pol=int(pol),
+            progress_callback=progress_callback,
         )
         return HeatmapLoad(np.asarray(da.values, dtype=np.float64))
     if method == "patch_fit":
@@ -157,6 +197,7 @@ def compute_source_heatmap(
             dec=dec,
             statistic="max",
             scale=scale,
+            pol=int(pol),
             progress_callback=progress_callback,
         )
         return HeatmapLoad(np.asarray(result.stat_map.values, dtype=np.float64), patch_stat_result=result)
@@ -166,6 +207,7 @@ def compute_source_heatmap(
             dec=dec,
             statistic=method,
             scale=scale,
+            pol=int(pol),
             progress_callback=progress_callback,
         )
         return HeatmapLoad(np.asarray(result.stat_map.values, dtype=np.float64), patch_stat_result=result)
@@ -181,6 +223,7 @@ def compute_overlay_patch_fit(
     freq_idx: int,
     scale: float,
     patch_fit_max_reduced_chi_squared: float,
+    pol: int = 0,
 ) -> PatchFitCellResult:
     """Fit a Gaussian patch on the overlay cell at ``(time_idx, freq_idx)``."""
     return dataset.radport.patch_fit_cell(
@@ -191,6 +234,7 @@ def compute_overlay_patch_fit(
         scale=float(scale),
         max_reduced_chi_squared=float(patch_fit_max_reduced_chi_squared),
         allow_position_offset=True,
+        pol=int(pol),
     )
 
 
@@ -279,6 +323,70 @@ def format_heatmap_time_axis_label(
     else:
         day = calendar_mmdd_labels_for_time_coord(time_values)[int(time_idx)]
     return f"{day} {lst}"
+
+
+def match_detection_slice(
+    time_mjd: np.ndarray,
+    freq_mhz: np.ndarray,
+    lst_hours: np.ndarray,
+    *,
+    on_date: date,
+    lst_hour: int,
+    band_mhz: float | None,
+) -> tuple[int, int, str]:
+    """Map a detection's UTC date, LST hour, and subband onto store indices.
+
+    ``lst_hours`` is mean LST in hours for each time sample (already computed
+    for the heatmap). ``freq_mhz`` is the store's frequency axis in MHz.
+    ``band_mhz`` is the detection subband, or ``None`` when the detection is
+    wideband and no subband shares that time.
+    """
+    mjd = np.asarray(time_mjd, dtype=np.float64)
+    lst = np.asarray(lst_hours, dtype=np.float64)
+    mhz = np.asarray(freq_mhz, dtype=np.float64)
+    if mjd.size == 0 or mhz.size == 0 or lst.shape != mjd.shape:
+        msg = "Time and frequency axes are empty or mismatched."
+        raise ValueError(msg)
+
+    from astropy.time import Time
+
+    dates = [stamp.datetime.date() for stamp in Time(mjd, format="mjd", scale="utc")]
+    rounded = np.rint(lst).astype(int) % 24
+    hour = int(lst_hour) % 24
+    exact = [
+        index
+        for index, (day, rounded_hour) in enumerate(zip(dates, rounded, strict=True))
+        if day == on_date and int(rounded_hour) == hour
+    ]
+    if exact:
+        time_idx = min(exact, key=lambda index: _lst_hour_delta(float(lst[index]), hour))
+        time_note = f"{on_date.isoformat()} {hour:02d}h"
+    else:
+        same_day = [index for index, day in enumerate(dates) if day == on_date]
+        if same_day:
+            time_idx = min(same_day, key=lambda index: _lst_hour_delta(float(lst[index]), hour))
+            got = int(rounded[time_idx])
+            time_note = (
+                f"no {hour:02d}h sample on {on_date.isoformat()}; "
+                f"nearest LST is {got:02d}h"
+            )
+        else:
+            noon = Time(f"{on_date.isoformat()}T12:00:00", scale="utc")
+            time_idx = int(np.argmin(np.abs(mjd - float(noon.mjd))))
+            time_note = f"{on_date.isoformat()} is not in this store"
+
+    if band_mhz is None:
+        freq_idx = int(mhz.size // 2)
+        freq_note = f"middle channel {float(mhz[freq_idx]):.0f} MHz"
+    else:
+        freq_idx = int(np.argmin(np.abs(mhz - float(band_mhz))))
+        freq_note = f"{float(mhz[freq_idx]):.0f} MHz"
+    return time_idx, freq_idx, f"{time_note}, {freq_note}"
+
+
+def _lst_hour_delta(lst_hour: float, target_hour: int) -> float:
+    delta = abs(float(lst_hour) - float(target_hour)) % 24.0
+    return min(delta, 24.0 - delta)
 
 
 def _format_scalar_hover(value: float, *, fmt: str = ".3g") -> str:
