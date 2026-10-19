@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord
@@ -36,6 +36,9 @@ class DatasetLoad:
     Pure data so the load orchestration can be unit tested without xarray or a
     live Zarr store; the notebook fills this in from ``open_dataset`` + the
     LST/frequency coordinate computation.
+
+    ``overlay_dataset`` and ``spectrum_dataset`` are optional sibling stores.
+    ``None`` means that role reads ``dataset`` (``ZARR_PATH``).
     """
 
     dataset: Any
@@ -43,6 +46,38 @@ class DatasetLoad:
     default_freq_idx: int
     lst_hours: Any
     freq_mhz: Any
+    overlay_dataset: Any = None
+    spectrum_dataset: Any = None
+    overlay_path: str | None = None
+    spectrum_path: str | None = None
+
+
+_ZARR_SUFFIX = ".zarr"
+_SIBLING_ROLES = ("overlay", "spectrum")
+
+
+def sibling_zarr_path(source: str, role: Literal["overlay", "spectrum"]) -> str:
+    """Path of the optional ``_overlay`` or ``_spectrum`` store beside ``source``.
+
+    A trailing slash is removed. When ``source`` ends in ``.zarr``, the role is
+    inserted before that suffix (``store.zarr`` → ``store_overlay.zarr``).
+    Otherwise the role is appended. A source that already ends in
+    ``_overlay.zarr`` or ``_spectrum.zarr`` is returned unchanged so discovery
+    does not stack suffixes. ``s3://`` URLs stay strings.
+    """
+    if role not in _SIBLING_ROLES:
+        msg = f"role must be 'overlay' or 'spectrum', got {role!r}"
+        raise ValueError(msg)
+    text = str(source).rstrip("/")
+    if text.endswith(_ZARR_SUFFIX):
+        stem = text[: -len(_ZARR_SUFFIX)]
+        suffix = _ZARR_SUFFIX
+    else:
+        stem = text
+        suffix = ""
+    if stem.endswith("_overlay") or stem.endswith("_spectrum"):
+        return text
+    return f"{stem}_{role}{suffix}"
 
 
 def run_dataset_load(
