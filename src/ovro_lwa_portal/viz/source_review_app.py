@@ -14,7 +14,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import ipywidgets as widgets
 from ipywidgets import Widget, embed
@@ -31,7 +31,7 @@ from bokeh.models import ColumnDataSource, FixedTicker, HoverTool
 from bokeh.plotting import figure
 
 from ovro_lwa_portal import resolve_coordinate_string
-from ovro_lwa_portal.io import DataSourceError, cap_lm_chunks
+from ovro_lwa_portal.io import DataSourceError, _detect_source_type, cap_lm_chunks
 from ovro_lwa_portal.name_resolution import format_icrs_degree_pair
 from ovro_lwa_portal.viz.hips import (
     compute_hips_percentile_cuts,
@@ -68,6 +68,7 @@ from ovro_lwa_portal.viz.source_review import (
     plan_center_action,
     run_dataset_load,
     should_reset_heatmap_on_center,
+    sibling_zarr_path,
 )
 from ovro_lwa_portal.accessor import PatchFitCellResult
 from ovro_lwa_portal.dynspec_fill import (
@@ -150,6 +151,29 @@ class SourceReviewConfig:
     overlay_vmax: float | None = None
     overlay_opacity: float = 1.0
     log_overlay_timing: bool = False
+
+
+def _sky_axis_sizes(ds: xr.Dataset) -> dict[str, int]:
+    """Sizes of the five image axes on ``SKY`` (0 when an axis is absent)."""
+    dims = ("time", "frequency", "polarization", "l", "m")
+    if "SKY" not in ds:
+        return {dim: -1 for dim in dims}
+    sky = ds["SKY"]
+    return {dim: int(sky.sizes[dim]) if dim in sky.sizes else 0 for dim in dims}
+
+
+def _require_matching_sky(
+    base: xr.Dataset,
+    other: xr.Dataset,
+    base_path: str,
+    other_path: str,
+) -> None:
+    """Raise when two stores do not share the five ``SKY`` axis sizes."""
+    base_sizes = _sky_axis_sizes(base)
+    other_sizes = _sky_axis_sizes(other)
+    if base_sizes != other_sizes:
+        msg = f"SKY sizes differ: {base_path} {base_sizes} vs {other_path} {other_sizes}"
+        raise ValueError(msg)
 
 
 LOADING_SPINNER_HTML = (
@@ -294,6 +318,11 @@ class SourceReview(param.Parameterized):
         self._ui_session: PanelUISession | None = None
         self._scroll_log = ScrollLog()
         self._dataset: xr.Dataset | None = None
+        # SKY for each role. None until open; then either a sibling or ``_dataset``.
+        self._overlay_dataset: xr.Dataset | None = None
+        self._spectrum_dataset: xr.Dataset | None = None
+        self._overlay_path: str | None = None
+        self._spectrum_path: str | None = None
         self._cache: dict[tuple[str, str], HeatmapLoad] = {}
         self._heatmap_values: np.ndarray | None = None
         self._overlay_patch_fit_result: PatchFitCellResult | None = None
@@ -314,6 +343,7 @@ class SourceReview(param.Parameterized):
         self._fov_executor: ThreadPoolExecutor | None = None
         self._read_executor: ThreadPoolExecutor | None = None
         self._direct_sky: tuple[xr.Dataset, DirectZarrArray | None] | None = None
+        self._direct_by_id: dict[int, DirectZarrArray | None] = {}
         self._fov_pan_attached = False
         self._spectrum_fill: ProgressiveSpectrumFill | None = None
         self._spectrum_progress_at = 0.0
@@ -1712,6 +1742,92 @@ class SourceReview(param.Parameterized):
 
         return _callback
 
+    def _open_capped_dataset(self, path: str) -> xr.Dataset:
+        """Open one store with native chunks and the review ``l``/``m`` cap."""
+        return cap_lm_chunks(
+            ovro.open_dataset(
+                path,
+                chunks={},
+                storage_options=self._storage_options,
+            ),
+            self._config.zarr_lm_chunk,
+        )
+
+    def _select_polarization(
+        self,
+        ds: xr.Dataset,
+        report: Callable[[str], None] | None = None,
+    ) -> xr.Dataset:
+        """Apply ``polarization_isel`` when the store has that dimension."""
+        if self._config.polarization_isel is None or "polarization" not in ds.dims:
+            return ds
+        pol_sel = tuple(int(i) for i in self._config.polarization_isel)
+        n_pol = int(ds.sizes["polarization"])
+        bad = [i for i in pol_sel if i < 0 or i >= n_pol]
+        if bad:
+            stokes = (
+                list(ds.coords["polarization"].values) if "polarization" in ds.coords else []
+            )
+            msg = (
+                f"polarization_isel={pol_sel} is out of range for this store "
+                f"(polarization size={n_pol}, Stokes={stokes}). "
+                f"Use None or indices in 0..{max(n_pol - 1, 0)} "
+                "(Stokes-I-only stores cannot use (0, 1))."
+            )
+            raise IndexError(msg)
+        if report is not None:
+            report(f"Selecting polarization indices {pol_sel} (isel)")
+        return ds.isel(polarization=list(pol_sel))
+
+    def _sibling_present(self, path: str) -> tuple[bool, BaseException | None]:
+        """Whether ``path/.zgroup`` exists. Exceptions mean "absent"."""
+        try:
+            source_type, normalized = _detect_source_type(path)
+            if source_type == "local":
+                return (Path(normalized).expanduser() / ".zgroup").is_file(), None
+            if source_type != "remote":
+                return False, None
+            from urllib.parse import urlparse  # noqa: PLC0415
+
+            import fsspec  # noqa: PLC0415
+
+            parsed = urlparse(normalized)
+            fs_options = dict(self._storage_options) if self._storage_options else {}
+            if parsed.scheme == "s3" and fs_options:
+                config_kwargs = dict(fs_options.get("config_kwargs") or {})
+                config_kwargs.setdefault("max_pool_connections", 32)
+                fs_options["config_kwargs"] = config_kwargs
+            fs = fsspec.filesystem(parsed.scheme, **fs_options)
+            key = f"{parsed.netloc}/{parsed.path.lstrip('/')}/.zgroup"
+            return bool(fs.exists(key)), None
+        except Exception as exc:  # noqa: BLE001 — a failed probe falls back to ZARR_PATH
+            return False, exc
+
+    def _open_role_dataset(
+        self,
+        base: xr.Dataset,
+        role: Literal["overlay", "spectrum"],
+        report: Callable[[str], None],
+    ) -> tuple[xr.Dataset, str | None]:
+        """Open the role sibling, or return ``base`` when it is absent.
+
+        A present sibling whose ``SKY`` sizes differ from ``base`` raises.
+        """
+        sibling = sibling_zarr_path(self._zarr_path, role)
+        if sibling.rstrip("/") == str(self._zarr_path).rstrip("/"):
+            report(f"{role} reads: {self._zarr_path}")
+            return base, None
+        present, error = self._sibling_present(sibling)
+        if error is not None:
+            report(f"{role} sibling {sibling} unavailable ({error}); using {self._zarr_path}")
+            return base, None
+        if not present:
+            report(f"{role} sibling {sibling} not found; using {self._zarr_path}")
+            return base, None
+        report(f"Opening {role} sibling {sibling}…")
+        other = self._select_polarization(self._open_capped_dataset(sibling))
+        _require_matching_sky(base, other, self._zarr_path, sibling)
+        return other, sibling
 
     def _open_dataset(self) -> None:
         def _start() -> None:
@@ -1727,34 +1843,11 @@ class SourceReview(param.Parameterized):
             t_open = time.perf_counter()
 
             t_meta = time.perf_counter()
-            ds = cap_lm_chunks(
-                ovro.open_dataset(
-                    self._zarr_path,
-                    chunks={},
-                    storage_options=self._storage_options,
-                ),
-                self._config.zarr_lm_chunk,
-            )
-            if self._config.polarization_isel is not None and "polarization" in ds.dims:
-                pol_sel = tuple(int(i) for i in self._config.polarization_isel)
-                n_pol = int(ds.sizes["polarization"])
-                bad = [i for i in pol_sel if i < 0 or i >= n_pol]
-                if bad:
-                    stokes = (
-                        list(ds.coords["polarization"].values)
-                        if "polarization" in ds.coords
-                        else []
-                    )
-                    msg = (
-                        f"polarization_isel={pol_sel} is out of range for this store "
-                        f"(polarization size={n_pol}, Stokes={stokes}). "
-                        f"Use None or indices in 0..{max(n_pol - 1, 0)} "
-                        "(Stokes-I-only stores cannot use (0, 1))."
-                    )
-                    raise IndexError(msg)
-                report(f"Selecting polarization indices {pol_sel} (isel)")
-                ds = ds.isel(polarization=list(pol_sel))
+            ds = self._open_capped_dataset(self._zarr_path)
+            ds = self._select_polarization(ds, report)
             report(f"Zarr opened ({time.perf_counter() - t_meta:.1f} s)")
+            overlay_ds, overlay_path = self._open_role_dataset(ds, "overlay", report)
+            spectrum_ds, spectrum_path = self._open_role_dataset(ds, "spectrum", report)
 
             if self._config.skip_first_valid_sky_scan:
                 t0, f0 = 0, int(ds.sizes["frequency"]) // 2
@@ -1783,6 +1876,10 @@ class SourceReview(param.Parameterized):
                 default_freq_idx=f0,
                 lst_hours=lst_hours,
                 freq_mhz=freq_mhz,
+                overlay_dataset=overlay_ds,
+                spectrum_dataset=spectrum_ds,
+                overlay_path=overlay_path,
+                spectrum_path=spectrum_path,
             )
 
         def _work() -> None:
@@ -1797,6 +1894,10 @@ class SourceReview(param.Parameterized):
                     load.lst_hours,
                     load.freq_mhz,
                     None,
+                    overlay_dataset=load.overlay_dataset,
+                    spectrum_dataset=load.spectrum_dataset,
+                    overlay_path=load.overlay_path,
+                    spectrum_path=load.spectrum_path,
                 ),
                 on_error=lambda exc: self._finish_open(None, None, None, None, None, exc),
                 log=self._log,
@@ -1815,6 +1916,10 @@ class SourceReview(param.Parameterized):
         lst_hours: np.ndarray | None,
         freq_mhz: np.ndarray | None,
         error: BaseException | None,
+        overlay_dataset: xr.Dataset | None = None,
+        spectrum_dataset: xr.Dataset | None = None,
+        overlay_path: str | None = None,
+        spectrum_path: str | None = None,
     ) -> None:
         if error is not None:
             self.loading = False
@@ -1829,6 +1934,12 @@ class SourceReview(param.Parameterized):
         assert default_time_idx is not None and default_freq_idx is not None
 
         self._dataset = ds
+        self._overlay_dataset = overlay_dataset if overlay_dataset is not None else ds
+        self._spectrum_dataset = spectrum_dataset if spectrum_dataset is not None else ds
+        self._overlay_path = overlay_path
+        self._spectrum_path = spectrum_path
+        self._direct_by_id = {}
+        self._direct_sky = None
         self._lst_hours = lst_hours
         self._time_day_labels = calendar_mmdd_labels_for_time_coord(ds.coords["time"].values)
         self._freq_mhz = freq_mhz
@@ -1844,15 +1955,8 @@ class SourceReview(param.Parameterized):
             f"Opened — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs, "
             f"{int(ds.sizes['l'])}×{int(ds.sizes['m'])} px, WCS={ds.radport.has_wcs}."
         )
-        direct = self._direct_sky_array()
-        if direct is not None:
-            self._log(
-                f"Chunk reads: Zarr direct, chunks={direct.chunks} "
-                f"({direct.chunk_nbytes / 1e6:.1f} MB), "
-                f"{read_workers(direct.chunk_nbytes)} workers."
-            )
-        else:
-            self._log("Chunk reads: through xarray (store not resolvable for direct reads).")
+        self._log_role_reads("overlay", self._overlay_dataset, self._overlay_path)
+        self._log_role_reads("spectrum", self._spectrum_dataset, self._spectrum_path)
 
         def _clear_loading() -> None:
             self.loading = False
@@ -1920,7 +2024,7 @@ class SourceReview(param.Parameterized):
             t0 = time.perf_counter()
             try:
                 payload = compute_source_heatmap(
-                    self._dataset,
+                    self._spectrum_dataset or self._dataset,
                     src,
                     method=method,
                     scale=self._patch_scale,
@@ -2022,11 +2126,12 @@ class SourceReview(param.Parameterized):
         job_id: int,
         started_at: float,
     ) -> None:
-        if job_id != self._heatmap_job_id or self._dataset is None:
+        spectrum = self._spectrum_dataset or self._dataset
+        if job_id != self._heatmap_job_id or spectrum is None:
             return
         l_indices, m_indices, visible = tracked
-        sky = self._dataset["SKY"]
-        direct = self._direct_sky_array()
+        sky = spectrum["SKY"]
+        direct = self._direct_array(spectrum)
         time_chunk, freq_chunk = spectrum_chunk_lengths(sky, direct)
         reader = TrackedPixelReader(
             sky,
@@ -2505,21 +2610,51 @@ class SourceReview(param.Parameterized):
             self._fov_executor = pool
         return pool
 
-    def _direct_sky_array(self) -> DirectZarrArray | None:
-        """On-disk SKY for chunk reads, or ``None`` to read through xarray."""
-        dataset = self._dataset
+    def _direct_array(self, dataset: xr.Dataset | None) -> DirectZarrArray | None:
+        """On-disk SKY for ``dataset``, or ``None`` to read through xarray."""
         if dataset is None:
             return None
-        cached = self._direct_sky
-        if cached is None or cached[0] is not dataset:
-            cached = (dataset, direct_zarr_array(dataset))
-            self._direct_sky = cached
-        return cached[1]
+        key = id(dataset)
+        if key not in self._direct_by_id:
+            self._direct_by_id[key] = direct_zarr_array(dataset)
+        return self._direct_by_id[key]
+
+    def _direct_sky_array(self) -> DirectZarrArray | None:
+        """On-disk SKY for overlay plane reads (the overlay sibling, or ``ZARR_PATH``)."""
+        dataset = self._overlay_dataset or self._dataset
+        direct = self._direct_array(dataset)
+        if dataset is not None:
+            self._direct_sky = (dataset, direct)
+        return direct
+
+    def _log_role_reads(
+        self,
+        role: str,
+        dataset: xr.Dataset | None,
+        path: str | None,
+    ) -> None:
+        """Log which store and chunk shape a visualization will read."""
+        if dataset is None:
+            return
+        used = path if path is not None else self._zarr_path
+        direct = self._direct_array(dataset)
+        if direct is None:
+            self._log(f"{role} reads: {used} (through xarray)")
+            return
+        self._log(
+            f"{role} reads: {used} chunks={direct.chunks} "
+            f"({direct.chunk_nbytes / 1e6:.1f} MB), "
+            f"{read_workers(direct.chunk_nbytes)} workers."
+        )
 
     def _read_pool(self) -> ThreadPoolExecutor:
-        """One task per on-disk chunk; sized from the chunk bytes."""
-        direct = self._direct_sky_array()
-        workers = read_workers(direct.chunk_nbytes) if direct is not None else 4
+        """One task per on-disk chunk; sized from the larger open chunk."""
+        nbytes = [
+            direct.chunk_nbytes
+            for dataset in (self._overlay_dataset, self._spectrum_dataset, self._dataset)
+            if (direct := self._direct_array(dataset)) is not None
+        ]
+        workers = max((read_workers(size) for size in nbytes), default=4)
         pool = self._read_executor
         if pool is None or pool._max_workers != workers:
             if pool is not None:
@@ -2541,9 +2676,12 @@ class SourceReview(param.Parameterized):
     def _ensure_fov_session(self) -> FovOverlaySession | None:
         widget = self._sky_widget
         dataset = self._dataset
-        if widget is None or dataset is None or "SKY" not in dataset:
+        overlay = self._overlay_dataset or dataset
+        if widget is None or dataset is None or overlay is None or "SKY" not in overlay:
             return None
         session = self._fov_session
+        # ``ds`` stays the default store so WCS comes from ZARR_PATH. Pixels come
+        # from the overlay sibling when that store is present.
         if session is None or session.sky is not widget or session.ds is not dataset:
             session = FovOverlaySession(
                 widget,
@@ -2568,11 +2706,12 @@ class SourceReview(param.Parameterized):
         return session
 
     def _sky_plane_reader(self) -> DirectZarrArray | SkyPlaneReader:
-        direct = self._direct_sky_array()
+        dataset = self._overlay_dataset or self._dataset
+        direct = self._direct_array(dataset)
         if direct is not None:
             return direct
-        assert self._dataset is not None
-        return SkyPlaneReader(self._dataset["SKY"])
+        assert dataset is not None
+        return SkyPlaneReader(dataset["SKY"])
 
     def _finish_fov_overlay(
         self,
