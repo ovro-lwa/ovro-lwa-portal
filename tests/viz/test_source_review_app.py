@@ -413,6 +413,61 @@ def test_configure_sky_widget_display_applies_config(tmp_path: Path) -> None:
     assert widget.background_cut_max == 42.0
 
 
+def _write_survey(root: Path, name: str, cut: str) -> Path:
+    survey = root / name
+    survey.mkdir()
+    (survey / "properties").write_text(f"hips_pixel_cut = {cut}\n", encoding="utf-8")
+    return survey
+
+
+def test_hips_selector_replaces_method_selector(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    a = _write_survey(tmp_path, "a.hips", "-1 2")
+    b = _write_survey(tmp_path, "b.hips", "-3 4")
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=a,
+            hips_http_prefix="http://host:3005",
+            hips_backgrounds=(a, b),
+        ),
+        validate_zarr=False,
+    )
+    assert review._hips_selector is not None
+    assert review._hips_selector.options == {"a": str(a), "b": str(b)}
+    assert review._hips_selector.value == str(a)
+    assert review._method_selector not in review._layout.select(type(review._method_selector))
+
+    widget = MagicMock()
+    review._sky_widget = widget
+    review._set_hips_background(b)
+
+    assert review._hips_background_url == "http://host:3005/b.hips/"
+    assert widget.background_survey == "http://host:3005/b.hips/"
+    assert widget.background_cut_min == -3.0
+    assert widget.background_cut_max == 4.0
+
+
+def test_method_selector_kept_without_hips_backgrounds(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(hips_root=tmp_path, hips_background=tmp_path / "bg.hips"),
+        validate_zarr=False,
+    )
+    assert review._hips_selector is None
+    assert review._method_selector in review._layout.select(type(review._method_selector))
+
+
 def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:
     zarr = tmp_path / "store.zarr"
     zarr.mkdir()

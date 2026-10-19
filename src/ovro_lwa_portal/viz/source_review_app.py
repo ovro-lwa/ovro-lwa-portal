@@ -73,6 +73,7 @@ from ovro_lwa_portal.accessor import PatchFitCellResult
 from ovro_lwa_portal.dynspec_fill import (
     ProgressiveSpectrumFill,
     TrackedPixelReader,
+    plan_fill_units,
     spectrum_chunk_lengths,
 )
 from ovro_lwa_portal.fov_overlay import FovOverlaySession, SkyPlaneReader, attach_fov_pan_reload
@@ -132,6 +133,8 @@ class SourceReviewConfig:
         "/lustre/pipeline/calibration/hips/Blue_I_deep_Taper_Robust-0.75_Jan25.hips"
     )
     hips_http_prefix: str = "/calibration/hips"
+    # When set, a HiPS background selector replaces the heatmap method selector.
+    hips_backgrounds: tuple[Path, ...] = ()
     # HiPS background (Aladin Lite setCuts)
     hips_background_percentile_low: float = 2.0
     hips_background_percentile_high: float = 98.0
@@ -313,11 +316,11 @@ class SourceReview(param.Parameterized):
         self._direct_sky: tuple[xr.Dataset, DirectZarrArray | None] | None = None
         self._fov_pan_attached = False
         self._spectrum_fill: ProgressiveSpectrumFill | None = None
-        self._hips_background_url = hips_background_survey_url(
-            self._config.hips_background,
-            hips_root=self._config.hips_root,
-            http_prefix=self._config.hips_http_prefix,
-        )
+        self._spectrum_progress_at = 0.0
+        self._heatmap_push_queued = False
+        self._heatmap_after_publish: Callable[[], None] | None = None
+        self._hips_background = Path(self._config.hips_background)
+        self._hips_background_url = self._hips_survey_url(self._hips_background)
         self._time_idx = 0
         self._freq_idx = 0
         self._pending_overlay_slice: tuple[int, int] | None = None
@@ -391,6 +394,23 @@ class SourceReview(param.Parameterized):
             name="Heatmap method",
             width=220,
         )
+        self._hips_selector: pn.widgets.Select | None = None
+        if self._config.hips_backgrounds:
+            surveys = {
+                Path(path).name.removesuffix(".hips"): str(path)
+                for path in self._config.hips_backgrounds
+            }
+            current = str(self._hips_background)
+            if current not in surveys.values():
+                surveys = {self._hips_background.name.removesuffix(".hips"): current, **surveys}
+            self._hips_selector = pn.widgets.Select(
+                name="HiPS background",
+                options=surveys,
+                value=current,
+                width=260,
+            )
+            self._hips_selector.param.watch(self._on_hips_background_change, "value")
+        control_selector = self._hips_selector or self._method_selector
         # ipywidgets spinner in Jupyter; Panel spinner under ``panel serve`` (native comm).
         if self._panel_serve_mode:
             self._loading_widget = None
@@ -466,7 +486,7 @@ class SourceReview(param.Parameterized):
                 self._stokes_toggle,
                 self._overlay_toggle,
                 self._fit_overlay_button,
-                self._method_selector,
+                control_selector,
                 self._loading_pane,
                 sizing_mode="stretch_width",
                 margin=(0, 0, 8, 0),
@@ -496,13 +516,11 @@ class SourceReview(param.Parameterized):
                     f"Known sources: {len(self._known_source_names)} names from {resolved_sources}"
                 )
         self._log(f"Zarr: {self._zarr_path}")
-        props = self._config.hips_background / "properties"
-        if props.is_file():
-            self._log(f"HiPS background: {self._hips_background_url}")
-        else:
+        self._log_hips_background()
+        if self._hips_selector is not None:
             self._log(
-                f"WARNING: HiPS not found on disk ({self._config.hips_background}); "
-                f"background URL is {self._hips_background_url!r}"
+                f"HiPS backgrounds: {len(self._hips_selector.options)} "
+                f"under {self._config.hips_root}"
             )
         self._set_status(
             "**Enter a coordinate** (`RA°, Dec°` or source name), then click "
@@ -603,9 +621,23 @@ class SourceReview(param.Parameterized):
         *,
         after_publish: Callable[[], None] | None = None,
     ) -> None:
-        """Push in-place heatmap edits after the active hold cycle (or on io_loop)."""
+        """Push in-place heatmap edits after the active hold cycle (or on io_loop).
+
+        Remote stores paint many partial spectra. Each paint used to push the
+        whole notebook layout, which stalled the SkyWidget comm while the
+        activity log (a separate channel) kept updating. One push stays queued;
+        it sends the latest image and the latest completion callback.
+        """
+        if after_publish is not None:
+            self._heatmap_after_publish = after_publish
+        if self._heatmap_push_queued:
+            return
+        self._heatmap_push_queued = True
 
         def _push() -> None:
+            self._heatmap_push_queued = False
+            follow = self._heatmap_after_publish
+            self._heatmap_after_publish = None
             if isinstance(self._ui, ServedPanelUISession):
                 handles = self._heatmap_bokeh_handles
                 if handles is not None and self._heatmap_pane.object is not handles.plot:
@@ -616,8 +648,8 @@ class SourceReview(param.Parameterized):
                     *self._notebook_ui_views(),
                     force_push=True,
                 )
-            if after_publish is not None:
-                after_publish()
+            if follow is not None:
+                follow()
 
         defer_after_notebook_hold(_push)
 
@@ -1656,7 +1688,8 @@ class SourceReview(param.Parameterized):
         last_key: dict[str, tuple[int, str]] = {}
 
         def _callback(stage: str, current: int, total: int, message: str) -> None:
-            # Pixel track is fast; log start + finish only (skip per-batch lines).
+            # Skip per-batch pixel-track lines. Start, finish, and storage
+            # heartbeats (current == 0, "still working") still reach the log.
             if stage == "track" and total > 1 and current not in (0, total):
                 return
             if stage in ("extract", "reduce", "fit") and total > 1:
@@ -1917,7 +1950,11 @@ class SourceReview(param.Parameterized):
     def _spectrum_fill_session(self) -> ProgressiveSpectrumFill:
         fill = self._spectrum_fill
         if fill is None or fill.executor is not self._read_pool():
-            fill = ProgressiveSpectrumFill(self._read_pool(), self._schedule_main)
+            fill = ProgressiveSpectrumFill(
+                self._read_pool(),
+                self._schedule_main,
+                paint_interval_s=1.0,
+            )
             self._spectrum_fill = fill
         return fill
 
@@ -2000,6 +2037,33 @@ class SourceReview(param.Parameterized):
             direct=direct,
         )
 
+        n_units = len(
+            plan_fill_units(
+                int(sky.sizes["time"]),
+                int(sky.sizes["frequency"]),
+                time_chunk,
+                freq_chunk,
+            )
+        )
+        self._spectrum_progress_at = 0.0
+        self._log(
+            f"Reading spectrum from the store ({n_units} chunks, "
+            f"time x freq chunk {time_chunk} x {freq_chunk})…"
+        )
+
+        def _on_chunk(done_chunks: int, total_chunks: int) -> None:
+            if job_id != self._heatmap_job_id:
+                return
+            now = time.perf_counter()
+            if done_chunks != total_chunks and now - self._spectrum_progress_at < 2.0:
+                return
+            self._spectrum_progress_at = now
+            elapsed = now - started_at
+            self._log(
+                f"Spectrum read {done_chunks}/{total_chunks} chunks "
+                f"from the store ({elapsed:.0f}s)"
+            )
+
         def _paint(values: np.ndarray, done: bool) -> None:
             self._paint_dynamic_spectrum(
                 src,
@@ -2020,6 +2084,7 @@ class SourceReview(param.Parameterized):
             freq_chunk=freq_chunk,
             paint=_paint,
             on_error=_on_error,
+            on_chunk=_on_chunk,
         )
 
     def _paint_dynamic_spectrum(
@@ -2284,6 +2349,11 @@ class SourceReview(param.Parameterized):
         widget.stretch = cfg.overlay_stretch
         widget.opacity = float(cfg.overlay_opacity)
         widget.background_opacity = float(cfg.background_opacity)
+        self._apply_hips_background_cuts(widget)
+
+    def _apply_hips_background_cuts(self, widget: SkyWidget) -> None:
+        """Set HiPS cuts: fixed config, else ``hips_pixel_cut``, else tile percentiles."""
+        cfg = self._config
         if cfg.background_cut_min is not None and cfg.background_cut_max is not None:
             widget.background_cut_min = float(cfg.background_cut_min)
             widget.background_cut_max = float(cfg.background_cut_max)
@@ -2292,7 +2362,7 @@ class SourceReview(param.Parameterized):
                 f"{cfg.background_cut_max:.4g}"
             )
             return
-        suggested = read_hips_pixel_cut(cfg.hips_background)
+        suggested = read_hips_pixel_cut(self._hips_background)
         if suggested is not None:
             cut_lo, cut_hi = suggested
             widget.background_cut_min = cut_lo
@@ -2301,7 +2371,7 @@ class SourceReview(param.Parameterized):
             return
         try:
             cut_lo, cut_hi = compute_hips_percentile_cuts(
-                cfg.hips_background,
+                self._hips_background,
                 percentile_low=cfg.hips_background_percentile_low,
                 percentile_high=cfg.hips_background_percentile_high,
             )
@@ -2314,6 +2384,41 @@ class SourceReview(param.Parameterized):
             )
         except (FileNotFoundError, ValueError) as exc:
             self._log(f"WARNING: HiPS display cuts not set — {exc}")
+
+    def _hips_survey_url(self, hips_dir: Path) -> str:
+        return hips_background_survey_url(
+            hips_dir,
+            hips_root=self._config.hips_root,
+            http_prefix=self._config.hips_http_prefix,
+        )
+
+    def _log_hips_background(self) -> None:
+        if (self._hips_background / "properties").is_file():
+            self._log(f"HiPS background: {self._hips_background_url}")
+        else:
+            self._log(
+                f"WARNING: HiPS not found on disk ({self._hips_background}); "
+                f"background URL is {self._hips_background_url!r}"
+            )
+
+    def _on_hips_background_change(self, event: object) -> None:
+        path = Path(str(getattr(event, "new", "")))
+        self._schedule_ui_action(lambda: self._set_hips_background(path))
+
+    def _set_hips_background(self, hips_dir: Path) -> None:
+        """Switch the Aladin background survey and apply that survey's cuts."""
+        if hips_dir == self._hips_background:
+            return
+        self._hips_background = hips_dir
+        self._hips_background_url = self._hips_survey_url(hips_dir)
+        self._log_hips_background()
+        widget = self._sky_widget
+        if widget is None:
+            return
+        # Cuts first: the JS layer is built with the cuts present when the survey changes.
+        self._apply_hips_background_cuts(widget)
+        widget.background_survey = self._hips_background_url
+        self._force_send_sky_widget_state(widget)
 
     def _mount_sky_widget(self, ds: xr.Dataset) -> None:
         """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""

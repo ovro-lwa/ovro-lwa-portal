@@ -903,9 +903,30 @@ class FovOverlaySession:
             _apply(_read_only())
             return
 
+        self.log(
+            f"FOV overlay [{reason} read] gen={gen} t={t_idx} f={f_idx} "
+            "reading cutout from the store"
+        )
         fut = pool.submit(_read_only)
+        stop_pulse = threading.Event()
+
+        def _pulse() -> None:
+            t0 = time.perf_counter()
+            while not stop_pulse.wait(5.0):
+                if fut.done() or gen != self._gen:
+                    return
+                elapsed = time.perf_counter() - t0
+                self.schedule_main(
+                    lambda e=elapsed: self.log(
+                        f"FOV overlay [{reason} reading] gen={gen} "
+                        f"still reading the store ({e:.0f}s)"
+                    )
+                )
+
+        threading.Thread(target=_pulse, name="fov-read-pulse", daemon=True).start()
 
         def _done(done: Future[tuple[int, np.ndarray, WCS, FovCutoutSpec, float]]) -> None:
+            stop_pulse.set()
             try:
                 result = done.result()
             except Exception as exc:  # noqa: BLE001 — worker errors stay on the log

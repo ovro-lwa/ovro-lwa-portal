@@ -1032,8 +1032,15 @@ def open_dataset(
                     )
                     raise ImportError(msg) from e
 
-                # Create filesystem with storage options
-                fs = fsspec.filesystem(protocol, **storage_options)
+                # Create filesystem with storage options. Review reads fan out
+                # across threads; the botocore default of 10 connections queues
+                # those requests on S3.
+                fs_options = dict(storage_options)
+                if protocol == "s3":
+                    config_kwargs = dict(fs_options.get("config_kwargs") or {})
+                    config_kwargs.setdefault("max_pool_connections", 32)
+                    fs_options["config_kwargs"] = config_kwargs
+                fs = fsspec.filesystem(protocol, **fs_options)
 
                 # Get path without protocol (e.g., s3://bucket/path -> bucket/path)
                 path = f"{parsed_url.netloc}/{parsed_url.path.lstrip('/')}"

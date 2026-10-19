@@ -171,6 +171,22 @@ def hips_background_survey_url(
     return f"{base}/{rel.as_posix()}/"
 
 
+def list_hips_surveys(hips_root: Path | str | None = None) -> list[Path]:
+    """HiPS survey directories under ``hips_root``, sorted by name.
+
+    A survey is a ``*.hips`` directory with a ``properties`` file, the same
+    check ``SourceReview`` uses before it logs the background URL.
+    """
+    root = Path(hips_root).expanduser() if hips_root is not None else resolve_hips_root()
+    if not root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.name.endswith(".hips") and (path / "properties").is_file()
+    )
+
+
 def read_hips_pixel_cut(hips_dir: Path | str) -> tuple[float, float] | None:
     """Suggested display cuts from a HiPS ``properties`` file.
 

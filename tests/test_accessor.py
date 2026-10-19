@@ -4556,6 +4556,50 @@ class TestCelestialTimeSeriesTracking:
         assert table.template_header is not None
         assert np.all(table.header_valid)
 
+    def test_bulk_fits_header_str_loads_the_time_axis_once(self) -> None:
+        """Remote review must not issue one store read per time for WCS headers."""
+        from unittest.mock import patch
+
+        from tests.test_fits_to_zarr import _encoded_fits_header_bytes, _make_sin_wcs_header_str
+
+        from ovro_lwa_portal.accessor import _bulk_per_time_wcs_header_strings
+
+        hdr0 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=180.0, crval2=45.0)
+        hdr1 = _make_sin_wcs_header_str(nx=8, ny=8, crval1=181.0, crval2=45.0)
+        fits_per_time = np.array(
+            [
+                _encoded_fits_header_bytes(hdr0, nl=8, nm=8),
+                _encoded_fits_header_bytes(hdr1, nl=8, nm=8),
+            ],
+            dtype=object,
+        )
+        ds = xr.Dataset(
+            {
+                "fits_header_str": (
+                    ("time", "frequency", "polarization"),
+                    fits_per_time.reshape(2, 1, 1),
+                ),
+            },
+            coords={
+                "time": ("time", np.arange(2, dtype=float)),
+                "frequency": ("frequency", np.array([55e6])),
+                "polarization": ("polarization", np.array([0])),
+            },
+        ).chunk({"time": 1})
+        loads: list[dict[str, int]] = []
+        real_load = xr.DataArray.load
+
+        def _counting_load(array: xr.DataArray, **kwargs: object) -> xr.DataArray:
+            loads.append({str(k): int(v) for k, v in array.sizes.items()})
+            return real_load(array, **kwargs)
+
+        with patch.object(xr.DataArray, "load", _counting_load):
+            headers = _bulk_per_time_wcs_header_strings(ds, 2)
+
+        assert loads == [{"time": 2}]
+        assert headers[0] and headers[1]
+        assert "181" in headers[1]
+
     def test_per_time_wcs_track_table_falls_back_when_headers_differ(self) -> None:
         from ovro_lwa_portal.accessor import _build_per_time_wcs_track_table
         from tests.test_fits_to_zarr import _make_sin_wcs_header_str

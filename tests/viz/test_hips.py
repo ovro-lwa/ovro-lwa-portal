@@ -13,6 +13,7 @@ from ovro_lwa_portal.viz.hips import (
     configure_hips_background,
     hips_background_survey_url,
     hips_http_server_survey_url,
+    list_hips_surveys,
     normalize_hips_survey_name,
     read_hips_pixel_cut,
     resolve_hips_survey_path,
@@ -112,6 +113,17 @@ def test_read_hips_pixel_cut(tmp_path: Path) -> None:
     )
     assert read_hips_pixel_cut(survey) == (-0.43321555852890015, 1.3386840355396323)
     assert read_hips_pixel_cut(tmp_path / "missing.hips") is None
+
+
+def test_list_hips_surveys(tmp_path: Path) -> None:
+    for name in ("b.hips", "a.hips", "no_props.hips", "other_dir"):
+        (tmp_path / name).mkdir()
+    for name in ("b.hips", "a.hips", "other_dir"):
+        (tmp_path / name / "properties").write_text("hips_order = 2\n", encoding="utf-8")
+    (tmp_path / "index.html").write_text("", encoding="utf-8")
+
+    assert [p.name for p in list_hips_surveys(tmp_path)] == ["a.hips", "b.hips"]
+    assert list_hips_surveys(tmp_path / "missing") == []
 
 
 def test_compute_hips_percentile_cuts(tmp_path: Path) -> None:
