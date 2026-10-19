@@ -224,15 +224,16 @@ def configure_source_review_notebook() -> None:
 
 
 def configure_source_review_serve() -> None:
-    """One-time ``panel serve`` setup: astrowidget patch + ipywidgets bridge.
+    """One-time ``panel serve`` setup: astrowidget patch, ipywidgets, and Tabulator.
 
     Do **not** call ``pn.extension('ipywidgets')`` in JupyterLab — only for
-    standalone Bokeh server apps (``scripts/serve_source_review.py``).
+    standalone Bokeh server apps (``scripts/serve_source_review.py`` and
+    ``scripts/serve_exopipe_candidate_review.py``).
     """
     _patch_astrowidget_get_wcs()
     # Bokeh is already active under ``panel serve``; loading the bokeh extension
     # here triggers "extension not recognized" on Panel 1.8 + Bokeh 3.9.
-    pn.extension("ipywidgets", sizing_mode="stretch_width")
+    pn.extension("ipywidgets", "tabulator", sizing_mode="stretch_width")
 
 
 class ServeSkyWidget(SkyWidget):
@@ -255,6 +256,30 @@ class ServeSkyWidget(SkyWidget):
         if name in self._NULLABLE_FLOAT_TRAITS and value is None:
             value = float("nan")
         super().set_trait(name, value, *args, **kwargs)
+
+
+def _replace_child_pane(root: pn.viewable.Viewable, old: object, new: object) -> bool:
+    """Replace ``old`` in ``root`` or in one immediate row or column child.
+
+    Returns True when the pane was found. Nested catalog rows keep the sky pane
+    one level down from the Source Review column.
+    """
+    objects = list(getattr(root, "objects", ()))
+    for index, pane in enumerate(objects):
+        if pane is old:
+            objects[index] = new
+            root.objects = objects  # type: ignore[attr-defined]
+            return True
+    for pane in objects:
+        if not isinstance(pane, (pn.Row, pn.Column)):
+            continue
+        nested = list(pane.objects)
+        for index, child in enumerate(nested):
+            if child is old:
+                nested[index] = new
+                pane.objects = nested
+                return True
+    return False
 
 
 class SourceReview(param.Parameterized):
@@ -710,21 +735,17 @@ class SourceReview(param.Parameterized):
         """Mount ``SkyWidget`` in the layout (``panel serve`` only).
 
         Replaces the HTML placeholder with a fresh ``IPyWidget`` pane so the
-        ipywidgets_bokeh bundle and live comm share one model id.
+        ipywidgets_bokeh bundle and live comm share one model id. The placeholder
+        may sit in the top-level column or one row or column beneath it (the
+        candidate catalog row).
         """
         new_pane = pn.pane.IPyWidget(
             widget,
             height=620,
             sizing_mode="stretch_width",
         )
-        objects = list(self._layout.objects)
-        for index, pane in enumerate(objects):
-            if pane is self._sky_pane:
-                objects[index] = new_pane
-                break
-        else:
+        if not _replace_child_pane(self._layout, self._sky_pane, new_pane):
             return
-        self._layout.objects = objects
         self._sky_pane = new_pane
         doc = pn.state.curdoc
         if doc is not None:

@@ -8,10 +8,12 @@ the ExoPipe generator.
 from __future__ import annotations
 
 import re
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from html.parser import HTMLParser
+from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import urlopen
@@ -506,6 +508,169 @@ def load_selected_candidate(
     raise ValueError(msg)
 
 
+@dataclass(frozen=True)
+class CandidateCatalogLayout:
+    """Candidate column placed beside a Source Review sky pane."""
+
+    table: CandidateTabulator
+    load_button: pn.widgets.Button
+    catalog: pn.Column
+    sky_row: pn.Row
+
+
+def _detection_time_freq(review: Any, html: str) -> tuple[int | None, int | None]:
+    """Time and frequency indices for the brightest detection on this page."""
+    from ovro_lwa_portal.viz.source_review_data import match_detection_slice
+
+    detections = parse_source_detections(html)
+    dataset = review._dataset
+    lst_hours = review._lst_hours
+    freq_mhz = review._freq_mhz
+    if not detections or dataset is None or lst_hours is None or freq_mhz is None:
+        return None, None
+    peak = peak_detection(detections)
+    band_mhz, band_note = subband_mhz_for_overlay(peak, detections)
+    time_idx, freq_idx, slice_note = match_detection_slice(
+        dataset.coords["time"].values,
+        freq_mhz,
+        lst_hours,
+        on_date=peak.on_date,
+        lst_hour=peak.lst_hour,
+        band_mhz=band_mhz,
+    )
+    review._log(f"{peak.band} SNR {peak.snr:.1f}: {band_note}. Store sample {slice_note}.")
+    return time_idx, freq_idx
+
+
+def _fetch_source_page_on_worker(
+    review: Any,
+    key: tuple[str, str],
+    apply: Callable[[str, str], None],
+) -> None:
+    """GET the source page off the Bokeh thread, then schedule ``apply``."""
+
+    def _work() -> None:
+        try:
+            html = fetch_text(source_page_url(key[0], key[1]))
+            degrees = parse_combined_position(html)
+        except (URLError, ValueError) as exc:
+            message = f"WARNING: Could not open {key[1]}: {exc}"
+
+            def _report(text: str = message) -> None:
+                review._log(text)
+
+            review._ui.schedule(_report)
+            return
+
+        def _finish(parsed: str = degrees, page: str = html) -> None:
+            apply(parsed, page)
+
+        review._ui.schedule(_finish)
+
+    threading.Thread(target=_work, name="exopipe-source-page", daemon=True).start()
+
+
+def attach_candidate_catalog(review: Any, candidates: pd.DataFrame) -> CandidateCatalogLayout:
+    """Place the candidate table beside ``review``'s sky pane.
+
+    The sky pane stays a child of :attr:`CandidateCatalogLayout.sky_row` so
+    ``panel serve`` can replace it when the Zarr store opens. Load fetches the
+    ExoPipe source page and calls ``review.review_catalog_position``. Under
+    :class:`~ovro_lwa_portal.viz.panel_ui_session.ServedPanelUISession` that
+    fetch runs on a worker and the review call is scheduled back onto the
+    Bokeh document. Header filters stay in the browser.
+    """
+    objects = list(review._layout.objects)
+    try:
+        sky_index = objects.index(review._sky_pane)
+    except ValueError as exc:
+        msg = "Sky pane is not in the Source Review layout."
+        raise ValueError(msg) from exc
+
+    header_filters, filter_configuration = candidate_tabulator_filters(candidates.columns)
+    table = CandidateTabulator(
+        candidates,
+        show_index=False,
+        sizing_mode="stretch_width",
+        height=620,
+        header_filters=header_filters,
+        configuration=filter_configuration,
+        hidden_columns=["base_url"],
+        editors={column: None for column in candidates.columns},
+        pagination="local",
+        page_size=50,
+        selectable=1,
+    )
+    position_cache: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def _on_click(_event: object) -> None:
+        row = table.clicked_row
+        if row is None:
+            review._log("WARNING: Select a visible row, then press Load.")
+            return
+        review._log(f"Selected {row.stokes} {row.source}. Press Load.")
+
+    def _load(_event: object | None = None) -> None:
+        try:
+            row = load_selected_candidate(
+                candidates,
+                clicked_iloc=table.clicked_iloc,
+                clicked_filter_key=table.clicked_filter_key,
+                selection=list(table.selection or []),
+                filters=table.filters,
+                picked_iloc=table.clicked_iloc,
+            )
+        except ValueError as exc:
+            review._log(f"WARNING: {exc}")
+            return
+        key = (str(row.base_url), str(row.source))
+        review._log(f"Loading {row.stokes} {row.source}…")
+
+        def _apply(degrees: str, html: str) -> None:
+            position_cache[key] = (degrees, html)
+            time_idx, freq_idx = _detection_time_freq(review, html)
+            review.review_catalog_position(
+                degrees,
+                name=str(row.source),
+                stokes=str(row.stokes),
+                time_idx=time_idx,
+                freq_idx=freq_idx,
+            )
+
+        cached = position_cache.get(key)
+        if cached is not None:
+            _apply(*cached)
+            return
+        if getattr(review, "_panel_serve_mode", False):
+            _fetch_source_page_on_worker(review, key, _apply)
+            return
+        try:
+            html = fetch_text(source_page_url(key[0], key[1]))
+            _apply(parse_combined_position(html), html)
+        except (URLError, ValueError) as exc:
+            review._log(f"WARNING: Could not open {key[1]}: {exc}")
+
+    table.on_click(_on_click)
+    load_button = pn.widgets.Button(name="Load", button_type="primary", width=120)
+    load_button.on_click(_load)
+    catalog = pn.Column(
+        pn.pane.Markdown("**Candidates** — select one row, then **Load**."),
+        load_button,
+        table,
+        sizing_mode="stretch_width",
+    )
+    sky_row = pn.Row(catalog, review._sky_pane, sizing_mode="stretch_width")
+    objects[sky_index] = sky_row
+    review._layout.objects = objects
+    review._layout.max_width = None
+    return CandidateCatalogLayout(
+        table=table,
+        load_button=load_button,
+        catalog=catalog,
+        sky_row=sky_row,
+    )
+
+
 def candidate_from_selection(frame: pd.DataFrame, selection: Sequence[int]) -> pd.Series:
     """Return the last selected candidate row.
 
@@ -805,7 +970,9 @@ class _LocbarParser(HTMLParser):
 
 __all__ = [
     "CANDIDATE_COLUMNS",
+    "CandidateCatalogLayout",
     "CandidateTabulator",
+    "attach_candidate_catalog",
     "SourceDetection",
     "URLError",
     "candidate_from_selection",

@@ -12,6 +12,7 @@ from panel.io.model import JSCode
 from ovro_lwa_portal.name_resolution import resolve_coordinate_string
 from ovro_lwa_portal.viz.exopipe_catalog import (
     CandidateTabulator,
+    attach_candidate_catalog,
     candidate_from_selection,
     candidate_row_for_load,
     candidate_tabulator_filters,
@@ -333,3 +334,129 @@ def test_load_candidate_table_concatenates_queues_without_network() -> None:
     assert stokes_v.iloc[0].n_epoch == "4"
     assert stokes_v.iloc[0].base_url == "http://127.0.0.1:8766"
     assert isinstance(frame, pd.DataFrame)
+
+
+def _review_for_catalog() -> object:
+    sky = pn.pane.HTML("sky")
+
+    class _Review:
+        def __init__(self) -> None:
+            self._sky_pane = sky
+            self._dataset = None
+            self._lst_hours = None
+            self._freq_mhz = None
+            self._layout = pn.Column(
+                pn.pane.Markdown("controls"),
+                pn.pane.Markdown("status"),
+                sky,
+                pn.pane.Markdown("heatmap"),
+                pn.pane.Markdown("log"),
+            )
+            self.logs: list[str] = []
+            self.loaded: tuple[tuple[object, ...], dict[str, object]] | None = None
+
+        def _log(self, message: str) -> None:
+            self.logs.append(message)
+
+        def review_catalog_position(self, *args: object, **kwargs: object) -> None:
+            self.loaded = (args, kwargs)
+
+    return _Review()
+
+
+def test_attach_candidate_catalog_nests_the_sky_pane() -> None:
+    review = _review_for_catalog()
+    frame = pd.DataFrame(
+        {
+            "stokes": ["I"],
+            "source": ["J1841-0157"],
+            "base_url": ["http://127.0.0.1:8768"],
+        }
+    )
+    layout = attach_candidate_catalog(review, frame)
+    assert review._sky_pane in list(layout.sky_row.objects)  # type: ignore[attr-defined]
+    assert layout.sky_row in list(review._layout.objects)  # type: ignore[attr-defined]
+    assert review._sky_pane not in list(review._layout.objects)  # type: ignore[attr-defined]
+    assert review._layout.max_width is None  # type: ignore[attr-defined]
+
+
+def test_attach_candidate_catalog_load_reviews_the_clicked_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review = _review_for_catalog()
+    frame = pd.DataFrame(
+        {
+            "stokes": ["I"],
+            "source": ["J1841-0157"],
+            "base_url": ["http://127.0.0.1:8768"],
+        }
+    )
+    layout = attach_candidate_catalog(review, frame)
+    monkeypatch.setattr(
+        "ovro_lwa_portal.viz.exopipe_catalog.fetch_text",
+        lambda _url: _LOCBAR,
+    )
+    layout.table.clicked_iloc = 0
+    layout.table.clicked_filter_key = ()
+    layout.table.selection = [0]
+    layout.load_button.clicks += 1
+
+    loaded = review.loaded  # type: ignore[attr-defined]
+    assert loaded is not None
+    assert loaded[0] == ("280.46630 -1.96395",)
+    assert loaded[1]["name"] == "J1841-0157"
+    assert loaded[1]["stokes"] == "I"
+    assert loaded[1]["time_idx"] is None
+    assert loaded[1]["freq_idx"] is None
+
+
+def test_attach_candidate_catalog_serve_fetch_is_scheduled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serve mode must fetch off the caller thread and apply on ``schedule``."""
+    import threading
+    import time
+
+    review = _review_for_catalog()
+    review._panel_serve_mode = True  # type: ignore[attr-defined]
+    scheduled: list[object] = []
+
+    class _Session:
+        def schedule(self, callback: object) -> None:
+            scheduled.append(callback)
+
+    review._ui = _Session()  # type: ignore[attr-defined]
+    frame = pd.DataFrame(
+        {
+            "stokes": ["I"],
+            "source": ["J1841-0157"],
+            "base_url": ["http://127.0.0.1:8768"],
+        }
+    )
+    layout = attach_candidate_catalog(review, frame)
+    fetch_threads: list[threading.Thread] = []
+
+    def _fetch(_url: str) -> str:
+        fetch_threads.append(threading.current_thread())
+        return _LOCBAR
+
+    monkeypatch.setattr("ovro_lwa_portal.viz.exopipe_catalog.fetch_text", _fetch)
+    layout.table.clicked_iloc = 0
+    layout.table.clicked_filter_key = ()
+    layout.table.selection = [0]
+    layout.load_button.clicks += 1
+
+    assert review.loaded is None  # type: ignore[attr-defined]
+    deadline = time.monotonic() + 2.0
+    while not scheduled and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert fetch_threads
+    assert fetch_threads[0] is not threading.main_thread()
+    assert fetch_threads[0].name == "exopipe-source-page"
+    assert len(scheduled) == 1
+    scheduled[0]()  # type: ignore[operator]
+    loaded = review.loaded  # type: ignore[attr-defined]
+    assert loaded is not None
+    assert loaded[0] == ("280.46630 -1.96395",)
+    assert loaded[1]["name"] == "J1841-0157"
+    assert loaded[1]["stokes"] == "I"
