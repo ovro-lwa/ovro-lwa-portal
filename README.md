@@ -328,8 +328,10 @@ pixi run panel serve scripts/serve_exopipe_candidate_review.py \
 The ExoPipe indexes must be reachable from the Panel host (the notebook's SSH
 forward to `127.0.0.1:8766` and `127.0.0.1:8768`). Override them with
 `OVRO_EXOPIPE_V_URL` and `OVRO_EXOPIPE_I_URL`, or repeat `--queue V=http://…`.
-HiPS follows `OVRO_HIPS_HTTP_BASE` (default `http://localhost:3005`). A relative
-prefix together with `--hips-root` mounts tiles on the Panel port.
+The control row lists every HiPS survey under `OVRO_HIPS_ROOT` (default
+`/lustre/pipeline/calibration/hips`). Tile URLs use `OVRO_HIPS_HTTP_BASE`
+(default `http://localhost:3005`). A relative prefix together with
+`--hips-root` mounts tiles on the Panel port.
 
 ## Quick Start
 

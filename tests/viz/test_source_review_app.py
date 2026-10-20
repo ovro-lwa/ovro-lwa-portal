@@ -551,6 +551,27 @@ def test_hips_selector_replaces_method_selector(tmp_path: Path) -> None:
     assert widget.background_cut_max == 4.0
 
 
+def test_hidden_heatmap_method_is_omitted_without_surveys(tmp_path: Path) -> None:
+    """ExoPipe does not fall back to the heatmap-method menu."""
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+            show_heatmap_method=False,
+        ),
+        validate_zarr=False,
+    )
+    names = [str(getattr(child, "name", "")) for child in review._layout.objects[0].objects]
+    assert "Heatmap method" not in names
+    assert "HiPS background" not in names
+
+
 def test_method_selector_kept_without_hips_backgrounds(tmp_path: Path) -> None:
     zarr = tmp_path / "store.zarr"
     zarr.mkdir()

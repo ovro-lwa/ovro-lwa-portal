@@ -21,7 +21,7 @@ Optional environment variables::
     OVRO_EXOPIPE_V_URL        Stokes V index (default ``http://127.0.0.1:8766``)
     OVRO_EXOPIPE_I_URL        Stokes I index (default ``http://127.0.0.1:8768``)
     OVRO_HIPS_HTTP_BASE       HiPS URL (default ``http://localhost:3005``)
-    OVRO_HIPS_ROOT            HiPS files on disk, used when the prefix is relative
+    OVRO_HIPS_ROOT            HiPS survey root (default ``/lustre/pipeline/calibration/hips``)
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from ovro_lwa_portal.viz.exopipe_catalog import (
     attach_candidate_catalog,
     load_candidate_table,
 )
+from ovro_lwa_portal.viz.hips import list_hips_surveys
 from ovro_lwa_portal.viz.hips_server import register_hips_panel_serve
 from ovro_lwa_portal.viz.panel_ui_session import ServedPanelUISession
 from ovro_lwa_portal.viz.source_review_app import (
@@ -119,7 +120,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--patch-scale", type=float, default=5.0)
     parser.add_argument("--sky-fov-deg", type=float, default=8.0)
-    parser.add_argument("--heatmap-method", default="dynamic_spectrum")
     parser.add_argument(
         "--hips-root",
         type=Path,
@@ -171,13 +171,15 @@ def _build_app(args: argparse.Namespace) -> SourceReview:
         patch_scale=args.patch_scale,
         sky_fov_deg=args.sky_fov_deg,
         patch_fit_max_reduced_chi_squared=10.0,
-        heatmap_method=args.heatmap_method,
+        heatmap_method="dynamic_spectrum",
         storage_options=resolved.storage_options,
         config=SourceReviewConfig(
             zarr_lm_chunk=args.zarr_lm_chunk,
             hips_root=args.hips_root,
             hips_background=args.hips_background,
             hips_http_prefix=args.hips_http_prefix,
+            hips_backgrounds=tuple(list_hips_surveys(args.hips_root)),
+            show_heatmap_method=False,
         ),
         validate_zarr=False,
         ui_session=ui_session,

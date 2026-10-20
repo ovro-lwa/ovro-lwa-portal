@@ -136,6 +136,9 @@ class SourceReviewConfig:
     hips_http_prefix: str = "/calibration/hips"
     # When set, a HiPS background selector replaces the heatmap method selector.
     hips_backgrounds: tuple[Path, ...] = ()
+    # ExoPipe review sets this false: the spectrum stays ``dynamic_spectrum``
+    # and an empty survey list does not show the method menu.
+    show_heatmap_method: bool = True
     # HiPS background (Aladin Lite setCuts)
     hips_background_percentile_low: float = 2.0
     hips_background_percentile_high: float = 98.0
@@ -465,7 +468,6 @@ class SourceReview(param.Parameterized):
                 width=260,
             )
             self._hips_selector.param.watch(self._on_hips_background_change, "value")
-        control_selector = self._hips_selector or self._method_selector
         # ipywidgets spinner in Jupyter; Panel spinner under ``panel serve`` (native comm).
         if self._panel_serve_mode:
             self._loading_widget = None
@@ -533,16 +535,22 @@ class SourceReview(param.Parameterized):
             disabled=True,
         )
         self._fit_overlay_button.on_click(self._on_fit_overlay)
+        control_widgets: list[object] = [
+            self._coord_input,
+            self._coord_slew,
+            self._coord_generate,
+            self._stokes_toggle,
+            self._overlay_toggle,
+            self._fit_overlay_button,
+        ]
+        if self._hips_selector is not None:
+            control_widgets.append(self._hips_selector)
+        elif self._config.show_heatmap_method:
+            control_widgets.append(self._method_selector)
+        control_widgets.append(self._loading_pane)
         self._layout = pn.Column(
             pn.Row(
-                self._coord_input,
-                self._coord_slew,
-                self._coord_generate,
-                self._stokes_toggle,
-                self._overlay_toggle,
-                self._fit_overlay_button,
-                control_selector,
-                self._loading_pane,
+                *control_widgets,
                 sizing_mode="stretch_width",
                 margin=(0, 0, 8, 0),
             ),
