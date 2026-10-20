@@ -22,11 +22,38 @@ from ovro_lwa_portal.viz.source_review import (
     run_dataset_load,
     should_build_heatmap_grid,
     should_reset_heatmap_on_center,
+    sibling_zarr_path,
 )
 
 # Cas A and a clearly different target (Cyg A) for "different source" cases.
 CAS_A = SkyCoord(ra=350.8500 * u.deg, dec=58.8150 * u.deg, frame="icrs")
 CYG_A = SkyCoord(ra=299.8682 * u.deg, dec=40.7339 * u.deg, frame="icrs")
+
+
+@pytest.mark.parametrize(
+    ("source", "role", "expected"),
+    [
+        (
+            "s3://ovro/IVsub_1hMHz_Taper_dewarped_aligned.zarr",
+            "overlay",
+            "s3://ovro/IVsub_1hMHz_Taper_dewarped_aligned_overlay.zarr",
+        ),
+        (
+            "/fast/claw/store.zarr/",
+            "spectrum",
+            "/fast/claw/store_spectrum.zarr",
+        ),
+        ("/fast/claw/store", "overlay", "/fast/claw/store_overlay"),
+        (
+            "s3://ovro/foo_overlay.zarr",
+            "spectrum",
+            "s3://ovro/foo_overlay.zarr",
+        ),
+    ],
+)
+def test_sibling_zarr_path(source: str, role: str, expected: str) -> None:
+    """Suffix is inserted before ``.zarr`` and is not stacked on a sibling path."""
+    assert sibling_zarr_path(source, role) == expected
 
 
 def _nudged(coord: SkyCoord, arcsec: float) -> SkyCoord:
