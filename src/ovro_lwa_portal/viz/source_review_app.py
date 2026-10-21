@@ -14,9 +14,10 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import ipywidgets as widgets
+from ipywidgets import Widget, embed
 import numpy as np
 import ovro_lwa_portal as ovro
 import panel as pn
@@ -30,9 +31,13 @@ from bokeh.models import ColumnDataSource, FixedTicker, HoverTool
 from bokeh.plotting import figure
 
 from ovro_lwa_portal import resolve_coordinate_string
-from ovro_lwa_portal.io import DataSourceError, cap_lm_chunks
+from ovro_lwa_portal.io import DataSourceError, _detect_source_type, cap_lm_chunks
 from ovro_lwa_portal.name_resolution import format_icrs_degree_pair
-from ovro_lwa_portal.viz.hips import compute_hips_percentile_cuts, hips_background_survey_url
+from ovro_lwa_portal.viz.hips import (
+    compute_hips_percentile_cuts,
+    hips_background_survey_url,
+    read_hips_pixel_cut,
+)
 from ovro_lwa_portal.viz.pipeline_qa_app import (
     ACTIVITY_LOG_HEIGHT_PX,
     ScrollLog,
@@ -63,11 +68,13 @@ from ovro_lwa_portal.viz.source_review import (
     plan_center_action,
     run_dataset_load,
     should_reset_heatmap_on_center,
+    sibling_zarr_path,
 )
 from ovro_lwa_portal.accessor import PatchFitCellResult
 from ovro_lwa_portal.dynspec_fill import (
     ProgressiveSpectrumFill,
     TrackedPixelReader,
+    plan_fill_units,
     spectrum_chunk_lengths,
 )
 from ovro_lwa_portal.fov_overlay import FovOverlaySession, SkyPlaneReader, attach_fov_pan_reload
@@ -127,6 +134,11 @@ class SourceReviewConfig:
         "/lustre/pipeline/calibration/hips/Blue_I_deep_Taper_Robust-0.75_Jan25.hips"
     )
     hips_http_prefix: str = "/calibration/hips"
+    # When set, a HiPS background selector replaces the heatmap method selector.
+    hips_backgrounds: tuple[Path, ...] = ()
+    # ExoPipe review sets this false: the spectrum stays ``dynamic_spectrum``
+    # and an empty survey list does not show the method menu.
+    show_heatmap_method: bool = True
     # HiPS background (Aladin Lite setCuts)
     hips_background_percentile_low: float = 2.0
     hips_background_percentile_high: float = 98.0
@@ -144,12 +156,50 @@ class SourceReviewConfig:
     log_overlay_timing: bool = False
 
 
+def _sky_axis_sizes(ds: xr.Dataset) -> dict[str, int]:
+    """Sizes of the five image axes on ``SKY`` (0 when an axis is absent)."""
+    dims = ("time", "frequency", "polarization", "l", "m")
+    if "SKY" not in ds:
+        return {dim: -1 for dim in dims}
+    sky = ds["SKY"]
+    return {dim: int(sky.sizes[dim]) if dim in sky.sizes else 0 for dim in dims}
+
+
+def _require_matching_sky(
+    base: xr.Dataset,
+    other: xr.Dataset,
+    base_path: str,
+    other_path: str,
+) -> None:
+    """Raise when two stores do not share the five ``SKY`` axis sizes."""
+    base_sizes = _sky_axis_sizes(base)
+    other_sizes = _sky_axis_sizes(other)
+    if base_sizes != other_sizes:
+        msg = f"SKY sizes differ: {base_path} {base_sizes} vs {other_path} {other_sizes}"
+        raise ValueError(msg)
+    for dim in base_sizes:
+        left, right = base.coords.get(dim), other.coords.get(dim)
+        if (left is None) != (right is None) or (
+            left is not None and right is not None and not left.variable.equals(right.variable)
+        ):
+            msg = f"SKY {dim} coordinates differ: {base_path} vs {other_path}"
+            raise ValueError(msg)
+
+
 LOADING_SPINNER_HTML = (
     '<div style="display:inline-block;width:22px;height:22px;vertical-align:middle;'
     'border:3px solid #ddd;border-top-color:#0d6efd;border-radius:50%;'
     'animation:ovro-lwa-spin 0.8s linear infinite"></div>'
     "<style>@keyframes ovro-lwa-spin{to{transform:rotate(360deg)}}</style>"
 )
+
+
+def _ipywidget_embed_bundle(widget: object) -> dict[str, object]:
+    """Snapshot an ipywidget the way Panel's notebook ``IPyWidget`` model does."""
+    spec = widget.get_view_spec()  # type: ignore[attr-defined]
+    state = Widget.get_manager_state(widgets=[])
+    state["state"] = embed.dependency_state([widget], drop_defaults=True)
+    return {"spec": spec, "state": state}
 
 
 def _placeholder_heatmap_figure() -> figure:
@@ -162,6 +212,7 @@ def _placeholder_heatmap_figure() -> figure:
     plot = figure(
         width=1000,
         height=400,
+        sizing_mode="stretch_width",
         x_range=(0, 1),
         y_range=(0, 1),
         tools="",
@@ -183,15 +234,16 @@ def configure_source_review_notebook() -> None:
 
 
 def configure_source_review_serve() -> None:
-    """One-time ``panel serve`` setup: astrowidget patch + ipywidgets bridge.
+    """One-time ``panel serve`` setup: astrowidget patch, ipywidgets, and Tabulator.
 
     Do **not** call ``pn.extension('ipywidgets')`` in JupyterLab — only for
-    standalone Bokeh server apps (``scripts/serve_source_review.py``).
+    standalone Bokeh server apps (``scripts/serve_source_review.py`` and
+    ``scripts/serve_exopipe_candidate_review.py``).
     """
     _patch_astrowidget_get_wcs()
     # Bokeh is already active under ``panel serve``; loading the bokeh extension
     # here triggers "extension not recognized" on Panel 1.8 + Bokeh 3.9.
-    pn.extension("ipywidgets", sizing_mode="stretch_width")
+    pn.extension("ipywidgets", "tabulator", sizing_mode="stretch_width")
 
 
 class ServeSkyWidget(SkyWidget):
@@ -214,6 +266,30 @@ class ServeSkyWidget(SkyWidget):
         if name in self._NULLABLE_FLOAT_TRAITS and value is None:
             value = float("nan")
         super().set_trait(name, value, *args, **kwargs)
+
+
+def _replace_child_pane(root: pn.viewable.Viewable, old: object, new: object) -> bool:
+    """Replace ``old`` in ``root`` or in one immediate row or column child.
+
+    Returns True when the pane was found. Nested catalog rows keep the sky pane
+    one level down from the Source Review column.
+    """
+    objects = list(getattr(root, "objects", ()))
+    for index, pane in enumerate(objects):
+        if pane is old:
+            objects[index] = new
+            root.objects = objects  # type: ignore[attr-defined]
+            return True
+    for pane in objects:
+        if not isinstance(pane, (pn.Row, pn.Column)):
+            continue
+        nested = list(pane.objects)
+        for index, child in enumerate(nested):
+            if child is old:
+                nested[index] = new
+                pane.objects = nested
+                return True
+    return False
 
 
 class SourceReview(param.Parameterized):
@@ -277,6 +353,11 @@ class SourceReview(param.Parameterized):
         self._ui_session: PanelUISession | None = None
         self._scroll_log = ScrollLog()
         self._dataset: xr.Dataset | None = None
+        # SKY for each role. None until open; then either a sibling or ``_dataset``.
+        self._overlay_dataset: xr.Dataset | None = None
+        self._spectrum_dataset: xr.Dataset | None = None
+        self._overlay_path: str | None = None
+        self._spectrum_path: str | None = None
         self._cache: dict[tuple[str, str], HeatmapLoad] = {}
         self._heatmap_values: np.ndarray | None = None
         self._overlay_patch_fit_result: PatchFitCellResult | None = None
@@ -297,15 +378,17 @@ class SourceReview(param.Parameterized):
         self._fov_executor: ThreadPoolExecutor | None = None
         self._read_executor: ThreadPoolExecutor | None = None
         self._direct_sky: tuple[xr.Dataset, DirectZarrArray | None] | None = None
+        self._direct_by_id: dict[int, DirectZarrArray | None] = {}
         self._fov_pan_attached = False
         self._spectrum_fill: ProgressiveSpectrumFill | None = None
-        self._hips_background_url = hips_background_survey_url(
-            self._config.hips_background,
-            hips_root=self._config.hips_root,
-            http_prefix=self._config.hips_http_prefix,
-        )
+        self._spectrum_progress_at = 0.0
+        self._heatmap_push_queued = False
+        self._heatmap_after_publish: Callable[[], None] | None = None
+        self._hips_background = Path(self._config.hips_background)
+        self._hips_background_url = self._hips_survey_url(self._hips_background)
         self._time_idx = 0
         self._freq_idx = 0
+        self._pending_overlay_slice: tuple[int, int] | None = None
         self._default_time_idx = 0
         self._default_freq_idx = 0
         self._heatmap_job_id = 0
@@ -317,6 +400,7 @@ class SourceReview(param.Parameterized):
         self._overlay_fit_job_id = 0
         self._fit_overlay_sync_token = 0
         self._last_sent_image_revision: int | None = None
+        self._notebook_sky_embed_live = False
 
         super().__init__(coordinate_string=coordinate_string.strip(), **params)
 
@@ -375,6 +459,22 @@ class SourceReview(param.Parameterized):
             name="Heatmap method",
             width=220,
         )
+        self._hips_selector: pn.widgets.Select | None = None
+        if self._config.hips_backgrounds:
+            surveys = {
+                Path(path).name.removesuffix(".hips"): str(path)
+                for path in self._config.hips_backgrounds
+            }
+            current = str(self._hips_background)
+            if current not in surveys.values():
+                surveys = {self._hips_background.name.removesuffix(".hips"): current, **surveys}
+            self._hips_selector = pn.widgets.Select(
+                name="HiPS background",
+                options=surveys,
+                value=current,
+                width=260,
+            )
+            self._hips_selector.param.watch(self._on_hips_background_change, "value")
         # ipywidgets spinner in Jupyter; Panel spinner under ``panel serve`` (native comm).
         if self._panel_serve_mode:
             self._loading_widget = None
@@ -410,6 +510,7 @@ class SourceReview(param.Parameterized):
         self._coord_input.param.watch(self._on_coord_value_input, "value_input")
         self._coord_input.param.watch(self._on_coord_value, "value")
         self._suppress_coord_value_handler = False
+        self._suppress_stokes_handler = False
         self._coord_slew = pn.widgets.Button(
             name="Center",
             button_type="primary",
@@ -441,16 +542,22 @@ class SourceReview(param.Parameterized):
             disabled=True,
         )
         self._fit_overlay_button.on_click(self._on_fit_overlay)
+        control_widgets: list[object] = [
+            self._coord_input,
+            self._coord_slew,
+            self._coord_generate,
+            self._stokes_toggle,
+            self._overlay_toggle,
+            self._fit_overlay_button,
+        ]
+        if self._hips_selector is not None:
+            control_widgets.append(self._hips_selector)
+        elif self._config.show_heatmap_method:
+            control_widgets.append(self._method_selector)
+        control_widgets.append(self._loading_pane)
         self._layout = pn.Column(
             pn.Row(
-                self._coord_input,
-                self._coord_slew,
-                self._coord_generate,
-                self._stokes_toggle,
-                self._overlay_toggle,
-                self._fit_overlay_button,
-                self._method_selector,
-                self._loading_pane,
+                *control_widgets,
                 sizing_mode="stretch_width",
                 margin=(0, 0, 8, 0),
             ),
@@ -479,13 +586,11 @@ class SourceReview(param.Parameterized):
                     f"Known sources: {len(self._known_source_names)} names from {resolved_sources}"
                 )
         self._log(f"Zarr: {self._zarr_path}")
-        props = self._config.hips_background / "properties"
-        if props.is_file():
-            self._log(f"HiPS background: {self._hips_background_url}")
-        else:
+        self._log_hips_background()
+        if self._hips_selector is not None:
             self._log(
-                f"WARNING: HiPS not found on disk ({self._config.hips_background}); "
-                f"background URL is {self._hips_background_url!r}"
+                f"HiPS backgrounds: {len(self._hips_selector.options)} "
+                f"under {self._config.hips_root}"
             )
         self._set_status(
             "**Enter a coordinate** (`RA°, Dec°` or source name), then click "
@@ -586,9 +691,23 @@ class SourceReview(param.Parameterized):
         *,
         after_publish: Callable[[], None] | None = None,
     ) -> None:
-        """Push in-place heatmap edits after the active hold cycle (or on io_loop)."""
+        """Push in-place heatmap edits after the active hold cycle (or on io_loop).
+
+        Remote stores paint many partial spectra. Each paint used to push the
+        whole notebook layout, which stalled the SkyWidget comm while the
+        activity log (a separate channel) kept updating. One push stays queued;
+        it sends the latest image and the latest completion callback.
+        """
+        if after_publish is not None:
+            self._heatmap_after_publish = after_publish
+        if self._heatmap_push_queued:
+            return
+        self._heatmap_push_queued = True
 
         def _push() -> None:
+            self._heatmap_push_queued = False
+            follow = self._heatmap_after_publish
+            self._heatmap_after_publish = None
             if isinstance(self._ui, ServedPanelUISession):
                 handles = self._heatmap_bokeh_handles
                 if handles is not None and self._heatmap_pane.object is not handles.plot:
@@ -599,8 +718,8 @@ class SourceReview(param.Parameterized):
                     *self._notebook_ui_views(),
                     force_push=True,
                 )
-            if after_publish is not None:
-                after_publish()
+            if follow is not None:
+                follow()
 
         defer_after_notebook_hold(_push)
 
@@ -631,21 +750,17 @@ class SourceReview(param.Parameterized):
         """Mount ``SkyWidget`` in the layout (``panel serve`` only).
 
         Replaces the HTML placeholder with a fresh ``IPyWidget`` pane so the
-        ipywidgets_bokeh bundle and live comm share one model id.
+        ipywidgets_bokeh bundle and live comm share one model id. The placeholder
+        may sit in the top-level column or one row or column beneath it (the
+        candidate catalog row).
         """
         new_pane = pn.pane.IPyWidget(
             widget,
             height=620,
             sizing_mode="stretch_width",
         )
-        objects = list(self._layout.objects)
-        for index, pane in enumerate(objects):
-            if pane is self._sky_pane:
-                objects[index] = new_pane
-                break
-        else:
+        if not _replace_child_pane(self._layout, self._sky_pane, new_pane):
             return
-        self._layout.objects = objects
         self._sky_pane = new_pane
         doc = pn.state.curdoc
         if doc is not None:
@@ -1351,6 +1466,115 @@ class SourceReview(param.Parameterized):
             pass
         self._log(f"[diag] Click reported=({ra_deg:.4f}, {dec_deg:.4f}) | " + " | ".join(parts))
 
+    def review_catalog_position(
+        self,
+        coordinate_string: str,
+        *,
+        name: str,
+        stokes: str,
+        time_idx: int | None = None,
+        freq_idx: int | None = None,
+    ) -> None:
+        """Center on an ExoPipe combined position and start the dynamic spectrum.
+
+        ``coordinate_string`` is the locbar degree pair (``RA Dec``). ``name``
+        is the source id used as the heatmap label. ``stokes`` selects the
+        queue's Stokes plane. When ``time_idx`` and ``freq_idx`` are both set,
+        the sky overlay uses that detection sample instead of the middle
+        finite heatmap cell. Does not reset the heatmap to zeros: the spectrum
+        publish replaces the previous figure.
+        """
+        self._schedule_ui_action(
+            lambda: self._review_catalog_position_impl(
+                coordinate_string,
+                name=name,
+                stokes=stokes,
+                time_idx=time_idx,
+                freq_idx=freq_idx,
+            )
+        )
+
+    def _review_catalog_position_impl(
+        self,
+        coordinate_string: str,
+        *,
+        name: str,
+        stokes: str,
+        time_idx: int | None = None,
+        freq_idx: int | None = None,
+    ) -> None:
+        text = coordinate_string.strip()
+        if not text:
+            self._log("WARNING: Catalog position is empty.")
+            return
+        resolution, messages = resolve_coordinate_string(
+            text,
+            use_ned_fallback=self._config.use_ned_fallback,
+            ned_timeout=self._config.ned_timeout_s,
+            known_source_names=frozenset(item.casefold() for item in self._known_source_names),
+        )
+        for message in messages:
+            self._log(message)
+        if resolution is None:
+            self._log(
+                f"WARNING: Could not resolve catalog position {text!r} "
+                "(expected RA/Dec in degrees)."
+            )
+            return
+        coord = resolution.coord
+        if stokes not in self.param.stokes.objects:
+            self._log(f"WARNING: This store does not contain Stokes {stokes}.")
+            return
+        self._set_coordinate_field_from_text(text, log_prefix="Catalog")
+        if str(self.stokes) != stokes:
+            self._suppress_stokes_handler = True
+            try:
+                self.stokes = stokes
+            finally:
+                self._suppress_stokes_handler = False
+            self._apply_sky_widget_pol()
+            self._cache.clear()
+            self._invalidate_overlay_patch_fit()
+        self._coord = coord
+        self._current_source = build_source_from_coordinate(name, coord)
+        self._pending_overlay_slice = None
+        widget = self._sky_widget
+        if widget is None:
+            self._log("Sky widget not ready — wait for the Zarr store to open.")
+            return
+        if time_idx is not None and freq_idx is not None:
+            resolved_time = int(time_idx)
+            resolved_freq = int(freq_idx)
+            if self._lst_hours is not None and len(self._lst_hours):
+                resolved_time = int(np.clip(resolved_time, 0, len(self._lst_hours) - 1))
+            if self._freq_mhz is not None and len(self._freq_mhz):
+                resolved_freq = int(np.clip(resolved_freq, 0, len(self._freq_mhz) - 1))
+            self._time_idx = resolved_time
+            self._freq_idx = resolved_freq
+            self._pending_overlay_slice = (resolved_time, resolved_freq)
+            overlay = self._overlay_time_freq_text(resolved_time, resolved_freq)
+            self._set_status(f"**{name}** · overlay {overlay}")
+            self._log(f"Overlay detection sample {overlay}.")
+        widget.goto(coord, fov=self._sky_fov_deg * u.deg)
+        self._set_sky_crosshair(widget, coord)
+        # The first notebook snapshot is the placeholder. Later Loads update that
+        # same embed: a new IPyWidget model on every Load left the previous sky
+        # view on screen.
+        if not self._panel_serve_mode:
+            self._refresh_notebook_sky_embed()
+        self._force_send_sky_widget_state(widget)
+        if not self._panel_serve_mode:
+            self._schedule_main(lambda: self._force_send_sky_widget_state(widget))
+        self._schedule_overlay_slice_load(
+            self._time_idx,
+            self._freq_idx,
+            center_on_target=True,
+            center=coord,
+            manage_spinner=True,
+        )
+        self._fade_heatmap_for_new_candidate()
+        self._load_heatmap()
+
     def _on_generate_heatmap(self, _event: object | None = None) -> None:
         self._schedule_ui_action(self._on_generate_heatmap_impl)
 
@@ -1399,6 +1623,22 @@ class SourceReview(param.Parameterized):
             return 0
         label = str(self.stokes) if self.stokes in options else options[0]
         return polarization_index_for_stokes(self._dataset, label)
+
+    def _overlay_time_freq_text(self, time_idx: int, freq_idx: int) -> str:
+        """Calendar day, LST, and frequency of the slice shown on the sky."""
+        when = f"t={int(time_idx)}"
+        if self._dataset is not None and self._lst_hours is not None and len(self._lst_hours):
+            when = format_heatmap_time_axis_label(
+                np.asarray(self._dataset.coords["time"].values),
+                int(time_idx),
+                self._lst_hours,
+                day_labels=self._time_day_labels,
+            )
+        if self._freq_mhz is not None and len(self._freq_mhz):
+            freq = f"{float(self._freq_mhz[int(freq_idx)]):.1f} MHz"
+        else:
+            freq = f"f={int(freq_idx)}"
+        return f"Stokes {self.stokes} · {when} · {freq}"
 
     def _slice_descriptor(self, time_idx: int, freq_idx: int) -> str:
         """Stokes + time/frequency label for overlay logs, status, and titles."""
@@ -1450,10 +1690,12 @@ class SourceReview(param.Parameterized):
         cube.pol = self._pol_idx()
 
     def _on_stokes_change(self, *_events: object) -> None:
+        if self._suppress_stokes_handler:
+            return
         self._schedule_ui_action(self._on_stokes_change_impl)
 
     def _on_stokes_change_impl(self) -> None:
-        if self._dataset is None:
+        if self._suppress_stokes_handler or self._dataset is None:
             return
         self._apply_sky_widget_pol()
         self._cache.clear()
@@ -1516,7 +1758,8 @@ class SourceReview(param.Parameterized):
         last_key: dict[str, tuple[int, str]] = {}
 
         def _callback(stage: str, current: int, total: int, message: str) -> None:
-            # Pixel track is fast; log start + finish only (skip per-batch lines).
+            # Skip per-batch pixel-track lines. Start, finish, and storage
+            # heartbeats (current == 0, "still working") still reach the log.
             if stage == "track" and total > 1 and current not in (0, total):
                 return
             if stage in ("extract", "reduce", "fit") and total > 1:
@@ -1539,6 +1782,96 @@ class SourceReview(param.Parameterized):
 
         return _callback
 
+    def _open_capped_dataset(self, path: str) -> xr.Dataset:
+        """Open one store with native chunks and the review ``l``/``m`` cap."""
+        return cap_lm_chunks(
+            ovro.open_dataset(
+                path,
+                chunks={},
+                storage_options=self._storage_options,
+            ),
+            self._config.zarr_lm_chunk,
+        )
+
+    def _select_polarization(
+        self,
+        ds: xr.Dataset,
+        report: Callable[[str], None] | None = None,
+    ) -> xr.Dataset:
+        """Apply ``polarization_isel`` when the store has that dimension."""
+        if self._config.polarization_isel is None or "polarization" not in ds.dims:
+            return ds
+        pol_sel = tuple(int(i) for i in self._config.polarization_isel)
+        n_pol = int(ds.sizes["polarization"])
+        bad = [i for i in pol_sel if i < 0 or i >= n_pol]
+        if bad:
+            stokes = (
+                list(ds.coords["polarization"].values) if "polarization" in ds.coords else []
+            )
+            msg = (
+                f"polarization_isel={pol_sel} is out of range for this store "
+                f"(polarization size={n_pol}, Stokes={stokes}). "
+                f"Use None or indices in 0..{max(n_pol - 1, 0)} "
+                "(Stokes-I-only stores cannot use (0, 1))."
+            )
+            raise IndexError(msg)
+        if report is not None:
+            report(f"Selecting polarization indices {pol_sel} (isel)")
+        return ds.isel(polarization=list(pol_sel))
+
+    def _sibling_present(self, path: str) -> tuple[bool, BaseException | None]:
+        """Whether ``path/.zgroup`` exists. Exceptions mean "absent"."""
+        try:
+            source_type, normalized = _detect_source_type(path)
+            if source_type == "local":
+                return (Path(normalized).expanduser() / ".zgroup").is_file(), None
+            if source_type != "remote":
+                return False, None
+            from urllib.parse import urlparse  # noqa: PLC0415
+
+            import fsspec  # noqa: PLC0415
+
+            parsed = urlparse(normalized)
+            fs_options = dict(self._storage_options) if self._storage_options else {}
+            if parsed.scheme == "s3" and fs_options:
+                config_kwargs = dict(fs_options.get("config_kwargs") or {})
+                config_kwargs.setdefault("max_pool_connections", 32)
+                fs_options["config_kwargs"] = config_kwargs
+            fs = fsspec.filesystem(parsed.scheme, **fs_options)
+            key = (
+                f"{normalized.rstrip('/')}/.zgroup"
+                if parsed.scheme in ("http", "https")
+                else f"{parsed.netloc}/{parsed.path.lstrip('/')}/.zgroup"
+            )
+            return bool(fs.exists(key)), None
+        except Exception as exc:  # noqa: BLE001 — a failed probe falls back to ZARR_PATH
+            return False, exc
+
+    def _open_role_dataset(
+        self,
+        base: xr.Dataset,
+        role: Literal["overlay", "spectrum"],
+        report: Callable[[str], None],
+    ) -> tuple[xr.Dataset, str | None]:
+        """Open the role sibling, or return ``base`` when it is absent.
+
+        A present sibling whose ``SKY`` sizes differ from ``base`` raises.
+        """
+        sibling = sibling_zarr_path(self._zarr_path, role)
+        if sibling.rstrip("/") == str(self._zarr_path).rstrip("/"):
+            report(f"{role} reads: {self._zarr_path}")
+            return base, None
+        present, error = self._sibling_present(sibling)
+        if error is not None:
+            report(f"{role} sibling {sibling} unavailable ({error}); using {self._zarr_path}")
+            return base, None
+        if not present:
+            report(f"{role} sibling {sibling} not found; using {self._zarr_path}")
+            return base, None
+        report(f"Opening {role} sibling {sibling}…")
+        other = self._select_polarization(self._open_capped_dataset(sibling))
+        _require_matching_sky(base, other, self._zarr_path, sibling)
+        return other, sibling
 
     def _open_dataset(self) -> None:
         def _start() -> None:
@@ -1554,34 +1887,11 @@ class SourceReview(param.Parameterized):
             t_open = time.perf_counter()
 
             t_meta = time.perf_counter()
-            ds = cap_lm_chunks(
-                ovro.open_dataset(
-                    self._zarr_path,
-                    chunks={},
-                    storage_options=self._storage_options,
-                ),
-                self._config.zarr_lm_chunk,
-            )
-            if self._config.polarization_isel is not None and "polarization" in ds.dims:
-                pol_sel = tuple(int(i) for i in self._config.polarization_isel)
-                n_pol = int(ds.sizes["polarization"])
-                bad = [i for i in pol_sel if i < 0 or i >= n_pol]
-                if bad:
-                    stokes = (
-                        list(ds.coords["polarization"].values)
-                        if "polarization" in ds.coords
-                        else []
-                    )
-                    msg = (
-                        f"polarization_isel={pol_sel} is out of range for this store "
-                        f"(polarization size={n_pol}, Stokes={stokes}). "
-                        f"Use None or indices in 0..{max(n_pol - 1, 0)} "
-                        "(Stokes-I-only stores cannot use (0, 1))."
-                    )
-                    raise IndexError(msg)
-                report(f"Selecting polarization indices {pol_sel} (isel)")
-                ds = ds.isel(polarization=list(pol_sel))
+            ds = self._open_capped_dataset(self._zarr_path)
+            ds = self._select_polarization(ds, report)
             report(f"Zarr opened ({time.perf_counter() - t_meta:.1f} s)")
+            overlay_ds, overlay_path = self._open_role_dataset(ds, "overlay", report)
+            spectrum_ds, spectrum_path = self._open_role_dataset(ds, "spectrum", report)
 
             if self._config.skip_first_valid_sky_scan:
                 t0, f0 = 0, int(ds.sizes["frequency"]) // 2
@@ -1610,6 +1920,10 @@ class SourceReview(param.Parameterized):
                 default_freq_idx=f0,
                 lst_hours=lst_hours,
                 freq_mhz=freq_mhz,
+                overlay_dataset=overlay_ds,
+                spectrum_dataset=spectrum_ds,
+                overlay_path=overlay_path,
+                spectrum_path=spectrum_path,
             )
 
         def _work() -> None:
@@ -1624,6 +1938,10 @@ class SourceReview(param.Parameterized):
                     load.lst_hours,
                     load.freq_mhz,
                     None,
+                    overlay_dataset=load.overlay_dataset,
+                    spectrum_dataset=load.spectrum_dataset,
+                    overlay_path=load.overlay_path,
+                    spectrum_path=load.spectrum_path,
                 ),
                 on_error=lambda exc: self._finish_open(None, None, None, None, None, exc),
                 log=self._log,
@@ -1642,6 +1960,10 @@ class SourceReview(param.Parameterized):
         lst_hours: np.ndarray | None,
         freq_mhz: np.ndarray | None,
         error: BaseException | None,
+        overlay_dataset: xr.Dataset | None = None,
+        spectrum_dataset: xr.Dataset | None = None,
+        overlay_path: str | None = None,
+        spectrum_path: str | None = None,
     ) -> None:
         if error is not None:
             self.loading = False
@@ -1656,6 +1978,12 @@ class SourceReview(param.Parameterized):
         assert default_time_idx is not None and default_freq_idx is not None
 
         self._dataset = ds
+        self._overlay_dataset = overlay_dataset if overlay_dataset is not None else ds
+        self._spectrum_dataset = spectrum_dataset if spectrum_dataset is not None else ds
+        self._overlay_path = overlay_path
+        self._spectrum_path = spectrum_path
+        self._direct_by_id = {}
+        self._direct_sky = None
         self._lst_hours = lst_hours
         self._time_day_labels = calendar_mmdd_labels_for_time_coord(ds.coords["time"].values)
         self._freq_mhz = freq_mhz
@@ -1671,15 +1999,8 @@ class SourceReview(param.Parameterized):
             f"Opened — {int(ds.sizes['time'])} times × {int(ds.sizes['frequency'])} freqs, "
             f"{int(ds.sizes['l'])}×{int(ds.sizes['m'])} px, WCS={ds.radport.has_wcs}."
         )
-        direct = self._direct_sky_array()
-        if direct is not None:
-            self._log(
-                f"Chunk reads: Zarr direct, chunks={direct.chunks} "
-                f"({direct.chunk_nbytes / 1e6:.1f} MB), "
-                f"{read_workers(direct.chunk_nbytes)} workers."
-            )
-        else:
-            self._log("Chunk reads: through xarray (store not resolvable for direct reads).")
+        self._log_role_reads("overlay", self._overlay_dataset, self._overlay_path)
+        self._log_role_reads("spectrum", self._spectrum_dataset, self._spectrum_path)
 
         def _clear_loading() -> None:
             self.loading = False
@@ -1722,21 +2043,34 @@ class SourceReview(param.Parameterized):
             self._ensure_heatmap_grid(force=True, announce=False)
 
     def _load_heatmap(self) -> None:
+        pending_overlay_slice = self._pending_overlay_slice
+        self._pending_overlay_slice = None
         if self._dataset is None or self._current_source is None:
             return
         src = self._current_source
         method = str(self.heatmap_method)
+        self._heatmap_job_id += 1
+        job_id = self._heatmap_job_id
         cache_key = (self.coordinate_string.strip(), method, str(self.stokes))
         if cache_key in self._cache:
             cached = self._cache[cache_key]
             if method == "dynamic_spectrum":
-                self._schedule_main(lambda: self._paint_dynamic_spectrum(src, cached.values, done=True))
+                self._schedule_main(
+                    lambda: self._paint_dynamic_spectrum(
+                        src, cached.values, done=True, job_id=job_id
+                    )
+                )
             else:
-                self._dispatch(lambda: self._apply_heatmap(src, cached))
+                self._dispatch(
+                    lambda: self._apply_heatmap(
+                        src,
+                        cached,
+                        job_id=job_id,
+                        pending_overlay_slice=pending_overlay_slice,
+                    )
+                )
             return
 
-        self._heatmap_job_id += 1
-        job_id = self._heatmap_job_id
         self._invalidate_overlay_patch_fit()
         self._begin_heatmap_load(src)
         if method == "dynamic_spectrum":
@@ -1747,7 +2081,7 @@ class SourceReview(param.Parameterized):
             t0 = time.perf_counter()
             try:
                 payload = compute_source_heatmap(
-                    self._dataset,
+                    self._spectrum_dataset or self._dataset,
                     src,
                     method=method,
                     scale=self._patch_scale,
@@ -1759,14 +2093,14 @@ class SourceReview(param.Parameterized):
                 captured_error = exc
                 self._schedule_main(
                     lambda err=captured_error: self._finish_heatmap(
-                        src, None, err, job_id, t0
+                        src, None, err, job_id, t0, pending_overlay_slice
                     )
                 )
                 return
             captured_payload = payload
             self._schedule_main(
                 lambda result=captured_payload: self._finish_heatmap(
-                    src, result, None, job_id, t0
+                    src, result, None, job_id, t0, pending_overlay_slice
                 )
             )
 
@@ -1777,7 +2111,11 @@ class SourceReview(param.Parameterized):
     def _spectrum_fill_session(self) -> ProgressiveSpectrumFill:
         fill = self._spectrum_fill
         if fill is None or fill.executor is not self._read_pool():
-            fill = ProgressiveSpectrumFill(self._read_pool(), self._schedule_main)
+            fill = ProgressiveSpectrumFill(
+                self._read_pool(),
+                self._schedule_main,
+                paint_interval_s=1.0,
+            )
             self._spectrum_fill = fill
         return fill
 
@@ -1845,11 +2183,12 @@ class SourceReview(param.Parameterized):
         job_id: int,
         started_at: float,
     ) -> None:
-        if job_id != self._heatmap_job_id or self._dataset is None:
+        spectrum = self._spectrum_dataset or self._dataset
+        if job_id != self._heatmap_job_id or spectrum is None:
             return
         l_indices, m_indices, visible = tracked
-        sky = self._dataset["SKY"]
-        direct = self._direct_sky_array()
+        sky = spectrum["SKY"]
+        direct = self._direct_array(spectrum)
         time_chunk, freq_chunk = spectrum_chunk_lengths(sky, direct)
         reader = TrackedPixelReader(
             sky,
@@ -1859,6 +2198,33 @@ class SourceReview(param.Parameterized):
             visible=visible,
             direct=direct,
         )
+
+        n_units = len(
+            plan_fill_units(
+                int(sky.sizes["time"]),
+                int(sky.sizes["frequency"]),
+                time_chunk,
+                freq_chunk,
+            )
+        )
+        self._spectrum_progress_at = 0.0
+        self._log(
+            f"Reading spectrum from the store ({n_units} chunks, "
+            f"time x freq chunk {time_chunk} x {freq_chunk})…"
+        )
+
+        def _on_chunk(done_chunks: int, total_chunks: int) -> None:
+            if job_id != self._heatmap_job_id:
+                return
+            now = time.perf_counter()
+            if done_chunks != total_chunks and now - self._spectrum_progress_at < 2.0:
+                return
+            self._spectrum_progress_at = now
+            elapsed = now - started_at
+            self._log(
+                f"Spectrum read {done_chunks}/{total_chunks} chunks "
+                f"from the store ({elapsed:.0f}s)"
+            )
 
         def _paint(values: np.ndarray, done: bool) -> None:
             self._paint_dynamic_spectrum(
@@ -1880,6 +2246,7 @@ class SourceReview(param.Parameterized):
             freq_chunk=freq_chunk,
             paint=_paint,
             on_error=_on_error,
+            on_chunk=_on_chunk,
         )
 
     def _paint_dynamic_spectrum(
@@ -1909,14 +2276,22 @@ class SourceReview(param.Parameterized):
         def _after_publish() -> None:
             if not done:
                 return
-            self._finish_dynamic_spectrum_log(src, started_at)
+            self._finish_dynamic_spectrum_log(src, started_at, job_id=job_id)
 
         if done:
             self._publish_heatmap_mutation_to_notebook(after_publish=_after_publish)
         else:
             self._publish_heatmap_mutation_to_notebook()
 
-    def _finish_dynamic_spectrum_log(self, src: dict, started_at: float | None) -> None:
+    def _finish_dynamic_spectrum_log(
+        self,
+        src: dict,
+        started_at: float | None,
+        *,
+        job_id: int | None = None,
+    ) -> None:
+        if job_id is not None and job_id != self._heatmap_job_id:
+            return
         arr = self._heatmap_values
         if arr is None:
             return
@@ -1945,6 +2320,14 @@ class SourceReview(param.Parameterized):
             "**Click the heatmap** to inspect a time/frequency slice."
         )
         self._sync_fit_overlay_button()
+
+    def _fade_heatmap_for_new_candidate(self) -> None:
+        """Dim the previous spectrum until this candidate's values are drawn."""
+        handles = self._heatmap_bokeh_handles
+        if handles is None:
+            return
+        handles.image_renderer.glyph.global_alpha = 0.35
+        self._publish_heatmap_mutation_to_notebook()
 
     def _begin_heatmap_load(self, src: dict) -> None:
         """Show spinner/status for a new heatmap job."""
@@ -1979,6 +2362,7 @@ class SourceReview(param.Parameterized):
         error: BaseException | None,
         job_id: int,
         started_at: float,
+        pending_overlay_slice: tuple[int, int] | None = None,
     ) -> None:
         if job_id != self._heatmap_job_id:
             return
@@ -2008,7 +2392,14 @@ class SourceReview(param.Parameterized):
         )
 
         def _apply_and_hint() -> None:
-            self._apply_heatmap(src, payload)
+            if job_id != self._heatmap_job_id:
+                return
+            self._apply_heatmap(
+                src,
+                payload,
+                job_id=job_id,
+                pending_overlay_slice=pending_overlay_slice,
+            )
             if self._dataset is None:
                 return
             hint = diagnose_heatmap_coverage(
@@ -2027,14 +2418,25 @@ class SourceReview(param.Parameterized):
         self.loading = False
         self._sync_spinner(False)
 
-    def _apply_heatmap(self, src: dict, payload: HeatmapLoad) -> None:
+    def _apply_heatmap(
+        self,
+        src: dict,
+        payload: HeatmapLoad,
+        *,
+        job_id: int | None = None,
+        pending_overlay_slice: tuple[int, int] | None = None,
+    ) -> None:
+        if job_id is not None and job_id != self._heatmap_job_id:
+            return
         self._current_source = src
         self._heatmap_values = payload.values
         self._patch_stat_result = payload.patch_stat_result
         self._invalidate_overlay_patch_fit()
         self._coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg, frame="icrs")
         self._heatmap_coord = self._coord
-        self._time_idx, self._freq_idx = self._default_slice(payload.values)
+        self._time_idx, self._freq_idx = self._select_overlay_slice(
+            payload.values, pending_overlay_slice
+        )
         # Grid placeholder and deferred open-time grid must not clobber this figure.
         self._heatmap_grid_ready = True
 
@@ -2044,13 +2446,14 @@ class SourceReview(param.Parameterized):
         ra_h = self._coord.ra.to_string(unit=u.hour, precision=1)
         dec_s = self._coord.dec.to_string(unit=u.deg, precision=1)
         overlay_hint = (
-            "**Click the heatmap** to inspect a time/frequency slice."
+            "**Click the heatmap** to inspect another time/frequency slice."
             if self._overlay_enabled
             else "Overlay is **off** — toggle **Overlay** to show slices."
         )
         status_text = (
             f"**{src['name']}** — l={src['l']:.2f}°, b={src['b']:.2f}°, "
             f"RA={ra_h}, Dec={dec_s} · "
+            f"Overlay: {self._overlay_time_freq_text(self._time_idx, self._freq_idx)} · "
             f"Heatmap: **{self._heatmap_method_label()}** (Stokes {self.stokes}, "
             f"scale={self._patch_scale:g}) · "
             f"{overlay_hint}"
@@ -2062,6 +2465,8 @@ class SourceReview(param.Parameterized):
         overlay_generation = self._overlay_load_generation
 
         def _load_overlay_after_heatmap() -> None:
+            if job_id is not None and job_id != self._heatmap_job_id:
+                return
             if overlay_generation != self._overlay_load_generation:
                 return
             if (
@@ -2078,9 +2483,13 @@ class SourceReview(param.Parameterized):
                 )
 
         def _after_heatmap_publish() -> None:
+            if job_id is not None and job_id != self._heatmap_job_id:
+                return
             self._clear_loading_indicator()
 
             def _follow_up() -> None:
+                if job_id is not None and job_id != self._heatmap_job_id:
+                    return
                 self._set_status(status_text)
                 self._ui.schedule(_load_overlay_after_heatmap)
                 if pane_rebound:
@@ -2094,6 +2503,24 @@ class SourceReview(param.Parameterized):
         else:
             self._publish_heatmap_figure(figure, after_publish=_after_heatmap_publish)
         self._sync_fit_overlay_button()
+
+    def _consume_pending_overlay_slice(self, values: np.ndarray) -> tuple[int, int]:
+        """Use a catalog detection sample once, then fall back to the middle cell."""
+        pending = self._pending_overlay_slice
+        self._pending_overlay_slice = None
+        return self._select_overlay_slice(values, pending)
+
+    def _select_overlay_slice(
+        self,
+        values: np.ndarray,
+        pending: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        if pending is None:
+            return self._default_slice(values)
+        n_times, n_freqs = values.shape
+        time_idx = int(np.clip(pending[0], 0, max(n_times - 1, 0)))
+        freq_idx = int(np.clip(pending[1], 0, max(n_freqs - 1, 0)))
+        return time_idx, freq_idx
 
     def _default_slice(self, values: np.ndarray) -> tuple[int, int]:
         finite = np.argwhere(np.isfinite(values))
@@ -2124,6 +2551,11 @@ class SourceReview(param.Parameterized):
         widget.stretch = cfg.overlay_stretch
         widget.opacity = float(cfg.overlay_opacity)
         widget.background_opacity = float(cfg.background_opacity)
+        self._apply_hips_background_cuts(widget)
+
+    def _apply_hips_background_cuts(self, widget: SkyWidget) -> None:
+        """Set HiPS cuts: fixed config, else ``hips_pixel_cut``, else tile percentiles."""
+        cfg = self._config
         if cfg.background_cut_min is not None and cfg.background_cut_max is not None:
             widget.background_cut_min = float(cfg.background_cut_min)
             widget.background_cut_max = float(cfg.background_cut_max)
@@ -2132,9 +2564,16 @@ class SourceReview(param.Parameterized):
                 f"{cfg.background_cut_max:.4g}"
             )
             return
+        suggested = read_hips_pixel_cut(self._hips_background)
+        if suggested is not None:
+            cut_lo, cut_hi = suggested
+            widget.background_cut_min = cut_lo
+            widget.background_cut_max = cut_hi
+            self._log(f"HiPS cuts (hips_pixel_cut): {cut_lo:.4g} .. {cut_hi:.4g}")
+            return
         try:
             cut_lo, cut_hi = compute_hips_percentile_cuts(
-                cfg.hips_background,
+                self._hips_background,
                 percentile_low=cfg.hips_background_percentile_low,
                 percentile_high=cfg.hips_background_percentile_high,
             )
@@ -2147,6 +2586,41 @@ class SourceReview(param.Parameterized):
             )
         except (FileNotFoundError, ValueError) as exc:
             self._log(f"WARNING: HiPS display cuts not set — {exc}")
+
+    def _hips_survey_url(self, hips_dir: Path) -> str:
+        return hips_background_survey_url(
+            hips_dir,
+            hips_root=self._config.hips_root,
+            http_prefix=self._config.hips_http_prefix,
+        )
+
+    def _log_hips_background(self) -> None:
+        if (self._hips_background / "properties").is_file():
+            self._log(f"HiPS background: {self._hips_background_url}")
+        else:
+            self._log(
+                f"WARNING: HiPS not found on disk ({self._hips_background}); "
+                f"background URL is {self._hips_background_url!r}"
+            )
+
+    def _on_hips_background_change(self, event: object) -> None:
+        path = Path(str(getattr(event, "new", "")))
+        self._schedule_ui_action(lambda: self._set_hips_background(path))
+
+    def _set_hips_background(self, hips_dir: Path) -> None:
+        """Switch the Aladin background survey and apply that survey's cuts."""
+        if hips_dir == self._hips_background:
+            return
+        self._hips_background = hips_dir
+        self._hips_background_url = self._hips_survey_url(hips_dir)
+        self._log_hips_background()
+        widget = self._sky_widget
+        if widget is None:
+            return
+        # Cuts first: the JS layer is built with the cuts present when the survey changes.
+        self._apply_hips_background_cuts(widget)
+        widget.background_survey = self._hips_background_url
+        self._force_send_sky_widget_state(widget)
 
     def _mount_sky_widget(self, ds: xr.Dataset) -> None:
         """Match ``jupiter_flux_review.ipynb`` (proven with per-time CRVAL)."""
@@ -2173,6 +2647,50 @@ class SourceReview(param.Parameterized):
             self._install_sky_ipywidget_pane(widget)
         else:
             self._sky_container.children = [widget]
+            self._refresh_notebook_sky_embed()
+
+    def _refresh_notebook_sky_embed(self) -> None:
+        """Re-snapshot the notebook IPyWidget after SkyWidget replaces the placeholder.
+
+        Panel freezes ipywidget state into the Bokeh model when the pane is first
+        drawn. The first snapshot is the placeholder VBox, so a later ``children``
+        change stays in the kernel and the browser keeps "Sky view loads…".
+        """
+        from panel.models.ipywidget import IPyWidget as BkIPyWidget
+
+        pane = self._sky_pane
+        container = self._sky_container
+        if (
+            container is None
+            or not isinstance(pane, pn.pane.IPyWidget)
+            or not pane._models
+        ):
+            return
+        ref = next(iter(pane._models))
+        old_model, parent = pane._models[ref]
+        if parent is None:
+            return
+        style: dict[str, object] = {}
+        for attr in ("height", "width", "sizing_mode", "margin"):
+            if hasattr(old_model, attr):
+                style[attr] = getattr(old_model, attr)
+        children = list(parent.children)
+        try:
+            index = children.index(old_model)
+        except ValueError:
+            index = None
+        bundle = _ipywidget_embed_bundle(container)
+        if self._notebook_sky_embed_live:
+            # Replacing the Bokeh model again creates another on-screen sky view.
+            old_model.bundle = bundle
+            return
+        if index is None:
+            return
+        new_model = BkIPyWidget(widget=container, **style)
+        children[index] = new_model
+        parent.children = children
+        pane._models[ref] = (new_model, parent)
+        self._notebook_sky_embed_live = True
 
     def _on_view_gesture_revision(self, change) -> None:
         """Activity-log hook when pan/zoom triggers debounced overlay reproject."""
@@ -2189,21 +2707,51 @@ class SourceReview(param.Parameterized):
             self._fov_executor = pool
         return pool
 
-    def _direct_sky_array(self) -> DirectZarrArray | None:
-        """On-disk SKY for chunk reads, or ``None`` to read through xarray."""
-        dataset = self._dataset
+    def _direct_array(self, dataset: xr.Dataset | None) -> DirectZarrArray | None:
+        """On-disk SKY for ``dataset``, or ``None`` to read through xarray."""
         if dataset is None:
             return None
-        cached = self._direct_sky
-        if cached is None or cached[0] is not dataset:
-            cached = (dataset, direct_zarr_array(dataset))
-            self._direct_sky = cached
-        return cached[1]
+        key = id(dataset)
+        if key not in self._direct_by_id:
+            self._direct_by_id[key] = direct_zarr_array(dataset)
+        return self._direct_by_id[key]
+
+    def _direct_sky_array(self) -> DirectZarrArray | None:
+        """On-disk SKY for overlay plane reads (the overlay sibling, or ``ZARR_PATH``)."""
+        dataset = self._overlay_dataset or self._dataset
+        direct = self._direct_array(dataset)
+        if dataset is not None:
+            self._direct_sky = (dataset, direct)
+        return direct
+
+    def _log_role_reads(
+        self,
+        role: str,
+        dataset: xr.Dataset | None,
+        path: str | None,
+    ) -> None:
+        """Log which store and chunk shape a visualization will read."""
+        if dataset is None:
+            return
+        used = path if path is not None else self._zarr_path
+        direct = self._direct_array(dataset)
+        if direct is None:
+            self._log(f"{role} reads: {used} (through xarray)")
+            return
+        self._log(
+            f"{role} reads: {used} chunks={direct.chunks} "
+            f"({direct.chunk_nbytes / 1e6:.1f} MB), "
+            f"{read_workers(direct.chunk_nbytes)} workers."
+        )
 
     def _read_pool(self) -> ThreadPoolExecutor:
-        """One task per on-disk chunk; sized from the chunk bytes."""
-        direct = self._direct_sky_array()
-        workers = read_workers(direct.chunk_nbytes) if direct is not None else 4
+        """One task per on-disk chunk; sized from the larger open chunk."""
+        nbytes = [
+            direct.chunk_nbytes
+            for dataset in (self._overlay_dataset, self._spectrum_dataset, self._dataset)
+            if (direct := self._direct_array(dataset)) is not None
+        ]
+        workers = max((read_workers(size) for size in nbytes), default=4)
         pool = self._read_executor
         if pool is None or pool._max_workers != workers:
             if pool is not None:
@@ -2225,9 +2773,12 @@ class SourceReview(param.Parameterized):
     def _ensure_fov_session(self) -> FovOverlaySession | None:
         widget = self._sky_widget
         dataset = self._dataset
-        if widget is None or dataset is None or "SKY" not in dataset:
+        overlay = self._overlay_dataset or dataset
+        if widget is None or dataset is None or overlay is None or "SKY" not in overlay:
             return None
         session = self._fov_session
+        # ``ds`` stays the default store so WCS comes from ZARR_PATH. Pixels come
+        # from the overlay sibling when that store is present.
         if session is None or session.sky is not widget or session.ds is not dataset:
             session = FovOverlaySession(
                 widget,
@@ -2252,11 +2803,12 @@ class SourceReview(param.Parameterized):
         return session
 
     def _sky_plane_reader(self) -> DirectZarrArray | SkyPlaneReader:
-        direct = self._direct_sky_array()
+        dataset = self._overlay_dataset or self._dataset
+        direct = self._direct_array(dataset)
         if direct is not None:
             return direct
-        assert self._dataset is not None
-        return SkyPlaneReader(self._dataset["SKY"])
+        assert dataset is not None
+        return SkyPlaneReader(dataset["SKY"])
 
     def _finish_fov_overlay(
         self,
@@ -2674,6 +3226,7 @@ class SourceReview(param.Parameterized):
         plot = figure(
             width=1000,
             height=400,
+            sizing_mode="stretch_width",
             title=self._heatmap_figure_title(subject=title_name),
             x_range=(0, n_times),
             y_range=(0, n_freqs),
@@ -2764,6 +3317,7 @@ class SourceReview(param.Parameterized):
         }
         glyph.dw = n_times
         glyph.dh = n_freqs
+        glyph.global_alpha = 1.0
         glyph.color_mapper = _color_mapper(values.astype(np.float64, copy=False))
 
         hover_data, tooltips = self._heatmap_hover_payload(

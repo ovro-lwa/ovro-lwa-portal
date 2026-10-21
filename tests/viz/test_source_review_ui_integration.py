@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -99,6 +100,63 @@ def _assert_heatmap_bokeh_model_live(harness: PanelUITestHarness, review: Source
 
 def _spinner_spinning(review: SourceReview) -> bool:
     return "ovro-lwa-spin" in (review._loading_widget.value or "")
+
+
+@pytest.mark.parametrize("method", ["dynamic_spectrum", "patch_max"])
+def test_cached_heatmap_request_invalidates_older_job(
+    tmp_path: Path,
+    method: str,
+) -> None:
+    """A queued cache hit must supersede in-flight work and ignore stale paints."""
+    _, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review.heatmap_method = method
+    review.coordinate_string = "Cas A"
+    review._cache[("Cas A", method, str(review.stokes))] = HeatmapLoad(
+        values=np.full((6, 4), 42.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+    review._heatmap_job_id = 1
+    scheduled: list[Callable[[], None]] = []
+    review._schedule_main = lambda callback: scheduled.append(callback)  # type: ignore[method-assign]
+    review._dispatch = lambda callback: scheduled.append(callback)  # type: ignore[method-assign]
+
+    review._load_heatmap()
+
+    assert review._heatmap_job_id == 2
+    assert len(scheduled) == 1
+    review._heatmap_job_id += 1
+    scheduled[0]()
+
+    assert review._heatmap_values is None
+
+
+def test_finish_heatmap_ignores_stale_deferred_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completion queued for publish cannot overwrite a newer heatmap request."""
+    _, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review._heatmap_job_id = 1
+    src = review._current_source
+    assert src is not None
+    payload = HeatmapLoad(
+        values=np.full((6, 4), 43.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+    deferred: list[Callable[[], None]] = []
+    monkeypatch.setattr(sra, "_run_after_hold", lambda callback: deferred.append(callback))
+
+    review._finish_heatmap(src, payload, None, job_id=1, started_at=time.perf_counter())
+
+    assert len(deferred) == 1
+    review._heatmap_job_id += 1
+    deferred[0]()
+
+    assert review._heatmap_values is None
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
@@ -239,6 +297,36 @@ def _mount_review_jupyter(
     monkeypatch.setattr(pqa, "_schedule_ipython_main", loop.add_callback)
     review._ui_session = JupyterPanelUISession(review._notebook_ui_views)
     return harness, review, loop
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_notebook_sky_embed_includes_widget_mounted_after_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first Panel snapshot is the placeholder; mounting must re-embed."""
+    from ipywidgets import HTML
+
+    harness, review, _loop = _mount_review_jupyter(tmp_path, monkeypatch)
+    assert review._sky_pane._models
+    review._sky_container.children = [HTML("SKY-MOUNTED")]
+    review._refresh_notebook_sky_embed()
+
+    _ref, (model, _parent) = next(iter(review._sky_pane._models.items()))
+    blob = str(model.bundle)
+    assert "SKY-MOUNTED" in blob
+    assert "Sky view loads after the Zarr store opens." not in blob
+    sky_model = harness.bokeh_model(review._sky_pane, review._layout)
+    assert sky_model is model
+    parent = sky_model.document
+    assert parent is not None
+    n_models = len(parent.roots)
+    review._sky_container.children = [HTML("SKY-MOVED")]
+    review._refresh_notebook_sky_embed()
+    _ref, (again, _parent) = next(iter(review._sky_pane._models.items()))
+    assert again is model
+    assert "SKY-MOVED" in str(model.bundle)
+    assert len(parent.roots) == n_models
 
 
 def _make_dataset(*, n_times: int = 6, n_freqs: int = 4) -> xr.Dataset:
@@ -1108,6 +1196,189 @@ def test_center_without_overlay_resets_mismatched_heatmap(
     _flush_jupyter_io(loop)
 
     assert reset_calls == [True]
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_review_catalog_position_skips_heatmap_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog click must not republish the zeros grid before the new spectrum."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_coord = CYG_A
+    review._heatmap_values = np.ones((6, 4))
+
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    review._sky_widget = widget
+
+    reset_calls: list[bool] = []
+    load_calls: list[bool] = []
+    overlay_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(review, "_reset_heatmap_to_zeros", lambda: reset_calls.append(True))
+    monkeypatch.setattr(review, "_load_heatmap", lambda: load_calls.append(True))
+    monkeypatch.setattr(
+        review,
+        "_schedule_overlay_slice_load",
+        lambda *args, **kwargs: overlay_calls.append(kwargs),
+    )
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    monkeypatch.setattr(review, "_log_overlay_diagnostics", lambda *a, **k: None)
+
+    review.review_catalog_position("280.46630 -1.96395", name="J1841-0157", stokes="I")
+    _flush_jupyter_io(loop)
+
+    assert reset_calls == []
+    assert load_calls == [True]
+    assert len(overlay_calls) == 1
+    assert overlay_calls[0].get("center_on_target") is True
+    widget.goto.assert_called_once()
+    widget.set_crosshair.assert_called_once()
+    assert review._current_source is not None
+    assert review._current_source["name"] == "J1841-0157"
+    assert review._heatmap_coord == CYG_A
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_review_catalog_position_switches_stokes_without_zeros_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stokes on a catalog click must not clear the heatmap before Generate."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review.stokes = "I"
+    review._heatmap_coord = CYG_A
+    review._heatmap_values = np.ones((6, 4))
+
+    widget = MagicMock()
+    widget.image_shape = (0, 0)
+    review._sky_widget = widget
+
+    grid_calls: list[bool] = []
+
+    def _grid(*_args: object, **_kwargs: object) -> None:
+        grid_calls.append(True)
+
+    monkeypatch.setattr(review, "_ensure_heatmap_grid", _grid)
+    monkeypatch.setattr(review, "_load_heatmap", lambda: None)
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+
+    review.review_catalog_position("148.28526 +7.92746", name="J0953+0755", stokes="V")
+    _flush_jupyter_io(loop)
+
+    assert review.stokes == "V"
+    assert grid_calls == []
+    assert review._heatmap_coord == CYG_A
+    assert review._current_source is not None
+    assert review._current_source["name"] == "J0953+0755"
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_catalog_load_fades_the_previous_spectrum_until_new_values_paint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Load dims the current spectrum; the next paint restores it."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._heatmap_values = np.ones((6, 4))
+    review._refresh_heatmap_figure(review._heatmap_values)
+    glyph = review._heatmap_bokeh_handles.image_renderer.glyph
+    assert glyph.global_alpha == 1.0
+
+    monkeypatch.setattr(review, "_load_heatmap", lambda: None)
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+    widget = MagicMock()
+    widget.image_shape = (8, 8)
+    review._sky_widget = widget
+
+    review.review_catalog_position("280.46630 -1.96395", name="J1841-0157", stokes="I")
+    _flush_jupyter_io(loop)
+    assert glyph.global_alpha == 0.35
+
+    review._update_heatmap_figure_shell(
+        review._heatmap_bokeh_handles,
+        np.full((6, 4), 2.0),
+    )
+    assert glyph.global_alpha == 1.0
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_review_catalog_position_keeps_detection_slice_for_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A catalog time/frequency survives the post-heatmap overlay choice."""
+    _harness, review, loop = _mount_review_jupyter(tmp_path, monkeypatch, layout_only=True)
+    _seed_dataset(review)
+    review._lst_hours = np.arange(6, dtype=float)
+    review._freq_mhz = np.array([18.0, 32.0, 46.0, 82.0])
+    widget = MagicMock()
+    widget.image_shape = (8, 8)
+    review._sky_widget = widget
+    monkeypatch.setattr(review, "_load_heatmap", lambda: None)
+    monkeypatch.setattr(review, "_schedule_overlay_slice_load", lambda *a, **k: None)
+    monkeypatch.setattr(review, "_sync_fit_overlay_button", lambda: None)
+
+    review.review_catalog_position(
+        "280.46630 -1.96395",
+        name="J1841-0157",
+        stokes="I",
+        time_idx=4,
+        freq_idx=1,
+    )
+    _flush_jupyter_io(loop)
+
+    assert "32.0 MHz" in review.status
+    assert "01-01 04h" in review.status
+    assert review._pending_overlay_slice == (4, 1)
+    chosen = review._consume_pending_overlay_slice(np.zeros((6, 4)))
+    assert chosen == (4, 1)
+    assert review._pending_overlay_slice is None
+    assert review._consume_pending_overlay_slice(np.zeros((6, 4))) == review._default_slice(
+        np.zeros((6, 4))
+    )
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_dynamic_spectrum_request_does_not_leak_detection_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _harness, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review._pending_overlay_slice = (4, 1)
+    monkeypatch.setattr(review, "_start_dynamic_spectrum", lambda *_args: None)
+
+    review._load_heatmap()
+
+    assert review._pending_overlay_slice is None
+    assert review._consume_pending_overlay_slice(np.zeros((6, 4))) == review._default_slice(
+        np.zeros((6, 4))
+    )
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_heatmap_request_owns_its_detection_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _harness, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review.heatmap_method = "patch_max"
+    review._pending_overlay_slice = (4, 1)
+    review._cache[("", "patch_max", "I")] = HeatmapLoad(values=np.ones((6, 4)))
+    monkeypatch.setattr(review, "_dispatch", lambda callback: callback())
+
+    review._load_heatmap()
+    assert review._pending_overlay_slice is None
+
+    assert (review._time_idx, review._freq_idx) == (4, 1)
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
