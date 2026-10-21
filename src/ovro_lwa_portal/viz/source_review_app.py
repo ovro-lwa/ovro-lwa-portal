@@ -1537,6 +1537,7 @@ class SourceReview(param.Parameterized):
             self._invalidate_overlay_patch_fit()
         self._coord = coord
         self._current_source = build_source_from_coordinate(name, coord)
+        self._pending_overlay_slice = None
         widget = self._sky_widget
         if widget is None:
             self._log("Sky widget not ready — wait for the Zarr store to open.")
@@ -2042,6 +2043,8 @@ class SourceReview(param.Parameterized):
             self._ensure_heatmap_grid(force=True, announce=False)
 
     def _load_heatmap(self) -> None:
+        pending_overlay_slice = self._pending_overlay_slice
+        self._pending_overlay_slice = None
         if self._dataset is None or self._current_source is None:
             return
         src = self._current_source
@@ -2058,7 +2061,14 @@ class SourceReview(param.Parameterized):
                     )
                 )
             else:
-                self._dispatch(lambda: self._apply_heatmap(src, cached, job_id=job_id))
+                self._dispatch(
+                    lambda: self._apply_heatmap(
+                        src,
+                        cached,
+                        job_id=job_id,
+                        pending_overlay_slice=pending_overlay_slice,
+                    )
+                )
             return
 
         self._invalidate_overlay_patch_fit()
@@ -2083,14 +2093,14 @@ class SourceReview(param.Parameterized):
                 captured_error = exc
                 self._schedule_main(
                     lambda err=captured_error: self._finish_heatmap(
-                        src, None, err, job_id, t0
+                        src, None, err, job_id, t0, pending_overlay_slice
                     )
                 )
                 return
             captured_payload = payload
             self._schedule_main(
                 lambda result=captured_payload: self._finish_heatmap(
-                    src, result, None, job_id, t0
+                    src, result, None, job_id, t0, pending_overlay_slice
                 )
             )
 
@@ -2352,6 +2362,7 @@ class SourceReview(param.Parameterized):
         error: BaseException | None,
         job_id: int,
         started_at: float,
+        pending_overlay_slice: tuple[int, int] | None = None,
     ) -> None:
         if job_id != self._heatmap_job_id:
             return
@@ -2383,7 +2394,12 @@ class SourceReview(param.Parameterized):
         def _apply_and_hint() -> None:
             if job_id != self._heatmap_job_id:
                 return
-            self._apply_heatmap(src, payload, job_id=job_id)
+            self._apply_heatmap(
+                src,
+                payload,
+                job_id=job_id,
+                pending_overlay_slice=pending_overlay_slice,
+            )
             if self._dataset is None:
                 return
             hint = diagnose_heatmap_coverage(
@@ -2408,6 +2424,7 @@ class SourceReview(param.Parameterized):
         payload: HeatmapLoad,
         *,
         job_id: int | None = None,
+        pending_overlay_slice: tuple[int, int] | None = None,
     ) -> None:
         if job_id is not None and job_id != self._heatmap_job_id:
             return
@@ -2417,7 +2434,9 @@ class SourceReview(param.Parameterized):
         self._invalidate_overlay_patch_fit()
         self._coord = SkyCoord(ra=src["ra"] * u.deg, dec=src["dec"] * u.deg, frame="icrs")
         self._heatmap_coord = self._coord
-        self._time_idx, self._freq_idx = self._consume_pending_overlay_slice(payload.values)
+        self._time_idx, self._freq_idx = self._select_overlay_slice(
+            payload.values, pending_overlay_slice
+        )
         # Grid placeholder and deferred open-time grid must not clobber this figure.
         self._heatmap_grid_ready = True
 
@@ -2489,6 +2508,13 @@ class SourceReview(param.Parameterized):
         """Use a catalog detection sample once, then fall back to the middle cell."""
         pending = self._pending_overlay_slice
         self._pending_overlay_slice = None
+        return self._select_overlay_slice(values, pending)
+
+    def _select_overlay_slice(
+        self,
+        values: np.ndarray,
+        pending: tuple[int, int] | None,
+    ) -> tuple[int, int]:
         if pending is None:
             return self._default_slice(values)
         n_times, n_freqs = values.shape

@@ -1346,6 +1346,42 @@ def test_review_catalog_position_keeps_detection_slice_for_overlay(
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_dynamic_spectrum_request_does_not_leak_detection_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _harness, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review._pending_overlay_slice = (4, 1)
+    monkeypatch.setattr(review, "_start_dynamic_spectrum", lambda *_args: None)
+
+    review._load_heatmap()
+
+    assert review._pending_overlay_slice is None
+    assert review._consume_pending_overlay_slice(np.zeros((6, 4))) == review._default_slice(
+        np.zeros((6, 4))
+    )
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
+def test_heatmap_request_owns_its_detection_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _harness, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review.heatmap_method = "patch_max"
+    review._pending_overlay_slice = (4, 1)
+    review._cache[("", "patch_max", "I")] = HeatmapLoad(values=np.ones((6, 4)))
+    monkeypatch.setattr(review, "_dispatch", lambda callback: callback())
+
+    review._load_heatmap()
+    assert review._pending_overlay_slice is None
+
+    assert (review._time_idx, review._freq_idx) == (4, 1)
+
+
+@pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
 def test_generate_after_center_rebinds_desynced_heatmap_pane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
