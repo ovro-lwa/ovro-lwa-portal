@@ -171,6 +171,51 @@ def hips_background_survey_url(
     return f"{base}/{rel.as_posix()}/"
 
 
+def list_hips_surveys(hips_root: Path | str | None = None) -> list[Path]:
+    """HiPS survey directories under ``hips_root``, sorted by name.
+
+    A survey is a ``*.hips`` directory with a ``properties`` file, the same
+    check ``SourceReview`` uses before it logs the background URL.
+    """
+    root = Path(hips_root).expanduser() if hips_root is not None else resolve_hips_root()
+    if not root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in root.iterdir()
+        if path.name.endswith(".hips") and (path / "properties").is_file()
+    )
+
+
+def read_hips_pixel_cut(hips_dir: Path | str) -> tuple[float, float] | None:
+    """Suggested display cuts from a HiPS ``properties`` file.
+
+    ``hips_pixel_cut`` is the low and high pixel value for displaying the
+    survey. Returns ``None`` when the file or keyword is absent.
+    """
+    path = Path(hips_dir).expanduser() / "properties"
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        if key.strip() != "hips_pixel_cut":
+            continue
+        parts = raw.split()
+        if len(parts) < 2:
+            return None
+        try:
+            low = float(parts[0])
+            high = float(parts[1])
+        except ValueError:
+            return None
+        if high <= low:
+            return None
+        return low, high
+    return None
+
+
 def compute_hips_percentile_cuts(
     hips_dir: Path | str,
     *,

@@ -181,15 +181,22 @@ class ProgressiveSpectrumFill:
         freq_chunk: int,
         paint: Callable[[np.ndarray, bool], None],
         on_error: Callable[[BaseException], None],
+        on_chunk: Callable[[int, int], None] | None = None,
     ) -> None:
         self._gen += 1
         gen = self._gen
         grid = np.full((int(n_time), int(n_freq)), np.nan, dtype=np.float64)
         units = plan_fill_units(int(n_time), int(n_freq), int(time_chunk), int(freq_chunk))
-        state = {"remaining": len(units), "last": 0.0, "painted": False, "failed": False}
+        state = {
+            "remaining": len(units),
+            "total": len(units),
+            "last": 0.0,
+            "painted": False,
+            "failed": False,
+        }
 
         def _drain() -> None:
-            self._drain(gen, grid, state, paint, on_error)
+            self._drain(gen, grid, state, paint, on_error, on_chunk)
 
         if not units:
             self.schedule_main(lambda: paint(grid.copy(), True))
@@ -223,6 +230,7 @@ class ProgressiveSpectrumFill:
         state: dict[str, float | int | bool],
         paint: Callable[[np.ndarray, bool], None],
         on_error: Callable[[BaseException], None],
+        on_chunk: Callable[[int, int], None] | None = None,
     ) -> None:
         if gen != self._gen or state["failed"]:
             return
@@ -244,6 +252,9 @@ class ProgressiveSpectrumFill:
             grid[unit.t0 : unit.t1, unit.f0 : unit.f1] = block
             state["remaining"] = int(state["remaining"]) - 1
             wrote = True
+            if on_chunk is not None:
+                done = int(state["total"]) - int(state["remaining"])
+                on_chunk(done, int(state["total"]))
         if not wrote:
             return
         now = time.perf_counter()

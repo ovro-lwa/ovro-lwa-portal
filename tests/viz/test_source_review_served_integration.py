@@ -332,3 +332,39 @@ def test_served_session_slow_zarr_open_then_generate_publishes(
 
     assert _heatmap_values_max(review) == pytest.approx(88.0)
     _assert_heatmap_bokeh_model_live(harness, review)
+
+
+def test_served_catalog_row_remount_replaces_nested_sky_model(tmp_path: Path) -> None:
+    """A catalog row must not hide the sky pane from serve-mode remount."""
+    from panel.io.state import set_curdoc
+
+    import pandas as pd
+
+    from ovro_lwa_portal.viz.exopipe_catalog import attach_candidate_catalog
+    from ovro_lwa_portal.viz.source_review_app import ServeSkyWidget, configure_source_review_serve
+
+    configure_source_review_serve()
+    harness, review, session, _ticks = _mount_review_served(tmp_path)
+    frame = pd.DataFrame(
+        {
+            "stokes": ["I"],
+            "source": ["J1841-0157"],
+            "base_url": ["http://127.0.0.1:8768"],
+        }
+    )
+    attached = attach_candidate_catalog(review, frame)
+    session.bind_document(harness.doc)
+    with set_curdoc(harness.doc):
+        widget = ServeSkyWidget()
+    review._sky_widget = widget
+    review._install_sky_ipywidget_pane(widget)
+
+    assert isinstance(review._sky_pane, pn.pane.IPyWidget)
+    assert review._sky_pane in list(attached.sky_row.objects)
+    ref = next(iter(review._sky_pane._models))
+    old_model = review._sky_pane._models[ref][0]
+    widget.view_ra = 12.5
+    review._remount_sky_ipywidget_model(widget)
+    new_model = review._sky_pane._models[ref][0]
+    assert new_model is not old_model
+    assert review._sky_pane in list(attached.sky_row.objects)

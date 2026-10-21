@@ -92,6 +92,104 @@ def test_source_review_resolves_local_zarr(tmp_path: Path) -> None:
     assert review._zarr_source_type == "local"
 
 
+def _write_sky_store(
+    path: Path,
+    chunks: tuple[int, int, int, int, int],
+    *,
+    n_l: int = 8,
+    n_m: int = 8,
+) -> None:
+    import xarray as xr
+
+    sky = np.ones((4, 2, 1, n_l, n_m), dtype=np.float32)
+    ds = xr.Dataset(
+        {"SKY": (("time", "frequency", "polarization", "l", "m"), sky)},
+        coords={
+            "time": np.array([60000.0, 60000.01, 60000.02, 60000.03]),
+            "frequency": np.array([1.0e8, 1.1e8]),
+            "polarization": [1],
+            "l": np.arange(n_l),
+            "m": np.arange(n_m),
+        },
+    )
+    ds.to_zarr(path, mode="w", encoding={"SKY": {"chunks": chunks}})
+
+
+def _review_for(path: Path, tmp_path: Path) -> SourceReview:
+    def _inline(callback) -> None:
+        callback()
+
+    return SourceReview(
+        path,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+        ),
+        validate_zarr=False,
+        dispatch_override=_inline,
+    )
+
+
+def _open_review(review: SourceReview) -> None:
+    """Run ``_open_dataset`` on this thread so ``_finish_open`` completes."""
+    import threading
+
+    real = threading.Thread
+
+    class _InlineThread(real):
+        def start(self) -> None:
+            self.run()
+
+    threading.Thread = _InlineThread
+    try:
+        review._open_dataset()
+    finally:
+        threading.Thread = real
+
+
+def test_open_without_siblings_uses_base_dataset(tmp_path: Path) -> None:
+    base = tmp_path / "obs.zarr"
+    _write_sky_store(base, (2, 2, 1, 4, 4))
+    review = _review_for(base, tmp_path)
+    _open_review(review)
+    assert review._dataset is not None
+    assert review._overlay_dataset is review._dataset
+    assert review._spectrum_dataset is review._dataset
+
+
+def test_open_uses_sibling_chunk_shapes(tmp_path: Path) -> None:
+    base = tmp_path / "obs.zarr"
+    _write_sky_store(base, (2, 2, 1, 4, 4))
+    _write_sky_store(tmp_path / "obs_overlay.zarr", (1, 1, 1, 8, 8))
+    _write_sky_store(tmp_path / "obs_spectrum.zarr", (4, 2, 1, 2, 2))
+    review = _review_for(base, tmp_path)
+    _open_review(review)
+    overlay = review._direct_array(review._overlay_dataset)
+    spectrum = review._direct_array(review._spectrum_dataset)
+    assert overlay is not None and spectrum is not None
+    assert overlay.chunks == (1, 1, 1, 8, 8)
+    assert spectrum.chunks == (4, 2, 1, 2, 2)
+    assert review._overlay_dataset is not review._dataset
+    assert review._spectrum_dataset is not review._dataset
+
+
+def test_open_rejects_overlay_with_different_l_size(tmp_path: Path) -> None:
+    base = tmp_path / "obs.zarr"
+    overlay = tmp_path / "obs_overlay.zarr"
+    _write_sky_store(base, (2, 2, 1, 4, 4))
+    _write_sky_store(overlay, (1, 1, 1, 16, 8), n_l=16)
+    review = _review_for(base, tmp_path)
+    opened = review._open_capped_dataset(review._zarr_path)
+    with pytest.raises(ValueError, match="SKY sizes differ") as caught:
+        review._open_role_dataset(opened, "overlay", lambda _message: None)
+    text = str(caught.value)
+    assert str(base) in text
+    assert str(overlay) in text
+
+
 def test_serve_sky_widget_coerces_null_background_cuts() -> None:
     """JSON null from ipywidgets_bokeh must not raise on Float HiPS cut traits."""
     import math
@@ -411,6 +509,82 @@ def test_configure_sky_widget_display_applies_config(tmp_path: Path) -> None:
     assert widget.background_opacity == 0.85
     assert widget.background_cut_min == -1.0
     assert widget.background_cut_max == 42.0
+
+
+def _write_survey(root: Path, name: str, cut: str) -> Path:
+    survey = root / name
+    survey.mkdir()
+    (survey / "properties").write_text(f"hips_pixel_cut = {cut}\n", encoding="utf-8")
+    return survey
+
+
+def test_hips_selector_replaces_method_selector(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    a = _write_survey(tmp_path, "a.hips", "-1 2")
+    b = _write_survey(tmp_path, "b.hips", "-3 4")
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=a,
+            hips_http_prefix="http://host:3005",
+            hips_backgrounds=(a, b),
+        ),
+        validate_zarr=False,
+    )
+    assert review._hips_selector is not None
+    assert review._hips_selector.options == {"a": str(a), "b": str(b)}
+    assert review._hips_selector.value == str(a)
+    assert review._method_selector not in review._layout.select(type(review._method_selector))
+
+    widget = MagicMock()
+    review._sky_widget = widget
+    review._set_hips_background(b)
+
+    assert review._hips_background_url == "http://host:3005/b.hips/"
+    assert widget.background_survey == "http://host:3005/b.hips/"
+    assert widget.background_cut_min == -3.0
+    assert widget.background_cut_max == 4.0
+
+
+def test_hidden_heatmap_method_is_omitted_without_surveys(tmp_path: Path) -> None:
+    """ExoPipe does not fall back to the heatmap-method menu."""
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(
+            hips_root=tmp_path,
+            hips_background=tmp_path / "missing.hips",
+            show_heatmap_method=False,
+        ),
+        validate_zarr=False,
+    )
+    names = [str(getattr(child, "name", "")) for child in review._layout.objects[0].objects]
+    assert "Heatmap method" not in names
+    assert "HiPS background" not in names
+
+
+def test_method_selector_kept_without_hips_backgrounds(tmp_path: Path) -> None:
+    zarr = tmp_path / "store.zarr"
+    zarr.mkdir()
+    review = SourceReview(
+        zarr,
+        patch_scale=5.0,
+        sky_fov_deg=8.0,
+        patch_fit_max_reduced_chi_squared=10.0,
+        config=SourceReviewConfig(hips_root=tmp_path, hips_background=tmp_path / "bg.hips"),
+        validate_zarr=False,
+    )
+    assert review._hips_selector is None
+    assert review._method_selector in review._layout.select(type(review._method_selector))
 
 
 def test_overlay_scale_kwargs_and_fixed_scale(tmp_path: Path) -> None:

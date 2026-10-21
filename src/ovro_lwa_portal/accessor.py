@@ -181,22 +181,12 @@ def _read_wcs_header_str(
     """
     if _has_fits_header_str(ds):
         try:
-            from astropy.io.fits import Header
-            from astropy.wcs import WCS
-
             full_hdr = _read_fits_header_str(
                 ds, time_idx=time_idx, freq_idx=freq_idx, pol_idx=int(pol_idx)
             )
-            from astropy.wcs import FITSFixedWarning
-
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", category=FITSFixedWarning)
-                wcs = WCS(Header.fromstring(full_hdr, sep="\n"))
-            if not wcs.has_celestial:
-                return None
-            return wcs.celestial.to_header(relax=True).tostring(sep="\n")
         except ValueError:
             return None
+        return _celestial_header_from_fits_text(full_hdr)
 
     if _has_per_time_wcs_header_str(ds) and "wcs_header_str" in ds:
         wcs_var = ds["wcs_header_str"]
@@ -707,11 +697,88 @@ def _world2pix_from_header_str(
     return l_idx, m_idx, True
 
 
-def _bulk_per_time_wcs_header_strings(ds: xr.Dataset, n_times: int) -> list[str]:
-    """Load decoded celestial WCS header strings for every time index in one pass."""
+def _celestial_header_from_fits_text(full_hdr: str) -> str | None:
+    """Celestial WCS cards from one decoded primary header, or ``None`` if unusable."""
+    if _is_nan_like_header_text(full_hdr) or not full_hdr.strip():
+        return None
+    try:
+        from astropy.io.fits import Header
+        from astropy.wcs import FITSFixedWarning, WCS
+    except ImportError:
+        raise
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FITSFixedWarning)
+            wcs = WCS(Header.fromstring(full_hdr, sep="\n"))
+    except (OSError, ValueError):
+        return None
+    if not wcs.has_celestial:
+        return None
+    return wcs.celestial.to_header(relax=True).tostring(sep="\n")
+
+
+def _load_header_values(
+    sel: xr.DataArray,
+    *,
+    n_times: int,
+    progress_callback: RadportProgressCallback | None,
+    message: str,
+) -> np.ndarray:
+    """Read a per-time header array in one store request."""
+    t0 = time.perf_counter()
+    with _radport_progress_heartbeat(
+        progress_callback,
+        stage="track",
+        current=0,
+        total=n_times,
+        message=message,
+    ):
+        if getattr(sel, "chunks", None):
+            sel = sel.load()
+        raw = np.asarray(sel.values)
+    elapsed = time.perf_counter() - t0
+    _emit_radport_progress(
+        progress_callback,
+        "track",
+        n_times,
+        n_times,
+        f"{message} in {elapsed:.1f}s",
+    )
+    return raw
+
+
+def _bulk_per_time_wcs_header_strings(
+    ds: xr.Dataset,
+    n_times: int,
+    *,
+    progress_callback: RadportProgressCallback | None = None,
+) -> list[str]:
+    """Load decoded celestial WCS header strings for every time index in one pass.
+
+    ``fits_header_str`` is read once for ``frequency=0`` and ``polarization=0``.
+    A per-time ``isel`` is one object request each, which stalls remote stores
+    before any spectrum chunk is read.
+    """
     if _has_fits_header_str(ds):
+        sel = ds["fits_header_str"]
+        if "frequency" in sel.dims:
+            sel = sel.isel(frequency=0)
+        if "polarization" in sel.dims:
+            sel = sel.isel(polarization=0)
+        raw = _load_header_values(
+            sel,
+            n_times=n_times,
+            progress_callback=progress_callback,
+            message="Reading per-time WCS headers from the store",
+        )
+        if raw.shape[0] != n_times or raw.ndim != 1:
+            msg = (
+                f"fits_header_str selection has shape {raw.shape}; "
+                f"expected ({n_times},) after selecting frequency and polarization"
+            )
+            raise ValueError(msg)
         return [
-            _read_wcs_header_str(ds, time_idx=ti, freq_idx=0) or ""
+            _celestial_header_from_fits_text(_decode_wcs_header_bytes(raw[ti])) or ""
             for ti in range(n_times)
         ]
 
@@ -719,9 +786,12 @@ def _bulk_per_time_wcs_header_strings(ds: xr.Dataset, n_times: int) -> list[str]
     sel = wcs_var
     if wcs_var.ndim == 2 and "frequency" in wcs_var.dims:
         sel = wcs_var.isel(frequency=0)
-    if hasattr(sel, "chunks") and sel.chunks is not None:
-        sel = sel.load()
-    raw = np.asarray(sel.values)
+    raw = _load_header_values(
+        sel,
+        n_times=n_times,
+        progress_callback=progress_callback,
+        message="Reading per-time WCS headers from the store",
+    )
     if raw.shape[0] != n_times:
         msg = (
             f"wcs_header_str time length {raw.shape[0]} does not match "
@@ -2810,7 +2880,11 @@ class RadportAccessor:
         progress_callback: RadportProgressCallback | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Map fixed (RA, Dec) through ``wcs_header_str(time)`` in-process."""
-        header_strs = _bulk_per_time_wcs_header_strings(self._obj, n_times)
+        header_strs = _bulk_per_time_wcs_header_strings(
+            self._obj,
+            n_times,
+            progress_callback=progress_callback,
+        )
         table = _build_per_time_wcs_track_table(header_strs)
         return _track_pixels_from_wcs_table(
             table,

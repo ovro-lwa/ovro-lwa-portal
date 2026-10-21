@@ -311,6 +311,28 @@ Useful options (see `scripts/serve_source_review.py`):
 Do **not** call `pn.extension("ipywidgets")` in JupyterLab — that bridge is for
 `panel serve` only.
 
+## Serve ExoPipe candidate review as a Panel app
+
+`notebooks/exopipe_candidate_review.ipynb` stays the Jupyter entry point. The
+standalone app is `scripts/serve_exopipe_candidate_review.py`. It uses the same
+`ServedPanelUISession` as Source Review and listens on port **5010** so it does
+not share port 5006 with Source Review or ports 8766 and 8768 with the ExoPipe
+indexes.
+
+```bash
+export OVRO_SOURCE_REVIEW_ZARR=/path/to/store.zarr
+pixi run panel serve scripts/serve_exopipe_candidate_review.py \
+  --port 5010 --show --autoreload
+```
+
+The ExoPipe indexes must be reachable from the Panel host (the notebook's SSH
+forward to `127.0.0.1:8766` and `127.0.0.1:8768`). Override them with
+`OVRO_EXOPIPE_V_URL` and `OVRO_EXOPIPE_I_URL`, or repeat `--queue V=http://…`.
+The control row lists every HiPS survey under `OVRO_HIPS_ROOT` (default
+`/lustre/pipeline/calibration/hips`). Tile URLs use `OVRO_HIPS_HTTP_BASE`
+(default `http://localhost:3005`). A relative prefix together with
+`--hips-root` mounts tiles on the Panel port.
+
 ## Quick Start
 
 ### Loading OVRO-LWA Data

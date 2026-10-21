@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import astropy.units as u
@@ -20,6 +21,7 @@ from ovro_lwa_portal.viz.source_review_data import (
     filter_known_source_names,
     format_heatmap_time_axis_label,
     load_known_sources,
+    match_detection_slice,
     polarization_index_for_stokes,
     resolve_known_sources_path,
 )
@@ -174,3 +176,39 @@ def test_compute_source_heatmap_uses_selected_pol(iv_polarization_dataset: xr.Da
         pol=1,
     )
     assert calls == [1]
+
+
+def test_match_detection_slice_uses_date_lst_and_subband() -> None:
+    from astropy.time import Time
+
+    mjd = np.array(
+        [
+            Time("2025-05-05T16:00:00", scale="utc").mjd,
+            Time("2025-05-05T17:00:00", scale="utc").mjd,
+            Time("2025-05-06T17:00:00", scale="utc").mjd,
+        ]
+    )
+    time_idx, freq_idx, note = match_detection_slice(
+        mjd,
+        np.array([18.0, 23.0, 32.0, 36.0]),
+        np.array([16.1, 17.2, 17.4]),
+        on_date=date(2025, 5, 5),
+        lst_hour=17,
+        band_mhz=32.0,
+    )
+    assert time_idx == 1
+    assert freq_idx == 2
+    assert "2025-05-05 17h" in note
+    assert "32 MHz" in note
+
+    wide_time, wide_freq, wide_note = match_detection_slice(
+        mjd,
+        np.array([18.0, 23.0, 32.0, 36.0]),
+        np.array([16.1, 17.2, 17.4]),
+        on_date=date(2025, 5, 5),
+        lst_hour=17,
+        band_mhz=None,
+    )
+    assert wide_time == 1
+    assert wide_freq == 2
+    assert "middle channel" in wide_note
