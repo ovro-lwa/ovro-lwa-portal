@@ -1837,7 +1837,11 @@ class SourceReview(param.Parameterized):
                 config_kwargs.setdefault("max_pool_connections", 32)
                 fs_options["config_kwargs"] = config_kwargs
             fs = fsspec.filesystem(parsed.scheme, **fs_options)
-            key = f"{parsed.netloc}/{parsed.path.lstrip('/')}/.zgroup"
+            key = (
+                f"{normalized.rstrip('/')}/.zgroup"
+                if parsed.scheme in ("http", "https")
+                else f"{parsed.netloc}/{parsed.path.lstrip('/')}/.zgroup"
+            )
             return bool(fs.exists(key)), None
         except Exception as exc:  # noqa: BLE001 — a failed probe falls back to ZARR_PATH
             return False, exc
