@@ -177,6 +177,13 @@ def _require_matching_sky(
     if base_sizes != other_sizes:
         msg = f"SKY sizes differ: {base_path} {base_sizes} vs {other_path} {other_sizes}"
         raise ValueError(msg)
+    for dim in base_sizes:
+        left, right = base.coords.get(dim), other.coords.get(dim)
+        if (left is None) != (right is None) or (
+            left is not None and right is not None and not left.variable.equals(right.variable)
+        ):
+            msg = f"SKY {dim} coordinates differ: {base_path} vs {other_path}"
+            raise ValueError(msg)
 
 
 LOADING_SPINNER_HTML = (
