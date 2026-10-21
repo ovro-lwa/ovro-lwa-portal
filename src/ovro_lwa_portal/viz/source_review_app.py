@@ -2046,17 +2046,21 @@ class SourceReview(param.Parameterized):
             return
         src = self._current_source
         method = str(self.heatmap_method)
+        self._heatmap_job_id += 1
+        job_id = self._heatmap_job_id
         cache_key = (self.coordinate_string.strip(), method, str(self.stokes))
         if cache_key in self._cache:
             cached = self._cache[cache_key]
             if method == "dynamic_spectrum":
-                self._schedule_main(lambda: self._paint_dynamic_spectrum(src, cached.values, done=True))
+                self._schedule_main(
+                    lambda: self._paint_dynamic_spectrum(
+                        src, cached.values, done=True, job_id=job_id
+                    )
+                )
             else:
-                self._dispatch(lambda: self._apply_heatmap(src, cached))
+                self._dispatch(lambda: self._apply_heatmap(src, cached, job_id=job_id))
             return
 
-        self._heatmap_job_id += 1
-        job_id = self._heatmap_job_id
         self._invalidate_overlay_patch_fit()
         self._begin_heatmap_load(src)
         if method == "dynamic_spectrum":
@@ -2262,14 +2266,22 @@ class SourceReview(param.Parameterized):
         def _after_publish() -> None:
             if not done:
                 return
-            self._finish_dynamic_spectrum_log(src, started_at)
+            self._finish_dynamic_spectrum_log(src, started_at, job_id=job_id)
 
         if done:
             self._publish_heatmap_mutation_to_notebook(after_publish=_after_publish)
         else:
             self._publish_heatmap_mutation_to_notebook()
 
-    def _finish_dynamic_spectrum_log(self, src: dict, started_at: float | None) -> None:
+    def _finish_dynamic_spectrum_log(
+        self,
+        src: dict,
+        started_at: float | None,
+        *,
+        job_id: int | None = None,
+    ) -> None:
+        if job_id is not None and job_id != self._heatmap_job_id:
+            return
         arr = self._heatmap_values
         if arr is None:
             return
@@ -2369,7 +2381,9 @@ class SourceReview(param.Parameterized):
         )
 
         def _apply_and_hint() -> None:
-            self._apply_heatmap(src, payload)
+            if job_id != self._heatmap_job_id:
+                return
+            self._apply_heatmap(src, payload, job_id=job_id)
             if self._dataset is None:
                 return
             hint = diagnose_heatmap_coverage(
@@ -2388,7 +2402,15 @@ class SourceReview(param.Parameterized):
         self.loading = False
         self._sync_spinner(False)
 
-    def _apply_heatmap(self, src: dict, payload: HeatmapLoad) -> None:
+    def _apply_heatmap(
+        self,
+        src: dict,
+        payload: HeatmapLoad,
+        *,
+        job_id: int | None = None,
+    ) -> None:
+        if job_id is not None and job_id != self._heatmap_job_id:
+            return
         self._current_source = src
         self._heatmap_values = payload.values
         self._patch_stat_result = payload.patch_stat_result
@@ -2424,6 +2446,8 @@ class SourceReview(param.Parameterized):
         overlay_generation = self._overlay_load_generation
 
         def _load_overlay_after_heatmap() -> None:
+            if job_id is not None and job_id != self._heatmap_job_id:
+                return
             if overlay_generation != self._overlay_load_generation:
                 return
             if (
@@ -2440,9 +2464,13 @@ class SourceReview(param.Parameterized):
                 )
 
         def _after_heatmap_publish() -> None:
+            if job_id is not None and job_id != self._heatmap_job_id:
+                return
             self._clear_loading_indicator()
 
             def _follow_up() -> None:
+                if job_id is not None and job_id != self._heatmap_job_id:
+                    return
                 self._set_status(status_text)
                 self._ui.schedule(_load_overlay_after_heatmap)
                 if pane_rebound:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -99,6 +100,63 @@ def _assert_heatmap_bokeh_model_live(harness: PanelUITestHarness, review: Source
 
 def _spinner_spinning(review: SourceReview) -> bool:
     return "ovro-lwa-spin" in (review._loading_widget.value or "")
+
+
+@pytest.mark.parametrize("method", ["dynamic_spectrum", "patch_max"])
+def test_cached_heatmap_request_invalidates_older_job(
+    tmp_path: Path,
+    method: str,
+) -> None:
+    """A queued cache hit must supersede in-flight work and ignore stale paints."""
+    _, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review.heatmap_method = method
+    review.coordinate_string = "Cas A"
+    review._cache[("Cas A", method, str(review.stokes))] = HeatmapLoad(
+        values=np.full((6, 4), 42.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+    review._heatmap_job_id = 1
+    scheduled: list[Callable[[], None]] = []
+    review._schedule_main = lambda callback: scheduled.append(callback)  # type: ignore[method-assign]
+    review._dispatch = lambda callback: scheduled.append(callback)  # type: ignore[method-assign]
+
+    review._load_heatmap()
+
+    assert review._heatmap_job_id == 2
+    assert len(scheduled) == 1
+    review._heatmap_job_id += 1
+    scheduled[0]()
+
+    assert review._heatmap_values is None
+
+
+def test_finish_heatmap_ignores_stale_deferred_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completion queued for publish cannot overwrite a newer heatmap request."""
+    _, review = _mount_review(tmp_path)
+    _seed_dataset(review)
+    review._heatmap_job_id = 1
+    src = review._current_source
+    assert src is not None
+    payload = HeatmapLoad(
+        values=np.full((6, 4), 43.0),
+        patch_fit_result=None,
+        patch_stat_result=None,
+    )
+    deferred: list[Callable[[], None]] = []
+    monkeypatch.setattr(sra, "_run_after_hold", lambda callback: deferred.append(callback))
+
+    review._finish_heatmap(src, payload, None, job_id=1, started_at=time.perf_counter())
+
+    assert len(deferred) == 1
+    review._heatmap_job_id += 1
+    deferred[0]()
+
+    assert review._heatmap_values is None
 
 
 @pytest.mark.filterwarnings("ignore:There is no current event loop:DeprecationWarning")
