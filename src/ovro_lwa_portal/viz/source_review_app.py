@@ -1522,6 +1522,9 @@ class SourceReview(param.Parameterized):
             )
             return
         coord = resolution.coord
+        if stokes not in self.param.stokes.objects:
+            self._log(f"WARNING: This store does not contain Stokes {stokes}.")
+            return
         self._set_coordinate_field_from_text(text, log_prefix="Catalog")
         if str(self.stokes) != stokes:
             self._suppress_stokes_handler = True
