@@ -623,10 +623,14 @@ def attach_candidate_catalog(review: Any, candidates: pd.DataFrame) -> Candidate
         except ValueError as exc:
             review._log(f"WARNING: {exc}")
             return
+        request_id = getattr(review, "_catalog_load_generation", 0) + 1
+        review._catalog_load_generation = request_id
         key = (str(row.base_url), str(row.source))
         review._log(f"Loading {row.stokes} {row.source}…")
 
         def _apply(degrees: str, html: str) -> None:
+            if request_id != review._catalog_load_generation:
+                return
             position_cache[key] = (degrees, html)
             time_idx, freq_idx = _detection_time_freq(review, html)
             review.review_catalog_position(
